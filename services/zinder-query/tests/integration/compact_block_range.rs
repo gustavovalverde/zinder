@@ -445,7 +445,7 @@ async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> 
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 0, 0);
+    let compact_block = compact_block_with_tree_sizes(&block, 0, 0)?;
     let replay = encode_fixture_block_replay(&block, &[]);
 
     store.commit_chain_epoch(ChainEpochArtifacts::new(

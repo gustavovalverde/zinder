@@ -238,11 +238,9 @@ async fn subtree_roots_response_stays_bound_to_reader_epoch_if_current_epoch_adv
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (first_epoch, first_block, _first_compact_block) = synthetic_chain_epoch(1, 1);
-    let first_compact_block =
-        compact_block_with_tree_sizes(first_block.height, first_block.block_hash, 0, 0);
+    let first_compact_block = compact_block_with_tree_sizes(&first_block, 0, 0)?;
     let (second_epoch, second_block, _second_compact_block) = synthetic_chain_epoch(2, 2);
-    let second_compact_block =
-        compact_block_with_tree_sizes(second_block.height, second_block.block_hash, 0, 0);
+    let second_compact_block = compact_block_with_tree_sizes(&second_block, 0, 0)?;
     let first_replay = encode_fixture_block_replay(&first_block, &[]);
     let second_replay = encode_fixture_block_replay(&second_block, &[]);
 

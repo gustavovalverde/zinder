@@ -14,6 +14,8 @@ use zinder_runtime::{
     resolve_ops_listen_addr, validate_zinder_grpc_endpoint,
 };
 
+use super::upstream_contract::ZinderUpstreamContractError;
+
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9070";
 const DEFAULT_EXPLORER_QUERY_ENDPOINT: &str = "http://127.0.0.1:9068";
 const DEFAULT_WALLET_QUERY_ENDPOINT: &str = "http://127.0.0.1:9102";
@@ -65,6 +67,9 @@ pub(crate) enum CipherscanConfigError {
 
     #[error("failed to connect to Zinder gRPC endpoint: {0}")]
     ZinderGrpcConnect(#[from] BearerTokenConnectError),
+
+    #[error(transparent)]
+    UpstreamContract(#[from] ZinderUpstreamContractError),
 
     #[error("failed to bind Cipherscan REST listen address {listen_addr}: {source}")]
     Bind {

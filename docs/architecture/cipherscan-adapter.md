@@ -16,7 +16,7 @@ zinder-compat-cipherscan
 ExplorerQuery / WalletQuery / operations endpoints
     |
     v
-canonical store and replayable materialized views
+wallet-serving state; optional canonical and materialized-view stores
 ```
 
 ## Boundaries
@@ -48,16 +48,38 @@ records how the adapter consumes that contract. The executable acceptance
 procedure lives in the
 [Cipherscan adapter verification runbook](../runbooks/cipherscan-adapter-verification.md).
 
+Startup admission certifies one stateless retained-transaction vertical, not
+the entire registered router. The required native capabilities are
+`explorer.server_info_v1`, `explorer.transaction.detail_v4`,
+`wallet.read.server_info_v2`, `wallet.read.transaction_by_id_v2`, and
+`wallet.read.transaction_bytes_v1`. Identity and network must match exactly,
+and the contract revision must meet the adapter's minimum. Block, address, fee, broadcast, and materialized-view
+capabilities are deployment-specific request-time concerns. When a registered
+route reaches a native method that the deployment reports as `UNIMPLEMENTED`,
+the adapter returns `503` with `code = "capability_unavailable"` and `no-store`
+instead of preventing the stateless transaction service from becoming ready.
+Realtime admission remains a separate optional pair as described below.
+The Explorer runtime advertises transaction detail v4 only after it has admitted
+the same WalletQuery runtime for retained transaction bytes, epoch-pinned
+transparent prevouts, and epoch-pinned transparent spends, so the adapter's
+Explorer capability check transitively certifies that join contract.
+For coinbase transaction detail, `ExplorerQuery.BlockDetail` is optional
+enrichment for the full output total rather than part of startup admission. An
+`UNIMPLEMENTED` response leaves `totalOutput` null and adds an explicit
+`zinderUnavailable` reason; the adapter never substitutes the partial
+transparent-output sum. Transient and internal failures still propagate
+through the normal upstream error mapping.
+
 ## Coverage Matrix
 
 | Route family | Current status | Zinder source | Adapter responsibility | Remaining requirement | Ownership (Zinder, adapter, sidecar, unavailable) |
 | --- | --- | --- | --- | --- | --- |
 | Chain identity and health: `/api/info`, `/api/blockchain-info`, `/api/network/health` | Complete | `WalletQuery.VisibleTipBlock`, `ExplorerQuery.ServerInfo`, `WalletQuery.ServerInfo`, operations readiness | Preserve Cipherscan envelopes and distinguish query-plane health from direct-node availability | None for current fields | Zinder, adapter |
 | Recent blocks and block detail: `/api/blocks`, `/api/blocks/list`, `/api/network/blocks/recent`, `/api/block/:heightOrHash` | Complete | `ExplorerQuery.BlockProductionSeries`, `ExplorerQuery.BlockTransactions`, `WalletQuery.Transaction`, final-note commitment-root artifacts | Pagination, difficulty and display units, standard-script address decoding, coinbase presentation, Cipherscan row names | Pool branding is external; nonstandard or absent facts remain unavailable | Zinder, adapter, sidecar |
-| Mined transaction detail and bytes: `/api/tx/:txid`, `/api/tx/:txid/raw`, `/api/tx/raw/batch`, `/api/tx/:txid/verbose` | Complete for retained bytes and mined detail; verbose decoding is deliberately degraded | `ExplorerQuery.TransactionDetail`, `WalletQuery.Transaction`, transaction-byte retention | Map inputs, outputs, spent state, fee fields, pool balances, and raw-byte envelopes | Historical bytes outside retention and a reusable decoded-transaction contract are unavailable | Zinder, adapter, unavailable |
+| Mined transaction detail and bytes: `/api/tx/:txid`, `/api/tx/:txid/raw`, `/api/tx/raw/batch`, `/api/tx/:txid/verbose` | Complete for retained bytes and mined detail; verbose decoding is deliberately degraded | Stateless `ExplorerQuery.TransactionDetail` v4, `WalletQuery.Transaction`, transaction-byte retention, epoch-pinned prevout and spend lookups | Map inputs, outputs, spent state, exact fee fields when every transparent prevout resolves, pool balances, and raw-byte envelopes | Historical bytes outside retention and a reusable decoded-transaction contract are unavailable | Zinder, adapter, unavailable |
 | Broadcast and transaction browsing: `/api/tx/broadcast`, `/api/transactions/list`, `/api/tx/shielded` | Complete | `WalletQuery.BroadcastTransaction`, `ExplorerQuery.TransactionHistory` v2 | Map typed broadcast outcomes; translate Cipherscan paging to filter- and fence-bound native cursors | None for the supported confirmed-history contract | Zinder, adapter |
 | Commitment-root search: `/api/search/anchor/:root` | Complete for canonical matches; displaced matches are activation-limited | `ExplorerQuery.CommitmentRootSearch`, final-note commitment-root artifacts, displaced-root archive capability | Map canonical and retained displaced positives into Cipherscan arrays; retain indeterminate state for empty displaced results | Pre-activation displaced history cannot prove absence; displaced miner identity remains unavailable without a retained standard payout | Zinder, adapter, unavailable |
-| Mempool and realtime: `/api/mempool`, `/api/mempool/tx/:txid`, root WebSocket | Complete | `MempoolSnapshot`, `IngestControl.MempoolTransaction`, `ExplorerQuery.TransactionDetail`, `WalletQuery.ChainEvents`, `WalletQuery.MempoolEvents` | Preserve mempool fallback behavior and `new_block`, `mempool_tx`, and `mempool_removed` frames; manage reconnect cursors internally | Parent-input enrichment, shielded balances, and paid fees for pending transactions remain unavailable | Zinder, adapter, unavailable |
+| Mempool and realtime: `/api/mempool`, `/api/mempool/tx/:txid`, root WebSocket | REST complete; root WebSocket capability-gated | `ExplorerQuery.MempoolSnapshot`, `ExplorerQuery.TransactionDetail`; `wallet.events.chain_v1` and `wallet.events.mempool_v2` from the exact-pair `WalletQuery` runtime; `explorer.block.production_series_v2` for complete block frames | Preserve mempool fallback behavior; hydrate visible commits through epoch-pinned `ExplorerQuery.BlockProductionSeries`; emit `new_block`, `mempool_tx`, and `mempool_removed`; resume from the last published native cursor | The root returns an explicit `503` when either current-native event capability or block-production hydration is absent; materialized block coverage can still be temporarily unavailable; parent-input enrichment, shielded balances, and paid fees for pending transactions remain unavailable | Zinder, adapter, unavailable |
 | Transparent addresses and ranking: `/api/address/:address`, `/api/rich-list`, `/api/labels`, `/api/label/:address` | Address and ranking complete; label routes are degraded | `ExplorerQuery.TransparentAddressActivity`, `ExplorerQuery.TransparentAddressRanking`, retained transaction facts | Address encoding, page coercion, Cipherscan units, field names, and typed degradation | Labels and counterparty annotations require a registry sidecar | Zinder, adapter, sidecar |
 | Supply, activity, and economics: `/api/network/stats`, `/api/supply`, `/api/circulating-supply`, `/api/supply/transparent-breakdown`, `/api/network/halving`, `/api/network/emission` | Complete for current supply, bounded activity, script breakdown, consensus subsidy, and observed issuance | `ValuePoolSummary`, `BlockProductionSeries`, `TransparentAddressRanking`, `UtxoSetSummary`, `ValuePoolBalanceHistory` | Formatting, Cipherscan periods, supply presentation, and consensus-backed calculations | Category labels are sidecar data; historical subsidy allocation needs a proven cross-product requirement before a new materialized view | Zinder, adapter, sidecar |
 | Fees: `/api/network/fees`, `/api/network/fee-distribution` | Complete | `FeeSummary`, conventional-fee distribution, `PaidFeeDistribution`, intrinsic value balances | Expose Cipherscan periods, percentiles, units, and the distinction between conventional and actual paid fees | Conventional fees are only a degraded fallback when paid-fee coverage is unavailable | Zinder, adapter |

@@ -7,9 +7,8 @@ use eyre::eyre;
 use std::sync::Arc;
 use tonic::{Code, Request};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId,
-    CompactChainMetadata, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentOutputArtifact,
+    BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, TransactionId,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
@@ -18,7 +17,10 @@ use zinder_testkit::{
     StoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
 };
 
-use crate::common::{chain_epoch_artifacts_with_transparent_facts, synthetic_chain_epoch};
+use crate::common::{
+    chain_epoch_artifacts_with_transparent_facts, compact_block_with_tree_sizes,
+    synthetic_chain_epoch,
+};
 
 fn synthetic_transparent_output_artifact(
     block_height: BlockHeight,
@@ -271,28 +273,10 @@ fn commit_two_block_fixture(
             u64::try_from(b"raw-block-1-101".len()).unwrap_or(u64::MAX),
         ),
     ];
-    let compact_blocks = vec![
-        zinder_core::CompactBlockArtifact::empty(
-            BlockId::new(first_height, first_hash),
-            BlockHash::from_bytes([0; 32]),
-            0,
-            CompactChainMetadata {
-                sapling_commitment_tree_size: 0,
-                orchard_commitment_tree_size: 0,
-                ironwood_commitment_tree_size: 0,
-            },
-        ),
-        zinder_core::CompactBlockArtifact::empty(
-            BlockId::new(second_height, second_hash),
-            first_hash,
-            0,
-            CompactChainMetadata {
-                sapling_commitment_tree_size: 0,
-                orchard_commitment_tree_size: 0,
-                ironwood_commitment_tree_size: 0,
-            },
-        ),
-    ];
+    let compact_blocks = blocks
+        .iter()
+        .map(|block_header| compact_block_with_tree_sizes(block_header, 0, 0))
+        .collect::<eyre::Result<Vec<_>>>()?;
     let prevouts = vec![
         synthetic_transparent_output_artifact(first_height, first_hash, 0xA1, 0x11),
         synthetic_transparent_output_artifact(first_height, first_hash, 0xA2, 0x22),

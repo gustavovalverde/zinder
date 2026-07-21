@@ -20,7 +20,7 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
 #[derive(Clone, Debug)]
 pub(crate) struct ExplorerConfig {
     pub(crate) network: Network,
-    pub(crate) storage: ResolvedSecondaryStorage,
+    pub(crate) storage: Option<ResolvedSecondaryStorage>,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) allow_public_bind: bool,
@@ -67,6 +67,9 @@ pub(crate) enum ExplorerConfigError {
     #[error("gRPC transport failed: {0}")]
     Transport(#[from] tonic::transport::Error),
 
+    #[error(transparent)]
+    WalletQueryContract(#[from] super::WalletQueryContractError),
+
     #[error("gRPC reflection initialization failed: {0}")]
     Reflection(#[from] tonic_reflection::server::Error),
 
@@ -86,16 +89,6 @@ pub(crate) fn load_explorer_config(
     overrides: ExplorerConfigOverrides,
 ) -> Result<ExplorerConfig, ExplorerConfigError> {
     let raw: ExplorerRawConfig = ConfigLoader::new()
-        // Storage defaults match the canonical Zinder layout. The explorer
-        // reads through a RocksDB secondary keyed at `explorer-secondary` so it
-        // does not contend with the wallet-query reader's secondary directory.
-        // Operators override via env vars (`ZINDER_STORAGE__PATH`,
-        // `ZINDER_STORAGE__SECONDARY_PATH`) or CLI flags.
-        .with_default("storage.path", "/var/lib/zinder/store")?
-        .with_default(
-            "storage.secondary_path",
-            "/var/lib/zinder/explorer-secondary",
-        )?
         .with_default("explorer.listen_addr", DEFAULT_LISTEN_ADDR)?
         .with_ops_section(RuntimeService::Explorer)?
         .with_security_section()?
@@ -152,7 +145,8 @@ struct ExplorerConfigToml {
     network: NetworkToml,
     ops: OpsToml,
     security: SecurityToml,
-    storage: SecondaryStorageToml,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage: Option<SecondaryStorageToml>,
     explorer: ExplorerToml,
 }
 
@@ -170,7 +164,10 @@ impl ExplorerConfigToml {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
-            storage: SecondaryStorageToml::from_resolved(&config.storage),
+            storage: config
+                .storage
+                .as_ref()
+                .map(SecondaryStorageToml::from_resolved),
             explorer: ExplorerToml {
                 listen_addr: config.listen_addr.to_string(),
                 bearer_token_path: config
@@ -185,7 +182,7 @@ impl ExplorerConfigToml {
 
 fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, ExplorerConfigError> {
     let network = raw.network.resolve()?;
-    let storage = resolve_secondary_storage(raw.storage)?;
+    let storage = resolve_optional_secondary_storage(raw.storage)?;
     let listen_addr_text = require_field(raw.explorer.listen_addr, "explorer.listen_addr")?;
     let listen_addr = parse_socket_addr("explorer.listen_addr", &listen_addr_text)?;
     let bearer_token_path = raw.explorer.bearer_token_path;
@@ -210,4 +207,13 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
         wallet_query_endpoint,
         node,
     })
+}
+
+fn resolve_optional_secondary_storage(
+    storage: SecondaryStorageSection,
+) -> Result<Option<ResolvedSecondaryStorage>, ConfigError> {
+    if storage.path.is_none() && storage.secondary_path.is_none() {
+        return Ok(None);
+    }
+    resolve_secondary_storage(storage).map(Some)
 }

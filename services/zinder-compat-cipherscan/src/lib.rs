@@ -27,7 +27,7 @@ use axum::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::{
-        HeaderValue, Method, StatusCode, Uri,
+        HeaderName, HeaderValue, Method, StatusCode, Uri,
         header::{
             ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
             ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL,
@@ -45,6 +45,7 @@ use time::{Date, Duration, Month, OffsetDateTime, format_description::well_known
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::Code;
+use tonic_types::StatusExt as _;
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::Height as ZebraHeight,
@@ -69,6 +70,7 @@ use zinder_core::{
         encode_bip70_chain_name, encode_rpc_transaction_id_hex, encode_zinder_native_chain_name,
     },
 };
+use zinder_proto::ZINDER_ERROR_DOMAIN;
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1, EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1,
     EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1, EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1,
@@ -86,20 +88,22 @@ use zinder_proto::v1::{
         ConventionalFeeDistributionResponse, DisplacedBlockDetailRequest,
         DisplacedBlockHistoryRequest, DisplacedBlockHistoryResponse, FeeSummaryRequest,
         MempoolSnapshotRequest, PaidFeeDistributionRequest, PaidFeeDistributionResponse,
-        ServerInfoRequest, TransactionComponentSummaryRequest, TransactionComponentSummaryResponse,
-        TransactionDetailRequest, TransactionHistoryAnchor, TransactionHistoryCountScope,
-        TransactionHistoryDirection, TransactionHistoryFilter, TransactionHistoryReadFence,
-        TransactionHistoryRequest, TransactionHistoryResponse, TransparentAddressActivityRequest,
-        TransparentAddressRankingRequest, TransparentAddressRankingResponse,
-        ValuePoolBalanceHistoryRequest, ValuePoolBalanceHistoryResponse,
-        ValuePoolFlowAmountThresholdSummaryRequest, ValuePoolFlowAmountThresholdSummaryResponse,
-        ValuePoolFlowDirection, ValuePoolFlowEventsInRangeRequest,
-        ValuePoolFlowEventsInRangeResponse, ValuePoolFlowFilter, ValuePoolFlowHistoryRequest,
-        ValuePoolFlowHistoryResponse, ValuePoolFlowPool, ValuePoolFlowRoundedAmountSummaryRequest,
-        ValuePoolFlowRoundedAmountSummaryResponse, ValuePoolFlowSummaryRequest,
-        ValuePoolFlowSummaryResolution, ValuePoolSummaryRequest, block_detail_request,
-        explorer_query_client::ExplorerQueryClient, lock_time, transaction_history_request,
+        RecentTransactionsRequest, ServerInfoRequest, TransactionComponentSummaryRequest,
+        TransactionComponentSummaryResponse, TransactionDetailRequest, TransactionHistoryAnchor,
+        TransactionHistoryCountScope, TransactionHistoryDirection, TransactionHistoryFilter,
+        TransactionHistoryReadFence, TransactionHistoryRequest, TransactionHistoryResponse,
+        TransparentAddressActivityRequest, TransparentAddressRankingRequest,
+        TransparentAddressRankingResponse, ValuePoolBalanceHistoryRequest,
+        ValuePoolBalanceHistoryResponse, ValuePoolFlowAmountThresholdSummaryRequest,
+        ValuePoolFlowAmountThresholdSummaryResponse, ValuePoolFlowDirection,
+        ValuePoolFlowEventsInRangeRequest, ValuePoolFlowEventsInRangeResponse, ValuePoolFlowFilter,
+        ValuePoolFlowHistoryRequest, ValuePoolFlowHistoryResponse, ValuePoolFlowPool,
+        ValuePoolFlowRoundedAmountSummaryRequest, ValuePoolFlowRoundedAmountSummaryResponse,
+        ValuePoolFlowSummaryRequest, ValuePoolFlowSummaryResolution, ValuePoolSummaryRequest,
+        block_detail_request, explorer_query_client::ExplorerQueryClient, lock_time,
+        transaction_history_request,
     },
+    ops::ErrorReason,
     wallet::{
         self, AddressLookup, BlockSelectorRequest, BroadcastTransactionRequest,
         SettledTipBlockRequest, TransactionRequest, VisibleTipBlockRequest, address_lookup,
@@ -123,9 +127,15 @@ const DEFAULT_MEMPOOL_LIMIT: u32 = 50;
 const DEFAULT_NON_CANONICAL_BLOCK_LIMIT: u32 = 50;
 const DEFAULT_REORG_FORK_LIMIT: u32 = 20;
 const MAX_LIMIT: u32 = 100;
+const MAX_SITEMAP_BLOCK_RANGE: u64 = 50_000;
+const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const SITEMAP_RECENT_TRANSACTION_LIMIT: u32 = 100;
+const SITEMAP_BLOCK_CACHE_COMPLETE_SECONDS: u32 = 86_400;
+const SITEMAP_CACHE_INCOMPLETE_SECONDS: u32 = 300;
 const MAX_NON_CANONICAL_BLOCK_LIMIT: u32 = 200;
 const BLOCK_SUMMARY_PAGE_SIZE: u32 = 1_024;
 const MAX_RAW_TRANSACTION_BATCH_SIZE: usize = 1_000;
+const MAX_ECMASCRIPT_DATE_UNIX_SECONDS: u64 = 8_640_000_000_000;
 const MAX_SCAN_RANGE_BLOCKS: u64 = 1_000_000;
 const MAX_ORCHARD_CANDIDATE_SCAN_BLOCKS: u64 = 8_064;
 const ORCHARD_CANDIDATE_SCAN_VIEWING_KEY_FIELDS: [&str; 6] = [
@@ -139,6 +149,13 @@ const ORCHARD_CANDIDATE_SCAN_VIEWING_KEY_FIELDS: [&str; 6] = [
 const REORG_HISTORY_PAGE_SIZE: u32 = 1_024;
 const MAX_REORG_HISTORY_PAGES: usize = 16;
 const CIPHERSCAN_ADAPTER_SOURCE: &str = "zinder-compat-cipherscan";
+const SEO_TRANSACTION_CACHE_CONTROL: &str = "public, s-maxage=30, stale-while-revalidate=300";
+const SITEMAP_RECENT_CACHE_CONTROL: &str = "public, max-age=300, stale-while-revalidate=600";
+const SITEMAP_RANGE_ERROR: &str =
+    "start and end must define a non-negative range of at most 50000 heights";
+const X_ROBOTS_TAG: HeaderName = HeaderName::from_static("x-robots-tag");
+const RAW_TRANSACTION_BYTES_LOCATION_FIELD: &str =
+    "location.mined.raw_transaction_bytes or location.in_mempool.raw_transaction_bytes";
 const FEE_SUMMARY_WINDOW_BLOCKS: u32 = 256;
 const ZIP317_MARGINAL_FEE_ZAT: i64 = 5_000;
 const ZIP317_GRACE_ACTIONS: u32 = 2;
@@ -260,9 +277,18 @@ const FORK_MONITOR_SPLIT_HINTS: [&str; 4] = [
 ];
 const REALTIME_EVENT_CHANNEL_CAPACITY: usize = 256;
 const REALTIME_SEND_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+#[cfg(not(test))]
 const REALTIME_RECONNECT_DELAY: StdDuration = StdDuration::from_secs(1);
+#[cfg(test)]
+const REALTIME_RECONNECT_DELAY: StdDuration = StdDuration::from_millis(20);
+#[cfg(not(test))]
 const REALTIME_HYDRATION_RETRY_DELAY: StdDuration = StdDuration::from_millis(250);
+#[cfg(test)]
+const REALTIME_HYDRATION_RETRY_DELAY: StdDuration = StdDuration::from_millis(10);
+#[cfg(not(test))]
 const REALTIME_HYDRATION_ATTEMPTS: usize = 20;
+#[cfg(test)]
+const REALTIME_HYDRATION_ATTEMPTS: usize = 3;
 const PRIVACY_STATS_EPOCH_RETRY_DELAY: StdDuration = StdDuration::from_millis(100);
 const PRIVACY_STATS_EPOCH_ATTEMPTS: usize = 20;
 
@@ -293,6 +319,7 @@ pub struct CipherscanRestAdapter {
     realtime_broadcaster: Arc<CipherscanRealtimeBroadcaster>,
     realtime_cancel: CancellationToken,
     realtime_tasks: TaskTracker,
+    realtime_mode: CipherscanRealtimeMode,
     transaction_history_count_cache:
         Arc<RwLock<BTreeMap<TransactionHistoryCountCacheKey, CachedTransactionHistoryCount>>>,
     mining_production_cache:
@@ -317,6 +344,30 @@ pub struct CipherscanMarketPriceEndpoints {
     pub current: reqwest::Url,
     /// Historical endpoint template containing one `{date}` placeholder.
     pub historical_template: String,
+}
+
+/// Availability of the Cipherscan root WebSocket contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CipherscanRealtimeMode {
+    /// Both canonical chain-event and mempool event streams are admitted.
+    Full,
+    /// The root route returns an explicit unavailable response without opening a WebSocket.
+    Unavailable,
+}
+
+/// Runtime controls for the capability-gated Cipherscan realtime surface.
+#[derive(Clone, Debug)]
+pub struct CipherscanRealtime {
+    mode: CipherscanRealtimeMode,
+    cancel: CancellationToken,
+}
+
+impl CipherscanRealtime {
+    /// Creates realtime controls for an admitted or explicitly unavailable surface.
+    #[must_use]
+    pub const fn new(mode: CipherscanRealtimeMode, cancel: CancellationToken) -> Self {
+        Self { mode, cancel }
+    }
 }
 
 impl CipherscanMarketPriceEndpoints {
@@ -796,6 +847,25 @@ struct MigrationDenominationAccumulator {
     volume_zat: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SitemapBlockRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug)]
+struct SitemapBlockFeed {
+    range: SitemapBlockRange,
+    tip: u32,
+    blocks: Vec<explorer::BlockSummary>,
+}
+
+impl SitemapBlockFeed {
+    fn is_complete(&self) -> bool {
+        u64::from(self.tip) > self.range.end
+    }
+}
+
 impl CipherscanRestAdapter {
     /// Creates an adapter from already-authenticated Zinder gRPC channels.
     pub fn new(
@@ -803,7 +873,7 @@ impl CipherscanRestAdapter {
         explorer_channel: AuthenticatedChannel,
         wallet_channel: AuthenticatedChannel,
         market_price_endpoints: CipherscanMarketPriceEndpoints,
-        realtime_cancel: CancellationToken,
+        realtime: CipherscanRealtime,
     ) -> Result<Self, MarketPriceInitializationError> {
         let (realtime_sender, _) = broadcast::channel(REALTIME_EVENT_CHANNEL_CAPACITY);
         Ok(Self {
@@ -814,8 +884,9 @@ impl CipherscanRestAdapter {
                 sender: realtime_sender,
                 is_started: AtomicBool::new(false),
             }),
-            realtime_cancel,
+            realtime_cancel: realtime.cancel,
             realtime_tasks: TaskTracker::new(),
+            realtime_mode: realtime.mode,
             transaction_history_count_cache: Arc::new(RwLock::new(BTreeMap::new())),
             mining_production_cache: Arc::new(RwLock::new(BTreeMap::new())),
             mining_production_refresh: Arc::new(Mutex::new(())),
@@ -843,9 +914,15 @@ impl CipherscanRestAdapter {
         let router = with_crosslink_and_reorg_routes(router);
         let router = with_privacy_routes(router);
 
+        let router = with_chain_analytics_routes(router);
+        let router = match self.realtime_mode {
+            CipherscanRealtimeMode::Full => router.route("/", get(realtime_websocket)),
+            CipherscanRealtimeMode::Unavailable => {
+                router.route("/", get(realtime_websocket_unavailable))
+            }
+        };
         with_cors_preflight(
-            with_chain_analytics_routes(router)
-                .route("/", get(realtime_websocket))
+            router
                 .route("/api/{*path}", any(compat_fallback))
                 .with_state(self),
         )
@@ -2093,6 +2170,78 @@ impl CipherscanRestAdapter {
         Ok((tip, at_epoch_id))
     }
 
+    async fn fetch_sitemap_block_feed(
+        &self,
+        range: SitemapBlockRange,
+    ) -> Result<SitemapBlockFeed, CipherscanRestError> {
+        let (tip, at_epoch_id) = self.fetch_visible_tip_block_context().await?;
+        let at_epoch_id = at_epoch_id.ok_or(CipherscanRestError::MissingUpstreamField(
+            "visible_tip_block.chain_view.chain_epoch",
+        ))?;
+        let requested_end = range.end.min(u64::from(tip.height));
+        let mut blocks = Vec::new();
+
+        if range.start <= requested_end {
+            let mut chunk_start = u32::try_from(range.start)
+                .map_err(|_| CipherscanRestError::InvalidRequest(SITEMAP_RANGE_ERROR.to_owned()))?;
+            let requested_end = u32::try_from(requested_end)
+                .map_err(|_| CipherscanRestError::InvalidRequest(SITEMAP_RANGE_ERROR.to_owned()))?;
+            loop {
+                let chunk_end = requested_end.min(
+                    chunk_start
+                        .saturating_add(BLOCK_SUMMARY_PAGE_SIZE)
+                        .saturating_sub(1),
+                );
+                let response = self
+                    .explorer_client()
+                    .block_summaries_in_range(explorer::BlockSummariesInRangeRequest {
+                        start_height: chunk_start,
+                        end_height: chunk_end,
+                        at_epoch_id: Some(at_epoch_id),
+                    })
+                    .await?
+                    .into_inner();
+                validate_sitemap_block_chunk(&response, chunk_start, chunk_end, at_epoch_id, &tip)?;
+                blocks.extend(response.summaries);
+                if chunk_end == requested_end {
+                    break;
+                }
+                chunk_start = chunk_end.saturating_add(1);
+            }
+        }
+
+        Ok(SitemapBlockFeed {
+            range,
+            tip: tip.height,
+            blocks,
+        })
+    }
+
+    async fn fetch_sitemap_recent_transactions(
+        &self,
+    ) -> Result<Vec<explorer::RecentTransactionEntry>, CipherscanRestError> {
+        let mut stream = self
+            .explorer_client()
+            .recent_transactions(RecentTransactionsRequest {
+                max_entries: SITEMAP_RECENT_TRANSACTION_LIMIT,
+                from_cursor: Vec::new(),
+            })
+            .await?
+            .into_inner();
+        let mut entries = Vec::new();
+        while let Some(chunk) = stream.message().await? {
+            if entries.len().saturating_add(chunk.entries.len())
+                > usize::try_from(SITEMAP_RECENT_TRANSACTION_LIMIT).unwrap_or(usize::MAX)
+            {
+                return Err(CipherscanRestError::InvalidUpstreamField(
+                    "recent_transactions.entries",
+                ));
+            }
+            entries.extend(chunk.entries);
+        }
+        Ok(entries)
+    }
+
     async fn fetch_visible_tip_commitment_tree_sizes(
         &self,
     ) -> Result<VisibleTipCommitmentTreeSizes, CipherscanRestError> {
@@ -2214,6 +2363,12 @@ fn with_chain_routes(router: Router<CipherscanRestAdapter>) -> Router<Cipherscan
         .route("/api/tx/{transaction_id}/verbose", get(verbose_transaction))
         .route("/api/tx/{transaction_id}/raw", get(raw_transaction))
         .route("/api/tx/{transaction_id}", get(transaction_detail))
+        .route("/api/seo/tx/{transaction_id}", get(seo_transaction))
+        .route(
+            "/api/sitemaps/transactions/recent",
+            get(sitemap_recent_transactions),
+        )
+        .route("/api/sitemaps/blocks", get(sitemap_blocks))
         .route("/api/transactions/list", get(transactions_list))
         .route("/api/shielded/list", get(shielded_flows))
 }
@@ -2377,6 +2532,10 @@ impl IntoResponse for CipherscanRestError {
                 Code::Unavailable | Code::DeadlineExceeded => {
                     (StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable")
                 }
+                Code::Unimplemented => (StatusCode::SERVICE_UNAVAILABLE, "capability_unavailable"),
+                Code::FailedPrecondition if is_dependency_not_configured(upstream) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "capability_unavailable")
+                }
                 Code::Ok
                 | Code::Cancelled
                 | Code::Unknown
@@ -2386,7 +2545,6 @@ impl IntoResponse for CipherscanRestError {
                 | Code::FailedPrecondition
                 | Code::Aborted
                 | Code::OutOfRange
-                | Code::Unimplemented
                 | Code::Internal
                 | Code::DataLoss
                 | Code::Unauthenticated => (StatusCode::BAD_GATEWAY, "upstream_error"),
@@ -2418,6 +2576,16 @@ impl IntoResponse for CipherscanRestError {
             }),
         )
     }
+}
+
+fn is_dependency_not_configured(status: &tonic::Status) -> bool {
+    status
+        .get_error_details()
+        .error_info()
+        .is_some_and(|error_info| {
+            error_info.domain == ZINDER_ERROR_DOMAIN
+                && error_info.reason == ErrorReason::DependencyNotConfigured.as_str_name()
+        })
 }
 
 fn with_chain_analytics_routes(
@@ -2484,6 +2652,13 @@ struct PageQuery {
     skip_count: Option<String>,
     #[serde(rename = "type")]
     transaction_type: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct SitemapBlockRangeQuery {
+    start: Option<String>,
+    end: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3230,11 +3405,16 @@ async fn transaction_detail(
             .as_ref()
             .map(|location| location.block_height);
         match mined_block_height {
-            Some(block_height) => Some(
-                adapter
-                    .fetch_coinbase_total_output_zat(block_height)
-                    .await?,
-            ),
+            Some(block_height) => match adapter.fetch_coinbase_total_output_zat(block_height).await
+            {
+                Ok(total_output_zat) => Some(total_output_zat),
+                Err(CipherscanRestError::Upstream(status))
+                    if status.code() == Code::Unimplemented =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            },
             None => None,
         }
     } else {
@@ -3252,12 +3432,282 @@ async fn transaction_detail(
         transaction_detail_json(CipherscanTransactionDetailJsonInput {
             network: adapter.network,
             facts,
-            location: response.location.as_ref(),
+            mined_transaction: Some(mined_transaction),
             response: &response,
             coinbase_total_output_zat,
             coinbase_miner_fields: coinbase_miner_fields.as_ref(),
         }),
     ))
+}
+
+async fn seo_transaction(
+    State(adapter): State<CipherscanRestAdapter>,
+    Path(transaction_id): Path<String>,
+) -> Result<Response, CipherscanRestError> {
+    if !is_rpc_transaction_id(&transaction_id) {
+        return Ok(invalid_txid_path_parameters_response());
+    }
+
+    let normalized_transaction_id = transaction_id.to_ascii_lowercase();
+    let upstream = adapter
+        .explorer_client()
+        .transaction_detail(TransactionDetailRequest {
+            transaction_id: normalized_transaction_id.clone(),
+            at_epoch_id: None,
+        })
+        .await
+        .map(tonic::Response::into_inner);
+    seo_transaction_response(&normalized_transaction_id, upstream)
+}
+
+fn seo_transaction_response(
+    transaction_id: &str,
+    upstream: Result<explorer::TransactionDetailResponse, tonic::Status>,
+) -> Result<Response, CipherscanRestError> {
+    if !is_rpc_transaction_id(transaction_id) {
+        return Ok(invalid_txid_path_parameters_response());
+    }
+
+    let response = match upstream {
+        Ok(response) => response,
+        Err(status) if status.code() == Code::NotFound => {
+            return Ok(seo_transaction_not_found_response());
+        }
+        Err(status) => return Err(CipherscanRestError::Upstream(status)),
+    };
+    if matches!(
+        response
+            .location
+            .as_ref()
+            .and_then(|location| location.location.as_ref()),
+        Some(transaction_location::Location::InMempool(_))
+    ) {
+        return Ok(seo_transaction_not_found_response());
+    }
+
+    let mut response = json_response(
+        StatusCode::OK,
+        seo_transaction_json(transaction_id, &response)?,
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(SEO_TRANSACTION_CACHE_CONTROL),
+    );
+    Ok(response)
+}
+
+fn seo_transaction_not_found_response() -> Response {
+    json_response(
+        StatusCode::NOT_FOUND,
+        json!({ "error": "Transaction not found" }),
+    )
+}
+
+async fn sitemap_recent_transactions(State(adapter): State<CipherscanRestAdapter>) -> Response {
+    let response = adapter
+        .fetch_sitemap_recent_transactions()
+        .await
+        .and_then(|entries| sitemap_recent_transactions_json(&entries));
+    match response {
+        Ok(body) => sitemap_response(StatusCode::OK, body, Some(SITEMAP_RECENT_CACHE_CONTROL)),
+        Err(error) => sitemap_error_response(error),
+    }
+}
+
+async fn sitemap_blocks(State(adapter): State<CipherscanRestAdapter>, uri: Uri) -> Response {
+    let Ok(Query(query)) = Query::<SitemapBlockRangeQuery>::try_from_uri(&uri) else {
+        return sitemap_invalid_range_response();
+    };
+    let Ok(range) = parse_sitemap_block_range(&query) else {
+        return sitemap_invalid_range_response();
+    };
+    match adapter.fetch_sitemap_block_feed(range).await {
+        Ok(feed) => {
+            let max_age = if feed.is_complete() {
+                SITEMAP_BLOCK_CACHE_COMPLETE_SECONDS
+            } else {
+                SITEMAP_CACHE_INCOMPLETE_SECONDS
+            };
+            let cache_control = format!(
+                "public, max-age={max_age}, stale-while-revalidate={}",
+                max_age.saturating_mul(2).max(600),
+            );
+            sitemap_response(
+                StatusCode::OK,
+                sitemap_block_feed_json(&feed),
+                Some(&cache_control),
+            )
+        }
+        Err(error) => sitemap_error_response(error),
+    }
+}
+
+fn sitemap_invalid_range_response() -> Response {
+    sitemap_response(
+        StatusCode::BAD_REQUEST,
+        json!({
+            "success": false,
+            "error": SITEMAP_RANGE_ERROR,
+        }),
+        None,
+    )
+}
+
+fn parse_sitemap_block_range(query: &SitemapBlockRangeQuery) -> Result<SitemapBlockRange, ()> {
+    let start = query
+        .start
+        .as_deref()
+        .and_then(parse_sitemap_block_height)
+        .ok_or(())?;
+    let end = query
+        .end
+        .as_deref()
+        .and_then(parse_sitemap_block_height)
+        .ok_or(())?;
+    let span = end
+        .checked_sub(start)
+        .and_then(|delta| delta.checked_add(1));
+    if span.is_none_or(|span| span > MAX_SITEMAP_BLOCK_RANGE) {
+        return Err(());
+    }
+    Ok(SitemapBlockRange { start, end })
+}
+
+fn parse_sitemap_block_height(encoded_height: &str) -> Option<u64> {
+    if encoded_height.is_empty() || !encoded_height.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    encoded_height
+        .parse()
+        .ok()
+        .filter(|height| *height <= MAX_JAVASCRIPT_SAFE_INTEGER)
+}
+
+fn validate_sitemap_block_chunk(
+    response: &explorer::BlockSummariesInRangeResponse,
+    expected_start: u32,
+    expected_end: u32,
+    expected_epoch_id: u64,
+    expected_tip: &wallet::BlockId,
+) -> Result<(), CipherscanRestError> {
+    let chain_epoch = response
+        .freshness
+        .as_ref()
+        .and_then(|freshness| freshness.chain_view.as_ref())
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+        .ok_or(CipherscanRestError::MissingUpstreamField(
+            "block_summaries_in_range.freshness.chain_view.chain_epoch",
+        ))?;
+    let response_tip =
+        chain_epoch
+            .visible_tip
+            .as_ref()
+            .ok_or(CipherscanRestError::MissingUpstreamField(
+                "block_summaries_in_range.freshness.chain_view.chain_epoch.visible_tip",
+            ))?;
+    if chain_epoch.chain_epoch_id != expected_epoch_id
+        || response_tip.height != expected_tip.height
+        || response_tip.hash != expected_tip.block_hash
+    {
+        return Err(CipherscanRestError::InvalidUpstreamField(
+            "block_summaries_in_range.freshness.chain_view.chain_epoch",
+        ));
+    }
+    let expected_count =
+        usize::try_from(inclusive_height_count(expected_start, expected_end)).unwrap_or(usize::MAX);
+    if response.summaries.len() != expected_count {
+        return Err(CipherscanRestError::MissingUpstreamField(
+            "block_summaries_in_range.summaries",
+        ));
+    }
+    for (offset, summary) in response.summaries.iter().enumerate() {
+        let expected_height = expected_start
+            .checked_add(u32::try_from(offset).unwrap_or(u32::MAX))
+            .ok_or(CipherscanRestError::InvalidUpstreamField(
+                "block_summaries_in_range.summaries.block_height",
+            ))?;
+        if summary.block_height != expected_height {
+            return Err(CipherscanRestError::InvalidUpstreamField(
+                "block_summaries_in_range.summaries.block_height",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sitemap_recent_transactions_json(
+    entries: &[explorer::RecentTransactionEntry],
+) -> Result<Value, CipherscanRestError> {
+    let transactions = entries
+        .iter()
+        .map(|entry| {
+            if !is_rpc_transaction_id(&entry.transaction_id) {
+                return Err(CipherscanRestError::InvalidUpstreamField(
+                    "recent_transactions.entries.transaction_id",
+                ));
+            }
+            Ok(json!({
+                "txid": entry.transaction_id,
+                "blockTime": sitemap_timestamp(entry.block_time_unix_seconds),
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "success": true,
+        "transactions": transactions,
+    }))
+}
+
+fn sitemap_block_feed_json(feed: &SitemapBlockFeed) -> Value {
+    let blocks = feed
+        .blocks
+        .iter()
+        .map(|summary| {
+            json!({
+                "height": summary.block_height,
+                "timestamp": sitemap_timestamp(summary.block_time_unix_seconds),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "success": true,
+        "range": {
+            "start": feed.range.start,
+            "end": feed.range.end,
+        },
+        "tip": feed.tip,
+        "complete": feed.is_complete(),
+        "blocks": blocks,
+    })
+}
+
+fn sitemap_timestamp(unix_seconds: i64) -> Value {
+    if unix_seconds == 0 {
+        Value::Null
+    } else {
+        json!(unix_seconds)
+    }
+}
+
+fn sitemap_error_response(error: CipherscanRestError) -> Response {
+    let mut response = error.into_response();
+    response
+        .headers_mut()
+        .insert(X_ROBOTS_TAG, HeaderValue::from_static("noindex"));
+    response
+}
+
+fn sitemap_response(status: StatusCode, body: Value, cache_control: Option<&str>) -> Response {
+    let mut response = json_response(status, body);
+    response
+        .headers_mut()
+        .insert(X_ROBOTS_TAG, HeaderValue::from_static("noindex"));
+    if let Some(cache_control) = cache_control
+        && let Ok(cache_control) = HeaderValue::from_str(cache_control)
+    {
+        response.headers_mut().insert(CACHE_CONTROL, cache_control);
+    }
+    response
 }
 
 fn validate_transaction_detail_outputs(
@@ -3337,11 +3787,14 @@ async fn raw_transaction(
         })
         .await?
         .into_inner();
-    let raw_bytes = raw_transaction_bytes(response.location.as_ref()).ok_or(
-        CipherscanRestError::MissingUpstreamField(
-            "location.mined.raw_transaction_bytes or location.in_mempool.raw_transaction_bytes",
-        ),
-    )?;
+    raw_transaction_response(&transaction_id, response.location.as_ref())
+}
+
+fn raw_transaction_response(
+    transaction_id: &str,
+    location: Option<&wallet::TransactionLocation>,
+) -> Result<Response, CipherscanRestError> {
+    let raw_bytes = required_raw_transaction_bytes(location)?;
     Ok(json_response(
         StatusCode::OK,
         json!({
@@ -3419,16 +3872,17 @@ async fn verbose_transaction(
         Err(status) => return Err(CipherscanRestError::Upstream(status)),
     };
 
-    let Some(raw_bytes) = raw_transaction_bytes(response.location.as_ref()) else {
-        return Ok(json_response(
-            StatusCode::NOT_FOUND,
-            json!({ "error": "Transaction not found" }),
-        ));
-    };
+    verbose_transaction_response(&transaction_id, response.location.as_ref())
+}
 
+fn verbose_transaction_response(
+    transaction_id: &str,
+    location: Option<&wallet::TransactionLocation>,
+) -> Result<Response, CipherscanRestError> {
+    let raw_bytes = required_raw_transaction_bytes(location)?;
     Ok(json_response(
         StatusCode::OK,
-        verbose_transaction_json(&transaction_id, raw_bytes),
+        verbose_transaction_json(transaction_id, raw_bytes),
     ))
 }
 
@@ -3456,13 +3910,12 @@ async fn raw_transactions_batch(
         match response {
             Ok(response) => {
                 let response = response.into_inner();
-                if let Some(raw_bytes) = raw_transaction_bytes(response.location.as_ref()) {
-                    transactions.push(raw_transaction_batch_row(&transaction_id, raw_bytes));
-                } else {
-                    failed.push(raw_transaction_batch_failure(
-                        &transaction_id,
-                        "Transaction raw bytes are unavailable",
-                    ));
+                match raw_transaction_batch_location_result(
+                    &transaction_id,
+                    response.location.as_ref(),
+                ) {
+                    Ok(transaction) => transactions.push(transaction),
+                    Err(failure) => failed.push(failure),
                 }
             }
             Err(error) => {
@@ -4043,7 +4496,11 @@ async fn mempool(
         .summary
         .as_ref()
         .ok_or(CipherscanRestError::MissingUpstreamField("summary"))?;
-    let transactions: Vec<Value> = snapshot.entries.iter().map(mempool_row).collect();
+    let transactions = snapshot
+        .entries
+        .iter()
+        .map(mempool_row)
+        .collect::<Result<Vec<_>, CipherscanRestError>>()?;
     Ok(json_response(
         StatusCode::OK,
         json!({
@@ -4095,13 +4552,14 @@ async fn mempool_transaction(
         .as_ref()
         .ok_or(CipherscanRestError::MissingUpstreamField("facts"))?;
     validate_transaction_detail_outputs(facts, &response)?;
+    let transaction = mempool_transaction_json(adapter.network, facts, mempool, &response)?;
 
     Ok(json_response(
         StatusCode::OK,
         json!({
             "success": true,
             "inMempool": true,
-            "transaction": mempool_transaction_json(adapter.network, facts, mempool, &response),
+            "transaction": transaction,
         }),
     ))
 }
@@ -6361,6 +6819,16 @@ async fn realtime_websocket(
     })
 }
 
+async fn realtime_websocket_unavailable() -> Response {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({
+            "code": "realtime_unavailable",
+            "error": "Cipherscan realtime requires the current native chain-event and mempool event capabilities from WalletQuery",
+        }),
+    )
+}
+
 async fn forward_realtime_events(
     mut websocket: WebSocket,
     mut realtime_events: broadcast::Receiver<CipherscanRealtimeDispatch>,
@@ -6557,14 +7025,17 @@ async fn relay_mempool_events(adapter: CipherscanRestAdapter) {
                 }
             };
 
-            if let Err(error) = publish_mempool_event(&adapter, &realtime_sender, &mempool_event) {
-                broadcast_realtime_source_unavailable(
-                    &realtime_sender,
-                    "mempool event decoding",
-                    &error,
-                );
+            match publish_mempool_event(&adapter, &realtime_sender, &mempool_event) {
+                Ok(()) => resume_cursor = Some(mempool_event.cursor.clone()),
+                Err(error) => {
+                    broadcast_realtime_source_unavailable(
+                        &realtime_sender,
+                        "mempool event decoding",
+                        &error,
+                    );
+                    break;
+                }
             }
-            resume_cursor = Some(mempool_event.cursor.clone());
         }
 
         if !wait_for_realtime_retry(&adapter.realtime_cancel).await {
@@ -6824,7 +7295,7 @@ fn publish_mempool_event(
                     "mempool_event.added.entry",
                 ))?;
             let facts = parse_realtime_mempool_facts(adapter.network, entry)?;
-            let transaction_data = mempool_added_json(&facts, entry);
+            let transaction_data = mempool_added_json(&facts, entry)?;
             broadcast_realtime_payload(realtime_sender, "mempool_tx", &transaction_data);
         }
         Some(mempool_event_envelope::Event::Invalidated(invalidated)) => {
@@ -7020,7 +7491,7 @@ fn sidecar_unavailable_response(error: &str, unavailable: &str) -> Response {
 struct CipherscanTransactionDetailJsonInput<'a> {
     network: Network,
     facts: &'a explorer::TransactionPublicFacts,
-    location: Option<&'a wallet::TransactionLocation>,
+    mined_transaction: Option<&'a wallet::MinedTransaction>,
     response: &'a explorer::TransactionDetailResponse,
     coinbase_total_output_zat: Option<u64>,
     coinbase_miner_fields: Option<&'a CipherscanCoinbaseMinerFields>,
@@ -7032,7 +7503,92 @@ struct CipherscanTransactionDetailZatoshiTotals {
     value_balance: Option<i64>,
 }
 
+fn seo_transaction_json(
+    requested_transaction_id: &str,
+    response: &explorer::TransactionDetailResponse,
+) -> Result<Value, CipherscanRestError> {
+    let facts = response
+        .facts
+        .as_ref()
+        .ok_or(CipherscanRestError::MissingUpstreamField(
+            "transaction_detail.facts",
+        ))?;
+    if !is_rpc_transaction_id(&facts.transaction_id)
+        || !facts
+            .transaction_id
+            .eq_ignore_ascii_case(requested_transaction_id)
+    {
+        return Err(CipherscanRestError::InvalidUpstreamField(
+            "transaction_detail.facts.transaction_id",
+        ));
+    }
+    let counts = facts
+        .counts
+        .as_ref()
+        .ok_or(CipherscanRestError::MissingUpstreamField(
+            "transaction_detail.facts.counts",
+        ))?;
+    let mined_transaction = mined_location(response.location.as_ref()).ok_or(
+        CipherscanRestError::MissingUpstreamField("transaction_detail.location.mined"),
+    )?;
+    let block_location =
+        mined_transaction
+            .location
+            .as_ref()
+            .ok_or(CipherscanRestError::MissingUpstreamField(
+                "transaction_detail.location.mined.location",
+            ))?;
+    if block_location.transaction_id != facts.transaction_id {
+        return Err(CipherscanRestError::InvalidUpstreamField(
+            "transaction_detail.location.mined.location.transaction_id",
+        ));
+    }
+    if !is_rpc_hash(&block_location.block_hash) {
+        return Err(CipherscanRestError::InvalidUpstreamField(
+            "transaction_detail.location.mined.location.block_hash",
+        ));
+    }
+    let chain_context = mined_transaction.chain_context.as_ref().ok_or(
+        CipherscanRestError::MissingUpstreamField(
+            "transaction_detail.location.mined.chain_context",
+        ),
+    )?;
+
+    Ok(json!({
+        "txid": facts.transaction_id,
+        "blockHeight": block_location.block_height,
+        "blockHash": block_location.block_hash,
+        "blockTime": chain_context.block_time,
+        "confirmations": chain_context.confirmations,
+        "isCanonical": true,
+        "status": "confirmed",
+        "isCoinbase": facts.is_coinbase,
+        "hasSapling": has_sapling_counts(counts),
+        "hasOrchard": counts.orchard_action_count > 0,
+        "hasIronwood": counts.ironwood_action_count > 0,
+        "hasShielded": has_shielded_components(Some(counts)),
+        "orchardActions": counts.orchard_action_count,
+        "shieldedSpends": counts.sapling_spend_count,
+        "shieldedOutputs": counts.sapling_output_count,
+        "fee": seo_transaction_fee(facts, response.paid_fee_zat),
+    }))
+}
+
+fn seo_transaction_fee(
+    facts: &explorer::TransactionPublicFacts,
+    paid_fee_zat: Option<u64>,
+) -> Option<f64> {
+    if facts.is_coinbase {
+        return Some(0.0);
+    }
+
+    paid_fee_zat
+        .and_then(|fee| i64::try_from(fee).ok())
+        .map(zec_from_zatoshis)
+}
+
 fn cipherscan_transaction_detail_totals(
+    is_coinbase: bool,
     response: &explorer::TransactionDetailResponse,
     coinbase_total_output_zat: Option<u64>,
 ) -> CipherscanTransactionDetailZatoshiTotals {
@@ -7057,7 +7613,11 @@ fn cipherscan_transaction_detail_totals(
         });
     CipherscanTransactionDetailZatoshiTotals {
         input: input_zat,
-        output: coinbase_total_output_zat.or(transparent_output_zat),
+        output: if is_coinbase {
+            coinbase_total_output_zat
+        } else {
+            transparent_output_zat
+        },
         value_balance: value_balance_zat,
     }
 }
@@ -7066,25 +7626,33 @@ fn transaction_detail_json(input: CipherscanTransactionDetailJsonInput<'_>) -> V
     let CipherscanTransactionDetailJsonInput {
         network,
         facts,
-        location,
+        mined_transaction,
         response,
         coinbase_total_output_zat,
         coinbase_miner_fields,
     } = input;
     let counts = facts.counts.as_ref();
     let fee = cipherscan_transaction_detail_fee(facts, response.paid_fee_zat);
-    let mined = mined_location(location);
-    let mempool = mempool_location(location);
-    let block_location = mined.and_then(|mined_transaction| mined_transaction.location.as_ref());
+    let block_location =
+        mined_transaction.and_then(|mined_transaction| mined_transaction.location.as_ref());
     let mined_chain_context =
-        mined.and_then(|mined_transaction| mined_transaction.chain_context.as_ref());
+        mined_transaction.and_then(|mined_transaction| mined_transaction.chain_context.as_ref());
     let transaction_rows = cipherscan_transaction_detail_rows(network, facts, response);
     let intrinsic_value_balances = response.intrinsic_value_balances.as_ref();
-    let totals = cipherscan_transaction_detail_totals(response, coinbase_total_output_zat);
+    let totals = cipherscan_transaction_detail_totals(
+        facts.is_coinbase,
+        response,
+        coinbase_total_output_zat,
+    );
     let cipherscan_fee = fee.amount_zec.filter(|amount| *amount > 0.0);
     let input_count = transaction_rows.inputs.len();
     let output_count = transaction_rows.outputs.len();
-    let unavailable = transaction_rows.unavailable;
+    let mut unavailable = transaction_rows.unavailable;
+    append_coinbase_total_unavailable(
+        &mut unavailable,
+        facts.is_coinbase,
+        coinbase_total_output_zat,
+    );
 
     let mut transaction = json!({
         "txid": facts.transaction_id,
@@ -7092,8 +7660,8 @@ fn transaction_detail_json(input: CipherscanTransactionDetailJsonInput<'_>) -> V
         "blockHash": block_location.map(|location| location.block_hash.as_str()),
         "blockTime": mined_chain_context.map(|chain_context| chain_context.block_time.to_string()),
         "confirmations": mined_chain_context.map(|chain_context| chain_context.confirmations),
-        "mempoolTime": mempool.map(mempool_first_seen_unix_seconds),
-        "status": transaction_status(location),
+        "mempoolTime": Value::Null,
+        "status": mined_transaction.map_or("unknown", |_| "mined"),
         "size": facts.size_bytes,
         "version": facts.version.as_ref().map(|version| version.effective_version),
         "versionKind": facts.version.as_ref().map(|version| version.kind),
@@ -7123,7 +7691,24 @@ fn transaction_detail_json(input: CipherscanTransactionDetailJsonInput<'_>) -> V
         "outputs": transaction_rows.outputs,
         "zinderUnavailable": unavailable,
     });
-    if let Value::Object(fields) = &mut transaction {
+    insert_transaction_detail_compat_fields(
+        &mut transaction,
+        &totals,
+        input_count,
+        output_count,
+        coinbase_miner_fields,
+    );
+    transaction
+}
+
+fn insert_transaction_detail_compat_fields(
+    transaction: &mut Value,
+    totals: &CipherscanTransactionDetailZatoshiTotals,
+    input_count: usize,
+    output_count: usize,
+    coinbase_miner_fields: Option<&CipherscanCoinbaseMinerFields>,
+) {
+    if let Value::Object(fields) = transaction {
         fields.insert(
             "valueBalance".to_owned(),
             json!(totals.value_balance.map(zec_from_zatoshis)),
@@ -7141,7 +7726,18 @@ fn transaction_detail_json(input: CipherscanTransactionDetailJsonInput<'_>) -> V
         fields.insert("bridge".to_owned(), Value::Null);
         fields.insert("stakingAction".to_owned(), Value::Null);
     }
-    transaction
+}
+
+fn append_coinbase_total_unavailable(
+    unavailable: &mut Vec<&'static str>,
+    is_coinbase: bool,
+    coinbase_total_output_zat: Option<u64>,
+) {
+    if is_coinbase && coinbase_total_output_zat.is_none() {
+        unavailable.push(
+            "The full coinbase output total is unavailable because block-detail enrichment is not provided by the connected Explorer deployment.",
+        );
+    }
 }
 
 struct CipherscanTransactionDetailRows {
@@ -7991,7 +8587,11 @@ fn value_pool_flow_coverage_json(coverage: &explorer::ValuePoolFlowCoverage) -> 
     })
 }
 
-fn mempool_row(entry: &explorer::MempoolActivityEntry) -> Value {
+fn mempool_row(entry: &explorer::MempoolActivityEntry) -> Result<Value, CipherscanRestError> {
+    let first_seen_unix_seconds = cipherscan_mempool_first_seen_unix_seconds(
+        entry.first_seen_unix_millis,
+        "mempool_snapshot.entries.first_seen_unix_millis",
+    )?;
     let counts = entry.component_counts.as_ref();
     let mut unavailable = Vec::new();
     if counts.is_none() {
@@ -8002,11 +8602,11 @@ fn mempool_row(entry: &explorer::MempoolActivityEntry) -> Value {
     unavailable.push(
         "Sapling, Orchard, and Ironwood value balances are unavailable from the native mempool surface.",
     );
-    json!({
+    Ok(json!({
         "txid": entry.transaction_id,
         "size": entry.size_bytes,
         "type": cipherscan_mempool_transaction_type(entry.privacy_shape),
-        "time": entry.first_seen_unix_millis / 1_000,
+        "time": first_seen_unix_seconds,
         "vin": counts.map_or(0, |counts| counts.transparent_input_count),
         "vout": counts.map_or(0, |counts| counts.transparent_output_count),
         "vShieldedSpend": counts.map_or(0, |counts| counts.sapling_spend_count),
@@ -8027,21 +8627,28 @@ fn mempool_row(entry: &explorer::MempoolActivityEntry) -> Value {
         "paid_fee_zat": entry.paid_fee_zat,
         "logical_actions": entry.logical_actions,
         "zinderUnavailable": unavailable,
-    })
+    }))
 }
 
-fn mempool_added_json(facts: &CoreTransactionPublicFacts, entry: &wallet::MempoolEntry) -> Value {
+fn mempool_added_json(
+    facts: &CoreTransactionPublicFacts,
+    entry: &wallet::MempoolEntry,
+) -> Result<Value, CipherscanRestError> {
+    let first_seen_unix_seconds = cipherscan_mempool_first_seen_unix_seconds(
+        entry.first_seen_unix_millis,
+        "mempool_event.added.entry.first_seen_unix_millis",
+    )?;
     let counts = facts.counts;
     let transparent_output_total_zat = entry
         .transparent_outputs
         .iter()
         .map(|output| output.value_zat)
         .fold(0_u64, u64::saturating_add);
-    json!({
+    Ok(json!({
         "txid": encode_rpc_transaction_id_hex(facts.transaction_id),
         "size": facts.size_bytes,
         "type": core_transaction_type(counts),
-        "time": entry.first_seen_unix_millis / 1_000,
+        "time": first_seen_unix_seconds,
         "inputCount": counts.transparent_input_count,
         "outputCount": counts.transparent_output_count,
         "hasSapling": counts.sapling_spend_count > 0 || counts.sapling_output_count > 0,
@@ -8054,7 +8661,7 @@ fn mempool_added_json(facts: &CoreTransactionPublicFacts, entry: &wallet::Mempoo
         "zinderUnavailable": [
             "Actual paid fee and shielded value balances are unavailable on the realtime mempool event."
         ],
-    })
+    }))
 }
 
 fn core_transaction_type(counts: CoreTransactionComponentCounts) -> &'static str {
@@ -8121,7 +8728,11 @@ fn mempool_transaction_json(
     facts: &explorer::TransactionPublicFacts,
     mempool: &wallet::MempoolEntry,
     response: &explorer::TransactionDetailResponse,
-) -> Value {
+) -> Result<Value, CipherscanRestError> {
+    let first_seen_unix_seconds = cipherscan_mempool_first_seen_unix_seconds(
+        mempool.first_seen_unix_millis,
+        "location.in_mempool.first_seen_unix_millis",
+    )?;
     let counts = facts.counts.as_ref();
     let outputs: Vec<Value> = response
         .transparent_outputs
@@ -8158,14 +8769,14 @@ fn mempool_transaction_json(
             "A transparent output uses a nonstandard script, so no address is inferred from its scriptPubKey.",
         );
     }
-    json!({
+    Ok(json!({
         "txid": facts.transaction_id,
         "size": facts.size_bytes,
         "type": compat_transaction_type(counts),
         "version": facts.version.as_ref().map(|version| version.effective_version),
         "versionKind": facts.version.as_ref().map(|version| version.kind),
         "locktime": lock_time_json(facts.lock_time.as_ref()),
-        "firstSeen": mempool_first_seen_unix_seconds(mempool),
+        "firstSeen": first_seen_unix_seconds,
         "vinCount": counts.map(|counts| counts.transparent_input_count),
         "voutCount": counts.map(|counts| counts.transparent_output_count),
         "shieldedSpends": counts.map(|counts| counts.sapling_spend_count),
@@ -8178,7 +8789,21 @@ fn mempool_transaction_json(
         "totalOutput": zec_from_unsigned_zatoshis(transparent_output_total_zat),
         "outputs": outputs,
         "zinderUnavailable": unavailable,
-    })
+    }))
+}
+
+fn cipherscan_mempool_first_seen_unix_seconds(
+    first_seen_unix_millis: u64,
+    field: &'static str,
+) -> Result<u64, CipherscanRestError> {
+    if first_seen_unix_millis == 0 {
+        return Err(CipherscanRestError::InvalidUpstreamField(field));
+    }
+    let first_seen_unix_seconds = first_seen_unix_millis / 1_000;
+    if first_seen_unix_seconds > MAX_ECMASCRIPT_DATE_UNIX_SECONDS {
+        return Err(CipherscanRestError::InvalidUpstreamField(field));
+    }
+    Ok(first_seen_unix_seconds)
 }
 
 fn shielded_stats_missing_since_response() -> Response {
@@ -13516,6 +14141,26 @@ fn raw_transaction_batch_row(transaction_id: &str, raw_bytes: &[u8]) -> Value {
     })
 }
 
+fn raw_transaction_batch_location_result(
+    transaction_id: &str,
+    location: Option<&wallet::TransactionLocation>,
+) -> Result<Value, Value> {
+    raw_transaction_bytes(location).map_or_else(
+        || {
+            Err(raw_transaction_batch_failure(
+                transaction_id,
+                "Transaction raw bytes are unavailable from the connected Zinder deployment",
+            ))
+        },
+        |raw_transaction_bytes| {
+            Ok(raw_transaction_batch_row(
+                transaction_id,
+                raw_transaction_bytes,
+            ))
+        },
+    )
+}
+
 fn verbose_transaction_json(transaction_id: &str, raw_bytes: &[u8]) -> Value {
     json!({
         "txid": transaction_id,
@@ -13652,7 +14297,7 @@ fn blockchain_info_json(network: Network, tip: &wallet::BlockId) -> Value {
 }
 
 fn raw_transaction_bytes(location: Option<&wallet::TransactionLocation>) -> Option<&[u8]> {
-    match location.and_then(|location| location.location.as_ref()) {
+    let raw_transaction_bytes = match location.and_then(|location| location.location.as_ref()) {
         Some(transaction_location::Location::Mined(mined)) => {
             mined.raw_transaction_bytes.as_deref()
         }
@@ -13660,7 +14305,16 @@ fn raw_transaction_bytes(location: Option<&wallet::TransactionLocation>) -> Opti
             Some(mempool.raw_transaction_bytes.as_slice())
         }
         None => None,
-    }
+    };
+    raw_transaction_bytes.filter(|raw_transaction_bytes| !raw_transaction_bytes.is_empty())
+}
+
+fn required_raw_transaction_bytes(
+    location: Option<&wallet::TransactionLocation>,
+) -> Result<&[u8], CipherscanRestError> {
+    raw_transaction_bytes(location).ok_or(CipherscanRestError::MissingUpstreamField(
+        RAW_TRANSACTION_BYTES_LOCATION_FIELD,
+    ))
 }
 
 fn mined_location(
@@ -13678,18 +14332,6 @@ fn mempool_location(
     match location.and_then(|location| location.location.as_ref()) {
         Some(transaction_location::Location::InMempool(mempool)) => Some(mempool),
         Some(transaction_location::Location::Mined(_)) | None => None,
-    }
-}
-
-const fn mempool_first_seen_unix_seconds(mempool: &wallet::MempoolEntry) -> u64 {
-    mempool.first_seen_unix_millis / 1_000
-}
-
-fn transaction_status(location: Option<&wallet::TransactionLocation>) -> &'static str {
-    match location.and_then(|location| location.location.as_ref()) {
-        Some(transaction_location::Location::Mined(_)) => "mined",
-        Some(transaction_location::Location::InMempool(_)) => "mempool",
-        None => "unknown",
     }
 }
 
@@ -14584,16 +15226,825 @@ fn insert_cors_headers(headers: &mut axum::http::HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::VecDeque, pin::Pin, sync::atomic::AtomicUsize};
+
     use axum::{
         body::{Body, to_bytes},
         http::Request as HttpRequest,
     };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        task::JoinHandle,
+    };
+    use tokio_stream::{Stream, StreamExt as _, wrappers::TcpListenerStream};
+    use tonic::transport::Server;
     use tower::ServiceExt;
+    use zinder_proto::v1::explorer::explorer_query_server::{ExplorerQuery, ExplorerQueryServer};
+    use zinder_proto::v1::wallet::wallet_query_server::{WalletQuery, WalletQueryServer};
 
     const SAMPLE_TRANSACTION_ID: &str =
         "73af76ccff3d661fb028d04325f2e93d88efe22525b01c6e8fab5e680a9cbbc8";
     const SAMPLE_BLOCK_HASH: &str =
         "00000000000000000000000000000000000000000000000000000000000000ab";
+
+    #[derive(Clone)]
+    enum SeoExplorerOutcome {
+        Response(Box<explorer::TransactionDetailResponse>),
+        Status(Code),
+    }
+
+    #[derive(Clone)]
+    enum SitemapRecentTransactionsOutcome {
+        Chunks(Vec<explorer::RecentTransactionsChunk>),
+        Status(Code),
+    }
+
+    #[derive(Clone)]
+    enum SitemapBlockSummariesOutcome {
+        Response(Box<explorer::BlockSummariesInRangeResponse>),
+        Status(Code),
+    }
+
+    #[derive(Clone)]
+    enum RealtimeChainOutcome {
+        Stream {
+            items: Vec<Result<wallet::ChainEventEnvelope, Code>>,
+            stay_open: bool,
+        },
+        Status(Code),
+    }
+
+    #[derive(Clone)]
+    enum RealtimeMempoolOutcome {
+        Stream {
+            items: Vec<Result<wallet::MempoolEventEnvelope, Code>>,
+            stay_open: bool,
+        },
+    }
+
+    #[derive(Clone)]
+    enum RealtimeBlockProductionOutcome {
+        Response(Box<explorer::BlockProductionSeriesResponse>),
+        Status(Code),
+    }
+
+    #[derive(Clone)]
+    struct SeoExplorerTestServer {
+        outcome: Arc<RwLock<SeoExplorerOutcome>>,
+        request_count: Arc<AtomicUsize>,
+        last_transaction_id: Arc<Mutex<Option<String>>>,
+        sitemap_recent_transactions_outcome: Arc<RwLock<SitemapRecentTransactionsOutcome>>,
+        sitemap_recent_transactions_requests: Arc<Mutex<Vec<explorer::RecentTransactionsRequest>>>,
+        sitemap_block_summaries_outcomes: Arc<Mutex<VecDeque<SitemapBlockSummariesOutcome>>>,
+        sitemap_block_summaries_requests: Arc<Mutex<Vec<explorer::BlockSummariesInRangeRequest>>>,
+        realtime_block_production_outcomes: Arc<Mutex<VecDeque<RealtimeBlockProductionOutcome>>>,
+        realtime_block_production_requests: Arc<Mutex<Vec<explorer::BlockProductionSeriesRequest>>>,
+        block_detail_code: Arc<RwLock<Code>>,
+    }
+
+    impl SeoExplorerTestServer {
+        fn new(outcome: SeoExplorerOutcome) -> Self {
+            Self {
+                outcome: Arc::new(RwLock::new(outcome)),
+                request_count: Arc::new(AtomicUsize::new(0)),
+                last_transaction_id: Arc::new(Mutex::new(None)),
+                sitemap_recent_transactions_outcome: Arc::new(RwLock::new(
+                    SitemapRecentTransactionsOutcome::Status(Code::Unimplemented),
+                )),
+                sitemap_recent_transactions_requests: Arc::new(Mutex::new(Vec::new())),
+                sitemap_block_summaries_outcomes: Arc::new(Mutex::new(VecDeque::new())),
+                sitemap_block_summaries_requests: Arc::new(Mutex::new(Vec::new())),
+                realtime_block_production_outcomes: Arc::new(Mutex::new(VecDeque::new())),
+                realtime_block_production_requests: Arc::new(Mutex::new(Vec::new())),
+                block_detail_code: Arc::new(RwLock::new(Code::Unimplemented)),
+            }
+        }
+
+        async fn set_outcome(&self, outcome: SeoExplorerOutcome) {
+            *self.outcome.write().await = outcome;
+        }
+
+        fn request_count(&self) -> usize {
+            self.request_count.load(Ordering::SeqCst)
+        }
+
+        async fn last_transaction_id(&self) -> Option<String> {
+            self.last_transaction_id.lock().await.clone()
+        }
+
+        async fn set_sitemap_recent_transactions_outcome(
+            &self,
+            outcome: SitemapRecentTransactionsOutcome,
+        ) {
+            *self.sitemap_recent_transactions_outcome.write().await = outcome;
+        }
+
+        async fn sitemap_recent_transactions_requests(
+            &self,
+        ) -> Vec<explorer::RecentTransactionsRequest> {
+            self.sitemap_recent_transactions_requests
+                .lock()
+                .await
+                .clone()
+        }
+
+        async fn set_sitemap_block_summaries_outcomes(
+            &self,
+            outcomes: impl IntoIterator<Item = SitemapBlockSummariesOutcome>,
+        ) {
+            *self.sitemap_block_summaries_outcomes.lock().await = outcomes.into_iter().collect();
+        }
+
+        async fn sitemap_block_summaries_requests(
+            &self,
+        ) -> Vec<explorer::BlockSummariesInRangeRequest> {
+            self.sitemap_block_summaries_requests.lock().await.clone()
+        }
+
+        async fn set_realtime_block_production_outcomes(
+            &self,
+            outcomes: impl IntoIterator<Item = RealtimeBlockProductionOutcome>,
+        ) {
+            *self.realtime_block_production_outcomes.lock().await = outcomes.into_iter().collect();
+        }
+
+        async fn realtime_block_production_requests(
+            &self,
+        ) -> Vec<explorer::BlockProductionSeriesRequest> {
+            self.realtime_block_production_requests.lock().await.clone()
+        }
+
+        async fn set_block_detail_code(&self, code: Code) {
+            *self.block_detail_code.write().await = code;
+        }
+    }
+
+    type SeoRecentTransactionsStream = Pin<
+        Box<
+            dyn Stream<Item = Result<explorer::RecentTransactionsChunk, tonic::Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    macro_rules! impl_seo_explorer_query {
+        ($($method:ident: $request:ident => $response:ident),+ $(,)?) => {
+            #[tonic::async_trait]
+            impl ExplorerQuery for SeoExplorerTestServer {
+                async fn transaction_detail(
+                    &self,
+                    request: tonic::Request<explorer::TransactionDetailRequest>,
+                ) -> Result<tonic::Response<explorer::TransactionDetailResponse>, tonic::Status> {
+                    self.request_count.fetch_add(1, Ordering::SeqCst);
+                    *self.last_transaction_id.lock().await =
+                        Some(request.into_inner().transaction_id);
+                    let outcome = self.outcome.read().await.clone();
+                    match outcome {
+                        SeoExplorerOutcome::Response(response) => {
+                            Ok(tonic::Response::new(*response))
+                        }
+                        SeoExplorerOutcome::Status(code) => {
+                            Err(tonic::Status::new(code, "controlled SEO test outcome"))
+                        }
+                    }
+                }
+
+                type RecentTransactionsStream = SeoRecentTransactionsStream;
+
+                async fn recent_transactions(
+                    &self,
+                    request: tonic::Request<explorer::RecentTransactionsRequest>,
+                ) -> Result<tonic::Response<Self::RecentTransactionsStream>, tonic::Status> {
+                    self.sitemap_recent_transactions_requests
+                        .lock()
+                        .await
+                        .push(request.into_inner());
+                    let outcome = self.sitemap_recent_transactions_outcome.read().await.clone();
+                    match outcome {
+                        SitemapRecentTransactionsOutcome::Chunks(chunks) => {
+                            let stream = tokio_stream::iter(chunks.into_iter().map(Ok));
+                            Ok(tonic::Response::new(Box::pin(stream)))
+                        }
+                        SitemapRecentTransactionsOutcome::Status(code) => Err(
+                            tonic::Status::new(code, "controlled sitemap recent outcome"),
+                        ),
+                    }
+                }
+
+                async fn block_summaries_in_range(
+                    &self,
+                    request: tonic::Request<explorer::BlockSummariesInRangeRequest>,
+                ) -> Result<tonic::Response<explorer::BlockSummariesInRangeResponse>, tonic::Status> {
+                    self.sitemap_block_summaries_requests
+                        .lock()
+                        .await
+                        .push(request.into_inner());
+                    let outcome = self.sitemap_block_summaries_outcomes.lock().await.pop_front();
+                    match outcome {
+                        Some(SitemapBlockSummariesOutcome::Response(response)) => {
+                            Ok(tonic::Response::new(*response))
+                        }
+                        Some(SitemapBlockSummariesOutcome::Status(code)) => Err(
+                            tonic::Status::new(code, "controlled sitemap block outcome"),
+                        ),
+                        None => Err(tonic::Status::unimplemented("block_summaries_in_range")),
+                    }
+                }
+
+                async fn block_production_series(
+                    &self,
+                    request: tonic::Request<explorer::BlockProductionSeriesRequest>,
+                ) -> Result<tonic::Response<explorer::BlockProductionSeriesResponse>, tonic::Status> {
+                    self.realtime_block_production_requests
+                        .lock()
+                        .await
+                        .push(request.into_inner());
+                    let outcome = self.realtime_block_production_outcomes.lock().await.pop_front();
+                    match outcome {
+                        Some(RealtimeBlockProductionOutcome::Response(response)) => {
+                            Ok(tonic::Response::new(*response))
+                        }
+                        Some(RealtimeBlockProductionOutcome::Status(code)) => Err(
+                            tonic::Status::new(code, "controlled realtime block-production outcome"),
+                        ),
+                        None => Err(tonic::Status::unimplemented("block_production_series")),
+                    }
+                }
+
+
+                async fn block_detail(
+                    &self,
+                    _request: tonic::Request<explorer::BlockDetailRequest>,
+                ) -> Result<tonic::Response<explorer::BlockDetailResponse>, tonic::Status> {
+                    Err(tonic::Status::new(
+                        *self.block_detail_code.read().await,
+                        "controlled block-detail outcome",
+                    ))
+                }
+
+                $(
+                    async fn $method(
+                        &self,
+                        _request: tonic::Request<explorer::$request>,
+                    ) -> Result<tonic::Response<explorer::$response>, tonic::Status> {
+                        Err(tonic::Status::unimplemented(stringify!($method)))
+                    }
+                )+
+            }
+        };
+    }
+
+    impl_seo_explorer_query! {
+            server_info: ServerInfoRequest => ServerInfoResponse,
+            block_production_in_time_range: BlockProductionInTimeRangeRequest => BlockProductionInTimeRangeResponse,
+            block_activity_distribution: BlockActivityDistributionRequest => BlockActivityDistributionResponse,
+            transaction_component_summary: TransactionComponentSummaryRequest => TransactionComponentSummaryResponse,
+            transparent_address_ranking: TransparentAddressRankingRequest => TransparentAddressRankingResponse,
+            block_transactions: BlockDetailRequest => BlockTransactionsResponse,
+            search: SearchRequest => SearchResponse,
+            commitment_root_search: CommitmentRootSearchRequest => CommitmentRootSearchResponse,
+            mempool_summary: MempoolSummaryRequest => MempoolSummaryResponse,
+            mempool_snapshot: MempoolSnapshotRequest => MempoolSnapshotResponse,
+            mempool_activity: MempoolActivityRequest => MempoolActivityResponse,
+            transparent_address_activity: TransparentAddressActivityRequest => TransparentAddressActivityResponse,
+            transparent_address_deltas: TransparentAddressDeltasRequest => TransparentAddressDeltasResponse,
+            fee_summary: FeeSummaryRequest => FeeSummaryResponse,
+            conventional_fee_distribution: ConventionalFeeDistributionRequest => ConventionalFeeDistributionResponse,
+            paid_fee_distribution: PaidFeeDistributionRequest => PaidFeeDistributionResponse,
+            value_pool_summary: ValuePoolSummaryRequest => ValuePoolSummaryResponse,
+            network_upgrade_status: NetworkUpgradeStatusRequest => NetworkUpgradeStatusResponse,
+            value_pool_flow_history: ValuePoolFlowHistoryRequest => ValuePoolFlowHistoryResponse,
+            value_pool_flow_events_in_range: ValuePoolFlowEventsInRangeRequest => ValuePoolFlowEventsInRangeResponse,
+            value_pool_flow_summary: ValuePoolFlowSummaryRequest => ValuePoolFlowSummaryResponse,
+            value_pool_flow_amount_threshold_summary: ValuePoolFlowAmountThresholdSummaryRequest => ValuePoolFlowAmountThresholdSummaryResponse,
+            value_pool_flow_rounded_amount_summary: ValuePoolFlowRoundedAmountSummaryRequest => ValuePoolFlowRoundedAmountSummaryResponse,
+            value_pool_balance_history: ValuePoolBalanceHistoryRequest => ValuePoolBalanceHistoryResponse,
+            utxo_set_summary: UtxoSetSummaryRequest => UtxoSetSummaryResponse,
+            chain_reorg_history: ChainReorgHistoryRequest => ChainReorgHistoryResponse,
+            displaced_block_history: DisplacedBlockHistoryRequest => DisplacedBlockHistoryResponse,
+            displaced_block_detail: DisplacedBlockDetailRequest => DisplacedBlockDetailResponse,
+            mempool_event_counts: MempoolEventCountsRequest => MempoolEventCountsResponse,
+            transaction_history: TransactionHistoryRequest => TransactionHistoryResponse,
+            overview_snapshot: OverviewSnapshotRequest => OverviewSnapshotResponse,
+            migration_overview: MigrationOverviewRequest => MigrationOverviewResponse,
+            migration_cohorts: MigrationCohortsRequest => MigrationCohortsResponse,
+            migration_denominations: MigrationDenominationsRequest => MigrationDenominationsResponse,
+    }
+
+    #[derive(Clone)]
+    struct SitemapWalletTestServer {
+        visible_tip_response: Arc<RwLock<Result<wallet::VisibleTipBlockResponse, Code>>>,
+        visible_tip_request_count: Arc<AtomicUsize>,
+        transaction_response: Arc<RwLock<Result<wallet::TransactionStatusResponse, Code>>>,
+        realtime_chain_outcomes: Arc<Mutex<VecDeque<RealtimeChainOutcome>>>,
+        realtime_chain_requests: Arc<Mutex<Vec<wallet::ChainEventsRequest>>>,
+        realtime_mempool_outcomes: Arc<Mutex<VecDeque<RealtimeMempoolOutcome>>>,
+        realtime_mempool_requests: Arc<Mutex<Vec<wallet::MempoolEventsRequest>>>,
+    }
+
+    impl SitemapWalletTestServer {
+        fn new(response: wallet::VisibleTipBlockResponse) -> Self {
+            Self {
+                visible_tip_response: Arc::new(RwLock::new(Ok(response))),
+                visible_tip_request_count: Arc::new(AtomicUsize::new(0)),
+                transaction_response: Arc::new(RwLock::new(Err(Code::Unimplemented))),
+                realtime_chain_outcomes: Arc::new(Mutex::new(VecDeque::new())),
+                realtime_chain_requests: Arc::new(Mutex::new(Vec::new())),
+                realtime_mempool_outcomes: Arc::new(Mutex::new(VecDeque::new())),
+                realtime_mempool_requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        async fn set_visible_tip_response(
+            &self,
+            response: Result<wallet::VisibleTipBlockResponse, Code>,
+        ) {
+            *self.visible_tip_response.write().await = response;
+        }
+
+        fn visible_tip_request_count(&self) -> usize {
+            self.visible_tip_request_count.load(Ordering::SeqCst)
+        }
+
+        async fn set_transaction_response(
+            &self,
+            response: Result<wallet::TransactionStatusResponse, Code>,
+        ) {
+            *self.transaction_response.write().await = response;
+        }
+
+        async fn set_realtime_chain_outcomes(
+            &self,
+            outcomes: impl IntoIterator<Item = RealtimeChainOutcome>,
+        ) {
+            *self.realtime_chain_outcomes.lock().await = outcomes.into_iter().collect();
+        }
+
+        async fn realtime_chain_requests(&self) -> Vec<wallet::ChainEventsRequest> {
+            self.realtime_chain_requests.lock().await.clone()
+        }
+
+        async fn set_realtime_mempool_outcomes(
+            &self,
+            outcomes: impl IntoIterator<Item = RealtimeMempoolOutcome>,
+        ) {
+            *self.realtime_mempool_outcomes.lock().await = outcomes.into_iter().collect();
+        }
+
+        async fn realtime_mempool_requests(&self) -> Vec<wallet::MempoolEventsRequest> {
+            self.realtime_mempool_requests.lock().await.clone()
+        }
+    }
+
+    type SitemapWalletStream<T> =
+        Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + 'static>>;
+
+    macro_rules! impl_sitemap_wallet_query {
+        ($($method:ident: $request:ident => $response:ident),+ $(,)?) => {
+            #[tonic::async_trait]
+            impl WalletQuery for SitemapWalletTestServer {
+                type CompactBlocksInRangeStream =
+                    SitemapWalletStream<wallet::CompactBlocksInRangeChunk>;
+                type FullBlocksInRangeStream = SitemapWalletStream<wallet::FullBlocksInRangeChunk>;
+                type ChainEventsStream = SitemapWalletStream<wallet::ChainEventEnvelope>;
+                type MempoolEventsStream = SitemapWalletStream<wallet::MempoolEventEnvelope>;
+                type TransparentAddressUnspentOutputsStream =
+                    SitemapWalletStream<wallet::TransparentUnspentOutputsChunk>;
+                type TransparentAddressTxIdsInRangeStream =
+                    SitemapWalletStream<wallet::TransparentAddressTxIdsChunk>;
+
+                async fn visible_tip_block(
+                    &self,
+                    _request: tonic::Request<wallet::VisibleTipBlockRequest>,
+                ) -> Result<tonic::Response<wallet::VisibleTipBlockResponse>, tonic::Status> {
+                    self.visible_tip_request_count.fetch_add(1, Ordering::SeqCst);
+                    let response = self.visible_tip_response.read().await.clone();
+                    match response {
+                        Ok(response) => Ok(tonic::Response::new(response)),
+                        Err(code) => Err(tonic::Status::new(
+                            code,
+                            "controlled sitemap visible-tip outcome",
+                        )),
+                    }
+                }
+
+                async fn compact_blocks_in_range(
+                    &self,
+                    _request: tonic::Request<wallet::CompactBlocksInRangeRequest>,
+                ) -> Result<tonic::Response<Self::CompactBlocksInRangeStream>, tonic::Status> {
+                    Err(tonic::Status::unimplemented("compact_blocks_in_range"))
+                }
+
+                async fn full_blocks_in_range(
+                    &self,
+                    _request: tonic::Request<wallet::FullBlocksInRangeRequest>,
+                ) -> Result<tonic::Response<Self::FullBlocksInRangeStream>, tonic::Status> {
+                    Err(tonic::Status::unimplemented("full_blocks_in_range"))
+                }
+
+                async fn transaction(
+                    &self,
+                    _request: tonic::Request<wallet::TransactionRequest>,
+                ) -> Result<tonic::Response<wallet::TransactionStatusResponse>, tonic::Status> {
+                    let response = self.transaction_response.read().await.clone();
+                    match response {
+                        Ok(response) => Ok(tonic::Response::new(response)),
+                        Err(code) => Err(tonic::Status::new(
+                            code,
+                            "controlled transaction outcome",
+                        )),
+                    }
+                }
+
+                async fn chain_events(
+                    &self,
+                    request: tonic::Request<wallet::ChainEventsRequest>,
+                ) -> Result<tonic::Response<Self::ChainEventsStream>, tonic::Status> {
+                    self.realtime_chain_requests
+                        .lock()
+                        .await
+                        .push(request.into_inner());
+                    let outcome = self.realtime_chain_outcomes.lock().await.pop_front();
+                    match outcome {
+                        Some(RealtimeChainOutcome::Stream { items, stay_open }) => {
+                            let stream = tokio_stream::iter(items.into_iter().map(|item| {
+                                item.map_err(|code| tonic::Status::new(code, "controlled chain stream error"))
+                            }));
+                            let stream: Self::ChainEventsStream = if stay_open {
+                                Box::pin(stream.chain(tokio_stream::pending()))
+                            } else {
+                                Box::pin(stream)
+                            };
+                            Ok(tonic::Response::new(stream))
+                        }
+                        Some(RealtimeChainOutcome::Status(code)) => Err(tonic::Status::new(
+                            code,
+                            "controlled chain subscribe error",
+                        )),
+                        None => Err(tonic::Status::unimplemented("chain_events")),
+                    }
+                }
+
+                async fn mempool_events(
+                    &self,
+                    request: tonic::Request<wallet::MempoolEventsRequest>,
+                ) -> Result<tonic::Response<Self::MempoolEventsStream>, tonic::Status> {
+                    self.realtime_mempool_requests
+                        .lock()
+                        .await
+                        .push(request.into_inner());
+                    let outcome = self.realtime_mempool_outcomes.lock().await.pop_front();
+                    match outcome {
+                        Some(RealtimeMempoolOutcome::Stream { items, stay_open }) => {
+                            let stream = tokio_stream::iter(items.into_iter().map(|item| {
+                                item.map_err(|code| tonic::Status::new(code, "controlled mempool stream error"))
+                            }));
+                            let stream: Self::MempoolEventsStream = if stay_open {
+                                Box::pin(stream.chain(tokio_stream::pending()))
+                            } else {
+                                Box::pin(stream)
+                            };
+                            Ok(tonic::Response::new(stream))
+                        }
+                        None => Err(tonic::Status::unimplemented("mempool_events")),
+                    }
+                }
+
+                async fn transparent_address_unspent_outputs(
+                    &self,
+                    _request: tonic::Request<wallet::TransparentAddressUnspentOutputsRequest>,
+                ) -> Result<tonic::Response<Self::TransparentAddressUnspentOutputsStream>, tonic::Status> {
+                    Err(tonic::Status::unimplemented("transparent_address_unspent_outputs"))
+                }
+
+                async fn transparent_address_tx_ids_in_range(
+                    &self,
+                    _request: tonic::Request<wallet::TransparentAddressTxIdsInRangeRequest>,
+                ) -> Result<tonic::Response<Self::TransparentAddressTxIdsInRangeStream>, tonic::Status> {
+                    Err(tonic::Status::unimplemented("transparent_address_tx_ids_in_range"))
+                }
+
+                $(
+                    async fn $method(
+                        &self,
+                        _request: tonic::Request<wallet::$request>,
+                    ) -> Result<tonic::Response<wallet::$response>, tonic::Status> {
+                        Err(tonic::Status::unimplemented(stringify!($method)))
+                    }
+                )+
+            }
+        };
+    }
+
+    impl_sitemap_wallet_query! {
+        settled_tip_block: SettledTipBlockRequest => SettledTipBlockResponse,
+        block_id_by_selector: BlockSelectorRequest => BlockIdResponse,
+        block_header_by_selector: BlockSelectorRequest => BlockHeaderResponse,
+        compact_block: CompactBlockRequest => CompactBlockResponse,
+        full_block: FullBlockRequest => FullBlockResponse,
+        tree_state_at_height: TreeStateAtHeightRequest => TreeStateResponse,
+        latest_tree_state_checkpoint: LatestTreeStateCheckpointRequest => TreeStateResponse,
+        subtree_roots: SubtreeRootsRequest => SubtreeRootsResponse,
+        broadcast_transaction: BroadcastTransactionRequest => BroadcastTransactionResponse,
+        mempool_snapshot: MempoolSnapshotRequest => MempoolSnapshotResponse,
+        transparent_mempool_outputs_by_address: TransparentMempoolOutputsByAddressRequest => TransparentMempoolOutputsByAddressResponse,
+        transparent_mempool_spends_by_outpoint: TransparentMempoolSpendsByOutpointRequest => TransparentMempoolSpendsByOutpointResponse,
+        transparent_outputs_by_outpoint: TransparentOutputsByOutpointRequest => TransparentOutputsByOutpointResponse,
+        transparent_spends_by_outpoint: TransparentSpendsByOutpointRequest => TransparentSpendsByOutpointResponse,
+        transparent_unspent_outputs_by_outpoint: TransparentUnspentOutputsByOutpointRequest => TransparentUnspentOutputsByOutpointResponse,
+        transparent_mempool_outputs_by_outpoint: TransparentMempoolOutputsByOutpointRequest => TransparentOutputsByOutpointResponse,
+        transparent_address_balance: TransparentAddressBalanceRequest => TransparentAddressBalanceResponse,
+        chain_value_pools_at_tip: ChainValuePoolsAtTipRequest => ChainValuePoolsAtTipResponse,
+        transparent_utxo_set_summary: TransparentUtxoSetSummaryRequest => TransparentUtxoSetSummaryResponse,
+        server_info: ServerInfoRequest => ServerInfoResponse,
+        network_upgrade_activations: NetworkUpgradeActivationsRequest => NetworkUpgradeActivationsResponse,
+    }
+
+    struct SeoRouterTestHarness {
+        router: Router,
+        explorer: SeoExplorerTestServer,
+        wallet: SitemapWalletTestServer,
+        cancel: CancellationToken,
+        server: JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    struct RealtimeRouterTestHarness {
+        adapter: CipherscanRestAdapter,
+        explorer: SeoExplorerTestServer,
+        wallet: SitemapWalletTestServer,
+        address: std::net::SocketAddr,
+        cancel: CancellationToken,
+        grpc_server: JoinHandle<Result<(), tonic::transport::Error>>,
+        http_server: JoinHandle<Result<(), std::io::Error>>,
+    }
+
+    impl Drop for RealtimeRouterTestHarness {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+            self.grpc_server.abort();
+            self.http_server.abort();
+        }
+    }
+
+    enum RawWebSocketFrame {
+        Text(String),
+        Close { code: u16, reason: String },
+        Other,
+    }
+
+    struct RawWebSocket {
+        stream: TcpStream,
+        buffered: VecDeque<u8>,
+    }
+
+    impl RawWebSocket {
+        async fn connect(
+            address: std::net::SocketAddr,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let mut stream = TcpStream::connect(address).await?;
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).await?;
+
+            let mut response = Vec::new();
+            let header_end = loop {
+                if let Some(position) = response.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    break position.saturating_add(4);
+                }
+                if response.len() > 16 * 1_024 {
+                    return Err(
+                        std::io::Error::other("WebSocket upgrade headers are too large").into(),
+                    );
+                }
+                let mut chunk = [0_u8; 1_024];
+                let read = stream.read(&mut chunk).await?;
+                if read == 0 {
+                    return Err(std::io::Error::other("WebSocket upgrade closed early").into());
+                }
+                response.extend_from_slice(&chunk[..read]);
+            };
+            let headers = std::str::from_utf8(&response[..header_end])?;
+            if !headers.starts_with("HTTP/1.1 101 ") {
+                return Err(std::io::Error::other(format!(
+                    "WebSocket upgrade failed: {}",
+                    headers.lines().next().unwrap_or("missing status line"),
+                ))
+                .into());
+            }
+
+            Ok(Self {
+                stream,
+                buffered: response[header_end..].iter().copied().collect(),
+            })
+        }
+
+        async fn read_frame(&mut self) -> Result<RawWebSocketFrame, Box<dyn std::error::Error>> {
+            let header = self.read_exact(2).await?;
+            let opcode = header[0] & 0x0f;
+            let masked = header[1] & 0x80 != 0;
+            if masked {
+                return Err(std::io::Error::other("server WebSocket frame was masked").into());
+            }
+            let payload_len = match header[1] & 0x7f {
+                length @ 0..=125 => usize::from(length),
+                126 => {
+                    let bytes = self.read_exact(2).await?;
+                    usize::from(u16::from_be_bytes([bytes[0], bytes[1]]))
+                }
+                127 => {
+                    let bytes = self.read_exact(8).await?;
+                    usize::try_from(u64::from_be_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]))?
+                }
+                _ => unreachable!(),
+            };
+            let payload = self.read_exact(payload_len).await?;
+            match opcode {
+                1 => Ok(RawWebSocketFrame::Text(String::from_utf8(payload)?)),
+                8 => {
+                    if payload.len() < 2 {
+                        return Ok(RawWebSocketFrame::Close {
+                            code: 0,
+                            reason: String::new(),
+                        });
+                    }
+                    Ok(RawWebSocketFrame::Close {
+                        code: u16::from_be_bytes([payload[0], payload[1]]),
+                        reason: String::from_utf8(payload[2..].to_vec())?,
+                    })
+                }
+                _ => Ok(RawWebSocketFrame::Other),
+            }
+        }
+
+        async fn read_json(&mut self) -> Result<Value, Box<dyn std::error::Error>> {
+            loop {
+                match self.read_frame().await? {
+                    RawWebSocketFrame::Text(payload) => {
+                        return Ok(serde_json::from_str(&payload)?);
+                    }
+                    RawWebSocketFrame::Close { code, reason } => {
+                        return Err(std::io::Error::other(format!(
+                            "WebSocket closed before JSON frame: {code} {reason}"
+                        ))
+                        .into());
+                    }
+                    RawWebSocketFrame::Other => {}
+                }
+            }
+        }
+
+        async fn read_exact(
+            &mut self,
+            length: usize,
+        ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let mut bytes = Vec::with_capacity(length);
+            while bytes.len() < length {
+                if let Some(byte) = self.buffered.pop_front() {
+                    bytes.push(byte);
+                    continue;
+                }
+                let remaining = length.saturating_sub(bytes.len());
+                let mut chunk = vec![0_u8; remaining];
+                self.stream.read_exact(&mut chunk).await?;
+                bytes.extend(chunk);
+            }
+            Ok(bytes)
+        }
+    }
+
+    impl Drop for SeoRouterTestHarness {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+            self.server.abort();
+        }
+    }
+
+    fn sitemap_visible_tip_response(
+        height: u32,
+        chain_epoch_id: u64,
+    ) -> wallet::VisibleTipBlockResponse {
+        wallet::VisibleTipBlockResponse {
+            chain_view: Some(wallet::ChainView {
+                chain_epoch: Some(wallet::ChainEpoch {
+                    chain_epoch_id,
+                    visible_tip: Some(wallet::BlockTip {
+                        height,
+                        hash: SAMPLE_BLOCK_HASH.to_owned(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            visible_tip_block: Some(wallet::BlockId {
+                height,
+                block_hash: SAMPLE_BLOCK_HASH.to_owned(),
+            }),
+        }
+    }
+
+    async fn seo_router_test_harness(
+        outcome: SeoExplorerOutcome,
+    ) -> Result<SeoRouterTestHarness, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let explorer = SeoExplorerTestServer::new(outcome);
+        let wallet = SitemapWalletTestServer::new(sitemap_visible_tip_response(100, 7));
+        let explorer_service = ExplorerQueryServer::new(explorer.clone());
+        let wallet_service = WalletQueryServer::new(wallet.clone());
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(explorer_service)
+                .add_service(wallet_service)
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    server_cancel.cancelled_owned(),
+                )
+                .await
+        });
+        let channel =
+            zinder_runtime::connect_zinder_grpc(&format!("http://{address}"), None).await?;
+        let adapter = CipherscanRestAdapter::new(
+            Network::ZcashRegtest,
+            channel.clone(),
+            channel,
+            CipherscanMarketPriceEndpoints::new(
+                "http://127.0.0.1:1/price".parse()?,
+                "http://127.0.0.1:1/history?date={date}".to_owned(),
+            )?,
+            CipherscanRealtime::new(
+                CipherscanRealtimeMode::Unavailable,
+                CancellationToken::new(),
+            ),
+        )?;
+        Ok(SeoRouterTestHarness {
+            router: adapter.router(),
+            explorer,
+            wallet,
+            cancel,
+            server,
+        })
+    }
+
+    async fn realtime_router_test_harness()
+    -> Result<RealtimeRouterTestHarness, Box<dyn std::error::Error>> {
+        let grpc_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let grpc_address = grpc_listener.local_addr()?;
+        let explorer = SeoExplorerTestServer::new(SeoExplorerOutcome::Status(Code::Unimplemented));
+        let wallet = SitemapWalletTestServer::new(sitemap_visible_tip_response(101, 11));
+        let explorer_service = ExplorerQueryServer::new(explorer.clone());
+        let wallet_service = WalletQueryServer::new(wallet.clone());
+        let cancel = CancellationToken::new();
+        let grpc_cancel = cancel.clone();
+        let grpc_server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(explorer_service)
+                .add_service(wallet_service)
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(grpc_listener),
+                    grpc_cancel.cancelled_owned(),
+                )
+                .await
+        });
+        let channel =
+            zinder_runtime::connect_zinder_grpc(&format!("http://{grpc_address}"), None).await?;
+        let adapter = CipherscanRestAdapter::new(
+            Network::ZcashRegtest,
+            channel.clone(),
+            channel,
+            CipherscanMarketPriceEndpoints::new(
+                "http://127.0.0.1:1/price".parse()?,
+                "http://127.0.0.1:1/history?date={date}".to_owned(),
+            )?,
+            CipherscanRealtime::new(CipherscanRealtimeMode::Full, cancel.clone()),
+        )?;
+        let http_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = http_listener.local_addr()?;
+        let http_cancel = cancel.clone();
+        let router = adapter.clone().router();
+        let http_server = tokio::spawn(async move {
+            axum::serve(http_listener, router)
+                .with_graceful_shutdown(http_cancel.cancelled_owned())
+                .await
+        });
+
+        Ok(RealtimeRouterTestHarness {
+            adapter,
+            explorer,
+            wallet,
+            address,
+            cancel,
+            grpc_server,
+            http_server,
+        })
+    }
 
     fn value_pool_test_source_tip(height: u32) -> wallet::BlockTip {
         wallet::BlockTip {
@@ -15089,6 +16540,445 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn unavailable_realtime_surface_is_explicit() -> Result<(), Box<dyn std::error::Error>> {
+        let harness =
+            seo_router_test_harness(SeoExplorerOutcome::Status(Code::Unimplemented)).await?;
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let body: Value = serde_json::from_slice(&body)?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], json!("realtime_unavailable"));
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("chain-event and mempool event"))
+        );
+        Ok(())
+    }
+
+    fn realtime_chain_commit(
+        cursor: &[u8],
+        block_height: u32,
+        chain_epoch_id: u64,
+    ) -> wallet::ChainEventEnvelope {
+        wallet::ChainEventEnvelope {
+            cursor: cursor.to_vec(),
+            event_sequence: chain_epoch_id,
+            event: Some(chain_event_envelope::Event::ChainCommitted(
+                wallet::ChainCommitted {
+                    committed: Some(wallet::ChainEpochCommitted {
+                        chain_epoch: Some(wallet::ChainEpoch {
+                            chain_epoch_id,
+                            visible_tip: Some(wallet::BlockTip {
+                                height: block_height,
+                                hash: SAMPLE_BLOCK_HASH.to_owned(),
+                            }),
+                            ..Default::default()
+                        }),
+                        start_height: block_height,
+                        end_height: block_height,
+                    }),
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn realtime_block_production_response(
+        block_height: u32,
+    ) -> explorer::BlockProductionSeriesResponse {
+        explorer::BlockProductionSeriesResponse {
+            start_height: block_height,
+            end_height: block_height,
+            covered_block_count: 1,
+            missing_block_count: 0,
+            points: vec![explorer::BlockProductionPoint {
+                summary: Some(explorer::BlockSummary {
+                    block_height,
+                    block_hash: SAMPLE_BLOCK_HASH.to_owned(),
+                    block_time_unix_seconds: 1_783_677_045,
+                    transaction_count: 2,
+                    total_size_bytes: 13_194,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn realtime_mempool_events()
+    -> Result<Vec<wallet::MempoolEventEnvelope>, Box<dyn std::error::Error>> {
+        let raw_transaction_bytes = transparent_transaction_bytes();
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let transaction_id = encode_rpc_transaction_id_hex(
+            zinder_source::parse_transaction_public_facts(
+                &raw_transaction_bytes,
+                None,
+                &activations,
+            )?
+            .transaction_id,
+        );
+        Ok(vec![
+            wallet::MempoolEventEnvelope {
+                cursor: vec![10],
+                event_sequence: 10,
+                event: Some(mempool_event_envelope::Event::Added(
+                    wallet::MempoolAddedEvent {
+                        entry: Some(wallet::MempoolEntry {
+                            transaction_id: transaction_id.clone(),
+                            raw_transaction_bytes,
+                            first_seen_unix_millis: 1_783_677_045_999,
+                            ..Default::default()
+                        }),
+                    },
+                )),
+                ..Default::default()
+            },
+            wallet::MempoolEventEnvelope {
+                cursor: vec![11],
+                event_sequence: 11,
+                event: Some(mempool_event_envelope::Event::Mined(
+                    wallet::MempoolMinedEvent {
+                        transaction_id: transaction_id.clone(),
+                        mined_height: 101,
+                        block_hash: SAMPLE_BLOCK_HASH.to_owned(),
+                    },
+                )),
+                ..Default::default()
+            },
+            wallet::MempoolEventEnvelope {
+                cursor: vec![12],
+                event_sequence: 12,
+                event: Some(mempool_event_envelope::Event::Invalidated(
+                    wallet::MempoolInvalidatedEvent {
+                        transaction_id,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+        ])
+    }
+
+    #[tokio::test]
+    async fn root_websocket_translates_native_chain_and_mempool_streams()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness = realtime_router_test_harness().await?;
+        harness
+            .explorer
+            .set_realtime_block_production_outcomes([RealtimeBlockProductionOutcome::Response(
+                Box::new(realtime_block_production_response(101)),
+            )])
+            .await;
+        harness
+            .wallet
+            .set_realtime_chain_outcomes([RealtimeChainOutcome::Stream {
+                items: vec![Ok(realtime_chain_commit(&[1], 101, 11))],
+                stay_open: true,
+            }])
+            .await;
+        harness
+            .wallet
+            .set_realtime_mempool_outcomes([RealtimeMempoolOutcome::Stream {
+                items: realtime_mempool_events()?.into_iter().map(Ok).collect(),
+                stay_open: true,
+            }])
+            .await;
+
+        let mut websocket = RawWebSocket::connect(harness.address).await?;
+        let messages = tokio::time::timeout(StdDuration::from_secs(3), async {
+            let mut messages = Vec::new();
+            while messages.len() < 4 {
+                messages.push(websocket.read_json().await?);
+            }
+            Ok::<Vec<Value>, Box<dyn std::error::Error>>(messages)
+        })
+        .await??;
+
+        let new_block = messages
+            .iter()
+            .find(|message| message["type"] == json!("new_block"))
+            .ok_or_else(|| std::io::Error::other("missing new_block frame"))?;
+        assert_eq!(new_block["data"]["height"], json!("101"));
+        assert_eq!(new_block["data"]["hash"], json!(SAMPLE_BLOCK_HASH));
+        assert_eq!(new_block["data"]["transaction_count"], json!(2));
+        assert_eq!(new_block["data"]["size"], json!(13_194));
+
+        let added = messages
+            .iter()
+            .find(|message| message["type"] == json!("mempool_tx"))
+            .ok_or_else(|| std::io::Error::other("missing mempool_tx frame"))?;
+        assert_eq!(added["data"]["time"], json!(1_783_677_045));
+        let removed = messages
+            .iter()
+            .filter(|message| message["type"] == json!("mempool_removed"))
+            .collect::<Vec<_>>();
+        assert_eq!(removed.len(), 2);
+        assert!(
+            removed
+                .iter()
+                .any(|message| message["data"]["reason"] == json!("mined"))
+        );
+        assert!(
+            removed
+                .iter()
+                .any(|message| message["data"]["reason"] == json!("invalidated"))
+        );
+        assert_eq!(
+            harness.explorer.realtime_block_production_requests().await,
+            vec![explorer::BlockProductionSeriesRequest {
+                start_height: 101,
+                end_height: 101,
+                at_epoch_id: Some(11),
+            }]
+        );
+        harness.adapter.shutdown_realtime().await;
+        Ok(())
+    }
+
+    async fn wait_for_chain_request_count(
+        wallet: &SitemapWalletTestServer,
+        expected: usize,
+    ) -> Result<Vec<wallet::ChainEventsRequest>, Box<dyn std::error::Error>> {
+        Ok(tokio::time::timeout(StdDuration::from_secs(3), async {
+            loop {
+                let requests = wallet.realtime_chain_requests().await;
+                if requests.len() >= expected {
+                    return requests;
+                }
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await?)
+    }
+
+    async fn wait_for_mempool_request_count(
+        wallet: &SitemapWalletTestServer,
+        expected: usize,
+    ) -> Result<Vec<wallet::MempoolEventsRequest>, Box<dyn std::error::Error>> {
+        Ok(tokio::time::timeout(StdDuration::from_secs(3), async {
+            loop {
+                let requests = wallet.realtime_mempool_requests().await;
+                if requests.len() >= expected {
+                    return requests;
+                }
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await?)
+    }
+
+    fn assert_live_tail(start: Option<&wallet::EventStreamStart>) {
+        assert!(matches!(
+            start.and_then(|start| start.position.as_ref()),
+            Some(event_stream_start::Position::LiveTail(_))
+        ));
+    }
+
+    fn assert_after_cursor(start: Option<&wallet::EventStreamStart>, expected: &[u8]) {
+        assert!(matches!(
+            start.and_then(|start| start.position.as_ref()),
+            Some(event_stream_start::Position::AfterCursor(cursor)) if cursor == expected
+        ));
+    }
+
+    #[tokio::test]
+    async fn chain_reconnect_resumes_published_cursor_and_failed_precondition_resets_live_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness = realtime_router_test_harness().await?;
+        harness
+            .explorer
+            .set_realtime_block_production_outcomes([RealtimeBlockProductionOutcome::Response(
+                Box::new(realtime_block_production_response(101)),
+            )])
+            .await;
+        harness
+            .wallet
+            .set_realtime_chain_outcomes([
+                RealtimeChainOutcome::Stream {
+                    items: vec![
+                        Ok(realtime_chain_commit(&[4, 5, 6], 101, 11)),
+                        Err(Code::Unavailable),
+                    ],
+                    stay_open: false,
+                },
+                RealtimeChainOutcome::Status(Code::FailedPrecondition),
+                RealtimeChainOutcome::Stream {
+                    items: Vec::new(),
+                    stay_open: true,
+                },
+            ])
+            .await;
+        harness
+            .wallet
+            .set_realtime_mempool_outcomes([RealtimeMempoolOutcome::Stream {
+                items: Vec::new(),
+                stay_open: true,
+            }])
+            .await;
+
+        let mut websocket = RawWebSocket::connect(harness.address).await?;
+        let block =
+            tokio::time::timeout(StdDuration::from_secs(3), websocket.read_json()).await??;
+        assert_eq!(block["type"], json!("new_block"));
+        let close =
+            tokio::time::timeout(StdDuration::from_secs(3), websocket.read_frame()).await??;
+        assert!(matches!(
+            close,
+            RawWebSocketFrame::Close { code: 1013, reason }
+                if reason == "realtime source unavailable"
+        ));
+
+        let chain_requests = wait_for_chain_request_count(&harness.wallet, 3).await?;
+        assert_live_tail(chain_requests[0].start.as_ref());
+        assert_after_cursor(chain_requests[1].start.as_ref(), &[4, 5, 6]);
+        assert_live_tail(chain_requests[2].start.as_ref());
+        assert!(chain_requests.iter().all(|request| {
+            request.family == wallet::ChainEventStreamFamily::Visible as i32
+                && request.address_filter.is_empty()
+        }));
+        let mempool_requests = harness.wallet.realtime_mempool_requests().await;
+        assert_eq!(mempool_requests.len(), 1);
+        assert_live_tail(mempool_requests[0].start.as_ref());
+        harness.adapter.shutdown_realtime().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_mempool_event_reconnects_after_last_published_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness = realtime_router_test_harness().await?;
+        harness
+            .wallet
+            .set_realtime_chain_outcomes([RealtimeChainOutcome::Stream {
+                items: Vec::new(),
+                stay_open: true,
+            }])
+            .await;
+        let valid_event = realtime_mempool_events()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| std::io::Error::other("missing valid mempool fixture"))?;
+        let valid_cursor = valid_event.cursor.clone();
+        let malformed_cursor = vec![99];
+        let malformed_event = wallet::MempoolEventEnvelope {
+            cursor: malformed_cursor.clone(),
+            event_sequence: 99,
+            event: Some(mempool_event_envelope::Event::Added(
+                wallet::MempoolAddedEvent { entry: None },
+            )),
+            ..Default::default()
+        };
+        harness
+            .wallet
+            .set_realtime_mempool_outcomes([
+                RealtimeMempoolOutcome::Stream {
+                    items: vec![Ok(valid_event), Ok(malformed_event), Err(Code::Unavailable)],
+                    stay_open: false,
+                },
+                RealtimeMempoolOutcome::Stream {
+                    items: Vec::new(),
+                    stay_open: true,
+                },
+            ])
+            .await;
+
+        let mut websocket = RawWebSocket::connect(harness.address).await?;
+        let published =
+            tokio::time::timeout(StdDuration::from_secs(3), websocket.read_json()).await??;
+        assert_eq!(published["type"], json!("mempool_tx"));
+        let close =
+            tokio::time::timeout(StdDuration::from_secs(3), websocket.read_frame()).await??;
+        assert!(matches!(
+            close,
+            RawWebSocketFrame::Close { code: 1013, reason }
+                if reason == "realtime source unavailable"
+        ));
+
+        let requests = wait_for_mempool_request_count(&harness.wallet, 2).await?;
+        assert_live_tail(requests[0].start.as_ref());
+        assert_after_cursor(requests[1].start.as_ref(), &valid_cursor);
+        assert_ne!(
+            requests[1]
+                .start
+                .as_ref()
+                .and_then(|start| start.position.as_ref()),
+            Some(&event_stream_start::Position::AfterCursor(malformed_cursor)),
+        );
+        harness.adapter.shutdown_realtime().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_block_hydration_closes_explicitly_without_advancing_chain_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness = realtime_router_test_harness().await?;
+        let incomplete = explorer::BlockProductionSeriesResponse {
+            start_height: 101,
+            end_height: 101,
+            covered_block_count: 0,
+            missing_block_count: 1,
+            ..Default::default()
+        };
+        harness
+            .explorer
+            .set_realtime_block_production_outcomes([
+                RealtimeBlockProductionOutcome::Response(Box::new(incomplete.clone())),
+                RealtimeBlockProductionOutcome::Response(Box::new(incomplete.clone())),
+                RealtimeBlockProductionOutcome::Response(Box::new(incomplete)),
+                RealtimeBlockProductionOutcome::Status(Code::Unavailable),
+            ])
+            .await;
+        harness
+            .wallet
+            .set_realtime_chain_outcomes([RealtimeChainOutcome::Stream {
+                items: vec![Ok(realtime_chain_commit(&[7, 8, 9], 101, 11))],
+                stay_open: true,
+            }])
+            .await;
+        harness
+            .wallet
+            .set_realtime_mempool_outcomes([RealtimeMempoolOutcome::Stream {
+                items: Vec::new(),
+                stay_open: true,
+            }])
+            .await;
+
+        let mut websocket = RawWebSocket::connect(harness.address).await?;
+        let close =
+            tokio::time::timeout(StdDuration::from_secs(3), websocket.read_frame()).await??;
+        assert!(matches!(
+            close,
+            RawWebSocketFrame::Close { code: 1013, reason }
+                if reason == "realtime source unavailable"
+        ));
+        let block_requests = harness.explorer.realtime_block_production_requests().await;
+        assert!(block_requests.len() >= REALTIME_HYDRATION_ATTEMPTS);
+        assert!(block_requests.iter().all(|request| {
+            request.start_height == 101
+                && request.end_height == 101
+                && request.at_epoch_id == Some(11)
+        }));
+        let chain_requests = harness.wallet.realtime_chain_requests().await;
+        assert_eq!(chain_requests.len(), 1);
+        assert_live_tail(chain_requests[0].start.as_ref());
+        harness.adapter.shutdown_realtime().await;
+        Ok(())
+    }
+
     #[test]
     fn realtime_commit_status_distinguishes_reader_lag_from_supersession() {
         assert_eq!(
@@ -15213,7 +17103,7 @@ mod tests {
             sprout_joinsplit_count: 0,
         };
 
-        let transaction = mempool_added_json(&facts, &entry);
+        let transaction = mempool_added_json(&facts, &entry)?;
 
         assert_eq!(transaction["txid"], json!(transaction_id));
         assert_eq!(transaction["size"], json!(2_878));
@@ -15227,6 +17117,36 @@ mod tests {
         assert_eq!(transaction["ironwoodActions"], json!(3));
         assert_eq!(transaction["totalOutput"], json!(0.001));
         assert!(transaction.get("fee").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mempool_added_json_rejects_invalid_first_seen_timestamp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let raw_transaction_bytes = transparent_transaction_bytes();
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let facts = zinder_source::parse_transaction_public_facts(
+            &raw_transaction_bytes,
+            None,
+            &activations,
+        )?;
+        for first_seen_unix_millis in [
+            0,
+            (MAX_ECMASCRIPT_DATE_UNIX_SECONDS + 1).saturating_mul(1_000),
+        ] {
+            let entry = wallet::MempoolEntry {
+                raw_transaction_bytes: raw_transaction_bytes.clone(),
+                first_seen_unix_millis,
+                ..Default::default()
+            };
+
+            assert!(matches!(
+                mempool_added_json(&facts, &entry),
+                Err(CipherscanRestError::InvalidUpstreamField(
+                    "mempool_event.added.entry.first_seen_unix_millis"
+                ))
+            ));
+        }
         Ok(())
     }
 
@@ -15273,7 +17193,8 @@ mod tests {
     }
 
     #[test]
-    fn mempool_transaction_json_preserves_parsed_counts() {
+    fn mempool_transaction_json_preserves_parsed_counts() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut script_pub_key = vec![0x76, 0xa9, 0x14];
         script_pub_key.extend_from_slice(&[0x42; 20]);
         script_pub_key.extend_from_slice(&[0x88, 0xac]);
@@ -15299,7 +17220,7 @@ mod tests {
         };
         let mempool = wallet::MempoolEntry {
             raw_transaction_bytes: vec![0, 1],
-            first_seen_unix_millis: 1_700_000_000_000,
+            first_seen_unix_millis: 1_700_000_000_999,
             ..Default::default()
         };
         let response = explorer::TransactionDetailResponse {
@@ -15325,13 +17246,14 @@ mod tests {
         };
 
         let transaction =
-            mempool_transaction_json(Network::ZcashTestnet, &facts, &mempool, &response);
+            mempool_transaction_json(Network::ZcashTestnet, &facts, &mempool, &response)?;
 
         assert_eq!(transaction["txid"], json!(SAMPLE_TRANSACTION_ID));
         assert_eq!(transaction["size"], json!(1234));
         assert_eq!(transaction["type"], json!("mixed"));
         assert_eq!(transaction["version"], json!(5));
         assert_eq!(transaction["firstSeen"], json!(1_700_000_000));
+        assert!(transaction.get("mempoolTime").is_none());
         assert_eq!(transaction["vinCount"], json!(1));
         assert_eq!(transaction["voutCount"], json!(2));
         assert_eq!(transaction["shieldedSpends"], json!(3));
@@ -15349,6 +17271,32 @@ mod tests {
                 .as_array()
                 .is_some_and(|fields| fields.len() == 2)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mempool_transaction_json_rejects_invalid_first_seen_timestamp() {
+        let facts = explorer::TransactionPublicFacts {
+            transaction_id: SAMPLE_TRANSACTION_ID.to_owned(),
+            ..Default::default()
+        };
+        let response = explorer::TransactionDetailResponse::default();
+        for first_seen_unix_millis in [
+            0,
+            (MAX_ECMASCRIPT_DATE_UNIX_SECONDS + 1).saturating_mul(1_000),
+        ] {
+            let mempool = wallet::MempoolEntry {
+                first_seen_unix_millis,
+                ..Default::default()
+            };
+
+            assert!(matches!(
+                mempool_transaction_json(Network::ZcashTestnet, &facts, &mempool, &response),
+                Err(CipherscanRestError::InvalidUpstreamField(
+                    "location.in_mempool.first_seen_unix_millis"
+                ))
+            ));
+        }
     }
 
     #[test]
@@ -15372,6 +17320,1286 @@ mod tests {
         assert!(mined_location(Some(&confirmed_location)).is_some());
     }
 
+    fn seo_transaction_test_response() -> explorer::TransactionDetailResponse {
+        explorer::TransactionDetailResponse {
+            facts: Some(explorer::TransactionPublicFacts {
+                transaction_id: SAMPLE_TRANSACTION_ID.to_owned(),
+                counts: Some(explorer::TransactionComponentCounts {
+                    transparent_input_count: 1,
+                    transparent_output_count: 2,
+                    sapling_spend_count: 3,
+                    sapling_output_count: 4,
+                    orchard_action_count: 5,
+                    sprout_joinsplit_count: 0,
+                    ironwood_action_count: 6,
+                }),
+                ..Default::default()
+            }),
+            location: Some(wallet::TransactionLocation {
+                location: Some(transaction_location::Location::Mined(
+                    wallet::MinedTransaction {
+                        location: Some(wallet::MinedBlockLocation {
+                            transaction_id: SAMPLE_TRANSACTION_ID.to_owned(),
+                            block_height: 2_345_678,
+                            block_hash: SAMPLE_BLOCK_HASH.to_owned(),
+                            tx_index_in_block: 7,
+                        }),
+                        chain_context: Some(wallet::MinedTransactionChainContext {
+                            consensus_branch_id: 0xc2d6_d0b4,
+                            block_time: 1_700_000_000,
+                            confirmations: 42,
+                        }),
+                        raw_transaction_bytes: None,
+                    },
+                )),
+            }),
+            paid_fee_zat: Some(12_500),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn seo_transaction_json_is_the_exact_canonical_contract() -> Result<(), CipherscanRestError> {
+        let response = seo_transaction_test_response();
+
+        let transaction = seo_transaction_json(SAMPLE_TRANSACTION_ID, &response)?;
+
+        assert_eq!(
+            transaction,
+            json!({
+                "txid": SAMPLE_TRANSACTION_ID,
+                "blockHeight": 2_345_678,
+                "blockHash": SAMPLE_BLOCK_HASH,
+                "blockTime": 1_700_000_000,
+                "confirmations": 42,
+                "isCanonical": true,
+                "status": "confirmed",
+                "isCoinbase": false,
+                "hasSapling": true,
+                "hasOrchard": true,
+                "hasIronwood": true,
+                "hasShielded": true,
+                "orchardActions": 5,
+                "shieldedSpends": 3,
+                "shieldedOutputs": 4,
+                "fee": 0.000_125,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn seo_transaction_fee_is_zero_for_coinbase_and_null_without_a_valid_paid_fee()
+    -> Result<(), CipherscanRestError> {
+        let mut coinbase = seo_transaction_test_response();
+        if let Some(facts) = coinbase.facts.as_mut() {
+            facts.is_coinbase = true;
+        }
+        coinbase.paid_fee_zat = Some(u64::MAX);
+        assert_eq!(
+            seo_transaction_json(SAMPLE_TRANSACTION_ID, &coinbase)?["fee"],
+            json!(0.0)
+        );
+
+        let mut missing_paid_fee = seo_transaction_test_response();
+        missing_paid_fee.paid_fee_zat = None;
+        assert_eq!(
+            seo_transaction_json(SAMPLE_TRANSACTION_ID, &missing_paid_fee)?["fee"],
+            Value::Null
+        );
+
+        let mut invalid_paid_fee = seo_transaction_test_response();
+        invalid_paid_fee.paid_fee_zat = Some(u64::MAX);
+        assert_eq!(
+            seo_transaction_json(SAMPLE_TRANSACTION_ID, &invalid_paid_fee)?["fee"],
+            Value::Null
+        );
+        Ok(())
+    }
+
+    fn cipherscan_result_response(result: Result<Response, CipherscanRestError>) -> Response {
+        match result {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        }
+    }
+
+    async fn response_body_json(response: Response) -> Result<Value, Box<dyn std::error::Error>> {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    #[tokio::test]
+    async fn seo_transaction_rejects_non_rpc_transaction_ids_with_the_zod_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = cipherscan_result_response(seo_transaction_response(
+            "not-a-transaction-id",
+            Ok(seo_transaction_test_response()),
+        ));
+        let status = response.status();
+        let body = response_body_json(response).await?;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            json!({
+                "error": "Invalid path parameters",
+                "details": [{
+                    "field": "txid",
+                    "message": "Invalid transaction ID",
+                }],
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seo_transaction_maps_native_not_found_and_mempool_to_the_same_404()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let native_not_found = cipherscan_result_response(seo_transaction_response(
+            SAMPLE_TRANSACTION_ID,
+            Err(tonic::Status::not_found("transaction not found")),
+        ));
+        let native_status = native_not_found.status();
+        let native_body = response_body_json(native_not_found).await?;
+
+        let mut mempool = seo_transaction_test_response();
+        mempool.location = Some(wallet::TransactionLocation {
+            location: Some(transaction_location::Location::InMempool(
+                wallet::MempoolEntry::default(),
+            )),
+        });
+        let mempool_not_found = cipherscan_result_response(seo_transaction_response(
+            SAMPLE_TRANSACTION_ID,
+            Ok(mempool),
+        ));
+        let mempool_status = mempool_not_found.status();
+        let mempool_body = response_body_json(mempool_not_found).await?;
+
+        assert_eq!(native_status, StatusCode::NOT_FOUND);
+        assert_eq!(mempool_status, native_status);
+        assert_eq!(mempool_body, native_body);
+        assert_eq!(native_body, json!({ "error": "Transaction not found" }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seo_transaction_uses_existing_upstream_unavailable_mapping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for status in [
+            tonic::Status::unavailable("explorer unavailable"),
+            tonic::Status::deadline_exceeded("explorer deadline exceeded"),
+        ] {
+            let response = cipherscan_result_response(seo_transaction_response(
+                SAMPLE_TRANSACTION_ID,
+                Err(status),
+            ));
+            let response_status = response.status();
+            let body = response_body_json(response).await?;
+
+            assert_eq!(response_status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["code"], json!("upstream_unavailable"));
+            assert_eq!(body["source"], json!(CIPHERSCAN_ADAPTER_SOURCE));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seo_transaction_maps_missing_canonical_fields_to_existing_503()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut missing_facts = seo_transaction_test_response();
+        missing_facts.facts = None;
+
+        let mut missing_counts = seo_transaction_test_response();
+        if let Some(facts) = missing_counts.facts.as_mut() {
+            facts.counts = None;
+        }
+
+        let mut missing_transaction_location = seo_transaction_test_response();
+        missing_transaction_location.location = None;
+
+        let mut missing_location_variant = seo_transaction_test_response();
+        missing_location_variant.location = Some(wallet::TransactionLocation::default());
+
+        let mut missing_mined_location = seo_transaction_test_response();
+        if let Some(transaction_location::Location::Mined(mined)) = missing_mined_location
+            .location
+            .as_mut()
+            .and_then(|location| location.location.as_mut())
+        {
+            mined.location = None;
+        }
+
+        let mut missing_chain_context = seo_transaction_test_response();
+        if let Some(transaction_location::Location::Mined(mined)) = missing_chain_context
+            .location
+            .as_mut()
+            .and_then(|location| location.location.as_mut())
+        {
+            mined.chain_context = None;
+        }
+
+        for response in [
+            missing_facts,
+            missing_counts,
+            missing_transaction_location,
+            missing_location_variant,
+            missing_mined_location,
+            missing_chain_context,
+        ] {
+            let response = cipherscan_result_response(seo_transaction_response(
+                SAMPLE_TRANSACTION_ID,
+                Ok(response),
+            ));
+            let status = response.status();
+            let body = response_body_json(response).await?;
+
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["code"], json!("upstream_field_unavailable"));
+            assert_eq!(body["source"], json!(CIPHERSCAN_ADAPTER_SOURCE));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seo_transaction_success_has_shared_cache_headers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = cipherscan_result_response(seo_transaction_response(
+            SAMPLE_TRANSACTION_ID,
+            Ok(seo_transaction_test_response()),
+        ));
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static(SEO_TRANSACTION_CACHE_CONTROL))
+        );
+        assert_eq!(
+            response.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("*"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seo_transaction_route_reaches_transaction_detail_and_preserves_success_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness = seo_router_test_harness(SeoExplorerOutcome::Response(Box::new(
+            seo_transaction_test_response(),
+        )))
+        .await?;
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/seo/tx/{SAMPLE_TRANSACTION_ID}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response_body_json(response).await?;
+
+        assert_eq!(harness.explorer.request_count(), 1);
+        assert_eq!(
+            harness.explorer.last_transaction_id().await.as_deref(),
+            Some(SAMPLE_TRANSACTION_ID)
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "txid": SAMPLE_TRANSACTION_ID,
+                "blockHeight": 2_345_678,
+                "blockHash": SAMPLE_BLOCK_HASH,
+                "blockTime": 1_700_000_000,
+                "confirmations": 42,
+                "isCanonical": true,
+                "status": "confirmed",
+                "isCoinbase": false,
+                "hasSapling": true,
+                "hasOrchard": true,
+                "hasIronwood": true,
+                "hasShielded": true,
+                "orchardActions": 5,
+                "shieldedSpends": 3,
+                "shieldedOutputs": 4,
+                "fee": 0.000_125,
+            })
+        );
+        assert_eq!(
+            headers.get(ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("*"))
+        );
+        assert_eq!(
+            headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static(SEO_TRANSACTION_CACHE_CONTROL))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn minimal_transaction_surface_serves_detail_seo_raw_and_verbose_from_native_pair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let raw_bytes = transparent_transaction_bytes();
+        let mut explorer_response = seo_transaction_test_response();
+        if let Some(facts) = explorer_response.facts.as_mut()
+            && let Some(counts) = facts.counts.as_mut()
+        {
+            counts.transparent_input_count = 0;
+            counts.transparent_output_count = 0;
+        }
+        let location = explorer_response
+            .location
+            .as_mut()
+            .and_then(|location| location.location.as_mut())
+            .and_then(|location| match location {
+                transaction_location::Location::Mined(mined) => {
+                    mined.raw_transaction_bytes = Some(raw_bytes.clone());
+                    Some(wallet::TransactionLocation {
+                        location: Some(transaction_location::Location::Mined(mined.clone())),
+                    })
+                }
+                transaction_location::Location::InMempool(_) => None,
+            })
+            .ok_or_else(|| std::io::Error::other("missing mined transaction fixture"))?;
+        let harness =
+            seo_router_test_harness(SeoExplorerOutcome::Response(Box::new(explorer_response)))
+                .await?;
+        harness
+            .wallet
+            .set_transaction_response(Ok(wallet::TransactionStatusResponse {
+                location: Some(location),
+                ..Default::default()
+            }))
+            .await;
+
+        for (uri, expected_field, expected_value) in [
+            (
+                format!("/api/tx/{SAMPLE_TRANSACTION_ID}"),
+                "txid",
+                json!(SAMPLE_TRANSACTION_ID),
+            ),
+            (
+                format!("/api/seo/tx/{SAMPLE_TRANSACTION_ID}"),
+                "txid",
+                json!(SAMPLE_TRANSACTION_ID),
+            ),
+            (
+                format!("/api/tx/{SAMPLE_TRANSACTION_ID}/raw"),
+                "hex",
+                json!(hex::encode(&raw_bytes)),
+            ),
+            (
+                format!("/api/tx/{SAMPLE_TRANSACTION_ID}/verbose"),
+                "hex",
+                json!(hex::encode(&raw_bytes)),
+            ),
+        ] {
+            let response = harness
+                .router
+                .clone()
+                .oneshot(HttpRequest::builder().uri(&uri).body(Body::empty())?)
+                .await?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response_body_json(response).await?;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(body[expected_field], expected_value, "{uri}");
+            assert_eq!(
+                headers.get(ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&HeaderValue::from_static("*")),
+                "{uri}",
+            );
+        }
+        Ok(())
+    }
+
+    async fn minimal_coinbase_router_test_harness(
+        raw_bytes: &[u8],
+    ) -> Result<SeoRouterTestHarness, Box<dyn std::error::Error>> {
+        let mut explorer_response = seo_transaction_test_response();
+        let facts = explorer_response
+            .facts
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("missing transaction facts fixture"))?;
+        facts.is_coinbase = true;
+        if let Some(counts) = facts.counts.as_mut() {
+            counts.transparent_input_count = 1;
+            counts.transparent_output_count = 1;
+        }
+        explorer_response.transparent_outputs = vec![explorer::TransparentOutput {
+            output_index: 0,
+            output: Some(wallet::TransparentOutput {
+                value_zat: 50_000,
+                script_pub_key: vec![0x51],
+            }),
+            ..Default::default()
+        }];
+        let wallet_location = explorer_response
+            .location
+            .as_ref()
+            .and_then(|location| location.location.as_ref())
+            .and_then(|location| match location {
+                transaction_location::Location::Mined(mined) => {
+                    let mut mined = mined.clone();
+                    mined.raw_transaction_bytes = Some(raw_bytes.to_vec());
+                    Some(wallet::TransactionLocation {
+                        location: Some(transaction_location::Location::Mined(mined)),
+                    })
+                }
+                transaction_location::Location::InMempool(_) => None,
+            })
+            .ok_or_else(|| std::io::Error::other("missing mined transaction fixture"))?;
+        let harness =
+            seo_router_test_harness(SeoExplorerOutcome::Response(Box::new(explorer_response)))
+                .await?;
+        harness
+            .wallet
+            .set_transaction_response(Ok(wallet::TransactionStatusResponse {
+                location: Some(wallet_location),
+                ..Default::default()
+            }))
+            .await;
+        Ok(harness)
+    }
+
+    #[tokio::test]
+    async fn minimal_transaction_surface_serves_coinbase_without_block_detail_enrichment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let raw_bytes = transparent_transaction_bytes();
+        let harness = minimal_coinbase_router_test_harness(&raw_bytes).await?;
+
+        let detail_response = harness
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/tx/{SAMPLE_TRANSACTION_ID}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let detail_status = detail_response.status();
+        let detail = response_body_json(detail_response).await?;
+        assert_eq!(detail_status, StatusCode::OK);
+        assert_eq!(detail["totalOutput"], Value::Null);
+        assert!(
+            detail["zinderUnavailable"]
+                .as_array()
+                .is_some_and(|reasons| reasons.iter().any(|reason| {
+                    reason
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("coinbase output total"))
+                }))
+        );
+
+        for (uri, expected_field, expected_value) in [
+            (
+                format!("/api/seo/tx/{SAMPLE_TRANSACTION_ID}"),
+                "fee",
+                json!(0.0),
+            ),
+            (
+                format!("/api/tx/{SAMPLE_TRANSACTION_ID}/raw"),
+                "hex",
+                json!(hex::encode(&raw_bytes)),
+            ),
+            (
+                format!("/api/tx/{SAMPLE_TRANSACTION_ID}/verbose"),
+                "hex",
+                json!(hex::encode(&raw_bytes)),
+            ),
+        ] {
+            let response = harness
+                .router
+                .clone()
+                .oneshot(HttpRequest::builder().uri(&uri).body(Body::empty())?)
+                .await?;
+            let status = response.status();
+            let body = response_body_json(response).await?;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(body[expected_field], expected_value, "{uri}");
+        }
+
+        let block_response = harness
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/block/101")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let block_status = block_response.status();
+        let block = response_body_json(block_response).await?;
+        assert_eq!(block_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(block["code"], json!("capability_unavailable"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coinbase_optional_enrichment_propagates_transient_and_internal_failures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut explorer_response = seo_transaction_test_response();
+        let facts = explorer_response
+            .facts
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("missing transaction facts fixture"))?;
+        facts.is_coinbase = true;
+        if let Some(counts) = facts.counts.as_mut() {
+            counts.transparent_input_count = 0;
+            counts.transparent_output_count = 0;
+        }
+        let harness =
+            seo_router_test_harness(SeoExplorerOutcome::Response(Box::new(explorer_response)))
+                .await?;
+
+        for (upstream_code, expected_status, expected_code) in [
+            (
+                Code::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_unavailable",
+            ),
+            (Code::Internal, StatusCode::BAD_GATEWAY, "upstream_error"),
+        ] {
+            harness.explorer.set_block_detail_code(upstream_code).await;
+            let response = harness
+                .router
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(format!("/api/tx/{SAMPLE_TRANSACTION_ID}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            let status = response.status();
+            let body = response_body_json(response).await?;
+            assert_eq!(status, expected_status, "{upstream_code:?}");
+            assert_eq!(body["code"], json!(expected_code), "{upstream_code:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_registered_route_maps_native_unimplemented_to_capability_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness = seo_router_test_harness(SeoExplorerOutcome::Response(Box::new(
+            seo_transaction_test_response(),
+        )))
+        .await?;
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/block/101")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response_body_json(response).await?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], json!("capability_unavailable"));
+        assert_eq!(body["source"], json!(CIPHERSCAN_ADAPTER_SOURCE));
+        assert_eq!(
+            headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            headers.get(ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("*"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unconfigured_native_dependency_maps_to_capability_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = CipherscanRestError::Upstream(zinder_proto::status_for_reason(
+            zinder_proto::v1::ops::ErrorReason::DependencyNotConfigured,
+            "BlockTransactions requires the BlockSummary materialized view",
+        ))
+        .into_response();
+        let status = response.status();
+        let body = response_body_json(response).await?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], json!("capability_unavailable"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unrelated_failed_preconditions_remain_upstream_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let statuses = [
+            tonic::Status::failed_precondition("missing structured reason"),
+            tonic::Status::with_error_details(
+                Code::FailedPrecondition,
+                "foreign dependency",
+                tonic_types::ErrorDetails::with_error_info(
+                    ErrorReason::DependencyNotConfigured.as_str_name(),
+                    "other.example.com",
+                    [],
+                ),
+            ),
+            zinder_proto::status_for_reason(
+                ErrorReason::ExplorerPreconditionUnsatisfied,
+                "configured view is not ready",
+            ),
+        ];
+
+        for upstream in statuses {
+            let response = CipherscanRestError::Upstream(upstream).into_response();
+            let status = response.status();
+            let body = response_body_json(response).await?;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body["code"], json!("upstream_error"));
+        }
+        Ok(())
+    }
+
+    async fn seo_router_get(
+        harness: &SeoRouterTestHarness,
+        transaction_id: &str,
+    ) -> Result<(StatusCode, axum::http::HeaderMap, Value), Box<dyn std::error::Error>> {
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/seo/tx/{transaction_id}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response_body_json(response).await?;
+        Ok((status, headers, body))
+    }
+
+    async fn sitemap_router_get(
+        harness: &SeoRouterTestHarness,
+        uri: &str,
+    ) -> Result<(StatusCode, axum::http::HeaderMap, Value), Box<dyn std::error::Error>> {
+        let response = harness
+            .router
+            .clone()
+            .oneshot(HttpRequest::builder().uri(uri).body(Body::empty())?)
+            .await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response_body_json(response).await?;
+        Ok((status, headers, body))
+    }
+
+    fn sitemap_explorer_freshness(
+        visible_tip_height: u32,
+        chain_epoch_id: u64,
+    ) -> explorer::ExplorerFreshness {
+        explorer::ExplorerFreshness {
+            chain_view: Some(wallet::ChainView {
+                chain_epoch: Some(wallet::ChainEpoch {
+                    chain_epoch_id,
+                    visible_tip: Some(wallet::BlockTip {
+                        height: visible_tip_height,
+                        hash: SAMPLE_BLOCK_HASH.to_owned(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn sitemap_block_summaries_response(
+        start: u32,
+        end: u32,
+        visible_tip_height: u32,
+        chain_epoch_id: u64,
+    ) -> explorer::BlockSummariesInRangeResponse {
+        explorer::BlockSummariesInRangeResponse {
+            freshness: Some(sitemap_explorer_freshness(
+                visible_tip_height,
+                chain_epoch_id,
+            )),
+            summaries: (start..=end)
+                .map(|height| explorer::BlockSummary {
+                    block_height: height,
+                    block_time_unix_seconds: if height == 0 {
+                        0
+                    } else {
+                        1_700_000_000_i64.saturating_add(i64::from(height))
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sitemap_routes_validate_ranges_before_native_calls()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness =
+            seo_router_test_harness(SeoExplorerOutcome::Status(Code::Unimplemented)).await?;
+
+        for uri in [
+            "/api/sitemaps/blocks",
+            "/api/sitemaps/blocks?start=-1&end=0",
+            "/api/sitemaps/blocks?start=0.0&end=1",
+            "/api/sitemaps/blocks?start=2&end=1",
+            "/api/sitemaps/blocks?start=0&end=50000",
+            "/api/sitemaps/blocks?start=0&start=1&end=2",
+            "/api/sitemaps/blocks?start=9007199254740992&end=9007199254740992",
+        ] {
+            let (status, headers, body) = sitemap_router_get(&harness, uri).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                body,
+                json!({
+                    "success": false,
+                    "error": SITEMAP_RANGE_ERROR,
+                }),
+                "{uri}",
+            );
+            assert_eq!(
+                headers.get(CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store")),
+            );
+            assert_eq!(
+                headers.get(&X_ROBOTS_TAG),
+                Some(&HeaderValue::from_static("noindex")),
+            );
+        }
+        assert_eq!(harness.wallet.visible_tip_request_count(), 0);
+        assert!(
+            harness
+                .explorer
+                .sitemap_block_summaries_requests()
+                .await
+                .is_empty()
+        );
+
+        let (status, _, body) = sitemap_router_get(
+            &harness,
+            "/api/sitemaps/blocks?start=9007199254740991&end=9007199254740991",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["range"],
+            json!({
+                "start": MAX_JAVASCRIPT_SAFE_INTEGER,
+                "end": MAX_JAVASCRIPT_SAFE_INTEGER,
+            })
+        );
+        assert_eq!(body["blocks"], json!([]));
+        assert_eq!(body["complete"], json!(false));
+        assert_eq!(harness.wallet.visible_tip_request_count(), 1);
+        assert!(
+            harness
+                .explorer
+                .sitemap_block_summaries_requests()
+                .await
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sitemap_recent_transactions_streams_native_chunks_with_public_cache_headers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness =
+            seo_router_test_harness(SeoExplorerOutcome::Status(Code::Unimplemented)).await?;
+        let entries = (0..100)
+            .map(|index| explorer::RecentTransactionEntry {
+                transaction_id: format!("{index:064x}"),
+                block_time_unix_seconds: if index == 99 {
+                    0
+                } else {
+                    1_700_000_000_i64.saturating_sub(index)
+                },
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        harness
+            .explorer
+            .set_sitemap_recent_transactions_outcome(SitemapRecentTransactionsOutcome::Chunks(
+                vec![
+                    explorer::RecentTransactionsChunk {
+                        entries: entries[..40].to_vec(),
+                        ..Default::default()
+                    },
+                    explorer::RecentTransactionsChunk {
+                        entries: entries[40..].to_vec(),
+                        ..Default::default()
+                    },
+                ],
+            ))
+            .await;
+
+        let (status, headers, body) =
+            sitemap_router_get(&harness, "/api/sitemaps/transactions/recent").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], json!(true));
+        assert_eq!(body["transactions"].as_array().map(Vec::len), Some(100));
+        assert_eq!(
+            body["transactions"][0]["txid"],
+            json!(format!("{:064x}", 0))
+        );
+        assert_eq!(body["transactions"][0]["blockTime"], json!(1_700_000_000));
+        assert_eq!(body["transactions"][99]["blockTime"], Value::Null);
+        let requests = harness
+            .explorer
+            .sitemap_recent_transactions_requests()
+            .await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_entries, 100);
+        assert!(requests[0].from_cursor.is_empty());
+        assert_eq!(
+            headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static(SITEMAP_RECENT_CACHE_CONTROL)),
+        );
+        assert_eq!(
+            headers.get(&X_ROBOTS_TAG),
+            Some(&HeaderValue::from_static("noindex")),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sitemap_blocks_pins_one_epoch_and_chunks_the_maximum_range()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness =
+            seo_router_test_harness(SeoExplorerOutcome::Status(Code::Unimplemented)).await?;
+        harness
+            .wallet
+            .set_visible_tip_response(Ok(sitemap_visible_tip_response(50_001, 77)))
+            .await;
+        let mut outcomes = Vec::new();
+        let mut start = 0_u32;
+        while start <= 49_999 {
+            let end = 49_999.min(start.saturating_add(1_023));
+            outcomes.push(SitemapBlockSummariesOutcome::Response(Box::new(
+                sitemap_block_summaries_response(start, end, 50_001, 77),
+            )));
+            if end == 49_999 {
+                break;
+            }
+            start = end.saturating_add(1);
+        }
+        harness
+            .explorer
+            .set_sitemap_block_summaries_outcomes(outcomes)
+            .await;
+
+        let (status, headers, body) =
+            sitemap_router_get(&harness, "/api/sitemaps/blocks?start=0&end=49999").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["range"], json!({ "start": 0, "end": 49_999 }));
+        assert_eq!(body["tip"], json!(50_001));
+        assert_eq!(body["complete"], json!(true));
+        assert_eq!(body["blocks"].as_array().map(Vec::len), Some(50_000));
+        assert_eq!(body["blocks"][0], json!({ "height": 0, "timestamp": null }));
+        assert_eq!(body["blocks"][49_999]["height"], json!(49_999));
+        assert_eq!(harness.wallet.visible_tip_request_count(), 1);
+        let requests = harness.explorer.sitemap_block_summaries_requests().await;
+        assert_eq!(requests.len(), 49);
+        assert_eq!(
+            requests
+                .first()
+                .map(|request| (request.start_height, request.end_height)),
+            Some((0, 1_023)),
+        );
+        assert_eq!(
+            requests
+                .last()
+                .map(|request| (request.start_height, request.end_height)),
+            Some((49_152, 49_999)),
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.at_epoch_id == Some(77))
+        );
+        assert_eq!(
+            headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static(
+                "public, max-age=86400, stale-while-revalidate=172800",
+            )),
+        );
+        assert_eq!(
+            headers.get(&X_ROBOTS_TAG),
+            Some(&HeaderValue::from_static("noindex")),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sitemap_blocks_truncates_future_inventory_and_uses_short_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness =
+            seo_router_test_harness(SeoExplorerOutcome::Status(Code::Unimplemented)).await?;
+        harness
+            .wallet
+            .set_visible_tip_response(Ok(sitemap_visible_tip_response(100, 9)))
+            .await;
+        harness
+            .explorer
+            .set_sitemap_block_summaries_outcomes([SitemapBlockSummariesOutcome::Response(
+                Box::new(sitemap_block_summaries_response(90, 100, 100, 9)),
+            )])
+            .await;
+
+        let (status, headers, body) =
+            sitemap_router_get(&harness, "/api/sitemaps/blocks?start=90&end=110").await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["complete"], json!(false));
+        assert_eq!(body["blocks"].as_array().map(Vec::len), Some(11));
+        assert_eq!(body["blocks"][10]["height"], json!(100));
+        assert_eq!(
+            headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static(
+                "public, max-age=300, stale-while-revalidate=600",
+            )),
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sitemap_native_failures_keep_existing_error_mapping_and_no_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness =
+            seo_router_test_harness(SeoExplorerOutcome::Status(Code::Unimplemented)).await?;
+        harness
+            .explorer
+            .set_sitemap_recent_transactions_outcome(SitemapRecentTransactionsOutcome::Status(
+                Code::Unavailable,
+            ))
+            .await;
+        let (recent_status, recent_headers, recent_body) =
+            sitemap_router_get(&harness, "/api/sitemaps/transactions/recent").await?;
+        assert_eq!(recent_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(recent_body["code"], json!("upstream_unavailable"));
+        assert_eq!(
+            recent_headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store")),
+        );
+        assert_eq!(
+            recent_headers.get(&X_ROBOTS_TAG),
+            Some(&HeaderValue::from_static("noindex")),
+        );
+
+        harness
+            .explorer
+            .set_sitemap_block_summaries_outcomes([SitemapBlockSummariesOutcome::Status(
+                Code::Unavailable,
+            )])
+            .await;
+        let (blocks_status, blocks_headers, blocks_body) =
+            sitemap_router_get(&harness, "/api/sitemaps/blocks?start=1&end=2").await?;
+        assert_eq!(blocks_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(blocks_body["code"], json!("upstream_unavailable"));
+        assert_eq!(
+            blocks_headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store")),
+        );
+        assert_eq!(
+            blocks_headers.get(&X_ROBOTS_TAG),
+            Some(&HeaderValue::from_static("noindex")),
+        );
+
+        let mut incomplete = sitemap_block_summaries_response(1, 2, 100, 7);
+        incomplete.summaries.pop();
+        harness
+            .explorer
+            .set_sitemap_block_summaries_outcomes([SitemapBlockSummariesOutcome::Response(
+                Box::new(incomplete),
+            )])
+            .await;
+        let (incomplete_status, incomplete_headers, incomplete_body) =
+            sitemap_router_get(&harness, "/api/sitemaps/blocks?start=1&end=2").await?;
+        assert_eq!(incomplete_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(incomplete_body["code"], json!("upstream_field_unavailable"));
+        assert_eq!(
+            incomplete_headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store")),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sitemap_block_chunk_rejects_missing_duplicate_out_of_order_and_epoch_drift() {
+        let expected_tip = wallet::BlockId {
+            height: 12,
+            block_hash: SAMPLE_BLOCK_HASH.to_owned(),
+        };
+        let mut missing = sitemap_block_summaries_response(10, 12, 12, 4);
+        missing.summaries.pop();
+        assert!(matches!(
+            validate_sitemap_block_chunk(&missing, 10, 12, 4, &expected_tip),
+            Err(CipherscanRestError::MissingUpstreamField(
+                "block_summaries_in_range.summaries"
+            ))
+        ));
+
+        let mut duplicate = sitemap_block_summaries_response(10, 12, 12, 4);
+        duplicate.summaries[1].block_height = 10;
+        assert!(matches!(
+            validate_sitemap_block_chunk(&duplicate, 10, 12, 4, &expected_tip),
+            Err(CipherscanRestError::InvalidUpstreamField(
+                "block_summaries_in_range.summaries.block_height"
+            ))
+        ));
+
+        let mut out_of_order = sitemap_block_summaries_response(10, 12, 12, 4);
+        out_of_order.summaries.swap(0, 1);
+        assert!(matches!(
+            validate_sitemap_block_chunk(&out_of_order, 10, 12, 4, &expected_tip),
+            Err(CipherscanRestError::InvalidUpstreamField(
+                "block_summaries_in_range.summaries.block_height"
+            ))
+        ));
+
+        let drifted = sitemap_block_summaries_response(10, 12, 12, 5);
+        assert!(matches!(
+            validate_sitemap_block_chunk(&drifted, 10, 12, 4, &expected_tip),
+            Err(CipherscanRestError::InvalidUpstreamField(
+                "block_summaries_in_range.freshness.chain_view.chain_epoch"
+            ))
+        ));
+    }
+
+    fn assert_seo_error_is_not_shared_cache(headers: &axum::http::HeaderMap) {
+        assert_eq!(
+            headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_ne!(
+            headers.get(CACHE_CONTROL),
+            Some(&HeaderValue::from_static(SEO_TRANSACTION_CACHE_CONTROL))
+        );
+    }
+
+    #[tokio::test]
+    async fn seo_transaction_route_preserves_every_error_boundary_and_no_store_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let harness = seo_router_test_harness(SeoExplorerOutcome::Response(Box::new(
+            seo_transaction_test_response(),
+        )))
+        .await?;
+
+        let (invalid_status, invalid_headers, invalid_body) =
+            seo_router_get(&harness, "not-a-transaction-id").await?;
+        assert_eq!(harness.explorer.request_count(), 0);
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            invalid_body,
+            json!({
+                "error": "Invalid path parameters",
+                "details": [{
+                    "field": "txid",
+                    "message": "Invalid transaction ID",
+                }],
+            })
+        );
+        assert_seo_error_is_not_shared_cache(&invalid_headers);
+
+        harness
+            .explorer
+            .set_outcome(SeoExplorerOutcome::Status(Code::NotFound))
+            .await;
+        let (native_status, native_headers, native_body) =
+            seo_router_get(&harness, SAMPLE_TRANSACTION_ID).await?;
+        assert_eq!(native_status, StatusCode::NOT_FOUND);
+        assert_seo_error_is_not_shared_cache(&native_headers);
+
+        let mut mempool = seo_transaction_test_response();
+        mempool.location = Some(wallet::TransactionLocation {
+            location: Some(transaction_location::Location::InMempool(
+                wallet::MempoolEntry::default(),
+            )),
+        });
+        harness
+            .explorer
+            .set_outcome(SeoExplorerOutcome::Response(Box::new(mempool)))
+            .await;
+        let (mempool_status, mempool_headers, mempool_body) =
+            seo_router_get(&harness, SAMPLE_TRANSACTION_ID).await?;
+        assert_eq!(mempool_status, native_status);
+        assert_eq!(mempool_body, native_body);
+        assert_seo_error_is_not_shared_cache(&mempool_headers);
+
+        for code in [Code::Unavailable, Code::DeadlineExceeded] {
+            harness
+                .explorer
+                .set_outcome(SeoExplorerOutcome::Status(code))
+                .await;
+            let (status, headers, body) = seo_router_get(&harness, SAMPLE_TRANSACTION_ID).await?;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["code"], json!("upstream_unavailable"));
+            assert_seo_error_is_not_shared_cache(&headers);
+        }
+
+        let mut missing_facts = seo_transaction_test_response();
+        missing_facts.facts = None;
+        harness
+            .explorer
+            .set_outcome(SeoExplorerOutcome::Response(Box::new(missing_facts)))
+            .await;
+        let (missing_status, missing_headers, missing_body) =
+            seo_router_get(&harness, SAMPLE_TRANSACTION_ID).await?;
+        assert_eq!(missing_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(missing_body["code"], json!("upstream_field_unavailable"));
+        assert_seo_error_is_not_shared_cache(&missing_headers);
+        assert_eq!(harness.explorer.request_count(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_detail_json_is_mined_only() {
+        let facts = explorer::TransactionPublicFacts {
+            transaction_id: SAMPLE_TRANSACTION_ID.to_owned(),
+            ..Default::default()
+        };
+        let mined_transaction = wallet::MinedTransaction::default();
+        let response = explorer::TransactionDetailResponse::default();
+
+        let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
+            network: Network::ZcashTestnet,
+            facts: &facts,
+            mined_transaction: Some(&mined_transaction),
+            response: &response,
+            coinbase_total_output_zat: None,
+            coinbase_miner_fields: None,
+        });
+
+        assert_eq!(transaction["status"], json!("mined"));
+        assert_eq!(transaction["mempoolTime"], Value::Null);
+        assert!(transaction.get("firstSeen").is_none());
+    }
+
+    #[test]
+    fn transaction_location_selects_raw_bytes_from_its_active_variant() {
+        let mempool_location_value = wallet::TransactionLocation {
+            location: Some(transaction_location::Location::InMempool(
+                wallet::MempoolEntry {
+                    transaction_id: SAMPLE_TRANSACTION_ID.to_owned(),
+                    auth_digest: "not raw transaction bytes".to_owned(),
+                    raw_transaction_bytes: vec![0x01, 0x02],
+                    ..Default::default()
+                },
+            )),
+        };
+        let mined_location_value = wallet::TransactionLocation {
+            location: Some(transaction_location::Location::Mined(
+                wallet::MinedTransaction {
+                    raw_transaction_bytes: Some(vec![0x03, 0x04]),
+                    ..Default::default()
+                },
+            )),
+        };
+        let mined_without_bytes = wallet::TransactionLocation {
+            location: Some(transaction_location::Location::Mined(
+                wallet::MinedTransaction::default(),
+            )),
+        };
+        let mined_with_empty_bytes = wallet::TransactionLocation {
+            location: Some(transaction_location::Location::Mined(
+                wallet::MinedTransaction {
+                    raw_transaction_bytes: Some(Vec::new()),
+                    ..Default::default()
+                },
+            )),
+        };
+        let mempool_with_empty_bytes = wallet::TransactionLocation {
+            location: Some(transaction_location::Location::InMempool(
+                wallet::MempoolEntry::default(),
+            )),
+        };
+        let location_without_variant = wallet::TransactionLocation::default();
+
+        assert_eq!(
+            raw_transaction_bytes(Some(&mempool_location_value)),
+            Some([0x01, 0x02].as_slice())
+        );
+        assert_eq!(
+            raw_transaction_bytes(Some(&mined_location_value)),
+            Some([0x03, 0x04].as_slice())
+        );
+        assert!(mempool_location(Some(&mempool_location_value)).is_some());
+        assert!(mined_location(Some(&mempool_location_value)).is_none());
+        assert!(mempool_location(Some(&mined_location_value)).is_none());
+        assert!(mined_location(Some(&mined_location_value)).is_some());
+        assert!(raw_transaction_bytes(Some(&mined_without_bytes)).is_none());
+        assert!(raw_transaction_bytes(Some(&mined_with_empty_bytes)).is_none());
+        assert!(raw_transaction_bytes(Some(&mempool_with_empty_bytes)).is_none());
+        assert!(raw_transaction_bytes(Some(&location_without_variant)).is_none());
+        assert!(raw_transaction_bytes(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_transaction_response_marks_missing_retention_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let location = wallet::TransactionLocation {
+            location: Some(transaction_location::Location::Mined(
+                wallet::MinedTransaction {
+                    raw_transaction_bytes: Some(Vec::new()),
+                    ..Default::default()
+                },
+            )),
+        };
+        let error = raw_transaction_response(SAMPLE_TRANSACTION_ID, Some(&location))
+            .err()
+            .ok_or_else(|| std::io::Error::other("raw response unexpectedly succeeded"))?;
+        let response = error.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let body: Value = serde_json::from_slice(&body)?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], json!("upstream_field_unavailable"));
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("raw_transaction_bytes"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verbose_transaction_response_marks_missing_retention_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let location = wallet::TransactionLocation {
+            location: Some(transaction_location::Location::InMempool(
+                wallet::MempoolEntry::default(),
+            )),
+        };
+        let error = verbose_transaction_response(SAMPLE_TRANSACTION_ID, Some(&location))
+            .err()
+            .ok_or_else(|| std::io::Error::other("verbose response unexpectedly succeeded"))?;
+        let response = error.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let body: Value = serde_json::from_slice(&body)?;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], json!("upstream_field_unavailable"));
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("raw_transaction_bytes"))
+        );
+        Ok(())
+    }
+
     #[test]
     fn transaction_detail_json_uses_the_block_coinbase_total() {
         let facts = explorer::TransactionPublicFacts {
@@ -15392,7 +18620,7 @@ mod tests {
         let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
             network: Network::ZcashTestnet,
             facts: &facts,
-            location: None,
+            mined_transaction: None,
             response: &response,
             coinbase_total_output_zat: Some(137_500_000),
             coinbase_miner_fields: Some(&coinbase_miner_fields),
@@ -15433,7 +18661,7 @@ mod tests {
         let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
             network: Network::ZcashTestnet,
             facts: &facts,
-            location: None,
+            mined_transaction: None,
             response: &response,
             coinbase_total_output_zat: None,
             coinbase_miner_fields: None,
@@ -15580,7 +18808,7 @@ mod tests {
         let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
             network: Network::ZcashTestnet,
             facts: &facts,
-            location: None,
+            mined_transaction: None,
             response: &response,
             coinbase_total_output_zat: None,
             coinbase_miner_fields: None,
@@ -15614,7 +18842,7 @@ mod tests {
         let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
             network: Network::ZcashTestnet,
             facts: &facts,
-            location: None,
+            mined_transaction: None,
             response: &response,
             coinbase_total_output_zat: None,
             coinbase_miner_fields: None,
@@ -15658,7 +18886,7 @@ mod tests {
         let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
             network: Network::ZcashTestnet,
             facts: &facts,
-            location: None,
+            mined_transaction: None,
             response: &response,
             coinbase_total_output_zat: None,
             coinbase_miner_fields: None,
@@ -15701,7 +18929,7 @@ mod tests {
         let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
             network: Network::ZcashTestnet,
             facts: &facts,
-            location: None,
+            mined_transaction: None,
             response: &response,
             coinbase_total_output_zat: None,
             coinbase_miner_fields: None,
@@ -15925,17 +19153,21 @@ mod tests {
     }
 
     #[test]
-    fn mempool_row_uses_cipherscan_labels_and_native_component_counts() {
+    fn mempool_row_uses_cipherscan_labels_and_native_component_counts()
+    -> Result<(), Box<dyn std::error::Error>> {
         let transparent = explorer::MempoolActivityEntry {
             privacy_shape: explorer::PrivacyShape::TransparentOnly as i32,
+            first_seen_unix_millis: 1_700_000_000_999,
             ..Default::default()
         };
         let shielded = explorer::MempoolActivityEntry {
             privacy_shape: explorer::PrivacyShape::ShieldedOnly as i32,
+            first_seen_unix_millis: 1_700_000_000_999,
             ..Default::default()
         };
         let mixed = explorer::MempoolActivityEntry {
             privacy_shape: explorer::PrivacyShape::Shielding as i32,
+            first_seen_unix_millis: 1_700_000_000_999,
             component_counts: Some(explorer::TransactionComponentCounts {
                 transparent_input_count: 2,
                 transparent_output_count: 3,
@@ -15948,30 +19180,55 @@ mod tests {
             transparent_output_total_zat: 123_456_789,
             ..Default::default()
         };
+        let transparent = mempool_row(&transparent)?;
+        let shielded = mempool_row(&shielded)?;
+        let mixed = mempool_row(&mixed)?;
 
-        assert_eq!(mempool_row(&transparent)["type"], json!("transparent"));
-        assert_eq!(mempool_row(&shielded)["type"], json!("shielded"));
-        assert_eq!(mempool_row(&mixed)["type"], json!("mixed"));
-        assert_eq!(mempool_row(&mixed)["vin"], json!(2));
-        assert_eq!(mempool_row(&mixed)["vout"], json!(3));
-        assert_eq!(mempool_row(&mixed)["vShieldedSpend"], json!(5));
-        assert_eq!(mempool_row(&mixed)["vShieldedOutput"], json!(7));
-        assert_eq!(mempool_row(&mixed)["orchardActions"], json!(11));
-        assert_eq!(mempool_row(&mixed)["ironwoodActions"], json!(13));
-        assert_eq!(mempool_row(&mixed)["hasSapling"], json!(true));
-        assert_eq!(mempool_row(&mixed)["hasOrchard"], json!(true));
-        assert_eq!(mempool_row(&mixed)["hasIronwood"], json!(true));
-        assert_eq!(mempool_row(&mixed)["totalOutput"], json!(1.234_567_89));
+        assert_eq!(transparent["type"], json!("transparent"));
+        assert_eq!(shielded["type"], json!("shielded"));
+        assert_eq!(mixed["type"], json!("mixed"));
+        assert_eq!(mixed["time"], json!(1_700_000_000));
+        assert_eq!(mixed["vin"], json!(2));
+        assert_eq!(mixed["vout"], json!(3));
+        assert_eq!(mixed["vShieldedSpend"], json!(5));
+        assert_eq!(mixed["vShieldedOutput"], json!(7));
+        assert_eq!(mixed["orchardActions"], json!(11));
+        assert_eq!(mixed["ironwoodActions"], json!(13));
+        assert_eq!(mixed["hasSapling"], json!(true));
+        assert_eq!(mixed["hasOrchard"], json!(true));
+        assert_eq!(mixed["hasIronwood"], json!(true));
+        assert_eq!(mixed["totalOutput"], json!(1.234_567_89));
         assert!(
-            mempool_row(&mixed)["zinderUnavailable"]
+            mixed["zinderUnavailable"]
                 .as_array()
                 .is_some_and(|fields| fields.len() == 1)
         );
         assert!(
-            mempool_row(&transparent)["zinderUnavailable"]
+            transparent["zinderUnavailable"]
                 .as_array()
                 .is_some_and(|fields| fields.len() == 2)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mempool_row_rejects_invalid_first_seen_timestamp() {
+        for first_seen_unix_millis in [
+            0,
+            (MAX_ECMASCRIPT_DATE_UNIX_SECONDS + 1).saturating_mul(1_000),
+        ] {
+            let entry = explorer::MempoolActivityEntry {
+                first_seen_unix_millis,
+                ..Default::default()
+            };
+
+            assert!(matches!(
+                mempool_row(&entry),
+                Err(CipherscanRestError::InvalidUpstreamField(
+                    "mempool_snapshot.entries.first_seen_unix_millis"
+                ))
+            ));
+        }
     }
 
     #[test]
@@ -16696,6 +19953,31 @@ mod tests {
         assert_eq!(failed_response["failed"][0]["error"], json!("not found"));
         assert_eq!(failed_response["failed"][0]["success"], json!(false));
         assert_eq!(failed_response["successful"], json!(0));
+    }
+
+    #[test]
+    fn raw_transaction_batch_counts_missing_retention_as_failed() {
+        let location = wallet::TransactionLocation {
+            location: Some(transaction_location::Location::InMempool(
+                wallet::MempoolEntry::default(),
+            )),
+        };
+        let outcome = raw_transaction_batch_location_result(SAMPLE_TRANSACTION_ID, Some(&location));
+        let (transactions, failed) = match outcome {
+            Ok(transaction) => (vec![transaction], Vec::new()),
+            Err(failure) => (Vec::new(), vec![failure]),
+        };
+        let response = raw_transaction_batch_json(&transactions, &failed, 1);
+
+        assert_eq!(response["transactions"], json!([]));
+        assert_eq!(response["total"], json!(1));
+        assert_eq!(response["successful"], json!(0));
+        assert_eq!(response["failed"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            response["failed"][0]["error"],
+            json!("Transaction raw bytes are unavailable from the connected Zinder deployment")
+        );
+        assert!(response["failed"][0].get("hex").is_none());
     }
 
     #[test]

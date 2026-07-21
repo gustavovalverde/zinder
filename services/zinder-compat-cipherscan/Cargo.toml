@@ -25,6 +25,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
 tonic = { workspace = true, features = ["transport"] }
+tonic-types.workspace = true
 tracing.workspace = true
 zebra-chain.workspace = true
 zinder-core.workspace = true
@@ -34,6 +35,8 @@ zinder-source.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
+zinder-query.workspace = true
+zinder-testkit.workspace = true
 
 [[bin]]
 name = "zinder-compat-cipherscan"

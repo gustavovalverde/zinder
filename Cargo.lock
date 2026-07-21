@@ -5736,13 +5736,16 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic",
+ "tonic-types",
  "tower",
  "tracing",
  "zebra-chain",
  "zinder-core",
  "zinder-proto",
+ "zinder-query",
  "zinder-runtime",
  "zinder-source",
+ "zinder-testkit",
 ]
 
 [[package]]

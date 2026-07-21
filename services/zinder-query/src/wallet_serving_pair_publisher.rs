@@ -783,8 +783,8 @@ mod tests {
             WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, WALLET_READ_COMPACT_BLOCK_AT_V2,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
             WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
-            WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
-            WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+            WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1,
+            WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
         },
         v1::{
             ingest::{
@@ -998,6 +998,7 @@ mod tests {
         ));
         let server_info_settings = ServerInfoSettings {
             transaction_broadcast_enabled: true,
+            transaction_blobs_retained: true,
             capability_profile: WalletCapabilityProfile::ExactPair,
             ..ServerInfoSettings::default()
         };
@@ -1143,6 +1144,7 @@ mod tests {
             WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
             WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
             WALLET_READ_TRANSACTION_BY_ID_V2,
+            WALLET_READ_TRANSACTION_BYTES_V1,
             WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
             WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
             WALLET_EVENTS_CHAIN_V1,
@@ -1442,6 +1444,7 @@ mod tests {
         block_hash: BlockHash,
         parent_hash: BlockHash,
     ) -> CanonicalBuildBlock {
+        let block_time_seconds = height.value();
         let facts = CanonicalBlockFacts {
             block_header: BlockHeaderArtifact::new(
                 height,
@@ -1449,7 +1452,7 @@ mod tests {
                 parent_hash,
                 [0; 32],
                 [0; 32],
-                i64::from(height.value()),
+                i64::from(block_time_seconds),
                 0,
                 [0; 32],
                 0,
@@ -1469,7 +1472,7 @@ mod tests {
             compact_block: zinder_core::CompactBlockArtifact::empty(
                 BlockId::new(height, block_hash),
                 parent_hash,
-                height.value(),
+                block_time_seconds,
                 zinder_core::CompactChainMetadata {
                     sapling_commitment_tree_size: 0,
                     orchard_commitment_tree_size: 0,
@@ -1479,7 +1482,7 @@ mod tests {
             tip_metadata: ChainTipMetadata::new(0, 0, 0),
             tree_state_checkpoint: Some(CommitmentTreeCheckpoint::new(
                 BlockId::new(height, block_hash),
-                height.value(),
+                block_time_seconds,
                 CommitmentTreeFrontiers::default(),
             )),
             block_final_note_commitment_roots: None,

@@ -155,6 +155,9 @@ impl WalletCapabilityProfile {
             | capabilities::WALLET_READ_TRANSACTION_BYTES_V1
             | capabilities::WALLET_READ_SERVER_INFO_V2
             | capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1
+            | capabilities::WALLET_READ_TRANSPARENT_OUTPUTS_V1
+            | capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1
+            | capabilities::WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1
             | capabilities::WALLET_BROADCAST_TRANSACTION_V1
             | capabilities::WALLET_SNAPSHOT_MEMPOOL_V2
             | capabilities::WALLET_EVENTS_MEMPOOL_V2
@@ -165,9 +168,6 @@ impl WalletCapabilityProfile {
             | capabilities::WALLET_ADDRESS_TRANSPARENT_BALANCE_V1
             | capabilities::WALLET_READ_FULL_BLOCK_AT_V1
             | capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
-            | capabilities::WALLET_READ_TRANSPARENT_OUTPUTS_V1
-            | capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1
-            | capabilities::WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1
             | capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1
             | capabilities::WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1
             | capabilities::WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1
@@ -1050,11 +1050,11 @@ fn native_shielded_protocol(
 mod server_info_tests {
     use zinder_proto::capabilities::{
         CAPABILITIES, CapabilitySurface, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
-        WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_FULL_BLOCK_AT_V1,
+        WALLET_EVENTS_CHAIN_V1, WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_FULL_BLOCK_AT_V1,
         WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_SETTLED_TIP_BLOCK_V1,
         WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1,
         WALLET_READ_TRANSPARENT_OUTPUTS_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
-        WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+        WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
     };
 
     use super::{
@@ -1190,6 +1190,8 @@ mod server_info_tests {
         let settings = ServerInfoSettings {
             capability_profile: WalletCapabilityProfile::ExactPair,
             transparent_address_history_available: true,
+            transparent_outpoint_spend_available: true,
+            transaction_blobs_retained: true,
             ..ServerInfoSettings::default()
         };
         let capabilities = build_wallet_server_info(&settings)
@@ -1208,6 +1210,13 @@ mod server_info_tests {
             &capabilities,
             WALLET_READ_TRANSPARENT_OUTPUTS_V1
         ));
+        assert!(advertises(&capabilities, WALLET_READ_TRANSPARENT_SPENDS_V1));
+        assert!(advertises(
+            &capabilities,
+            WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1
+        ));
+        assert!(advertises(&capabilities, WALLET_READ_TRANSACTION_BYTES_V1));
+        assert!(advertises(&capabilities, WALLET_EVENTS_CHAIN_V1));
         assert!(advertises(
             &capabilities,
             WALLET_ADDRESS_TRANSPARENT_HISTORY_V1

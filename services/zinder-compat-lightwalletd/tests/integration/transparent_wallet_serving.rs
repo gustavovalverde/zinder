@@ -13,10 +13,10 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
-    BlockHeaderArtifact, BlockHeight, BlockHeightRange, CommitmentTreeCheckpoint,
-    CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
-    TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentUnspentOutput,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+    CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::{
@@ -548,6 +548,13 @@ impl CanonicalReader for MissingTransactionBlobCanonicalReader {
         height: BlockHeight,
     ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
         self.canonical_reader.block_header_at(height)
+    }
+
+    fn block_id_by_hash(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<BlockId>, CanonicalStoreError> {
+        self.canonical_reader.block_id_by_hash(block_hash)
     }
 
     fn compact_block_at(

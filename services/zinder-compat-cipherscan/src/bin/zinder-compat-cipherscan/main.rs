@@ -5,16 +5,49 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use zinder_compat_cipherscan::CipherscanRestAdapter;
+use zinder_compat_cipherscan::{CipherscanRealtime, CipherscanRealtimeMode, CipherscanRestAdapter};
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_runtime::{
-    Readiness, ReadinessState, RuntimeService, StartupPhase, cancel_on_terminating_signal,
-    connect_zinder_grpc, install_tracing_subscriber, spawn_ops_endpoint_for,
+    AuthenticatedChannel, Readiness, ReadinessState, RuntimeService, StartupPhase,
+    StartupPhaseGuard, cancel_on_terminating_signal, connect_zinder_grpc,
+    install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 
 mod config;
+mod upstream_contract;
 
-use config::{CipherscanConfigError, CipherscanConfigOverrides};
+#[derive(Debug)]
+struct TrackedStartApiPhase {
+    guard: Option<StartupPhaseGuard>,
+}
+
+impl TrackedStartApiPhase {
+    fn start() -> Self {
+        Self {
+            guard: Some(StartupPhase::StartApi.start()),
+        }
+    }
+
+    fn record<T, E>(&mut self, outcome: Result<T, E>) -> Result<T, E>
+    where
+        E: std::fmt::Display,
+    {
+        if let Err(error) = &outcome
+            && let Some(guard) = self.guard.take()
+        {
+            guard.fail(error);
+        }
+        outcome
+    }
+
+    fn complete(mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.complete();
+        }
+    }
+}
+
+use config::{CipherscanConfig, CipherscanConfigError, CipherscanConfigOverrides};
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-cipherscan")]
@@ -105,7 +138,7 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
 
     let readiness = Readiness::default();
     readiness.set(ReadinessState::starting());
-    let start_api_phase = StartupPhase::StartApi.start();
+    let mut start_api_phase = TrackedStartApiPhase::start();
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatCipherscan,
         cipherscan_config.ops_listen_addr,
@@ -115,32 +148,30 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
         Vec::new(),
     );
 
-    let explorer_channel = connect_zinder_grpc(
-        &cipherscan_config.explorer_query_endpoint,
-        cipherscan_config.bearer_token.as_ref(),
-    )
-    .await?;
-    let wallet_channel = connect_zinder_grpc(
-        &cipherscan_config.wallet_query_endpoint,
-        cipherscan_config.bearer_token.as_ref(),
-    )
-    .await?;
-    let listener = TcpListener::bind(cipherscan_config.listen_addr)
+    let (explorer_channel, wallet_channel, upstream_admission) =
+        start_api_phase.record(connect_and_preflight_upstreams(&cipherscan_config).await)?;
+    let listener_result = TcpListener::bind(cipherscan_config.listen_addr)
         .await
         .map_err(|source| CipherscanConfigError::Bind {
             listen_addr: cipherscan_config.listen_addr,
             source,
-        })?;
+        });
+    let listener = start_api_phase.record(listener_result)?;
 
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
-    let adapter = CipherscanRestAdapter::new(
+    let adapter_result = CipherscanRestAdapter::new(
         cipherscan_config.network,
         explorer_channel,
         wallet_channel,
         cipherscan_config.market_price_endpoints.clone(),
-        cancel.clone(),
-    )?;
+        CipherscanRealtime::new(
+            realtime_mode(upstream_admission.realtime_websocket_enabled),
+            cancel.clone(),
+        ),
+    )
+    .map_err(CipherscanConfigError::from);
+    let adapter = start_api_phase.record(adapter_result)?;
     let app = adapter.clone().router();
 
     start_api_phase.complete();
@@ -177,6 +208,40 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
     serve_result.map_err(CipherscanConfigError::Serve)
 }
 
+const fn realtime_mode(is_enabled: bool) -> CipherscanRealtimeMode {
+    if is_enabled {
+        CipherscanRealtimeMode::Full
+    } else {
+        CipherscanRealtimeMode::Unavailable
+    }
+}
+
+async fn connect_and_preflight_upstreams(
+    config: &CipherscanConfig,
+) -> Result<
+    (
+        AuthenticatedChannel,
+        AuthenticatedChannel,
+        upstream_contract::UpstreamAdmission,
+    ),
+    CipherscanConfigError,
+> {
+    let explorer_channel = connect_zinder_grpc(
+        &config.explorer_query_endpoint,
+        config.bearer_token.as_ref(),
+    )
+    .await?;
+    let wallet_channel =
+        connect_zinder_grpc(&config.wallet_query_endpoint, config.bearer_token.as_ref()).await?;
+    let admission = upstream_contract::preflight_upstream_contract_pair(
+        config.network,
+        explorer_channel.clone(),
+        wallet_channel.clone(),
+    )
+    .await?;
+    Ok((explorer_channel, wallet_channel, admission))
+}
+
 fn emit_runtime_error(error: &CipherscanConfigError) -> ExitCode {
     tracing::error!(
         target: "zinder::compat::cipherscan",
@@ -199,5 +264,58 @@ impl From<Cli> for CipherscanConfigOverrides {
             historical_price_endpoint_template: cli.historical_price_endpoint_template,
             bearer_token_path: cli.bearer_token_path,
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_phase_tests {
+    use std::{io, net::SocketAddr};
+
+    use zinder_compat_cipherscan::MarketPriceInitializationError;
+    use zinder_testkit::LogCapture;
+
+    use super::{CipherscanConfigError, TrackedStartApiPhase};
+
+    #[test]
+    fn listener_bind_failure_marks_start_api_failed() {
+        let capture = LogCapture::install_for_target("zinder::startup");
+        let mut phase = TrackedStartApiPhase::start();
+        let listen_addr = SocketAddr::from(([127, 0, 0, 1], 9070));
+        let error = CipherscanConfigError::Bind {
+            listen_addr,
+            source: io::Error::new(io::ErrorKind::AddrInUse, "address is already in use"),
+        };
+
+        let outcome: Result<(), _> = phase.record(Err(error));
+
+        assert!(matches!(outcome, Err(CipherscanConfigError::Bind { .. })));
+        assert_failed_start_api_exit(&capture);
+    }
+
+    #[test]
+    fn adapter_construction_failure_marks_start_api_failed() {
+        let capture = LogCapture::install_for_target("zinder::startup");
+        let mut phase = TrackedStartApiPhase::start();
+        let error = CipherscanConfigError::MarketPriceClient(
+            MarketPriceInitializationError::InvalidHistoricalEndpointTemplate,
+        );
+
+        let outcome: Result<(), _> = phase.record(Err(error));
+
+        assert!(matches!(
+            outcome,
+            Err(CipherscanConfigError::MarketPriceClient(_))
+        ));
+        assert_failed_start_api_exit(&capture);
+    }
+
+    fn assert_failed_start_api_exit(capture: &LogCapture) {
+        let events = capture.events();
+        assert_eq!(events.len(), 2, "StartApi must emit entry and exit events");
+        let exit = &events[1];
+        assert_eq!(exit.field("phase_state"), Some("exit"));
+        assert_eq!(exit.field("phase"), Some("start_api"));
+        assert_eq!(exit.field("outcome"), Some("failed"));
+        assert!(exit.field("reason").is_some());
     }
 }

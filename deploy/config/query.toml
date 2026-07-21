@@ -14,6 +14,9 @@ method = "cookie"
 path = "/var/run/auth/.cookie"
 
 [storage]
+# The native runtime opens this canonical primary as the Wallet workload.
+# READY admission therefore requires complete transaction-blob coverage, and
+# ServerInfo advertises wallet.read.transaction_bytes_v1.
 path = "/var/lib/zinder/canonical"
 secondary_path = "/var/lib/zinder/query/canonical-secondary"
 

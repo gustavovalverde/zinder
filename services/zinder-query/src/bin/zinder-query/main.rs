@@ -122,6 +122,11 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         reorg_window_blocks: query_config.canonical_reorg_policy.reorg_window_blocks(),
         transaction_broadcast_enabled: true,
         chain_events_enabled: true,
+        // This runtime opens only READY `CanonicalStoreWorkload::Wallet`
+        // secondaries. Wallet admission requires transaction-blob coverage
+        // for the authenticated source rows, so mined bytes are retained.
+        transaction_blobs_retained: true,
+        transparent_outpoint_spend_available: true,
         transparent_address_history_available: false,
         capability_profile: WalletCapabilityProfile::ExactPair,
         ..ServerInfoSettings::default()

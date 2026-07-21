@@ -27,8 +27,8 @@ The decisions that govern this plane:
 `zinder-explorer` is an optional runtime over the shared query and storage
 libraries. It:
 
-- **Consumes** a prepared materialized-view store as a RocksDB secondary under `storage.path` when available, plus `WalletQuery` over gRPC for federated read paths.
-- **Owns** no primary RocksDB. `storage.path` is the canonical store path, and the optional materialized-view store lives in its `materialized-views` subdirectory. No release runtime currently writes that store.
+- **Consumes** an admitted `WalletQuery` gRPC channel for stateless transaction detail and other federated reads. When configured, it also opens a prepared canonical store and materialized-view store as RocksDB secondaries under `storage.path`.
+- **Owns** no primary RocksDB. The entire `[storage]` section is optional; when present, `storage.path` is the canonical store path, and the materialized-view store lives in its `materialized-views` subdirectory. No release runtime currently writes that store.
 - **Produces** the `ExplorerQuery` gRPC service.
 - **Does not** open any primary store, custody wallet secrets, or serve wallet balance RPCs. It may parse transaction bytes through `zinder-source` and attach an optional cached upstream-health observation to freshness; neither is an authoritative chain-fact read.
 
@@ -60,29 +60,15 @@ The same service also owns `BlockSummariesInRange`, `BlockDetail`, `Search`, `Tr
 
 ## Transaction detail shape
 
-`ExplorerQuery.TransactionDetail` resolves one transaction at an epoch-pinned wallet location. For a mined transaction it reads the canonical `TransactionFactsArtifact`, batch-loads the unique retained parent transaction facts, and returns public facts plus ordered transparent inputs and outputs. Each `TransparentInput` combines `input_index`, `spent_outpoint`, and independently optional `value_zat` and `script_pub_key` fields. Retained parent facts normally recover both; a retained fee row may preserve the value after the parent script is unavailable. Missing facts remain absent rather than becoming zero values or empty scripts. Each `TransparentOutput` combines its explicit `output_index` and intrinsic value/script with an optional canonical `spent_by` relation from `WalletQuery.TransparentSpendsByOutpoint`. The reverse-spend lookup is chunked at the wallet request cap, pins every chunk to the transaction's epoch, and requires the complete epoch identity to match before merging rows. Because the output itself is a retained canonical fact and an incomplete reverse-spend lookup fails closed, absent `spent_by` means unspent on that canonical epoch; mempool spends remain separate. For a mempool transaction, the wallet-provided payload is parsed through the same `TransactionPublicFactSet` parser ingest uses: ordered inputs carry their index and outpoint without pretending their parent value/script was resolved, while ordered outputs carry exact intrinsic values and scripts with no canonical spender. The parsed transaction id must match the requested id. Standard-address decoding remains an edge concern, shielded values are not implied, and the mined path does not parse raw bytes or change raw-byte retention.
+`ExplorerQuery.TransactionDetail` v4 is a stateless composition over one admitted `WalletQuery` runtime. At startup, `zinder-explorer` verifies the upstream service identity, network, contract revision, and 5 capabilities: `wallet.read.server_info_v2`, `wallet.read.transaction_by_id_v2`, `wallet.read.transaction_bytes_v1`, `wallet.read.transparent_outputs_v1`, and `wallet.read.transparent_spends_v1`. The runtime preserves that authenticated channel and advertises `explorer.transaction.detail_v4` only after this exact contract passes. Configuring an endpoint without admission does not enable the capability.
 
-`TransactionFeesConsumer` materializes `paid_fee_zat` only when every
-transparent prevout resolves and the canonical privacy shape is
-`TransparentOnly`. A transparent delta inside a shielding or mixed transaction
-is a transfer between pools, not a provable fee; shielded and unclassified rows
-therefore retain resolved input values but leave `paid_fee_zat` absent.
+For a mined transaction, the handler requires WalletQuery to return the canonical location, full chain-epoch identity, and retained transaction bytes. It rejects contradictions between a requested epoch and the response epoch, the mined location and the visible or settled tips, the reported confirmations and visible-tip height, or the chain-context branch and the configured activation branch at the mined height. It parses the retained bytes through the same `TransactionPublicFactSet` parser used by ingest, checks the parsed transaction id against both the request and wallet location, and requires any parsed consensus branch to match the verified chain context before enriching a legacy transaction that carries no parsed branch. The handler returns the parsed public facts, mined-only intrinsic value balances, and ordered transparent rows.
 
-An incompatible transaction-fee consumer layout requires a fresh
-materialized-view store rebuilt from canonical history. Every read requires an independently
-classified privacy shape and suppresses a paid-fee value unless that shape is
-`TransparentOnly`. Retained parent rows reconstruct fee input values when a fee
-row is missing or partial. Transaction detail uses one epoch-pinned canonical
-reader and one parent-fact batch for both public prevout enrichment and fee
-recovery, then merges projected and recovered values by input index so neither
-source can erase an available value. Recent-transaction pages apply the same
-merge only to transparent-only rows that still lack a proven fee, using two
-bounded batched canonical reads for at most the request's 1,024 rows. Readers
-never write materialized-view rows.
+The handler resolves every mined input through `WalletQuery.TransparentOutputsByOutpoint` and every mined output's optional spender through `WalletQuery.TransparentSpendsByOutpoint`. It chunks both joins at their wallet request caps, pins every request to the transaction's epoch id, and rejects a response unless the complete epoch identity matches before merging rows. Spend results are validated against the outpoints in their individual request chunk, so a response cannot inject an outpoint that belongs to a later chunk even when that outpoint belongs to the transaction globally.
 
-Mempool transactions retain their location semantics. Mempool rows expose transaction-intrinsic transparent facts from their transient payload, but do not claim canonical parent resolution, canonical spent state, or actual paid fees.
+Each mined `TransparentInput` preserves `input_index` and `spent_outpoint`, with `value_zat` and `script_pub_key` present only when the WalletQuery prevout join resolves them. The response reports `RESOLVED` only when every prevout resolves; otherwise it reports `PARTIAL` and leaves missing fields absent. `paid_fee_zat` is present only for a parsed `TransparentOnly` transaction whose every input resolved, and it equals the checked difference between the resolved input sum and parsed output sum. The handler never substitutes a conventional fee, a zero value, or a locally materialized fee row.
 
-The response composes canonical facts with the durable reverse-spend relation. A spender remains visible beyond the first wallet request batch, while epoch-pinned reads report the same outpoint as unspent before its spending epoch and spent afterwards.
+Mempool transactions use the same parser but do not issue canonical prevout or spender joins. Their ordered inputs retain only index and outpoint, their ordered outputs retain exact intrinsic values and scripts, and `paid_fee_zat` remains absent. Standard-address decoding remains an edge concern, and shielded values are never inferred. Neither mined nor mempool transaction detail requires a local canonical or materialized-view store.
 
 ## Block view shape
 
@@ -339,7 +325,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | Capability | Owner method | Always-on? |
 | ---------- | ------------ | ---------- |
 | `explorer.server_info_v1` | `ExplorerQuery.ServerInfo` | Yes |
-| `explorer.transaction.detail_v4` | `ExplorerQuery.TransactionDetail` | When the wallet endpoint and canonical store are configured |
+| `explorer.transaction.detail_v4` | `ExplorerQuery.TransactionDetail` | When one exact WalletQuery contract is admitted at startup; no local store is required |
 | `explorer.block.summary_v1` | `ExplorerQuery.BlockSummariesInRange` + `BlockDetail` summary part | When the block-summary consumer is built and caught up |
 | `explorer.block.production_series_v2` | `ExplorerQuery.BlockProductionSeries` | When the block-summary consumer and canonical secondary store are available |
 | `explorer.block.production_time_range_v1` | `ExplorerQuery.BlockProductionInTimeRange` | When the time index has contiguous height-domain coverage through its materialized-view tip |
@@ -396,6 +382,7 @@ Configuration follows the canonical TOML conventions:
 [ops]
 listen_addr = "127.0.0.1:9069"   # shared section; "" disables the endpoint
 
+# Optional: omit this section for stateless transaction detail.
 [storage]
 path = "/var/lib/zinder/store"
 secondary_path = "/var/lib/zinder/explorer-secondary"
@@ -403,22 +390,22 @@ secondary_path = "/var/lib/zinder/explorer-secondary"
 [explorer]
 listen_addr = "127.0.0.1:9068"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
-wallet_query_endpoint = "https://zinder.example:9102"   # optional native WalletQuery gRPC adapter
+wallet_query_endpoint = "https://zinder.example:9102"   # optional; required to advertise transaction detail v4
 
 [explorer.freshness]
 max_lag_blocks = 16              # response carries UNAVAILABLE_STALE beyond this
 warn_lag_blocks = 4              # readiness cause flips at this threshold
 ```
 
-When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The explorer's `wallet_query_endpoint` config points to an optional deployment that embeds the native `WalletQuery` adapter for its wallet-composed reads (transaction detail, block views, search, mempool activity, and value pools).
+When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The explorer also presents that token to `wallet_query_endpoint`. At startup, it admits the endpoint for transaction detail only after the exact WalletQuery contract above passes; other wallet-composed reads remain capability-gated by their own dependencies.
 
 Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-specific fields, plus the shared `ZINDER_OPS__*` prefix for the universal operational endpoint:
 
 - `ZINDER_EXPLORER__LISTEN_ADDR`
 - `ZINDER_EXPLORER__BEARER_TOKEN_PATH`
 - `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT`
-- `ZINDER_STORAGE__PATH`
-- `ZINDER_STORAGE__SECONDARY_PATH`
+- `ZINDER_STORAGE__PATH` (optional with `ZINDER_STORAGE__SECONDARY_PATH`; omit both for stateless operation)
+- `ZINDER_STORAGE__SECONDARY_PATH` (optional with `ZINDER_STORAGE__PATH`; omit both for stateless operation)
 - `ZINDER_OPS__LISTEN_ADDR` (shared with every Zinder binary; default `127.0.0.1:9069` for the explorer)
 
 ## Failure isolation
