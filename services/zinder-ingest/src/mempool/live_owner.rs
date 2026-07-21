@@ -310,6 +310,54 @@ impl LiveMempoolOwner {
         Ok(outcome)
     }
 
+    async fn append_and_apply_reconciliation_batch_locked(
+        &self,
+        canonical: &CanonicalControlHandle,
+        transitions: Vec<(MempoolEvent, UnixTimestampMillis)>,
+    ) -> Result<(), Status> {
+        let mut applicable_transitions = Vec::with_capacity(transitions.len());
+        for (event, observed_at) in transitions {
+            let preflight = self.index.preflight_event(&event).map_err(|error| {
+                self.mark_rebuild_required();
+                Status::failed_precondition(format!(
+                    "mempool index preflight rejected a reconciliation transition: {error}"
+                ))
+            })?;
+            if preflight == MempoolIndexPreflight::Apply {
+                applicable_transitions.push((event, observed_at));
+            }
+        }
+        if applicable_transitions.is_empty() {
+            return Ok(());
+        }
+
+        let expected_envelope_count = applicable_transitions.len();
+        let envelopes = canonical
+            .append_mempool_events(applicable_transitions)
+            .await?;
+        if envelopes.len() != expected_envelope_count {
+            self.mark_rebuild_required();
+            return Err(Status::unavailable(
+                "durable mempool reconciliation returned an incomplete transition batch",
+            ));
+        }
+        for envelope in envelopes {
+            let position = envelope.position();
+            let outcome =
+                apply_to_index(&self.index, envelope.event, position).inspect_err(|_status| {
+                    self.mark_rebuild_required();
+                })?;
+            if outcome != MempoolApplyOutcome::Applied {
+                self.mark_rebuild_required();
+                return Err(Status::unavailable(
+                    "durable mempool reconciliation could not be applied to the live index",
+                ));
+            }
+        }
+        record_mempool_size_gauge(&self.index);
+        Ok(())
+    }
+
     fn stage_event_locked(
         &self,
         event: MempoolEvent,
@@ -419,6 +467,7 @@ impl LiveMempoolOwner {
             .map(|entry| entry.transaction_id())
             .collect::<HashSet<_>>();
 
+        let mut removals = Vec::new();
         for entry in current_entries {
             let transaction_id = entry.transaction_id();
             if staged_transaction_ids.contains(&transaction_id) {
@@ -436,24 +485,26 @@ impl LiveMempoolOwner {
                         UnixTimestampMillis::now(),
                     )
                 });
-            let _outcome = self
-                .append_and_apply_locked(canonical, terminal_event, observed_at)
-                .await?;
+            removals.push((terminal_event, observed_at));
         }
+        self.append_and_apply_reconciliation_batch_locked(canonical, removals)
+            .await?;
+
+        let mut additions = Vec::new();
         for entry in staged_entries {
             if current_transaction_ids.contains(&entry.transaction_id()) {
                 continue;
             }
-            let _outcome = self
-                .append_and_apply_locked(
-                    canonical,
-                    MempoolEvent::Added {
-                        entry: entry.as_ref().clone(),
-                    },
-                    entry.first_seen_unix_millis(),
-                )
-                .await?;
+            additions.push((
+                MempoolEvent::Added {
+                    entry: entry.as_ref().clone(),
+                },
+                entry.first_seen_unix_millis(),
+            ));
         }
+        self.append_and_apply_reconciliation_batch_locked(canonical, additions)
+            .await?;
+
         for (side_event, observed_at) in staged_generation.side_events {
             let _outcome = self
                 .append_and_apply_locked(canonical, side_event, observed_at)

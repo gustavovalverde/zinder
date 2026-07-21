@@ -30,6 +30,14 @@ The decisions to record here are:
 
 The canonical store persists durable mempool event history in its `mempool_event` column family. Every typed `Added` / `Invalidated` / `Mined` envelope is committed there before consumers see it. The retention floor is stored with the canonical control records, so cursor expiration is a single durable read rather than a column-family scan.
 
+Source-generation reconciliation holds the live owner's mutation gate while it
+computes the old-to-new set delta. It appends the ordered removals in one synced
+RocksDB batch, applies their contiguous positions to the private index, and
+then does the same for additions. A network-upgrade activation can therefore
+evict thousands of transactions without issuing one synchronous write per
+transaction, while the durable event stream still retains one typed envelope
+per transaction and readers never observe a partially reconciled set.
+
 The split exists because the live index needs to answer transparent lookups in microseconds without a RocksDB round-trip, and because it can be reconstructed deterministically from a source snapshot at startup. The event log needs to answer cursor resume and rebroadcast detection with millisecond latency over hours of history, which RocksDB does well and an in-process ring buffer does not.
 
 ### Compatibility and native adapters reach the writer through `IngestControl`, not a second source connection
@@ -49,7 +57,7 @@ The concrete bindings are:
 
 - `IngestControlMempoolSurface` (in `services/zinder-compat-lightwalletd`) implements `MempoolSurface` over the `IngestControl.MempoolSnapshot` / `MempoolEvents` proxy methods.
 - `WalletQueryGrpcAdapter::with_ingest_control_proxy` makes the same proxy available to native `WalletQuery` consumers.
-- `spawn_ingest_control_tip_change_publisher` runs in the compat process and subscribes to `IngestControl.VisibleChainEvents`. It feeds a `TipChangeWatcher` so `LightwalletdGrpcAdapter::with_tip_change_watcher` can race the mempool-event stream against tip changes and close the gRPC stream on each best-block change. This restores the lightwalletd Go contract that Zodl's `sync` loop relies on without making the compat process open its own upstream node connection.
+- `spawn_ingest_control_tip_change_publisher` runs in the compat process and replays the retained `IngestControl.VisibleChainEvents` window before following live events. `MempoolSnapshotResponse.chain_view.chain_epoch.chain_epoch_id` fences the snapshot page, and `TipChangeWatcher::await_tip_change_after` resolves immediately when it has already retained a newer chain-event sequence. Epoch ids and chain-event sequences share one monotonic identity space. `LightwalletdGrpcAdapter` races that signal against the mempool stream and closes the gRPC stream on each best-block change. Replaying retained chain events prevents a writer or network interruption from hiding a change. This restores the lightwalletd Go contract that Zodl's `sync` loop relies on without making the compat process open its own upstream node connection.
 
 ### Retention is two-tier with separately tunable windows
 

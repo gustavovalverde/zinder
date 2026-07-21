@@ -124,7 +124,31 @@ impl RocksDbCanonicalStore {
         event: MempoolEvent,
         source_observed_at: UnixTimestampMillis,
     ) -> Result<MempoolEventEnvelope, CanonicalStoreError> {
-        validate_append_event(&event)?;
+        self.append_mempool_events(vec![(event, source_observed_at)])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CanonicalStoreError::MempoolEventLogInvalid {
+                reason: "single mempool event append produced no durable envelope".to_owned(),
+            })
+    }
+
+    /// Appends an ordered batch of durable mempool transitions before the
+    /// ingest owner mutates its process-local live index.
+    ///
+    /// Every event row, the final monotonic head pointer, and the first
+    /// retention floor are committed in one synced `RocksDB` write. Callers
+    /// preflight the complete transition set before invoking this method,
+    /// then apply the returned positions in order under their mutation gate.
+    pub fn append_mempool_events(
+        &self,
+        events: Vec<(MempoolEvent, UnixTimestampMillis)>,
+    ) -> Result<Vec<MempoolEventEnvelope>, CanonicalStoreError> {
+        for (event, _) in &events {
+            validate_append_event(event)?;
+        }
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
         let _lifecycle_guard = self.lifecycle_lock.lock();
         let current_event_sequence = current_mempool_event_sequence(self)?;
         if current_event_sequence == 0 {
@@ -134,38 +158,39 @@ impl RocksDbCanonicalStore {
                 self.cursor_auth_key,
             )?;
         }
-        let event_sequence = current_event_sequence
-            .checked_add(1)
-            .ok_or(CanonicalStoreError::MempoolEventSequenceOverflow)?;
-        let cursor = mempool_event_cursor(self, event_sequence, event.transaction_id())?;
-        let envelope = MempoolEventEnvelope {
-            cursor,
-            event_sequence,
-            source_observed_unix_millis: source_observed_at.value(),
-            event,
-        };
-
         let event_family = column_family(&self.bounded_open.db, MEMPOOL_EVENT_COLUMN_FAMILY)?;
         let mut batch = WriteBatch::default();
-        let encoded_envelope = encode_mempool_event_envelope(&envelope).map_err(|error| {
-            CanonicalStoreError::MempoolEventLogInvalid {
-                reason: error.to_string(),
-            }
-        })?;
-        batch.put_cf(
-            &event_family,
-            event_sequence.to_be_bytes(),
-            encoded_envelope,
-        );
+        let mut event_sequence = current_event_sequence;
+        let mut envelopes = Vec::with_capacity(events.len());
+        for (event, source_observed_at) in events {
+            event_sequence = event_sequence
+                .checked_add(1)
+                .ok_or(CanonicalStoreError::MempoolEventSequenceOverflow)?;
+            let cursor = mempool_event_cursor(self, event_sequence, event.transaction_id())?;
+            let envelope = MempoolEventEnvelope {
+                cursor,
+                event_sequence,
+                source_observed_unix_millis: source_observed_at.value(),
+                event,
+            };
+            let encoded_envelope = encode_mempool_event_envelope(&envelope).map_err(|error| {
+                CanonicalStoreError::MempoolEventLogInvalid {
+                    reason: error.to_string(),
+                }
+            })?;
+            batch.put_cf(
+                &event_family,
+                event_sequence.to_be_bytes(),
+                encoded_envelope,
+            );
+            envelopes.push(envelope);
+        }
         batch.put(MEMPOOL_EVENT_SEQUENCE_KEY, event_sequence.to_be_bytes());
         if current_event_sequence == 0 {
-            batch.put(
-                MEMPOOL_EVENT_RETENTION_FLOOR_KEY,
-                event_sequence.to_be_bytes(),
-            );
+            batch.put(MEMPOOL_EVENT_RETENTION_FLOOR_KEY, 1_u64.to_be_bytes());
         }
-        write_mempool_lifecycle_batch(self, &batch, "mempool event append")?;
-        Ok(envelope)
+        write_mempool_lifecycle_batch(self, &batch, "mempool event batch append")?;
+        Ok(envelopes)
     }
 
     /// Reads a bounded page of durable mempool events strictly after its

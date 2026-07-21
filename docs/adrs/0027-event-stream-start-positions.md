@@ -43,6 +43,14 @@ The server mints a head cursor when the subscription is accepted and the page lo
 
 `MempoolSnapshotResponse` carries `events_resume_cursor: bytes`, an opaque `MempoolEvents` `after_cursor` value anchored at the moment the snapshot walk began. The snapshot-sequence concept is deleted; there is no `snapshot_sequence` field.
 
+The response separately carries `chain_view.chain_epoch.chain_epoch_id`, which
+the writer captures before reading the snapshot page. The epoch id is a
+canonical-chain fence, not a mempool resume position; it advances in the same
+identity space as `ChainEventEnvelope.event_sequence`. A consumer that requires
+tip coherence closes or restarts its walk when it observes a larger chain-event
+sequence. Keeping the 2 positions distinct prevents a mempool event cursor from
+being misused as proof that the canonical tip remained stable.
+
 The writer's mempool index records the last-applied event position (`MempoolEventPosition`: event sequence plus transaction id) under the same lock that applies entries, so the anchor and the snapshot contents are consistent by construction. The first snapshot page captures that anchor; the HMAC-authenticated snapshot-page token embeds the anchor pair so every later page of the same walk re-mints the identical resume cursor, byte-identical to the anchor envelope's own cursor. A stale paging token whose anchor sits ahead of the writer's applied sequence returns `SNAPSHOT_PAGE_CURSOR_EXPIRED` with the anchor and current event sequences in the precondition detail.
 
 The handoff contract is at-least-once: replaying `MempoolEvents` from `events_resume_cursor` can re-deliver events already reflected in the snapshot (and a later page can enumerate an entry the stream also delivers), never lose one. Consumers apply events idempotently, which the typed `Added`/`Invalidated`/`Mined` envelopes make a keyed upsert/remove. When the writer had applied no mempool event when the walk began, `events_resume_cursor` is empty and the consumer subscribes with `earliest_retained`, which preserves at-least-once.
@@ -57,7 +65,7 @@ Consumers assert a minimum (`contract_revision >= N` for the semantics they were
 
 ### What this enables
 
-- A tail-only consumer (the compat shim's tip-change publisher, a monitoring probe) subscribes with `live_tail` and never replays or filters the retained window.
+- A tail-only monitoring probe can subscribe with `live_tail` and avoid retained-window replay. The compat shim deliberately starts at `earliest_retained`, because its process-local watcher must recover tip changes across writer or network interruptions.
 - A `MempoolSnapshot` walk followed by `MempoolEvents(after_cursor = events_resume_cursor)` is a gapless bootstrap: the lightwalletd shim's `GetMempoolStream` composes exactly this, streaming the snapshot contents first and the live stream after, with no client-side sequence filtering.
 - An accidental empty-cursor request can no longer silently mean "replay everything"; every start is an explicit, validated intent.
 

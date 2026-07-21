@@ -27,6 +27,7 @@ and wire contracts that actually carry versions.
 | `MaterializedViewStore` | Independent store for materialized-view rows, cursors, coverage, and schemas |
 | `ChainEvent` | Durable canonical append or replacement transition |
 | `MempoolEvent` | Typed live-pool transition: added, invalidated, or mined |
+| `MempoolSnapshotView` | Bounded live-pool page with a mempool-resume cursor and canonical `ChainEpoch` fence |
 
 Use `canonical` for chain truth, `wallet projection` for wallet query state,
 and `materialized view` for optional explorer aggregates. `fact` is appropriate
@@ -80,6 +81,14 @@ Do not substitute generic safety or finality labels for this field. `safe` is
 ambiguous, and `finalized` collides with Zcash consensus finality. Use
 `settled_tip` for the reorg-window boundary and a named consensus term when
 describing an actual consensus rule.
+
+`MempoolSnapshotView` keeps two independent monotonic positions. Its
+`events_resume_cursor` resumes `MempoolEvents` without a delivery gap. Its
+`chain_epoch.id` proves which canonical chain fence was captured before the
+page read. Epoch ids and chain-event sequences share one identity space, so a
+tip-coherent consumer restarts when it observes a larger chain-event sequence.
+The mempool cursor and chain epoch do not substitute for each other; live
+mempool-event consumers resume from the opaque cursor.
 
 ## Canonical writer vocabulary
 

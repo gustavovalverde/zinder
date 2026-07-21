@@ -195,6 +195,10 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         request: Request<wallet::MempoolSnapshotRequest>,
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
         let request = request.into_inner();
+        // Capture the canonical fence before touching the mempool page. A tip
+        // committed during or after the page read is therefore observable as
+        // a strictly newer chain event by tip-coherent consumers.
+        let snapshot = self.current_chain_epoch().await?;
         let page = self
             .mempool
             .snapshot_page(
@@ -203,7 +207,6 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 request.from_cursor,
             )
             .await?;
-        let snapshot = self.current_chain_epoch().await?;
         Ok(Response::new(wallet::MempoolSnapshotResponse {
             chain_view: Some(chain_view_message(snapshot.chain_epoch)),
             events_resume_cursor: page.events_resume_cursor,

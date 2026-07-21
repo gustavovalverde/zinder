@@ -79,6 +79,36 @@ async fn lightwalletd_get_mempool_tx_rejects_oversized_excluded_txid_suffixes_be
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_rejects_too_many_excluded_txid_suffixes_before_surface_lookup()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let outcome = adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: vec![vec![0xAA]; 1_025],
+            pool_types: Vec::new(),
+        }))
+        .await;
+    let status = outcome
+        .err()
+        .ok_or_else(|| eyre!("expected too many excluded txid suffixes to be rejected"))?;
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(
+        status.message(),
+        "exclude_txid_suffixes contains 1025 entries; at most 1024 are allowed"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn lightwalletd_get_mempool_tx_rejects_invalid_pool_type_before_surface_lookup()
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
@@ -133,6 +163,41 @@ async fn lightwalletd_get_mempool_tx_filters_excluded_txid_suffixes() -> eyre::R
     let collected = collect_compact_txids(response).await?;
     assert_eq!(collected.len(), 1);
     assert_eq!(collected[0], [0xBB; 32]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_tx_preserves_transactions_when_excluded_suffix_is_ambiguous()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let mut first_transaction_id = [0x11; 32];
+    first_transaction_id[31] = 0xAA;
+    let mut second_transaction_id = [0x22; 32];
+    second_transaction_id[31] = 0xAA;
+    let surface = ScriptedMempoolSurface::with_entries(vec![
+        synthetic_entry_with_transaction_id(first_transaction_id, synthetic_chain_epoch())?,
+        synthetic_entry_with_transaction_id(second_transaction_id, synthetic_chain_epoch())?,
+    ])
+    .with_snapshot_page_size(1);
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .with_mempool_surface(Arc::new(surface));
+
+    let response = adapter
+        .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
+            exclude_txid_suffixes: vec![vec![0xAA]],
+            pool_types: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let collected = collect_compact_txids(response).await?;
+    assert_eq!(collected, vec![first_transaction_id, second_transaction_id]);
     Ok(())
 }
 
@@ -407,7 +472,7 @@ fn synthetic_chain_epoch() -> ChainEpoch {
 
 fn synthetic_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> eyre::Result<MempoolEntry> {
     synthetic_entry_with_compact_tx(
-        transaction_id_byte,
+        [transaction_id_byte; 32],
         chain_epoch,
         &lightwalletd::CompactTx {
             index: 0,
@@ -427,12 +492,38 @@ fn synthetic_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> eyre::Re
     )
 }
 
+fn synthetic_entry_with_transaction_id(
+    transaction_id_bytes: [u8; 32],
+    chain_epoch: ChainEpoch,
+) -> eyre::Result<MempoolEntry> {
+    let payload_byte = transaction_id_bytes[0];
+    synthetic_entry_with_compact_tx(
+        transaction_id_bytes,
+        chain_epoch,
+        &lightwalletd::CompactTx {
+            index: 0,
+            txid: transaction_id_bytes.to_vec(),
+            fee: 0,
+            spends: Vec::new(),
+            outputs: vec![lightwalletd::CompactSaplingOutput {
+                cmu: vec![payload_byte; 32],
+                ephemeral_key: vec![payload_byte; 32],
+                ciphertext: vec![payload_byte; 52],
+            }],
+            actions: Vec::new(),
+            ironwood_actions: Vec::new(),
+            vin: Vec::new(),
+            vout: Vec::new(),
+        },
+    )
+}
+
 fn ironwood_only_entry(
     transaction_id_byte: u8,
     chain_epoch: ChainEpoch,
 ) -> eyre::Result<MempoolEntry> {
     synthetic_entry_with_compact_tx(
-        transaction_id_byte,
+        [transaction_id_byte; 32],
         chain_epoch,
         &lightwalletd::CompactTx {
             index: 0,
@@ -458,7 +549,7 @@ fn transparent_only_entry(
     chain_epoch: ChainEpoch,
 ) -> eyre::Result<MempoolEntry> {
     synthetic_entry_with_compact_tx(
-        transaction_id_byte,
+        [transaction_id_byte; 32],
         chain_epoch,
         &lightwalletd::CompactTx {
             index: 0,
@@ -481,11 +572,12 @@ fn transparent_only_entry(
 }
 
 fn synthetic_entry_with_compact_tx(
-    transaction_id_byte: u8,
+    transaction_id_bytes: [u8; 32],
     chain_epoch: ChainEpoch,
     compact_tx: &lightwalletd::CompactTx,
 ) -> eyre::Result<MempoolEntry> {
-    let transaction_id = TransactionId::from_bytes([transaction_id_byte; 32]);
+    let transaction_id = TransactionId::from_bytes(transaction_id_bytes);
+    let payload_byte = transaction_id_bytes[0];
     let compact_transaction_data = CompactTransactionData {
         fee_zat: Some(u64::from(compact_tx.fee)),
         sapling_spends: compact_tx
@@ -541,8 +633,8 @@ fn synthetic_entry_with_compact_tx(
     };
     MempoolEntry::new(
         transaction_id,
-        Some(AuthDigest::from_bytes([transaction_id_byte; 32])),
-        RawTransactionBytes::new(vec![transaction_id_byte; 16]),
+        Some(AuthDigest::from_bytes(transaction_id_bytes)),
+        RawTransactionBytes::new(vec![payload_byte; 16]),
         compact_transaction_data,
         MempoolObservation {
             first_seen_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
@@ -718,40 +810,90 @@ async fn lightwalletd_get_mempool_stream_closes_on_tip_change() -> eyre::Result<
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_stream_closes_when_tip_change_precedes_watcher_poll()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    let surface = ScriptedMempoolSurface::with_entries(Vec::new());
+    let tip_change_watcher = ScriptedTipChangeWatcher::new();
+    let tip_change_signal = tip_change_watcher.signal();
+    let adapter = LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
+    )
+    .with_mempool_surface(Arc::new(surface))
+    .with_tip_change_watcher(Arc::new(tip_change_watcher));
+
+    // The snapshot is fenced at chain epoch 7. Retaining chain-event sequence
+    // 8 before the stream task polls the watcher models the original startup
+    // race.
+    tip_change_signal.observe_tip_change();
+    let mut response_stream = adapter
+        .get_mempool_stream(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(2), response_stream.next())
+        .await
+        .map_err(|_| eyre!("stream did not honor the retained tip change before timeout"))?;
+    assert!(
+        next.is_none(),
+        "expected stream end after retained tip change, got: {next:?}"
+    );
+    Ok(())
+}
+
 struct ScriptedTipChangeWatcher {
-    notify: Arc<tokio::sync::Notify>,
+    sender: tokio::sync::watch::Sender<u64>,
+    receiver: tokio::sync::watch::Receiver<u64>,
 }
 
 impl ScriptedTipChangeWatcher {
     fn new() -> Self {
-        Self {
-            notify: Arc::new(tokio::sync::Notify::new()),
-        }
+        let (sender, receiver) = tokio::sync::watch::channel(7);
+        Self { sender, receiver }
     }
 
     fn signal(&self) -> ScriptedTipChangeSignal {
         ScriptedTipChangeSignal {
-            notify: Arc::clone(&self.notify),
+            sender: self.sender.clone(),
         }
     }
 }
 
 #[derive(Clone)]
 struct ScriptedTipChangeSignal {
-    notify: Arc<tokio::sync::Notify>,
+    sender: tokio::sync::watch::Sender<u64>,
 }
 
 impl ScriptedTipChangeSignal {
     fn observe_tip_change(&self) {
-        self.notify.notify_waiters();
+        self.sender.send_modify(|sequence| {
+            *sequence = sequence.saturating_add(1);
+        });
     }
 }
 
 #[async_trait]
 impl TipChangeWatcher for ScriptedTipChangeWatcher {
-    async fn await_tip_change(&self) -> Result<(), TipChangeWatcherError> {
-        self.notify.notified().await;
-        Ok(())
+    async fn await_tip_change_after(
+        &self,
+        chain_epoch_id: ChainEpochId,
+    ) -> Result<(), TipChangeWatcherError> {
+        let mut receiver = self.receiver.clone();
+        loop {
+            if *receiver.borrow_and_update() > chain_epoch_id.value() {
+                return Ok(());
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| TipChangeWatcherError::SignalClosed)?;
+        }
     }
 }
 
@@ -786,6 +928,7 @@ impl MempoolSurface for ScriptedMempoolSurface {
             .last()
             .map(|envelope| envelope.cursor.clone());
         Ok(MempoolSnapshotPage {
+            chain_epoch_id: ChainEpochId::new(7),
             events_resume_cursor,
             entries: page_entries,
             next_cursor,

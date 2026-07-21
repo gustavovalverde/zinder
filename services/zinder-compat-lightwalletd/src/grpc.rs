@@ -54,6 +54,8 @@ pub const DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS: NonZeroU32 = NonZeroU32::MIN.s
 pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 /// Page size used to drain the native mempool snapshot for lightwalletd.
 const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
+/// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
+const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
 
 /// Runtime options for [`LightwalletdGrpcAdapter`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -630,14 +632,18 @@ where
             .await
             .map_err(status_from_mempool_surface_error)?;
         let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
+        let mut exclude_suffix_match_counts = vec![0_usize; exclude_txid_suffixes.len()];
         let mut compact_messages = Vec::new();
         while let Some(entry_outcome) = entries.next().await {
             let entry = entry_outcome?;
-            if txid_matches_excluded_suffix(
-                &encode_internal_transaction_id(entry.transaction_id()),
-                &exclude_txid_suffixes,
-            ) {
-                continue;
+            let transaction_id = encode_internal_transaction_id(entry.transaction_id());
+            for (exclude_suffix, match_count) in exclude_txid_suffixes
+                .iter()
+                .zip(&mut exclude_suffix_match_counts)
+            {
+                if !exclude_suffix.is_empty() && transaction_id.ends_with(exclude_suffix) {
+                    *match_count = match_count.saturating_add(1);
+                }
             }
             let compact_message = compact_transaction_data_to_lightwalletd(
                 0,
@@ -652,9 +658,20 @@ where
             if !compact_transaction_has_payload(&pruned) {
                 continue;
             }
-            compact_messages.push(Ok(pruned));
+            compact_messages.push((transaction_id, pruned));
         }
-        Ok(Response::new(Box::pin(stream::iter(compact_messages))))
+        let filtered_messages =
+            compact_messages
+                .into_iter()
+                .filter_map(move |(transaction_id, compact_message)| {
+                    (!transaction_id_is_uniquely_excluded(
+                        &transaction_id,
+                        &exclude_txid_suffixes,
+                        &exclude_suffix_match_counts,
+                    ))
+                    .then_some(Ok(compact_message))
+                });
+        Ok(Response::new(Box::pin(stream::iter(filtered_messages))))
     }
 
     type GetMempoolStreamStream = GrpcStream<lightwalletd::RawTransaction>;
@@ -676,6 +693,7 @@ where
             .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
             .await
             .map_err(status_from_mempool_surface_error)?;
+        let snapshot_chain_epoch_id = first_page.chain_epoch_id;
         let event_stream = mempool_surface
             .mempool_events(first_page.events_resume_cursor.clone())
             .await
@@ -691,6 +709,7 @@ where
                 Box::pin(close_mempool_stream_on_tip_change(
                     raw_transaction_stream,
                     watcher,
+                    snapshot_chain_epoch_id,
                 ))
             } else {
                 Box::pin(raw_transaction_stream)
@@ -1536,6 +1555,7 @@ const fn u32_to_usize(count: u32) -> usize {
 fn close_mempool_stream_on_tip_change<S>(
     raw_transaction_stream: S,
     watcher: SharedTipChangeWatcher,
+    snapshot_chain_epoch_id: ChainEpochId,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<lightwalletd::RawTransaction, Status>>
 where
     S: tonic::codegen::tokio_stream::Stream<Item = Result<lightwalletd::RawTransaction, Status>>
@@ -1545,7 +1565,8 @@ where
     let (output_sender, output_receiver) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {
         tokio::pin!(raw_transaction_stream);
-        let mut tip_change_signal = Box::pin(watcher.await_tip_change());
+        let mut tip_change_signal =
+            Box::pin(watcher.await_tip_change_after(snapshot_chain_epoch_id));
         loop {
             tokio::select! {
                 outcome = tonic::codegen::tokio_stream::StreamExt::next(&mut raw_transaction_stream) => {
@@ -1633,6 +1654,12 @@ fn status_from_mempool_surface_error(error: MempoolSurfaceError) -> Status {
 }
 
 fn validate_excluded_txid_suffixes(exclude_suffixes: &[Vec<u8>]) -> Result<(), Status> {
+    if exclude_suffixes.len() > MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST {
+        return Err(Status::invalid_argument(format!(
+            "exclude_txid_suffixes contains {} entries; at most {MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST} are allowed",
+            exclude_suffixes.len(),
+        )));
+    }
     for (index, suffix) in exclude_suffixes.iter().enumerate() {
         if suffix.len() > 32 {
             return Err(Status::invalid_argument(format!(
@@ -1643,10 +1670,17 @@ fn validate_excluded_txid_suffixes(exclude_suffixes: &[Vec<u8>]) -> Result<(), S
     Ok(())
 }
 
-fn txid_matches_excluded_suffix(transaction_id: &[u8; 32], exclude_suffixes: &[Vec<u8>]) -> bool {
+fn transaction_id_is_uniquely_excluded(
+    transaction_id: &[u8; 32],
+    exclude_suffixes: &[Vec<u8>],
+    exclude_suffix_match_counts: &[usize],
+) -> bool {
     exclude_suffixes
         .iter()
-        .any(|suffix| !suffix.is_empty() && transaction_id.ends_with(suffix))
+        .zip(exclude_suffix_match_counts)
+        .any(|(suffix, match_count)| {
+            *match_count == 1 && !suffix.is_empty() && transaction_id.ends_with(suffix)
+        })
 }
 
 #[allow(

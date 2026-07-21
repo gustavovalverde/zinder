@@ -322,6 +322,15 @@ impl CanonicalControlHandle {
         .await
     }
 
+    /// Persists an ordered mempool-transition batch in one synced write.
+    pub(crate) async fn append_mempool_events(
+        &self,
+        events: Vec<(MempoolEvent, UnixTimestampMillis)>,
+    ) -> Result<Vec<MempoolEventEnvelope>, Status> {
+        self.request(|reply| CanonicalControlCommand::AppendMempoolEvents { events, reply })
+            .await
+    }
+
     /// Reads one bounded page from the durable mempool-event log.
     pub(crate) async fn mempool_event_page(
         &self,
@@ -513,6 +522,15 @@ pub enum CanonicalControlCommand {
         /// One-shot response carrying the durable position.
         reply: oneshot::Sender<Result<MempoolEventEnvelope, Status>>,
     },
+    /// Persist an ordered mempool-transition batch before the live owner
+    /// publishes the matching index changes.
+    AppendMempoolEvents {
+        /// Source-observed transitions already preflighted against the live
+        /// index in this exact order.
+        events: Vec<(MempoolEvent, UnixTimestampMillis)>,
+        /// One-shot response carrying contiguous durable positions.
+        reply: oneshot::Sender<Result<Vec<MempoolEventEnvelope>, Status>>,
+    },
     /// Read one bounded durable mempool-event page.
     MempoolEventPage {
         /// Opaque cursor to resume strictly after.
@@ -636,6 +654,9 @@ pub(crate) fn apply_canonical_control_command(
         } => {
             append_mempool_event(store, event, observed_at, reply);
         }
+        CanonicalControlCommand::AppendMempoolEvents { events, reply } => {
+            append_mempool_events(store, events, reply);
+        }
         CanonicalControlCommand::MempoolEventPage {
             from_cursor,
             max_events,
@@ -729,6 +750,19 @@ fn append_mempool_event(
         reply,
         store
             .append_mempool_event(*event, observed_at)
+            .map_err(|error| map_store_error(&error)),
+    );
+}
+
+fn append_mempool_events(
+    store: &RocksDbCanonicalStore,
+    events: Vec<(MempoolEvent, UnixTimestampMillis)>,
+    reply: oneshot::Sender<Result<Vec<MempoolEventEnvelope>, Status>>,
+) {
+    send_control_response(
+        reply,
+        store
+            .append_mempool_events(events)
             .map_err(|error| map_store_error(&error)),
     );
 }
@@ -1459,6 +1493,37 @@ pub(crate) mod test_support {
     };
 
     use super::*;
+
+    #[test]
+    fn canonical_mempool_event_batch_assigns_contiguous_positions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let transitions = (0_u8..=2)
+            .map(|transaction_id_byte| {
+                (
+                    MempoolEvent::Invalidated {
+                        transaction_id: TransactionId::from_bytes([transaction_id_byte; 32]),
+                        reason: MempoolEvictionReason::Unknown,
+                    },
+                    UnixTimestampMillis::new(1_000 + u64::from(transaction_id_byte)),
+                )
+            })
+            .collect();
+
+        let envelopes = store.append_mempool_events(transitions)?;
+        assert_eq!(
+            envelopes
+                .iter()
+                .map(|envelope| envelope.event_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let history =
+            store.mempool_event_history(MempoolEventHistoryRequest::with_default_limit(None))?;
+        assert_eq!(history, envelopes);
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn loopback_control_serializes_fixture_backed_leases_and_requires_bearer()
