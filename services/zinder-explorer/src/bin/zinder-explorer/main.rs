@@ -39,6 +39,7 @@ const DEFAULT_UPSTREAM_OBSERVATION_POLL_INTERVAL: Duration =
 #[derive(Parser)]
 #[command(name = "zinder-explorer")]
 #[command(about = "Zinder explorer-plane gRPC server")]
+#[command(version)]
 struct Cli {
     /// TOML configuration file loaded before environment variables and CLI overrides.
     #[arg(long = "config", global = true)]

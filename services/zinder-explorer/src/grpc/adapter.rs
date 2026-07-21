@@ -476,6 +476,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                     network: encode_zinder_native_chain_name(self.settings.network).to_owned(),
                     service_name: env!("CARGO_PKG_NAME").to_owned(),
                     service_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    build_git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
                     capabilities: self
                         .advertised_capabilities()
                         .into_iter()
@@ -1806,6 +1807,7 @@ mod tests {
             .info
             .and_then(|info| info.common)
             .ok_or("explorer server info missing common descriptor")?;
+        assert_eq!(common.build_git_commit, zinder_runtime::BUILD_GIT_COMMIT);
         assert_eq!(common.materialized_view_preset, "wallet");
         assert_eq!(common.materialized_view_identities.len(), 2);
         let outcome = adapter

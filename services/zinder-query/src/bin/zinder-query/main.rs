@@ -22,6 +22,7 @@ use config::{QueryConfigError, QueryConfigOverrides};
 #[derive(Parser)]
 #[command(name = "zinder-query")]
 #[command(about = "Zinder native WalletQuery gRPC server")]
+#[command(version)]
 struct Cli {
     /// TOML configuration file loaded before environment variables and CLI overrides.
     #[arg(long = "config", global = true)]

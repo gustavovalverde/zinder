@@ -40,7 +40,7 @@ services:
           nocopy: true
 
   zinder-ingest:
-    image: ${ZINDER_INGEST_IMAGE:-zinder-ingest:latest}
+    image: ${ZINDER_INGEST_IMAGE:-zinder-ingest:local}
     mem_limit: ${ZINDER_INGEST_MEMORY_LIMIT:-14g}
     build:
       context: ..
@@ -83,7 +83,7 @@ services:
       retries: 3
 
   zinder-projector:
-    image: ${ZINDER_PROJECTOR_IMAGE:-zinder-projector:latest}
+    image: ${ZINDER_PROJECTOR_IMAGE:-zinder-projector:local}
     mem_limit: ${ZINDER_PROJECTOR_MEMORY_LIMIT:-10g}
     build:
       context: ..
@@ -117,7 +117,7 @@ services:
       retries: 3
 
   zinder-query:
-    image: ${ZINDER_QUERY_IMAGE:-zinder-query:latest}
+    image: ${ZINDER_QUERY_IMAGE:-zinder-query:local}
     mem_limit: ${ZINDER_QUERY_MEMORY_LIMIT:-4g}
     build:
       context: ..
@@ -151,7 +151,7 @@ services:
       retries: 3
 
   zinder-compat-lightwalletd:
-    image: ${ZINDER_COMPAT_IMAGE:-zinder-compat-lightwalletd:latest}
+    image: ${ZINDER_COMPAT_IMAGE:-zinder-compat-lightwalletd:local}
     mem_limit: ${ZINDER_COMPAT_MEMORY_LIMIT:-4g}
     build:
       context: ..

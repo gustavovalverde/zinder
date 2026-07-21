@@ -1,6 +1,6 @@
 [package]
 name = "zinder-store"
-version = "0.1.0"
+version.workspace = true
 description = "Zinder canonical chain storage contracts and RocksDB adapter"
 edition.workspace = true
 readme = "../../README.md"
@@ -9,6 +9,7 @@ categories = ["database"]
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 base64.workspace = true

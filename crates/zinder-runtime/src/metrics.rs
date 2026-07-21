@@ -7,7 +7,7 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
 use thiserror::Error;
 
-use crate::OpsServer;
+use crate::{BUILD_GIT_COMMIT, OpsServer};
 
 static PROMETHEUS_HANDLE: OnceLock<MetricsHandle> = OnceLock::new();
 static PROMETHEUS_INSTALL_LOCK: Mutex<()> = Mutex::new(());
@@ -109,6 +109,7 @@ fn record_build_info(handle: MetricsHandle, server: &OpsServer) -> MetricsHandle
         "zinder_build_info",
         "service" => server.service_name,
         "version" => server.service_version,
+        "git_commit" => BUILD_GIT_COMMIT,
         "network" => server.network_name
     )
     .set(1.0);

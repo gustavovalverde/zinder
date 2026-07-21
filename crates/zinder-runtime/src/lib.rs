@@ -101,6 +101,15 @@ use tokio_util::sync::CancellationToken;
 /// future framework default change cannot silently widen the limit.
 pub const MAX_DECODING_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Git commit embedded by release builds.
+///
+/// Local builds outside the release workflow use `unknown` rather than an
+/// empty value so operators can distinguish absent provenance explicitly.
+pub const BUILD_GIT_COMMIT: &str = match option_env!("ZINDER_BUILD_GIT_COMMIT") {
+    Some(commit) => commit,
+    None => "unknown",
+};
+
 /// Spawns a task that cancels `cancel` when the process receives a
 /// terminating signal. Returns the join handle for the spawned task;
 /// callers usually drop it.

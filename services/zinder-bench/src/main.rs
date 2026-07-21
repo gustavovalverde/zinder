@@ -56,6 +56,7 @@ const DEFAULT_BLOCK_PREPARE_CONCURRENCY: u32 = 16;
 #[derive(Parser)]
 #[command(name = "zinder-bench")]
 #[command(about = "Zinder fixed-range storage benchmark harness")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

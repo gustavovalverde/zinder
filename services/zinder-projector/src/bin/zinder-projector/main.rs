@@ -60,6 +60,7 @@ const FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Parser)]
 #[command(name = "zinder-projector")]
 #[command(about = "Zinder wallet projection construction service")]
+#[command(version)]
 struct Cli {
     /// TOML configuration file loaded before environment and CLI overrides.
     #[arg(long = "config", global = true)]

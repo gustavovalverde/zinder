@@ -1,8 +1,7 @@
 name: build-images
 
 # Build every runtime image on PRs that could affect Rust binaries, Docker
-# contexts, or the image workflow. Tagged releases push through
-# release-images.yml.
+# contexts, or the image workflow. Tagged releases push through release.yml.
 
 on:
   pull_request:
@@ -32,19 +31,30 @@ concurrency:
 
 jobs:
   build:
-    name: build runtime images
-    runs-on: ubuntu-latest
+    name: build runtime images (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: amd64
+            ref: linux/amd64
+            runner: ubuntu-latest
+          - name: arm64
+            ref: linux/arm64
+            runner: ubuntu-24.04-arm
     env:
-      PR_TAG: pr-${{ github.event.pull_request.number || 'manual' }}
-      CACHE_SCOPE: zinder-rust-pr
+      PR_TAG: pr-${{ github.event.pull_request.number || 'manual' }}-${{ matrix.platform.name }}
+      CACHE_SCOPE: zinder-rust-pr-${{ matrix.platform.name }}
+      PLATFORM_REF: ${{ matrix.platform.ref }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Verify deployment admission
         run: bash scripts/test-deployment-admission.sh
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build and smoke test images
         run: |
@@ -63,6 +73,8 @@ jobs:
             docker buildx build \
               --file deploy/Dockerfile \
               --target "$target" \
+              --platform "$PLATFORM_REF" \
+              --build-arg "ZINDER_BUILD_GIT_COMMIT=${GITHUB_SHA}" \
               --load \
               --tag "${image_name}:${PR_TAG}" \
               --cache-from "type=gha,scope=${CACHE_SCOPE}" \

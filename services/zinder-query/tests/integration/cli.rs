@@ -4,6 +4,21 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
+#[test]
+fn version_reports_the_product_version() -> eyre::Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_zinder-query"))
+        .arg("--version")
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        format!("zinder-query {}\n", env!("CARGO_PKG_VERSION"))
+    );
+
+    Ok(())
+}
+
 fn query_command(temporary: &TempDir, canonical_secondary_root: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-query"));
     command.args([

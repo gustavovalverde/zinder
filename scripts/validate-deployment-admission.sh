@@ -6,7 +6,7 @@ usage() {
 Usage:
   validate-deployment-admission.sh --deployment-class CLASS --target TARGET
   validate-deployment-admission.sh --deployment-class CLASS --railway-default
-  validate-deployment-admission.sh --release-images-workflow PATH
+  validate-deployment-admission.sh --release-workflow PATH
   validate-deployment-admission.sh --build-images-workflow PATH
   validate-deployment-admission.sh --prometheus-config PATH
   validate-deployment-admission.sh --verify-railway-default
@@ -21,7 +21,7 @@ repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 deployment_class=""
 target=""
 railway_default=false
-release_images_workflow=""
+release_workflow=""
 build_images_workflow=""
 prometheus_config=""
 verify_railway_default=false
@@ -43,9 +43,9 @@ while [[ $# -gt 0 ]]; do
       railway_default=true
       shift
       ;;
-    --release-images-workflow)
+    --release-workflow)
       [[ $# -ge 2 ]] || usage
-      release_images_workflow="$2"
+      release_workflow="$2"
       shift 2
       ;;
     --build-images-workflow)
@@ -74,7 +74,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "$compose_contract" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_images_workflow" && -z "$build_images_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false ]] || usage
   [[ -r "$compose_contract" ]] || {
     echo "release admission rejected: cannot read resolved Compose contract $compose_contract" >&2
     exit 1
@@ -274,7 +274,7 @@ resolve_railway_default_target() {
 }
 
 if [[ "$verify_railway_default" = true ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_images_workflow" && -z "$build_images_workflow" && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
 
   target="$(resolve_railway_default_target)"
   [[ "$target" = "zinder-admission-required" ]] || {
@@ -298,7 +298,7 @@ if [[ "$verify_railway_default" = true ]]; then
 fi
 
 if [[ -n "$build_images_workflow" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_images_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
   [[ -r "$build_images_workflow" ]] || {
     echo "release admission rejected: cannot read build image workflow $build_images_workflow" >&2
     exit 1
@@ -315,13 +315,23 @@ if [[ -n "$build_images_workflow" ]]; then
     sed -n 's/^[[:space:]]*"\(zinder-[a-z0-9-]*:zinder-[a-z0-9-]*:zinder-[a-z0-9-]*\)"$/\1/p' \
       "$build_images_workflow" | sort -u
   )"
+  required_build_platforms="$({
+    printf '%s\n' linux/amd64 linux/arm64
+  } | sort)"
+  configured_build_platforms="$(
+    sed -n 's/^[[:space:]]*ref: \(linux\/[a-z0-9]*\)$/\1/p' \
+      "$build_images_workflow" | sort -u
+  )"
   if [[ "$configured_build_images" != "$required_build_images" ]] \
+    || [[ "$configured_build_platforms" != "$required_build_platforms" ]] \
+    || ! grep -Fq 'runner: ubuntu-24.04-arm' "$build_images_workflow" \
+    || ! grep -Fq -- '--platform "$PLATFORM_REF"' "$build_images_workflow" \
     || ! grep -Fq 'docker run --rm --entrypoint="$help_entrypoint" "${image_name}:${PR_TAG}" --help' \
       "$build_images_workflow"; then
     cat >&2 <<'EOF'
 release admission rejected: the pull-request image workflow must build and run
 the --help smoke for exactly ingest, projector, native query, and lightwalletd
-compatibility images.
+compatibility images on native amd64 and arm64 runners.
 EOF
     exit 1
   fi
@@ -329,7 +339,7 @@ EOF
 fi
 
 if [[ -n "$prometheus_config" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_images_workflow" && -z "$build_images_workflow" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
   [[ -r "$prometheus_config" ]] || {
     echo "release admission rejected: cannot read Prometheus config $prometheus_config" >&2
     exit 1
@@ -355,14 +365,79 @@ EOF
   exit 0
 fi
 
-if [[ -n "$release_images_workflow" ]]; then
+if [[ -n "$release_workflow" ]]; then
   [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$build_images_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
-  [[ -r "$release_images_workflow" ]] || {
-    echo "release admission rejected: cannot read image workflow $release_images_workflow" >&2
+  [[ -r "$release_workflow" ]] || {
+    echo "release admission rejected: cannot read release workflow $release_workflow" >&2
     exit 1
   }
 
-  if grep -Fq 'zinder-single-container' "$release_images_workflow"; then
+  if grep -Fq 'workflow_dispatch:' "$release_workflow"; then
+    cat >&2 <<'EOF'
+release admission rejected: the publishing workflow must not expose a manual
+dispatch path. Use the pull-request image workflow for build-only smoke tests.
+EOF
+    exit 1
+  fi
+
+  release_before_stable_promotion="$(sed '/^  promote-latest:/,$d' "$release_workflow")"
+  if grep -Fq ':latest' <<< "$release_before_stable_promotion"; then
+    cat >&2 <<'EOF'
+release admission rejected: latest may only move in the final stable promotion
+job after exact image manifests and the GitHub Release have succeeded.
+EOF
+    exit 1
+  fi
+
+  authorization_job="$(
+    awk '
+      $0 == "  authorize:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  if [[ -z "$authorization_job" ]] \
+    || ! grep -Fq 'environment: release' <<< "$authorization_job"; then
+    cat >&2 <<'EOF'
+release admission rejected: publication requires one protected
+release-environment authorization gate.
+EOF
+    exit 1
+  fi
+
+  publishing_jobs=(build merge prepare-release publish-release promote-latest)
+  required_predecessors=(authorize build merge prepare-release publish-release)
+  for index in "${!publishing_jobs[@]}"; do
+    publishing_job="${publishing_jobs[$index]}"
+    required_predecessor="${required_predecessors[$index]}"
+    job_body="$(
+      awk -v heading="  ${publishing_job}:" '
+        $0 == heading { in_job = 1; next }
+        in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+        in_job { print }
+      ' "$release_workflow"
+    )"
+    if [[ -z "$job_body" ]] \
+      || ! grep -Eq "^[[:space:]]+- ${required_predecessor}$" <<< "$job_body"; then
+      cat >&2 <<EOF
+release admission rejected: publishing job $publishing_job must depend on
+$required_predecessor so it cannot bypass release authorization.
+EOF
+      exit 1
+    fi
+  done
+
+  stable_promotion_job="$(sed -n '/^  promote-latest:/,$p' "$release_workflow")"
+  if ! grep -Fq "if: needs.validate.outputs.stable == 'true'" \
+    <<< "$stable_promotion_job"; then
+    cat >&2 <<'EOF'
+release admission rejected: latest promotion must be restricted to a validated
+stable SemVer tag.
+EOF
+    exit 1
+  fi
+
+  if grep -Fq 'zinder-single-container' "$release_workflow"; then
     cat >&2 <<'EOF'
 release admission rejected: the image workflow would publish the mixed
 zinder-single-container bundle. The Railway image set contains only the
@@ -371,7 +446,7 @@ EOF
     exit 1
   fi
 
-  if grep -Eq '"zinder-explorer:zinder-explorer"' "$release_images_workflow"; then
+  if grep -Eq '"zinder-explorer:zinder-explorer"' "$release_workflow"; then
     cat >&2 <<'EOF'
 release admission rejected: the release image set does not publish the optional
 explorer runtime.
@@ -379,7 +454,7 @@ EOF
     exit 1
   fi
 
-  if ! grep -Fq '"zinder-projector:zinder-projector"' "$release_images_workflow"; then
+  if ! grep -Fq '"zinder-projector:zinder-projector"' "$release_workflow"; then
     cat >&2 <<'EOF'
 release admission rejected: the image workflow omits the independent
 zinder-projector runtime required to construct and continuously follow the
@@ -388,7 +463,7 @@ EOF
     exit 1
   fi
 
-  if ! grep -Fq '"zinder-query:zinder-query"' "$release_images_workflow"; then
+  if ! grep -Fq '"zinder-query:zinder-query"' "$release_workflow"; then
     cat >&2 <<'EOF'
 release admission rejected: the image workflow omits the native WalletQuery
 runtime required by the complete topology.
@@ -396,7 +471,7 @@ EOF
     exit 1
   fi
 
-  if ! grep -Fq '"zinder-compat-lightwalletd:zinder-compat-lightwalletd"' "$release_images_workflow"; then
+  if ! grep -Fq '"zinder-compat-lightwalletd:zinder-compat-lightwalletd"' "$release_workflow"; then
     cat >&2 <<'EOF'
 release admission rejected: the image workflow omits the lightwalletd
 compatibility runtime required by the complete topology.
@@ -409,10 +484,10 @@ EOF
   } | sort)"
   build_release_images="$(
     sed -n 's/^[[:space:]]*"\(zinder-[a-z0-9-]*\):\1"$/\1/p' \
-      "$release_images_workflow" | sort -u
+      "$release_workflow" | sort -u
   )"
   merge_release_images="$(
-    sed -n '/^  merge:/,/^    steps:/p' "$release_images_workflow" \
+    sed -n '/^  merge:/,/^    steps:/p' "$release_workflow" \
       | sed -n 's/^[[:space:]]*- \(zinder-[a-z0-9-]*\)$/\1/p' \
       | sort -u
   )"

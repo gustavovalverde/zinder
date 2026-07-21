@@ -137,6 +137,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 network: encode_zinder_native_chain_name(self.network).to_owned(),
                 service_name: env!("CARGO_PKG_NAME").to_owned(),
                 service_version: env!("CARGO_PKG_VERSION").to_owned(),
+                build_git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
                 capabilities: self.advertised_capabilities(),
                 contract_revision: zinder_proto::CONTRACT_REVISION,
                 materialized_view_preset: String::new(),
@@ -1043,6 +1044,10 @@ mod tests {
         assert!(server_info.capabilities.iter().any(|capability| {
             capability == zinder_proto::capabilities::INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1
         }));
+        assert_eq!(
+            server_info.build_git_commit,
+            zinder_runtime::BUILD_GIT_COMMIT
+        );
         assert!(server_info.materialized_view_preset.is_empty());
         assert!(server_info.materialized_view_identities.is_empty());
 
@@ -1303,6 +1308,10 @@ mod tests {
                 .iter()
                 .any(|capability| capability == INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1),
             "the implemented visible chain-event control stream must be advertised"
+        );
+        assert_eq!(
+            server_info.build_git_commit,
+            zinder_runtime::BUILD_GIT_COMMIT
         );
         assert!(server_info.materialized_view_preset.is_empty());
         assert!(server_info.materialized_view_identities.is_empty());

@@ -45,11 +45,15 @@ expect_rejected \
   --target zinder-canonical-runtime
 
 bash "$validator" \
-  --release-images-workflow "$repository_root/.github/workflows/release-images.yml"
+  --release-workflow "$repository_root/.github/workflows/release.yml"
 bash "$validator" \
   --build-images-workflow "$repository_root/.github/workflows/build-images.yml"
 bash "$validator" \
   --prometheus-config "$repository_root/deploy/observability/prometheus.yml"
+
+if grep -Eq 'zinder-[a-z-]+:latest' "$repository_root/deploy/docker-compose.yml"; then
+  fail "the deployment Compose file defaults a Zinder runtime to latest"
+fi
 
 for z3_env in mainnet testnet; do
   grep -Fqx 'ZINDER_NODE__INDEXER_GRPC_ADDR=http://zebra:8155' \
@@ -244,36 +248,80 @@ expect_rejected \
   "a native query contract relying on an image-baked public-bind opt-in" \
   --compose-contract "$implicit_query_security_compose"
 
-mixed_release_workflow="$temporary_directory/release-images.yml"
-cp "$repository_root/.github/workflows/release-images.yml" "$mixed_release_workflow"
+mixed_release_workflow="$temporary_directory/release.yml"
+cp "$repository_root/.github/workflows/release.yml" "$mixed_release_workflow"
 printf '\n# forbidden release target: zinder-single-container\n' >> "$mixed_release_workflow"
 expect_rejected \
   "a release workflow containing the mixed single-container target" \
-  --release-images-workflow "$mixed_release_workflow"
+  --release-workflow "$mixed_release_workflow"
 
-projectorless_release_workflow="$temporary_directory/projectorless-release-images.yml"
+projectorless_release_workflow="$temporary_directory/projectorless-release.yml"
 sed '/"zinder-projector:zinder-projector"/d' \
-  "$repository_root/.github/workflows/release-images.yml" \
+  "$repository_root/.github/workflows/release.yml" \
   > "$projectorless_release_workflow"
 expect_rejected \
   "a release workflow omitting zinder-projector" \
-  --release-images-workflow "$projectorless_release_workflow"
+  --release-workflow "$projectorless_release_workflow"
 
-queryless_release_workflow="$temporary_directory/queryless-release-images.yml"
+queryless_release_workflow="$temporary_directory/queryless-release.yml"
 sed '/"zinder-query:zinder-query"/d' \
-  "$repository_root/.github/workflows/release-images.yml" \
+  "$repository_root/.github/workflows/release.yml" \
   > "$queryless_release_workflow"
 expect_rejected \
   "a release workflow omitting zinder-query" \
-  --release-images-workflow "$queryless_release_workflow"
+  --release-workflow "$queryless_release_workflow"
 
-queryless_merge_workflow="$temporary_directory/queryless-merge-release-images.yml"
+queryless_merge_workflow="$temporary_directory/queryless-merge-release.yml"
 sed '/^[[:space:]]*- zinder-query$/d' \
-  "$repository_root/.github/workflows/release-images.yml" \
+  "$repository_root/.github/workflows/release.yml" \
   > "$queryless_merge_workflow"
 expect_rejected \
   "a release workflow building query but omitting its published manifest" \
-  --release-images-workflow "$queryless_merge_workflow"
+  --release-workflow "$queryless_merge_workflow"
+
+manual_release_workflow="$temporary_directory/manual-release.yml"
+sed '/^on:/a\  workflow_dispatch:' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$manual_release_workflow"
+expect_rejected \
+  "a publishing workflow with a manual-dispatch path" \
+  --release-workflow "$manual_release_workflow"
+
+early_latest_workflow="$temporary_directory/early-latest-release.yml"
+sed '/-t "${image}:${RELEASE_TAG}"/a\            -t "${image}:latest"' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$early_latest_workflow"
+expect_rejected \
+  "a release workflow that promotes latest before final publication" \
+  --release-workflow "$early_latest_workflow"
+
+unprotected_release_workflow="$temporary_directory/unprotected-release.yml"
+awk '
+  /^  authorize:/ { in_authorize = 1 }
+  in_authorize && /^    environment: release$/ { next }
+  in_authorize && /^  build:/ { in_authorize = 0 }
+  { print }
+' "$repository_root/.github/workflows/release.yml" \
+  > "$unprotected_release_workflow"
+expect_rejected \
+  "a release workflow that pushes digests before environment approval" \
+  --release-workflow "$unprotected_release_workflow"
+
+bypassed_authorization_workflow="$temporary_directory/bypassed-authorization-release.yml"
+sed '/^[[:space:]]*- authorize$/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$bypassed_authorization_workflow"
+expect_rejected \
+  "a release workflow whose first registry writer bypasses approval" \
+  --release-workflow "$bypassed_authorization_workflow"
+
+bypassed_manifest_dependency_workflow="$temporary_directory/bypassed-manifest-release.yml"
+sed '/^[[:space:]]*- build$/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$bypassed_manifest_dependency_workflow"
+expect_rejected \
+  "a release workflow whose manifest publisher bypasses digest builds" \
+  --release-workflow "$bypassed_manifest_dependency_workflow"
 
 queryless_build_workflow="$temporary_directory/queryless-build-images.yml"
 sed '/"zinder-query:zinder-query:zinder-query"/d' \
@@ -298,6 +346,22 @@ sed '/docker run --rm --entrypoint="\$help_entrypoint"/d' \
 expect_rejected \
   "a pull-request image workflow without runtime help smokes" \
   --build-images-workflow "$helpless_build_workflow"
+
+arm64less_build_workflow="$temporary_directory/arm64less-build-images.yml"
+sed '/^[[:space:]]*-[[:space:]]*name: arm64$/,/^[[:space:]]*runner: ubuntu-24.04-arm$/d' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$arm64less_build_workflow"
+expect_rejected \
+  "a pull-request image workflow without native arm64 coverage" \
+  --build-images-workflow "$arm64less_build_workflow"
+
+platformless_build_workflow="$temporary_directory/platformless-build-images.yml"
+sed '/--platform "\$PLATFORM_REF"/d' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$platformless_build_workflow"
+expect_rejected \
+  "a pull-request image workflow that ignores its target platform" \
+  --build-images-workflow "$platformless_build_workflow"
 
 queryless_prometheus="$temporary_directory/queryless-prometheus.yml"
 sed '/targets: \["zinder-ingest:9106"\]/d' \

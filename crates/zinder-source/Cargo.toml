@@ -1,6 +1,6 @@
 [package]
 name = "zinder-source"
-version = "0.1.0"
+version.workspace = true
 description = "Zinder upstream node source domain values and adapters"
 edition.workspace = true
 readme = "../../README.md"
@@ -9,6 +9,7 @@ categories = ["api-bindings"]
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 arc-swap.workspace = true

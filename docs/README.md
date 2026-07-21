@@ -50,6 +50,7 @@ Extension guides:
 - [Deploying on a VM](runbooks/deploying-on-a-vm.md)
 - [Deploying on Railway](runbooks/deploying-on-railway.md)
 - [Cipherscan adapter verification](runbooks/cipherscan-adapter-verification.md)
+- [Releasing Zinder](runbooks/releasing.md)
 - [Testing](runbooks/testing.md)
 
 ## Architecture decision records

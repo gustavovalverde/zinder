@@ -51,8 +51,13 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let (status, _healthz_value) = get_json(listen_addr, "/healthz").await?;
+    let (status, healthz_value) = get_json(listen_addr, "/healthz").await?;
     assert_eq!(status, 200);
+    assert_eq!(healthz_value["version"], "0.0.0");
+    assert_eq!(
+        healthz_value["git_commit"],
+        zinder_runtime::BUILD_GIT_COMMIT
+    );
 
     let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
     assert_eq!(status, 200);
@@ -86,6 +91,13 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
         "{metrics_text}"
     );
     assert!(metrics_text.contains("version=\"0.0.0\""), "{metrics_text}");
+    assert!(
+        metrics_text.contains(&format!(
+            "git_commit=\"{}\"",
+            zinder_runtime::BUILD_GIT_COMMIT
+        )),
+        "{metrics_text}"
+    );
     assert!(
         metrics_text.contains("network=\"zcash-regtest\""),
         "{metrics_text}"

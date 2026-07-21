@@ -1,6 +1,6 @@
 [package]
 name = "zinder-explorer"
-version = "0.1.0"
+version.workspace = true
 description = "Zinder explorer-plane runtime serving block-explorer, dashboard, and analytics reads"
 edition.workspace = true
 readme = "../../README.md"
@@ -9,6 +9,7 @@ categories = ["api-bindings"]
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }

@@ -45,4 +45,8 @@ message ServerInfo {
   // Stable materialized-view identities selected by materialized_view_preset. Order is not
   // significant; consumers compare these as a set.
   repeated string materialized_view_identities = 7;
+
+  // Full Git commit embedded by the release build, or `unknown` for a local
+  // build without injected source metadata.
+  string build_git_commit = 8;
 }
