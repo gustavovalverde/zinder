@@ -393,7 +393,10 @@ fn coherent_tip_notification(
     certified_source_tip: BlockId,
     chain_tip_result: Result<ChainTipNotification, SourceError>,
 ) -> Result<(), SourceError> {
-    let notification = chain_tip_result?;
+    let notification =
+        chain_tip_result.map_err(|source_error| SourceError::MempoolStreamUnavailable {
+            reason: format!("indexer chain-tip monitor failed: {source_error}"),
+        })?;
     if notification.tip_id == certified_source_tip {
         return Ok(());
     }
@@ -637,6 +640,25 @@ mod tests {
         );
         assert!(matches!(
             coherent_tip_notification(source_tip, Ok(ChainTipNotification { tip_id: next_tip })),
+            Err(SourceError::MempoolStreamUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn certified_generation_normalizes_chain_tip_monitor_failures() {
+        let source_tip = BlockId::new(
+            zinder_core::BlockHeight::new(7),
+            zinder_core::BlockHash::from_bytes([7; 32]),
+        );
+        let outcome = coherent_tip_notification(
+            source_tip,
+            Err(SourceError::ChainTipStreamUnavailable {
+                reason: "forced restart".to_owned(),
+            }),
+        );
+
+        assert!(matches!(
+            outcome,
             Err(SourceError::MempoolStreamUnavailable { .. })
         ));
     }
