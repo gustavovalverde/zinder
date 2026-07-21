@@ -73,6 +73,8 @@ pub struct ServerInfoSettings {
     pub network: String,
     /// Semver of the running binary, sourced from `CARGO_PKG_VERSION`.
     pub service_version: String,
+    /// Git commit embedded by the build.
+    pub build_git_commit: String,
     /// Canonical artifact schema version reported by `PrimaryChainStore`.
     pub schema_version: u32,
     /// Configured reorg window depth in blocks.
@@ -200,6 +202,7 @@ impl Default for ServerInfoSettings {
         Self {
             network: "zcash-regtest".to_owned(),
             service_version: env!("CARGO_PKG_VERSION").to_owned(),
+            build_git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
             schema_version: u32::from(zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value()),
             reorg_window_blocks: 100,
             transaction_broadcast_enabled: false,
@@ -250,6 +253,7 @@ fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
         network: settings.network.clone(),
         service_name: env!("CARGO_PKG_NAME").to_owned(),
         service_version: settings.service_version.clone(),
+        build_git_commit: settings.build_git_commit.clone(),
         contract_revision: zinder_proto::CONTRACT_REVISION,
         capabilities: wallet_capability_strings(settings)
             .into_iter()
@@ -1084,6 +1088,7 @@ mod server_info_tests {
             unreachable!("common ops.ServerInfo field must always be set")
         };
         assert_eq!(common.service_name, env!("CARGO_PKG_NAME"));
+        assert_eq!(common.build_git_commit, zinder_runtime::BUILD_GIT_COMMIT);
         assert!(!common.capabilities.is_empty());
         assert!(common.materialized_view_preset.is_empty());
         assert!(common.materialized_view_identities.is_empty());

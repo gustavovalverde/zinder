@@ -1,6 +1,6 @@
 [package]
 name = "zinder-runtime"
-version = "0.1.0"
+version.workspace = true
 description = "Operational HTTP surface and shared configuration loader for Zinder service binaries"
 edition.workspace = true
 readme = "../../README.md"
@@ -9,6 +9,7 @@ categories = ["network-programming"]
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 axum.workspace = true

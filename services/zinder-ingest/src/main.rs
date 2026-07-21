@@ -47,6 +47,7 @@ const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
 #[derive(Parser)]
 #[command(name = "zinder-ingest")]
 #[command(about = "Zinder canonical chain ingestion")]
+#[command(version)]
 struct Cli {
     /// TOML configuration file loaded before environment variables and CLI overrides.
     #[arg(long = "config", global = true)]

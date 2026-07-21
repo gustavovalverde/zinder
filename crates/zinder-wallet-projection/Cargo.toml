@@ -1,6 +1,6 @@
 [package]
 name = "zinder-wallet-projection"
-version = "0.1.0"
+version.workspace = true
 description = "Wallet projection domain and durable encoding contracts"
 edition.workspace = true
 readme = "../../README.md"
@@ -9,6 +9,7 @@ categories = ["database"]
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 blake2b_simd.workspace = true

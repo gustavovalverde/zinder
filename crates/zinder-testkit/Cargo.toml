@@ -1,6 +1,6 @@
 [package]
 name = "zinder-testkit"
-version = "0.1.0"
+version.workspace = true
 description = "Deterministic chain, store, and node fixtures for Zinder tests"
 edition.workspace = true
 readme = "../../README.md"
@@ -9,7 +9,7 @@ categories = ["development-tools::testing"]
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true

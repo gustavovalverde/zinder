@@ -1120,6 +1120,7 @@ fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
         network: "zcash-regtest".to_owned(),
         service_name: "zinder-query".to_owned(),
         service_version: "0.1.0".to_owned(),
+        build_git_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
         capabilities: vec![zinder_proto::capabilities::WALLET_EVENTS_CHAIN_V1.to_owned()],
         contract_revision: zinder_proto::CONTRACT_REVISION,
         materialized_view_preset: "wallet".to_owned(),
@@ -1129,6 +1130,10 @@ fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
 
     assert_eq!(decoded.contract_revision, zinder_proto::CONTRACT_REVISION);
     assert_eq!(decoded.contract_revision, 2);
+    assert_eq!(
+        decoded.build_git_commit,
+        "0123456789abcdef0123456789abcdef01234567"
+    );
     assert_eq!(decoded.materialized_view_preset, "wallet");
     assert_eq!(
         decoded.materialized_view_identities,

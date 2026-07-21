@@ -1,6 +1,6 @@
 [package]
 name = "zinder-rocksdb-bulk-load"
-version = "0.1.0"
+version.workspace = true
 description = "Bulk-load and SST mechanics shared by Zinder storage engines"
 edition.workspace = true
 readme = "../../README.md"
@@ -9,6 +9,7 @@ categories = ["database"]
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 rust-rocksdb.workspace = true

@@ -51,11 +51,13 @@ FROM zinder-build-base AS zinder-binaries
 ARG RUST_VERSION
 ARG TARGETARCH
 ARG TARGETVARIANT
+ARG ZINDER_BUILD_GIT_COMMIT="unknown"
 
 # x86-64-v3 also reaches the vendored RocksDB C++ (hardware CRC32c, AVX2);
 # scoping to the target triple keeps build scripts and non-x86 images on the
 # baseline ISA. Runtime hosts are verified at startup before storage opens.
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"
+ENV ZINDER_BUILD_GIT_COMMIT=${ZINDER_BUILD_GIT_COMMIT}
 
 COPY . .
 

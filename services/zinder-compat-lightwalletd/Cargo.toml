@@ -1,6 +1,6 @@
 [package]
 name = "zinder-compat-lightwalletd"
-version = "0.1.0"
+version.workspace = true
 description = "lightwalletd-compatible gRPC adapter over Zinder wallet query data"
 edition.workspace = true
 readme = "../../README.md"
@@ -9,6 +9,7 @@ categories = ["network-programming"]
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 arc-swap.workspace = true

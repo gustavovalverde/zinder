@@ -8,6 +8,19 @@ use std::{fs, path::Path, process::Command};
 use tempfile::tempdir;
 
 #[test]
+fn version_reports_the_product_version() -> eyre::Result<()> {
+    let output = zinder_compat_command().arg("--version").output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        format!("zinder-compat-lightwalletd {}\n", env!("CARGO_PKG_VERSION"))
+    );
+
+    Ok(())
+}
+
+#[test]
 fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("compat-print-config-store");

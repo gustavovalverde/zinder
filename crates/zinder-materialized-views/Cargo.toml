@@ -1,6 +1,6 @@
 [package]
 name = "zinder-materialized-views"
-version = "0.1.0"
+version.workspace = true
 description = "Materialized-view plane SDK: MaterializedViewConsumer trait, BlockKeyedConsumer template, MaterializedViewStore, and the bundled consumer impls"
 edition.workspace = true
 readme = "../../README.md"
@@ -9,6 +9,7 @@ categories = ["api-bindings"]
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 metrics.workspace = true

@@ -19,6 +19,7 @@ use config::{CipherscanConfigError, CipherscanConfigOverrides};
 #[derive(Parser)]
 #[command(name = "zinder-compat-cipherscan")]
 #[command(about = "Cipherscan-compatible REST adapter over Zinder native gRPC services")]
+#[command(version)]
 struct Cli {
     /// TOML configuration file loaded before environment variables and CLI overrides.
     #[arg(long = "config", global = true)]

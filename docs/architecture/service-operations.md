@@ -13,6 +13,12 @@ Health does not imply readiness. A writer may be alive while synchronizing or
 recovering its source, and a reader may be alive while its secondaries cannot
 form an exact serving pair.
 
+`/healthz` identifies the service, product version, build Git commit, network,
+and advertised capabilities. Local builds use `unknown` when no commit was
+injected, while release images carry the full tag-target commit. The same
+version and commit appear in the `zinder_build_info` metric and native
+`ServerInfo`; lightwalletd compatibility exposes them through `LightdInfo`.
+
 ## Readiness vocabulary
 
 `ReadinessCause` is shared by JSON and protobuf surfaces:
@@ -84,8 +90,9 @@ not attempt a final write or migration.
 
 ## Metrics
 
-Every runtime exports build information and readiness state. Important release
-metrics include:
+Every runtime exports build information and readiness state.
+`zinder_build_info` is a constant gauge labeled by service, product version,
+build Git commit, and network. Important runtime metrics include:
 
 ### Canonical writer
 

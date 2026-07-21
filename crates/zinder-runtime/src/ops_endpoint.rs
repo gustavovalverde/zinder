@@ -9,7 +9,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    MetricsHandle, MetricsInstallError, Readiness, install_metrics_recorder,
+    BUILD_GIT_COMMIT, MetricsHandle, MetricsInstallError, Readiness, install_metrics_recorder,
     sections::RuntimeService,
 };
 
@@ -210,6 +210,7 @@ fn build_router(server: &OpsServer, readiness: Readiness, metrics: MetricsHandle
     let metrics_state = MetricsState {
         service_name: server.service_name,
         service_version: server.service_version,
+        build_git_commit: BUILD_GIT_COMMIT,
         network_name: server.network_name,
         readiness: readiness.clone(),
         metrics,
@@ -218,6 +219,7 @@ fn build_router(server: &OpsServer, readiness: Readiness, metrics: MetricsHandle
         status: "alive",
         service: server.service_name,
         version: server.service_version,
+        git_commit: BUILD_GIT_COMMIT,
         network: server.network_name,
         capabilities: server
             .advertised_capabilities
@@ -254,6 +256,7 @@ fn build_router(server: &OpsServer, readiness: Readiness, metrics: MetricsHandle
 struct MetricsState {
     service_name: &'static str,
     service_version: &'static str,
+    build_git_commit: &'static str,
     network_name: &'static str,
     readiness: Readiness,
     metrics: MetricsHandle,
@@ -264,6 +267,7 @@ struct HealthzBody {
     status: &'static str,
     service: &'static str,
     version: &'static str,
+    git_commit: &'static str,
     network: &'static str,
     capabilities: Vec<String>,
 }
@@ -313,6 +317,7 @@ fn metrics_handler(state: &MetricsState) -> (StatusCode, String) {
         "zinder_build_info",
         "service" => state.service_name,
         "version" => state.service_version,
+        "git_commit" => state.build_git_commit,
         "network" => state.network_name
     )
     .set(1.0);

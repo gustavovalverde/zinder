@@ -3,6 +3,19 @@ use std::{fs, path::Path, process::Command};
 use tempfile::tempdir;
 
 #[test]
+fn version_reports_the_product_version() -> eyre::Result<()> {
+    let output = projector_command().arg("--version").output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        format!("zinder-projector {}\n", env!("CARGO_PKG_VERSION"))
+    );
+
+    Ok(())
+}
+
+#[test]
 fn print_config_renders_the_complete_fail_closed_contract() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let canonical_path = tempdir.path().join("canonical");

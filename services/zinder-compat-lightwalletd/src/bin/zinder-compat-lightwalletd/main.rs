@@ -21,6 +21,7 @@ use zinder_query::{WalletServingPairConfig, WalletServingPairPublisher};
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
 #[command(about = "Zinder lightwalletd-compatible gRPC server")]
+#[command(version)]
 struct Cli {
     /// TOML configuration file loaded before environment variables and CLI overrides.
     #[arg(long = "config", global = true)]

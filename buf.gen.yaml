@@ -5,21 +5,29 @@
 # are excluded; downstream consumers consuming `lightwalletd` already have its
 # public protocol.
 #
-# Build invocation (per-release; the CI workflow at
-# .github/workflows/release-api-docs.yml runs the same commands):
+# Build invocation (used by release and protocol-contract workflows through
+# scripts/generate-api-artifacts.sh):
 #
-#   buf generate           # OpenAPI YAML into dist/openapi/
-#   buf build -o dist/zinder.v1.descriptor.bin
+#   bash scripts/generate-api-artifacts.sh
 #
 # The descriptor set artifact is built directly by `buf build` (no plugin);
 # the OpenAPI artifact uses the protoc-gen-openapiv2 plugin pinned below.
 
 version: v2
 
-clean: false
+clean: true
+
+# The OpenAPI generator uses Go's protobuf registry internally even though
+# Zinder does not publish generated Go sources. Managed mode supplies those
+# import paths without adding language-specific options to the source schemas.
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/gustavovalverde/zinder/gen/go
 
 plugins:
-  - remote: buf.build/grpc-ecosystem/openapiv2:v2.27.5
+  - remote: buf.build/grpc-ecosystem/openapiv2:v2.29.0
     out: dist/openapi
     opt:
       - logtostderr=true

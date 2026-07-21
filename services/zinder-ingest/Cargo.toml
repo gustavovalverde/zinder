@@ -1,6 +1,6 @@
 [package]
 name = "zinder-ingest"
-version = "0.1.0"
+version.workspace = true
 description = "Zinder ingestion runtime and artifact builders"
 edition.workspace = true
 readme = "../../README.md"
@@ -9,6 +9,7 @@ categories = ["command-line-utilities"]
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true

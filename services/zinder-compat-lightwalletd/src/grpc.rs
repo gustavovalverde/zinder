@@ -1423,9 +1423,7 @@ fn lightd_info(
         sapling_activation_height,
         consensus_branch_id,
         block_height: u64::from(tip_height.value()),
-        git_commit: option_env!("LIGHTWALLETD_COMPAT_BUILD_GIT_COMMIT")
-            .unwrap_or_default()
-            .to_owned(),
+        git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
         branch: String::new(),
         build_date: String::new(),
         build_user: String::new(),
@@ -1709,6 +1707,15 @@ mod tests {
             address_count: 1,
             chain_epoch: test_chain_epoch(),
         }
+    }
+
+    #[test]
+    fn lightd_info_reports_the_shared_build_identity() {
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let info = lightd_info(&activations, BlockHeight::new(1), true);
+
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.git_commit, zinder_runtime::BUILD_GIT_COMMIT);
     }
 
     fn compact_tx_with_ironwood() -> lightwalletd::CompactTx {

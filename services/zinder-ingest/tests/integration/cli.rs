@@ -14,6 +14,19 @@ use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::ChainFixture;
 
 #[test]
+fn version_reports_the_product_version() -> Result<(), Box<dyn Error>> {
+    let output = zinder_ingest_command().arg("--version").output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        format!("zinder-ingest {}\n", env!("CARGO_PKG_VERSION"))
+    );
+
+    Ok(())
+}
+
+#[test]
 fn print_config_validates_and_redacts_basic_auth() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("print-config-store");
