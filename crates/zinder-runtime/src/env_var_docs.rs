@@ -871,6 +871,37 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       greater than zero. Defaults to 100.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__MEMPOOL__MAX_TRANSACTION_COUNT",
+        toml_path: "ingest.mempool.max_transaction_count",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum number of transactions admitted into one coherent live mempool. \
+                      Exceeding the bound withdraws the serving generation and retries source \
+                      hydration. Must be greater than zero. Defaults to 8000.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES",
+        toml_path: "ingest.mempool.max_total_raw_transaction_bytes",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum cumulative raw transaction bytes admitted into one coherent live \
+                      mempool. Exceeding the bound withdraws the serving generation and retries \
+                      source hydration. Must be greater than zero. Defaults to 80000000.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__MEMPOOL__RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES",
+        toml_path: "ingest.mempool.reconciliation_batch_target_raw_transaction_bytes",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Target raw transaction bytes for one durable mempool reconciliation \
+                      write. A single protocol-valid transaction above the target is written \
+                      alone so reconciliation can make progress. Must be greater than zero. \
+                      Defaults to 16000000.",
+    },
+    EnvVarDoc {
         name: "ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS",
         toml_path: "projector.reorg_window_blocks",
         used_by: &["zinder-projector"],

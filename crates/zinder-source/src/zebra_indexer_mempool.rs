@@ -39,10 +39,11 @@ use zinder_proto::external::zebra_indexer_rpc::{
 };
 
 use crate::{
-    ChainTipNotification, MempoolHydrationFailureReason, MempoolSource, MempoolSourceCapabilities,
-    MempoolSourceEntry, MempoolSourceEvent, MempoolSourceEventStream, NodeSource, SourceError,
+    ChainTipNotification, MempoolHydrationFailureReason, MempoolSource,
+    MempoolSourceAdmissionLimits, MempoolSourceCapabilities, MempoolSourceEntry,
+    MempoolSourceEvent, MempoolSourceEventStream, NodeSource, SourceError,
     UpstreamTransactionLookup, ZebraIndexerChainTipSource, ZebraIndexerChainTipSourceOptions,
-    ZebraJsonRpcSource,
+    ZebraJsonRpcSource, mempool_source::MempoolSourceAdmission,
 };
 
 const ZEBRA_INDEXER_STREAMING_BACKEND_LABEL: &str = "zebra_indexer_streaming";
@@ -89,6 +90,8 @@ pub struct ZebraIndexerMempoolSourceOptions {
     pub request_timeout: Duration,
     /// Channel buffer size for the emitted source event stream.
     pub event_channel_capacity: usize,
+    /// Complete-generation transaction-count and raw-byte limits.
+    pub admission_limits: MempoolSourceAdmissionLimits,
 }
 
 impl Default for ZebraIndexerMempoolSourceOptions {
@@ -97,6 +100,7 @@ impl Default for ZebraIndexerMempoolSourceOptions {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_mins(1),
             event_channel_capacity: 256,
+            admission_limits: MempoolSourceAdmissionLimits::default(),
         }
     }
 }
@@ -187,6 +191,7 @@ impl MempoolSource for ZebraIndexerMempoolSource {
         spawn_wire_event_pump(wire_stream, self.hydration_json_rpc.clone(), wire_sender);
         spawn_certified_event_aggregator(
             self.hydration_json_rpc.clone(),
+            self.options.admission_limits,
             chain_tip_stream,
             wire_receiver,
             event_sender,
@@ -228,21 +233,26 @@ fn spawn_wire_event_pump(
 
 fn spawn_certified_event_aggregator(
     snapshot_json_rpc: ZebraJsonRpcSource,
+    admission_limits: MempoolSourceAdmissionLimits,
     mut chain_tip_stream: crate::ChainTipNotificationStream,
     mut wire_receiver: mpsc::Receiver<Result<MempoolSourceEvent, SourceError>>,
     event_sender: mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
 ) {
     tokio::spawn(async move {
-        let source_tip = match resnapshot_current_mempool(snapshot_json_rpc, &event_sender).await {
-            Ok(source_tip) => source_tip,
-            Err(source_error) => {
-                let _ = forward_error(source_error, &event_sender).await;
-                return;
-            }
-        };
+        let (source_tip, mut admission) =
+            match resnapshot_current_mempool(snapshot_json_rpc, admission_limits, &event_sender)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(source_error) => {
+                    let _ = forward_error(source_error, &event_sender).await;
+                    return;
+                }
+            };
         if matches!(
             flush_certification_prefix(
                 source_tip,
+                &mut admission,
                 &mut chain_tip_stream,
                 &mut wire_receiver,
                 &event_sender,
@@ -261,6 +271,7 @@ fn spawn_certified_event_aggregator(
         }
         forward_certified_generation(
             source_tip,
+            &mut admission,
             &mut chain_tip_stream,
             &mut wire_receiver,
             &event_sender,
@@ -271,6 +282,7 @@ fn spawn_certified_event_aggregator(
 
 async fn flush_certification_prefix(
     source_tip: BlockId,
+    admission: &mut MempoolSourceAdmission,
     chain_tip_stream: &mut crate::ChainTipNotificationStream,
     wire_receiver: &mut mpsc::Receiver<Result<MempoolSourceEvent, SourceError>>,
     event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
@@ -279,7 +291,7 @@ async fn flush_certification_prefix(
         match wire_receiver.try_recv() {
             Ok(wire_event) => {
                 if matches!(
-                    forward_result(wire_event, event_sender).await,
+                    forward_admitted_result(wire_event, admission, event_sender).await,
                     ForwardOutcome::ChannelClosed
                 ) {
                     return ForwardOutcome::ChannelClosed;
@@ -347,6 +359,7 @@ fn validate_pending_tip_notifications(
 
 async fn forward_certified_generation(
     source_tip: BlockId,
+    admission: &mut MempoolSourceAdmission,
     chain_tip_stream: &mut crate::ChainTipNotificationStream,
     wire_receiver: &mut mpsc::Receiver<Result<MempoolSourceEvent, SourceError>>,
     event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
@@ -379,7 +392,7 @@ async fn forward_certified_generation(
                     return;
                 };
                 if matches!(
-                    forward_result(wire_event, event_sender).await,
+                    forward_admitted_result(wire_event, admission, event_sender).await,
                     ForwardOutcome::ChannelClosed
                 ) {
                     return;
@@ -415,13 +428,18 @@ fn coherent_tip_notification(
 /// `getrawtransaction` round trips never delay live delta delivery.
 async fn resnapshot_current_mempool(
     hydration_json_rpc: ZebraJsonRpcSource,
+    admission_limits: MempoolSourceAdmissionLimits,
     event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
-) -> Result<BlockId, SourceError> {
+) -> Result<(BlockId, MempoolSourceAdmission), SourceError> {
     let source_tip_before = hydration_json_rpc.tip_id().await?;
     let observed_at = UnixTimestampMillis::now();
-    let transaction_ids = hydration_json_rpc
+    let mut transaction_ids = hydration_json_rpc
         .fetch_raw_mempool_transaction_ids()
         .await?;
+    transaction_ids.sort_unstable();
+    transaction_ids.dedup();
+    let mut admission = MempoolSourceAdmission::new(admission_limits);
+    admission.validate_snapshot_transaction_count(transaction_ids.len())?;
 
     let mut source_events =
         futures_util::stream::iter(transaction_ids.into_iter().map(Ok::<_, SourceError>))
@@ -433,6 +451,7 @@ async fn resnapshot_current_mempool(
             })
             .try_buffer_unordered(MEMPOOL_RESNAPSHOT_HYDRATION_CONCURRENCY);
     while let Some(source_event) = source_events.try_next().await? {
+        admit_source_event(&mut admission, &source_event)?;
         if matches!(
             forward_event(source_event, event_sender).await,
             ForwardOutcome::ChannelClosed
@@ -448,7 +467,7 @@ async fn resnapshot_current_mempool(
             reason: "source tip changed while constructing the mempool snapshot".to_owned(),
         });
     }
-    Ok(source_tip_after)
+    Ok((source_tip_after, admission))
 }
 
 /// Whether the consumer is still listening to the source-event channel.
@@ -514,13 +533,35 @@ async fn forward_error(
     }
 }
 
-async fn forward_result(
+async fn forward_admitted_result(
     source_result: Result<MempoolSourceEvent, SourceError>,
+    admission: &mut MempoolSourceAdmission,
     event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
 ) -> ForwardOutcome {
     match source_result {
-        Ok(source_event) => forward_event(source_event, event_sender).await,
+        Ok(source_event) => {
+            if let Err(source_error) = admit_source_event(admission, &source_event) {
+                let _ = forward_error(source_error, event_sender).await;
+                return ForwardOutcome::ChannelClosed;
+            }
+            forward_event(source_event, event_sender).await
+        }
         Err(source_error) => forward_error(source_error, event_sender).await,
+    }
+}
+
+fn admit_source_event(
+    admission: &mut MempoolSourceAdmission,
+    source_event: &MempoolSourceEvent,
+) -> Result<(), SourceError> {
+    match source_event {
+        MempoolSourceEvent::Added(entry) => admission.admit_added_entry(entry),
+        MempoolSourceEvent::Invalidated { transaction_id, .. }
+        | MempoolSourceEvent::Mined { transaction_id, .. } => {
+            admission.remove_transaction(*transaction_id);
+            Ok(())
+        }
+        MempoolSourceEvent::InitialSnapshotComplete { .. } => Ok(()),
     }
 }
 
@@ -809,7 +850,12 @@ mod tests {
         )?;
 
         let (event_sender, mut event_receiver) = mpsc::channel(8);
-        let source_tip = resnapshot_current_mempool(hydration_json_rpc, &event_sender).await?;
+        let (source_tip, _admission) = resnapshot_current_mempool(
+            hydration_json_rpc,
+            MempoolSourceAdmissionLimits::default(),
+            &event_sender,
+        )
+        .await?;
         drop(event_sender);
 
         assert_eq!(
@@ -836,6 +882,89 @@ mod tests {
             event_receiver.recv().await.is_none(),
             "resnapshot must not emit more than one event per mempool entry"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resnapshot_rejects_transaction_count_before_hydration() -> eyre::Result<()> {
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(serde_json::json!({
+                    "height": 7,
+                    "hash": vec![0x07; 32],
+                })),
+            ),
+            zinder_testkit::method("getrawmempool").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!(["11".repeat(32), "22".repeat(32)]),
+            )),
+        ])?;
+        let hydration_json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+        let limits = MempoolSourceAdmissionLimits {
+            max_transaction_count: std::num::NonZeroU32::MIN,
+            max_total_raw_transaction_bytes: std::num::NonZeroU64::MIN.saturating_add(99),
+        };
+        let (event_sender, _event_receiver) = mpsc::channel(4);
+
+        let outcome = resnapshot_current_mempool(hydration_json_rpc, limits, &event_sender).await;
+
+        assert!(matches!(
+            outcome,
+            Err(SourceError::MempoolTransactionCountLimitExceeded {
+                transaction_count: 2,
+                max_transaction_count: 1,
+            })
+        ));
+        assert!(server.requests_for("getrawtransaction")?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resnapshot_rejects_cumulative_raw_transaction_bytes() -> eyre::Result<()> {
+        let source_tip_response = serde_json::json!({
+            "height": 7,
+            "hash": vec![0x07; 32],
+        });
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            zinder_testkit::method("getbestblockheightandhash")
+                .reply(zinder_testkit::RpcReply::result(source_tip_response)),
+            zinder_testkit::method("getrawmempool").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!(["11".repeat(32), "22".repeat(32)]),
+            )),
+            zinder_testkit::method("getrawtransaction")
+                .reply(zinder_testkit::RpcReply::result(serde_json::json!("dead"))),
+            zinder_testkit::method("getrawtransaction")
+                .reply(zinder_testkit::RpcReply::result(serde_json::json!("beef"))),
+        ])?;
+        let hydration_json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+        let limits = MempoolSourceAdmissionLimits {
+            max_transaction_count: std::num::NonZeroU32::MIN.saturating_add(1),
+            max_total_raw_transaction_bytes: std::num::NonZeroU64::MIN.saturating_add(2),
+        };
+        let (event_sender, mut event_receiver) = mpsc::channel(4);
+
+        let outcome = resnapshot_current_mempool(hydration_json_rpc, limits, &event_sender).await;
+
+        assert!(matches!(
+            outcome,
+            Err(SourceError::MempoolRawTransactionBytesLimitExceeded {
+                total_raw_transaction_bytes: 4,
+                max_total_raw_transaction_bytes: 3,
+            })
+        ));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(Ok(MempoolSourceEvent::Added(_)))
+        ));
         Ok(())
     }
 
@@ -870,7 +999,12 @@ mod tests {
         )?;
         let (event_sender, mut event_receiver) = mpsc::channel(8);
 
-        let outcome = resnapshot_current_mempool(hydration_json_rpc, &event_sender).await;
+        let outcome = resnapshot_current_mempool(
+            hydration_json_rpc,
+            MempoolSourceAdmissionLimits::default(),
+            &event_sender,
+        )
+        .await;
 
         assert!(matches!(
             outcome,
@@ -919,7 +1053,12 @@ mod tests {
         )?;
         let (event_sender, _event_receiver) = mpsc::channel(1);
         let resnapshot_task = tokio::spawn(async move {
-            resnapshot_current_mempool(hydration_json_rpc, &event_sender).await
+            resnapshot_current_mempool(
+                hydration_json_rpc,
+                MempoolSourceAdmissionLimits::default(),
+                &event_sender,
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(1), async {

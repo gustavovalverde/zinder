@@ -110,6 +110,7 @@ async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_sou
             JsonRpcMempoolSourceOptions {
                 poll_interval: MEMPOOL_POLL_INTERVAL,
                 event_channel_capacity: 16,
+                ..JsonRpcMempoolSourceOptions::default()
             },
         );
         let mut event_stream = mempool_source.events().await?;
@@ -500,6 +501,7 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
         JsonRpcMempoolSourceOptions {
             poll_interval: MEMPOOL_POLL_INTERVAL,
             event_channel_capacity: 16,
+            ..JsonRpcMempoolSourceOptions::default()
         },
     );
     let mut event_stream = mempool_source.events().await?;

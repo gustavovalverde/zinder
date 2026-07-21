@@ -362,6 +362,28 @@ pub enum SourceError {
         reason: String,
     },
 
+    /// The upstream mempool contains more transactions than this adapter admits.
+    #[error(
+        "mempool transaction count exceeds ingest.mempool.max_transaction_count: count={transaction_count}, limit={max_transaction_count}"
+    )]
+    MempoolTransactionCountLimitExceeded {
+        /// Distinct transaction count observed in the upstream mempool.
+        transaction_count: u64,
+        /// Configured transaction-count ceiling.
+        max_transaction_count: u64,
+    },
+
+    /// The upstream mempool contains more raw transaction bytes than this adapter admits.
+    #[error(
+        "mempool raw transaction bytes exceed ingest.mempool.max_total_raw_transaction_bytes: bytes={total_raw_transaction_bytes}, limit={max_total_raw_transaction_bytes}"
+    )]
+    MempoolRawTransactionBytesLimitExceeded {
+        /// Cumulative raw transaction bytes observed in the upstream mempool.
+        total_raw_transaction_bytes: u64,
+        /// Configured cumulative raw-byte ceiling.
+        max_total_raw_transaction_bytes: u64,
+    },
+
     /// Upstream chain-tip notification stream is unavailable.
     ///
     /// Returned when the gRPC `ChainTipChange` subscription cannot be
@@ -466,7 +488,11 @@ impl SourceError {
     pub const fn upstream_classification(&self) -> SourceFailureClass {
         match self {
             Self::NodeUnavailable { .. } => SourceFailureClass::NodeUnreachable,
-            Self::SourceResponseTooLarge { .. } => SourceFailureClass::Configuration,
+            Self::SourceResponseTooLarge { .. }
+            | Self::MempoolTransactionCountLimitExceeded { .. }
+            | Self::MempoolRawTransactionBytesLimitExceeded { .. }
+            | Self::TransactionBroadcastDisabled
+            | Self::UnsupportedNodeAuth { .. } => SourceFailureClass::Configuration,
             Self::BlockUnavailable { .. }
             | Self::BlockReorgDuringFetch { .. }
             | Self::SubtreeRootsUnavailable { .. }
@@ -476,9 +502,6 @@ impl SourceError {
             }
             Self::NodeCapabilityMissing { .. } => SourceFailureClass::CapabilityMissing,
             Self::SourceProtocolMismatch { .. } => SourceFailureClass::ProtocolMismatch,
-            Self::TransactionBroadcastDisabled | Self::UnsupportedNodeAuth { .. } => {
-                SourceFailureClass::Configuration
-            }
             Self::InvalidBlockHashHex { .. }
             | Self::InvalidRawBlockHex { .. }
             | Self::InvalidRawTransactionHex { .. }

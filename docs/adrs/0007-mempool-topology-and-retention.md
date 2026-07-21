@@ -40,9 +40,14 @@ The canonical store persists durable mempool event history in its `mempool_event
 Source-generation reconciliation holds the live owner's mutation gate while it
 walks the old and new ordered indexes in bounded pages. It appends ordered
 removals and additions in synchronously committed RocksDB batches with a
-bounded event count, applying each batch's contiguous positions to the private
-index before continuing. Reads remain unavailable until every batch has been
-applied and the source generation is certified. A
+bounded event count and a bounded cumulative raw-transaction payload, applying
+each batch's contiguous positions to the private index before continuing. The
+raw-byte bound covers the variable transaction payload rather than claiming an
+exact encoded RocksDB batch size; envelope and derived compact-transaction
+overhead remain bounded by the event-count ceiling. A single oversized event is
+still admitted as a singleton so reconciliation always makes progress. Reads
+remain unavailable until every batch has been applied and the source generation
+is certified. A
 network-upgrade activation can therefore evict thousands of transactions
 without issuing one synchronous write per transaction or constructing one
 unbounded write batch, while the durable event stream still retains one typed
@@ -55,6 +60,27 @@ before `InitialSnapshotComplete` are provisional: the live owner stages them
 privately and discards the generation if hydration fails or its source tip
 changes. Polling verifies the source tip between bounded-size hydration batches;
 the streaming source verifies it before publishing the completion marker.
+
+Every polling and streaming generation also has source-admission ceilings for
+distinct transaction count and cumulative raw transaction bytes. The defaults
+are 8,000 transactions and 80,000,000 raw bytes, matching Zebra's default
+80,000,000 transaction-cost limit and its 10,000 minimum per-transaction cost.
+Limits are inclusive and apply to the complete admitted set across the initial
+snapshot and subsequent live deltas. Duplicate `Added` observations consume no
+additional capacity, and `Invalidated` or `Mined` observations release both
+entry and raw-byte capacity. Polling emits removals before additions from the
+same fenced snapshot so a capacity-neutral replacement cannot fail admission
+merely because the old entries have not been released yet.
+
+An upstream mempool above either local limit is not truncated. The source
+withdraws the generation, readers remain unavailable, and ingest retries until
+the upstream set fits or the operator raises the corresponding
+`[ingest.mempool]` limit. Provisional entries emitted before a cumulative-byte
+failure remain private and are discarded with the uncertified generation.
+Raising the limits admits proportionally more staged and live-index memory and
+can increase durable event-log and reconciliation work; lowering them provides
+a fail-closed resource ceiling at the cost of availability during unusually
+large mempool bursts.
 
 The split exists because the live index needs to answer transparent lookups in microseconds without a RocksDB round-trip, and because it can be reconstructed deterministically from a source snapshot at startup. The event log needs to answer cursor resume and rebroadcast detection with millisecond latency over hours of history, which RocksDB does well and an in-process ring buffer does not.
 

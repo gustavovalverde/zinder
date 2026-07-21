@@ -5,7 +5,7 @@
 //! the follower-owned canonical primary and are reached only through the
 //! canonical control channel.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, num::NonZeroU64, sync::Arc, time::Duration};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use tokio::sync::Mutex;
@@ -26,6 +26,7 @@ use zinder_store::{
     MempoolEventRetentionReport, StreamCursorTokenV1, mempool_event_envelope_message,
 };
 
+use crate::source_recovery::default_recovery_backoff;
 use crate::writer::control::CanonicalControlHandle;
 
 use super::{
@@ -36,6 +37,8 @@ use super::{
 const MEMPOOL_EVENT_PAGE_SIZE: u32 = 64;
 const MEMPOOL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS: usize = 256;
+/// Default raw transaction payload budget for one durable reconciliation append.
+pub const DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES: u64 = 16_000_000;
 
 /// One source generation buffered until its snapshot-complete marker.
 ///
@@ -99,6 +102,7 @@ enum MempoolOwnerStatus {
 #[derive(Clone)]
 pub struct LiveMempoolOwner {
     index: MempoolIndex,
+    reconciliation_batch_target_raw_transaction_bytes: u64,
     /// Serializes preflight, durable append, index mutation, event-page reads,
     /// and snapshot anchoring. No public response can observe an event between
     /// durable append and its verified in-memory mutation.
@@ -113,6 +117,24 @@ impl LiveMempoolOwner {
     pub fn new() -> Self {
         Self {
             index: MempoolIndex::new(),
+            reconciliation_batch_target_raw_transaction_bytes:
+                DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
+            mutation_gate: Arc::new(Mutex::new(())),
+            status: Arc::new(RwLock::new(MempoolOwnerStatus::Hydrating)),
+            staged_generation: Arc::new(ParkingMutex::new(Some(StagedMempoolGeneration::new()))),
+        }
+    }
+
+    /// Creates an empty live index with a custom raw transaction payload budget
+    /// for each durable reconciliation append.
+    #[must_use]
+    pub fn with_reconciliation_batch_target_raw_transaction_bytes(
+        reconciliation_batch_target_raw_transaction_bytes: NonZeroU64,
+    ) -> Self {
+        Self {
+            index: MempoolIndex::new(),
+            reconciliation_batch_target_raw_transaction_bytes:
+                reconciliation_batch_target_raw_transaction_bytes.get(),
             mutation_gate: Arc::new(Mutex::new(())),
             status: Arc::new(RwLock::new(MempoolOwnerStatus::Hydrating)),
             staged_generation: Arc::new(ParkingMutex::new(Some(StagedMempoolGeneration::new()))),
@@ -338,6 +360,47 @@ impl LiveMempoolOwner {
         Ok(outcome)
     }
 
+    async fn append_and_apply_reconciliation_transitions_locked(
+        &self,
+        canonical: &CanonicalControlHandle,
+        transitions: Vec<(MempoolEvent, UnixTimestampMillis)>,
+    ) -> Result<(), Status> {
+        let mut batch = Vec::with_capacity(
+            transitions
+                .len()
+                .min(MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS),
+        );
+        let mut batch_raw_transaction_bytes = 0_u64;
+        for transition in transitions {
+            let transition_raw_transaction_bytes = match &transition.0 {
+                MempoolEvent::Added { entry } => {
+                    u64::try_from(entry.raw_transaction_bytes().len()).unwrap_or(u64::MAX)
+                }
+                MempoolEvent::Invalidated { .. } | MempoolEvent::Mined { .. } | _ => 0,
+            };
+            let exceeds_event_limit = batch.len() >= MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS;
+            let exceeds_raw_transaction_byte_limit = !batch.is_empty()
+                && batch_raw_transaction_bytes.saturating_add(transition_raw_transaction_bytes)
+                    > self.reconciliation_batch_target_raw_transaction_bytes;
+            if exceeds_event_limit || exceeds_raw_transaction_byte_limit {
+                self.append_and_apply_reconciliation_batch_locked(
+                    canonical,
+                    std::mem::take(&mut batch),
+                )
+                .await?;
+                batch_raw_transaction_bytes = 0;
+            }
+            batch_raw_transaction_bytes =
+                batch_raw_transaction_bytes.saturating_add(transition_raw_transaction_bytes);
+            batch.push(transition);
+        }
+        if !batch.is_empty() {
+            self.append_and_apply_reconciliation_batch_locked(canonical, batch)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn append_and_apply_reconciliation_batch_locked(
         &self,
         canonical: &CanonicalControlHandle,
@@ -539,7 +602,7 @@ impl LiveMempoolOwner {
                     });
                 removals.push((terminal_event, observed_at));
             }
-            self.append_and_apply_reconciliation_batch_locked(canonical, removals)
+            self.append_and_apply_reconciliation_transitions_locked(canonical, removals)
                 .await?;
             if page.next_after_transaction_id.is_none() {
                 return Ok(());
@@ -577,7 +640,7 @@ impl LiveMempoolOwner {
                     )
                 })
                 .collect();
-            self.append_and_apply_reconciliation_batch_locked(canonical, additions)
+            self.append_and_apply_reconciliation_transitions_locked(canonical, additions)
                 .await?;
             if page.next_after_transaction_id.is_none() {
                 return Ok(());
@@ -680,11 +743,19 @@ pub async fn run_live_mempool_owner(
             .await
         {
             MempoolOwnerLoopOutcome::Shutdown => return,
-            MempoolOwnerLoopOutcome::Rehydrate => continue,
-            MempoolOwnerLoopOutcome::Rebuild => {}
-        }
-        if !withdraw_and_wait_for_mempool_rebuild(&owner, &mempool_ready_signal, &cancel).await {
-            return;
+            MempoolOwnerLoopOutcome::Rehydrate => {}
+            MempoolOwnerLoopOutcome::Rebuild { reconnect_backoff } => {
+                if !withdraw_and_wait_for_mempool_rebuild(
+                    &owner,
+                    &mempool_ready_signal,
+                    &cancel,
+                    reconnect_backoff,
+                )
+                .await
+                {
+                    return;
+                }
+            }
         }
     }
 }
@@ -693,7 +764,7 @@ pub async fn run_live_mempool_owner(
 enum MempoolOwnerLoopOutcome {
     Shutdown,
     Rehydrate,
-    Rebuild,
+    Rebuild { reconnect_backoff: Duration },
 }
 
 async fn restore_durable_mempool_index(
@@ -772,7 +843,9 @@ async fn consume_source_events(
                 event = "mempool_source_closed",
                 "live mempool source stream closed; reconnecting"
             );
-            return MempoolOwnerLoopOutcome::Rebuild;
+            return MempoolOwnerLoopOutcome::Rebuild {
+                reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
+            };
         };
         match source_event {
             Ok(MempoolSourceEvent::InitialSnapshotComplete { source_tip }) => {
@@ -783,7 +856,9 @@ async fn consume_source_events(
                         code = ?status.code(),
                         "live mempool source completion marker was rejected"
                     );
-                    return MempoolOwnerLoopOutcome::Rebuild;
+                    return MempoolOwnerLoopOutcome::Rebuild {
+                        reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
+                    };
                 }
                 mempool_ready_signal.set_ready();
                 tracing::info!(
@@ -802,13 +877,16 @@ async fn consume_source_events(
                         code = ?status.code(),
                         "live mempool source event was not published"
                     );
-                    return MempoolOwnerLoopOutcome::Rebuild;
+                    return MempoolOwnerLoopOutcome::Rebuild {
+                        reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
+                    };
                 }
             }
             Err(error) => {
                 metrics::counter!(
                     "zinder_mempool_source_errors_total",
-                    "kind" => "stream_item"
+                    "kind" => "stream_item",
+                    "failure_class" => error.upstream_classification().label()
                 )
                 .increment(1);
                 tracing::warn!(
@@ -817,7 +895,9 @@ async fn consume_source_events(
                     error = %error,
                     "live mempool source emitted an error item"
                 );
-                return MempoolOwnerLoopOutcome::Rebuild;
+                return MempoolOwnerLoopOutcome::Rebuild {
+                    reconnect_backoff: mempool_source_reconnect_backoff(&error),
+                };
             }
         }
     }
@@ -827,6 +907,7 @@ async fn withdraw_and_wait_for_mempool_rebuild(
     owner: &LiveMempoolOwner,
     mempool_ready_signal: &MempoolReadySignal,
     cancel: &CancellationToken,
+    reconnect_backoff: Duration,
 ) -> bool {
     owner.withdraw_for_rebuild().await;
     mempool_ready_signal.set_hydrating();
@@ -835,7 +916,11 @@ async fn withdraw_and_wait_for_mempool_rebuild(
         event = "mempool_index_rebuild_required",
         "withdrew live mempool reads until the source reseeds the index"
     );
-    !wait_or_cancel(cancel, MEMPOOL_RECONNECT_BACKOFF).await
+    !wait_or_cancel(cancel, reconnect_backoff).await
+}
+
+fn mempool_source_reconnect_backoff(error: &SourceError) -> Duration {
+    default_recovery_backoff().for_class(error.upstream_classification())
 }
 
 /// Runs the durable mempool-event retention loop through the canonical writer.
@@ -1002,7 +1087,8 @@ fn record_hydration_failure(reason: MempoolHydrationFailureReason) {
 fn record_source_open_failure(error: &SourceError) {
     metrics::counter!(
         "zinder_mempool_source_errors_total",
-        "kind" => "stream_open"
+        "kind" => "stream_open",
+        "failure_class" => error.upstream_classification().label()
     )
     .increment(1);
     tracing::warn!(
@@ -1023,14 +1109,22 @@ fn record_mempool_size_gauge(index: &MempoolIndex) {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, num::NonZeroU32, sync::Arc, time::Duration};
+    use std::{
+        error::Error,
+        num::{NonZeroU32, NonZeroU64},
+        sync::Arc,
+        time::Duration,
+    };
 
     use tokio_util::sync::CancellationToken;
     use tonic::Code;
     use zebra_chain::{
         serialization::ZcashDeserializeInto as _, transaction::Transaction as ZebraTransaction,
     };
-    use zinder_core::{AuthDigest, RawTransactionBytes, TransactionId, UnixTimestampMillis};
+    use zinder_core::{
+        AuthDigest, ChainEpoch, CompactTransactionData, MempoolEntry, MempoolEvictionReason,
+        MempoolObservation, RawTransactionBytes, TransactionId, UnixTimestampMillis,
+    };
     use zinder_source::MempoolSourceEntry;
     use zinder_store::MempoolEvent;
     use zinder_testkit::{MockMempoolSource, MockMempoolSourceControl};
@@ -1499,6 +1593,119 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn reconciliation_transitions_close_at_the_raw_transaction_byte_target()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let (batch_sender, mut batch_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let CanonicalControlCommand::AppendMempoolEvents { events, .. } = &command {
+                    let raw_transaction_bytes = events
+                        .iter()
+                        .map(|(event, _observed_at)| match event {
+                            MempoolEvent::Added { entry } => entry.raw_transaction_bytes().len(),
+                            MempoolEvent::Invalidated { .. } | MempoolEvent::Mined { .. } | _ => 0,
+                        })
+                        .sum::<usize>();
+                    let _send_outcome = batch_sender.send((events.len(), raw_transaction_bytes));
+                }
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let raw_transaction_byte_limit =
+            NonZeroU64::new(10).ok_or("raw transaction byte limit must be nonzero")?;
+        let owner = LiveMempoolOwner::with_reconciliation_batch_target_raw_transaction_bytes(
+            raw_transaction_byte_limit,
+        );
+        let transitions = [4_usize, 6, 7, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(transaction_index, raw_transaction_bytes)| {
+                added_transition(
+                    u8::try_from(transaction_index)?,
+                    raw_transaction_bytes,
+                    chain_epoch,
+                )
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+
+        owner
+            .append_and_apply_reconciliation_transitions_locked(&canonical, transitions)
+            .await?;
+        let terminal_transitions = (0_u8..4)
+            .map(|transaction_tag| {
+                (
+                    MempoolEvent::Invalidated {
+                        transaction_id: TransactionId::from_bytes([transaction_tag; 32]),
+                        reason: MempoolEvictionReason::Unknown,
+                    },
+                    UnixTimestampMillis::new(1_750_000_000_001),
+                )
+            })
+            .collect();
+        owner
+            .append_and_apply_reconciliation_transitions_locked(&canonical, terminal_transitions)
+            .await?;
+
+        assert_eq!(
+            std::iter::from_fn(|| batch_receiver.try_recv().ok()).collect::<Vec<_>>(),
+            vec![(2, 10), (2, 10), (4, 0)]
+        );
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconciliation_allows_an_oversized_addition_only_as_a_singleton_batch()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let (batch_sender, mut batch_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if let CanonicalControlCommand::AppendMempoolEvents { events, .. } = &command {
+                    let raw_transaction_bytes = events
+                        .iter()
+                        .map(|(event, _observed_at)| match event {
+                            MempoolEvent::Added { entry } => entry.raw_transaction_bytes().len(),
+                            MempoolEvent::Invalidated { .. } | MempoolEvent::Mined { .. } | _ => 0,
+                        })
+                        .sum::<usize>();
+                    let _send_outcome = batch_sender.send((events.len(), raw_transaction_bytes));
+                }
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let raw_transaction_byte_limit =
+            NonZeroU64::new(5).ok_or("raw transaction byte limit must be nonzero")?;
+        let owner = LiveMempoolOwner::with_reconciliation_batch_target_raw_transaction_bytes(
+            raw_transaction_byte_limit,
+        );
+        let transitions = vec![
+            added_transition(0, 8, chain_epoch)?,
+            added_transition(1, 2, chain_epoch)?,
+        ];
+
+        owner
+            .append_and_apply_reconciliation_transitions_locked(&canonical, transitions)
+            .await?;
+
+        assert_eq!(
+            std::iter::from_fn(|| batch_receiver.try_recv().ok()).collect::<Vec<_>>(),
+            vec![(1, 8), (1, 2)]
+        );
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn multi_page_mixed_replacement_applies_only_the_symmetric_difference()
     -> Result<(), Box<dyn Error>> {
@@ -1585,6 +1792,26 @@ mod tests {
             raw_transaction_bytes: RawTransactionBytes::new(raw_transaction_bytes),
             observed_at_unix_millis: UnixTimestampMillis::new(1_750_000_000_000),
         })
+    }
+
+    fn added_transition(
+        transaction_tag: u8,
+        raw_transaction_bytes: usize,
+        chain_epoch: ChainEpoch,
+    ) -> Result<(MempoolEvent, UnixTimestampMillis), Box<dyn Error>> {
+        let transaction_id = TransactionId::from_bytes([transaction_tag; 32]);
+        let observed_at = UnixTimestampMillis::new(1_750_000_000_000);
+        let entry = MempoolEntry::new(
+            transaction_id,
+            None,
+            RawTransactionBytes::new(vec![transaction_tag; raw_transaction_bytes]),
+            CompactTransactionData::default(),
+            MempoolObservation {
+                first_seen_unix_millis: observed_at,
+                first_seen_chain_epoch: chain_epoch,
+            },
+        )?;
+        Ok((MempoolEvent::Added { entry }, observed_at))
     }
 
     fn fixture_source_tip() -> zinder_core::BlockId {

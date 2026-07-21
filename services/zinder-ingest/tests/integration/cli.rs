@@ -106,12 +106,88 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("block_prepare_concurrency ="));
     assert!(stdout.contains("block_prepare_memory_watermark_bytes = 536870912"));
     assert!(stdout.contains("commit_reassembly_max_queued_artifact_bytes = 536870912"));
+    assert!(stdout.contains("[ingest.mempool]"));
+    assert!(stdout.contains("max_transaction_count = 8000"));
+    assert!(stdout.contains("max_total_raw_transaction_bytes = 80000000"));
+    assert!(stdout.contains("reconciliation_batch_target_raw_transaction_bytes = 16000000"));
     assert!(stdout.contains("[ingest.follow]"));
     assert!(stdout.contains("poll_interval_ms = 1000"));
     assert!(stdout.contains("lag_threshold_blocks ="));
     assert!(stdout.contains("[ingest.run_overrides]"));
     assert!(stdout.contains("allow_reorg_window_settlement = false"));
     assert!(stdout.contains("coverage = \"explicit\""));
+
+    Ok(())
+}
+
+#[test]
+fn mempool_limits_use_environment_overrides() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("mempool-limit-overrides-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_INGEST__MEMPOOL__MAX_TRANSACTION_COUNT", "7000")
+        .env(
+            "ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES",
+            "70000000",
+        )
+        .env(
+            "ZINDER_INGEST__MEMPOOL__RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES",
+            "7000000",
+        )
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("max_transaction_count = 7000"), "{stdout}");
+    assert!(
+        stdout.contains("max_total_raw_transaction_bytes = 70000000"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("reconciliation_batch_target_raw_transaction_bytes = 7000000"),
+        "{stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn zero_mempool_limits_fail_before_storage_creation() -> Result<(), Box<dyn Error>> {
+    let cases = [
+        (
+            "ZINDER_INGEST__MEMPOOL__MAX_TRANSACTION_COUNT",
+            "ingest.mempool.max_transaction_count must be greater than zero",
+        ),
+        (
+            "ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES",
+            "ingest.mempool.max_total_raw_transaction_bytes must be greater than zero",
+        ),
+        (
+            "ZINDER_INGEST__MEMPOOL__RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES",
+            "ingest.mempool.reconciliation_batch_target_raw_transaction_bytes must be greater than zero",
+        ),
+    ];
+
+    for (environment_variable, expected_error) in cases {
+        let tempdir = tempdir()?;
+        let storage_path = tempdir.path().join("zero-mempool-limit-store");
+        let config_path = tempdir.path().join("zinder-ingest.toml");
+        fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+        let output = zinder_ingest_command()
+            .args(["--print-config", "--config", path_str(&config_path)?])
+            .env(environment_variable, "0")
+            .output()?;
+
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains(expected_error), "{stderr}");
+        assert!(!storage_path.exists());
+    }
 
     Ok(())
 }

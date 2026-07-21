@@ -11,9 +11,10 @@ use zinder_ingest::{
     CanonicalCheckpointStagingRoot, CanonicalConstructionConfig, CanonicalControlCommand,
     CanonicalControlGrpcAdapter, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
     CanonicalRunOverrides, CanonicalWriterConfig, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-    IngestError, LiveMempoolOwner, NodeSourceKind, canonical_control_channel, classify_phase,
-    mempool_ready_channel, run_canonical_writer_with_control, run_live_mempool_owner,
-    run_mempool_retention, spawn_runtime_memory_metrics_task, spawn_upstream_health_probe_task,
+    IngestError, LiveMempoolOwner, MempoolIngestSettings, NodeSourceKind,
+    canonical_control_channel, classify_phase, mempool_ready_channel,
+    run_canonical_writer_with_control, run_live_mempool_owner, run_mempool_retention,
+    spawn_runtime_memory_metrics_task, spawn_upstream_health_probe_task,
 };
 use zinder_runtime::{
     OpsEndpointHandle, Readiness, ReadinessState, RuntimeService, StartupPhase,
@@ -21,8 +22,9 @@ use zinder_runtime::{
     spawn_ops_endpoint_for,
 };
 use zinder_source::{
-    JsonRpcMempoolSource, MempoolSource, NodeCapabilities, NodeCapability, NodeSource, NodeTarget,
-    ZebraIndexerMempoolSource, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
+    JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, NodeCapabilities,
+    NodeCapability, NodeSource, NodeTarget, ZebraIndexerMempoolSource,
+    ZebraIndexerMempoolSourceOptions, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
     ZebraJsonRpcSourceOptions,
 };
 use zinder_store::{ChainStoreOptions, MempoolEventRetentionConfig, SecondaryChainStore};
@@ -360,10 +362,15 @@ fn spawn_canonical_control_tasks(
 ) -> CanonicalControlTasks {
     if let Some(listen_addr) = command_config.ingest_control_listen_addr {
         let (canonical_control_handle, canonical_control_commands) = canonical_control_channel();
-        let mempool_owner = LiveMempoolOwner::default();
+        let mempool = command_config.runtime_config.mempool;
+        let mempool_owner =
+            LiveMempoolOwner::with_reconciliation_batch_target_raw_transaction_bytes(
+                mempool.reconciliation_batch_target_raw_transaction_bytes,
+            );
         let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
         writer_config.follow.mempool_ready_gate = Some(mempool_ready_gate);
-        let mempool_source = build_live_mempool_source(&command_config.runtime_config.node, source);
+        let mempool_source =
+            build_live_mempool_source(&command_config.runtime_config.node, source, mempool);
         let mempool_owner_task = tokio::spawn(run_live_mempool_owner(
             mempool_source,
             canonical_control_handle.clone(),
@@ -762,6 +769,7 @@ fn zebra_json_rpc_source_for_target(
 fn build_live_mempool_source(
     node_target: &NodeTarget,
     json_rpc: &ZebraJsonRpcSource,
+    mempool: MempoolIngestSettings,
 ) -> Arc<dyn MempoolSource> {
     node_target.indexer_grpc_addr.as_ref().map_or_else(
         || {
@@ -771,7 +779,13 @@ fn build_live_mempool_source(
                 backend = "zebra-json-rpc-polling",
                 "selected polling mempool source"
             );
-            Arc::new(JsonRpcMempoolSource::new(json_rpc.clone())) as Arc<dyn MempoolSource>
+            Arc::new(JsonRpcMempoolSource::with_options(
+                json_rpc.clone(),
+                JsonRpcMempoolSourceOptions {
+                    admission_limits: mempool.source_admission_limits,
+                    ..JsonRpcMempoolSourceOptions::default()
+                },
+            )) as Arc<dyn MempoolSource>
         },
         |indexer_endpoint| {
             tracing::info!(
@@ -781,9 +795,13 @@ fn build_live_mempool_source(
                 indexer_endpoint = %indexer_endpoint,
                 "selected streaming mempool source"
             );
-            Arc::new(ZebraIndexerMempoolSource::new(
+            Arc::new(ZebraIndexerMempoolSource::with_options(
                 ZebraIndexerSourceTarget::new(indexer_endpoint.clone()),
                 json_rpc.clone(),
+                ZebraIndexerMempoolSourceOptions {
+                    admission_limits: mempool.source_admission_limits,
+                    ..ZebraIndexerMempoolSourceOptions::default()
+                },
             )) as Arc<dyn MempoolSource>
         },
     )

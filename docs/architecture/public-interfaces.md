@@ -170,9 +170,9 @@ Release configuration is grouped by owner:
 
 - `[network]`, `[node]`, `[node.auth]`, `[ops]`, and `[security]` are shared
   sections;
-- `[storage]`, `[ingest]`, `[ingest.construction]`, `[ingest.follow]`,
-  `[ingest.run_overrides]`, `[retention]`, and `[ingest_control]` configure the
-  canonical writer;
+- `[storage]`, `[ingest]`, `[ingest.construction]`, `[ingest.mempool]`,
+  `[ingest.follow]`, `[ingest.run_overrides]`, `[retention]`, and
+  `[ingest_control]` configure the canonical writer;
 - `[storage]`, `[projector]`, `[ingest_control]`, and `[projector_control]`
   configure the wallet projector; and
 - `[storage]`, `[wallet]`, `[compat]`, and `[ingest_control]` configure the
@@ -185,6 +185,7 @@ ZINDER_NETWORK__NAME
 ZINDER_NODE__JSON_RPC_ADDR
 ZINDER_NODE__AUTH__METHOD
 ZINDER_INGEST__CONSTRUCTION__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS
+ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES
 ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS
 ZINDER_PROJECTOR__BUILD_OWNER_HEX
 ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS
@@ -264,6 +265,9 @@ stay synchronized with it.
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0016](../adrs/0016-source-segment-fetching.md). |
 | `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest | Optional | `storage.raw_blob_policy` | Immutable raw-blob retention contract: `none`, `transactions`, or `all`. Defaults to `none` for explicit coverage so canonical indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. Wallet-serving coverage defaults to `transactions` and rejects `none`, because native and lightwalletd-compatible transaction and transparent-history methods require retained bytes. The first canonical commit fixes historical coverage; changing a non-empty store requires a rebuild. |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds settlement, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
+| `ZINDER_INGEST__MEMPOOL__MAX_TRANSACTION_COUNT` | zinder-ingest | Optional | `ingest.mempool.max_transaction_count` | Maximum number of transactions admitted into one coherent live mempool. Exceeding the bound withdraws the serving generation and retries source hydration. Must be greater than zero. Defaults to 8000. |
+| `ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES` | zinder-ingest | Optional | `ingest.mempool.max_total_raw_transaction_bytes` | Maximum cumulative raw transaction bytes admitted into one coherent live mempool. Exceeding the bound withdraws the serving generation and retries source hydration. Must be greater than zero. Defaults to 80000000. |
+| `ZINDER_INGEST__MEMPOOL__RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES` | zinder-ingest | Optional | `ingest.mempool.reconciliation_batch_target_raw_transaction_bytes` | Target raw transaction bytes for one durable mempool reconciliation write. A single protocol-valid transaction above the target is written alone so reconciliation can make progress. Must be greater than zero. Defaults to 16000000. |
 | `ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS` | zinder-projector | Optional | `projector.reorg_window_blocks` | Wallet undo suffix depth and expected canonical replacement policy. Must match the canonical writer. Defaults to 100. |
 | `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | zinder-projector | Required | `projector.build_owner_hex` | Stable 16-byte wallet-build lease owner encoded as exactly 32 hexadecimal characters. Use a distinct value for each concurrently provisioned lane. |
 | `ZINDER_PROJECTOR__LEASE_DURATION_SECONDS` | zinder-projector | Required | `projector.lease_duration_seconds` | Wallet-build and canonical-retention lease duration in seconds. Must be at least 14400 so a durable construction phase cannot outlive its lease. |

@@ -25,9 +25,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use zinder_core::{MempoolEvictionReason, TransactionId, UnixTimestampMillis};
 
 use crate::{
-    MempoolHydrationFailureReason, MempoolSource, MempoolSourceCapabilities, MempoolSourceEntry,
-    MempoolSourceEvent, MempoolSourceEventStream, NodeSource, SourceError,
-    UpstreamTransactionLookup, ZebraJsonRpcSource,
+    MempoolHydrationFailureReason, MempoolSource, MempoolSourceAdmissionLimits,
+    MempoolSourceCapabilities, MempoolSourceEntry, MempoolSourceEvent, MempoolSourceEventStream,
+    NodeSource, SourceError, UpstreamTransactionLookup, ZebraJsonRpcSource,
+    mempool_source::MempoolSourceAdmission,
 };
 
 const JSON_RPC_POLLING_BACKEND_LABEL: &str = "json_rpc_polling";
@@ -62,6 +63,8 @@ pub struct JsonRpcMempoolSourceOptions {
     pub poll_interval: Duration,
     /// Channel buffer size for the emitted source event stream.
     pub event_channel_capacity: usize,
+    /// Complete-generation transaction-count and raw-byte limits.
+    pub admission_limits: MempoolSourceAdmissionLimits,
 }
 
 impl Default for JsonRpcMempoolSourceOptions {
@@ -69,6 +72,7 @@ impl Default for JsonRpcMempoolSourceOptions {
         Self {
             poll_interval: DEFAULT_MEMPOOL_POLL_INTERVAL,
             event_channel_capacity: 64,
+            admission_limits: MempoolSourceAdmissionLimits::default(),
         }
     }
 }
@@ -107,11 +111,12 @@ impl MempoolSource for JsonRpcMempoolSource {
         let (event_sender, event_receiver) = mpsc::channel(self.options.event_channel_capacity);
         let json_rpc = self.json_rpc.clone();
         let poll_interval = self.options.poll_interval;
-        let known_transaction_ids: Arc<Mutex<HashSet<TransactionId>>> =
-            Arc::new(Mutex::new(HashSet::new()));
+        let admission = Arc::new(Mutex::new(MempoolSourceAdmission::new(
+            self.options.admission_limits,
+        )));
 
         tokio::spawn(async move {
-            run_polling_loop(json_rpc, poll_interval, known_transaction_ids, event_sender).await;
+            run_polling_loop(json_rpc, poll_interval, admission, event_sender).await;
         });
 
         Ok(Box::pin(ReceiverStream::new(event_receiver)))
@@ -121,7 +126,7 @@ impl MempoolSource for JsonRpcMempoolSource {
 async fn run_polling_loop(
     json_rpc: ZebraJsonRpcSource,
     poll_interval: Duration,
-    known_transaction_ids: Arc<Mutex<HashSet<TransactionId>>>,
+    admission: Arc<Mutex<MempoolSourceAdmission>>,
     event_sender: mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
 ) {
     let mut certified_source_tip = None;
@@ -129,7 +134,7 @@ async fn run_polling_loop(
         let observed_at = UnixTimestampMillis::now();
         match poll_once(
             &json_rpc,
-            &known_transaction_ids,
+            &admission,
             observed_at,
             &event_sender,
             certified_source_tip,
@@ -157,12 +162,10 @@ async fn run_polling_loop(
             }
             Err(send_failed) if send_failed.is_send_failure() => return,
             Err(send_failed) => {
-                let send_outcome = event_sender
+                let _send_outcome = event_sender
                     .send(Err(send_failed.into_source_error()))
                     .await;
-                if send_outcome.is_err() {
-                    return;
-                }
+                return;
             }
         }
         sleep(poll_interval).await;
@@ -212,7 +215,7 @@ impl PollFailure {
 
 async fn poll_once(
     json_rpc: &ZebraJsonRpcSource,
-    known_transaction_ids: &Arc<Mutex<HashSet<TransactionId>>>,
+    admission: &Arc<Mutex<MempoolSourceAdmission>>,
     observed_at: UnixTimestampMillis,
     event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
     certified_source_tip: Option<zinder_core::BlockId>,
@@ -232,19 +235,23 @@ async fn poll_once(
         .map_err(PollFailure::Source)?
         .into_iter()
         .collect();
+    admission
+        .lock()
+        .validate_snapshot_transaction_count(observed_transaction_ids.len())
+        .map_err(PollFailure::Source)?;
 
     let (added_transaction_ids, removed_transaction_ids) =
-        diff_known_state(known_transaction_ids, &observed_transaction_ids);
+        diff_known_state(admission, &observed_transaction_ids);
 
     let mut pending_retry = false;
     for (transaction_ids, transition_kind) in [
-        (added_transaction_ids, PollTransitionKind::Added),
         (removed_transaction_ids, PollTransitionKind::Removed),
+        (added_transaction_ids, PollTransitionKind::Added),
     ] {
         for transaction_batch in transaction_ids.chunks(MEMPOOL_POLL_HYDRATION_CONCURRENCY) {
             match poll_transition_batch(
                 json_rpc,
-                known_transaction_ids,
+                admission,
                 transaction_batch,
                 transition_kind,
                 observed_at,
@@ -365,7 +372,7 @@ enum PollBatchCompletion {
 )]
 async fn poll_transition_batch(
     json_rpc: &ZebraJsonRpcSource,
-    known_transaction_ids: &Arc<Mutex<HashSet<TransactionId>>>,
+    admission: &Arc<Mutex<MempoolSourceAdmission>>,
     transaction_ids: &[TransactionId],
     transition_kind: PollTransitionKind,
     observed_at: UnixTimestampMillis,
@@ -400,13 +407,17 @@ async fn poll_transition_batch(
                 event,
                 transaction_id,
             } => {
+                if let MempoolSourceEvent::Added(entry) = &event {
+                    admission
+                        .lock()
+                        .admit_added_entry(entry)
+                        .map_err(PollFailure::Source)?;
+                }
                 forward_event(event, event_sender).await?;
                 match transition_kind {
-                    PollTransitionKind::Added => {
-                        remember_added_transaction_id(known_transaction_ids, transaction_id);
-                    }
+                    PollTransitionKind::Added => {}
                     PollTransitionKind::Removed => {
-                        forget_removed_transaction_id(known_transaction_ids, transaction_id);
+                        admission.lock().remove_transaction(transaction_id);
                     }
                 }
             }
@@ -425,34 +436,22 @@ async fn poll_transition_batch(
 }
 
 fn diff_known_state(
-    known_transaction_ids: &Arc<Mutex<HashSet<TransactionId>>>,
+    admission: &Arc<Mutex<MempoolSourceAdmission>>,
     observed_transaction_ids: &HashSet<TransactionId>,
 ) -> (Vec<TransactionId>, Vec<TransactionId>) {
-    let known_state = known_transaction_ids.lock();
-    let added: Vec<TransactionId> = observed_transaction_ids
-        .difference(&known_state)
+    let admission = admission.lock();
+    let added = observed_transaction_ids
+        .iter()
+        .filter(|transaction_id| !admission.contains_transaction(**transaction_id))
         .copied()
         .collect();
-    let removed: Vec<TransactionId> = known_state
-        .difference(observed_transaction_ids)
+    let removed = admission
+        .transaction_ids()
+        .filter(|transaction_id| !observed_transaction_ids.contains(transaction_id))
         .copied()
         .collect();
-    drop(known_state);
+    drop(admission);
     (added, removed)
-}
-
-fn remember_added_transaction_id(
-    known_transaction_ids: &Arc<Mutex<HashSet<TransactionId>>>,
-    transaction_id: TransactionId,
-) {
-    known_transaction_ids.lock().insert(transaction_id);
-}
-
-fn forget_removed_transaction_id(
-    known_transaction_ids: &Arc<Mutex<HashSet<TransactionId>>>,
-    transaction_id: TransactionId,
-) {
-    known_transaction_ids.lock().remove(&transaction_id);
 }
 
 enum PollObservation {
@@ -563,18 +562,38 @@ mod tests {
         TransactionId::from_bytes([byte; 32])
     }
 
+    fn admission_with_transaction_ids(
+        transaction_ids: impl IntoIterator<Item = TransactionId>,
+    ) -> Arc<Mutex<MempoolSourceAdmission>> {
+        let mut admission = MempoolSourceAdmission::new(MempoolSourceAdmissionLimits::default());
+        for transaction_id in transaction_ids {
+            let outcome = admission.admit_added_entry(&MempoolSourceEntry {
+                transaction_id,
+                auth_digest: None,
+                raw_transaction_bytes: zinder_core::RawTransactionBytes::new(vec![0]),
+                observed_at_unix_millis: UnixTimestampMillis::new(1),
+            });
+            assert!(outcome.is_ok(), "fixture admission failed: {outcome:?}");
+        }
+        Arc::new(Mutex::new(admission))
+    }
+
+    fn empty_admission() -> Arc<Mutex<MempoolSourceAdmission>> {
+        admission_with_transaction_ids([])
+    }
+
     #[test]
     fn diff_known_state_classifies_added_and_removed() {
-        let known_transaction_ids = Arc::new(Mutex::new(HashSet::from([
+        let admission = admission_with_transaction_ids([
             transaction_id_with_byte(0x01),
             transaction_id_with_byte(0x02),
-        ])));
+        ]);
         let observed = HashSet::from([
             transaction_id_with_byte(0x02),
             transaction_id_with_byte(0x03),
         ]);
 
-        let (added, removed) = diff_known_state(&known_transaction_ids, &observed);
+        let (added, removed) = diff_known_state(&admission, &observed);
 
         assert_eq!(added, vec![transaction_id_with_byte(0x03)]);
         assert_eq!(removed, vec![transaction_id_with_byte(0x01)]);
@@ -582,48 +601,53 @@ mod tests {
 
     #[test]
     fn added_observation_stays_pending_until_event_is_emitted() {
-        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let admission = empty_admission();
         let observed = HashSet::from([transaction_id_with_byte(0xAA)]);
 
-        let (added, removed) = diff_known_state(&known_transaction_ids, &observed);
+        let (added, removed) = diff_known_state(&admission, &observed);
 
         assert_eq!(added, vec![transaction_id_with_byte(0xAA)]);
         assert!(removed.is_empty());
-        assert!(known_transaction_ids.lock().is_empty());
+        assert!(admission.lock().transaction_ids().next().is_none());
 
-        let (retry_added, retry_removed) = diff_known_state(&known_transaction_ids, &observed);
+        let (retry_added, retry_removed) = diff_known_state(&admission, &observed);
         assert_eq!(retry_added, vec![transaction_id_with_byte(0xAA)]);
         assert!(retry_removed.is_empty());
 
-        remember_added_transaction_id(&known_transaction_ids, transaction_id_with_byte(0xAA));
-        let (after_emit_added, after_emit_removed) =
-            diff_known_state(&known_transaction_ids, &observed);
+        let admission_outcome = admission.lock().admit_added_entry(&MempoolSourceEntry {
+            transaction_id: transaction_id_with_byte(0xAA),
+            auth_digest: None,
+            raw_transaction_bytes: zinder_core::RawTransactionBytes::new(vec![0]),
+            observed_at_unix_millis: UnixTimestampMillis::new(1),
+        });
+        assert!(admission_outcome.is_ok());
+        let (after_emit_added, after_emit_removed) = diff_known_state(&admission, &observed);
         assert!(after_emit_added.is_empty());
         assert!(after_emit_removed.is_empty());
     }
 
     #[test]
     fn removed_observation_stays_pending_until_event_is_emitted() {
-        let known_transaction_ids =
-            Arc::new(Mutex::new(HashSet::from([transaction_id_with_byte(0xBB)])));
+        let admission = admission_with_transaction_ids([transaction_id_with_byte(0xBB)]);
         let observed = HashSet::new();
 
-        let (added, removed) = diff_known_state(&known_transaction_ids, &observed);
+        let (added, removed) = diff_known_state(&admission, &observed);
         assert!(added.is_empty());
         assert_eq!(removed, vec![transaction_id_with_byte(0xBB)]);
         assert!(
-            known_transaction_ids
+            admission
                 .lock()
-                .contains(&transaction_id_with_byte(0xBB))
+                .contains_transaction(transaction_id_with_byte(0xBB))
         );
 
-        let (retry_added, retry_removed) = diff_known_state(&known_transaction_ids, &observed);
+        let (retry_added, retry_removed) = diff_known_state(&admission, &observed);
         assert!(retry_added.is_empty());
         assert_eq!(retry_removed, vec![transaction_id_with_byte(0xBB)]);
 
-        forget_removed_transaction_id(&known_transaction_ids, transaction_id_with_byte(0xBB));
-        let (after_emit_added, after_emit_removed) =
-            diff_known_state(&known_transaction_ids, &observed);
+        admission
+            .lock()
+            .remove_transaction(transaction_id_with_byte(0xBB));
+        let (after_emit_added, after_emit_removed) = diff_known_state(&admission, &observed);
         assert!(after_emit_added.is_empty());
         assert!(after_emit_removed.is_empty());
     }
@@ -631,12 +655,60 @@ mod tests {
     #[test]
     fn diff_known_state_yields_empty_diffs_when_unchanged() {
         let initial = HashSet::from([transaction_id_with_byte(0x40)]);
-        let known_transaction_ids = Arc::new(Mutex::new(initial.clone()));
+        let admission = admission_with_transaction_ids(initial.iter().copied());
 
-        let (added, removed) = diff_known_state(&known_transaction_ids, &initial);
+        let (added, removed) = diff_known_state(&admission, &initial);
 
         assert!(added.is_empty());
         assert!(removed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn polling_rejects_transaction_count_before_hydration() -> eyre::Result<()> {
+        let source_tip_response = serde_json::json!({
+            "height": 7,
+            "hash": vec![0x07; 32],
+        });
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            zinder_testkit::method("getbestblockheightandhash")
+                .reply(zinder_testkit::RpcReply::result(source_tip_response)),
+            zinder_testkit::method("getrawmempool").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!(["11".repeat(32), "22".repeat(32)]),
+            )),
+        ])?;
+        let json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+        let limits = MempoolSourceAdmissionLimits {
+            max_transaction_count: std::num::NonZeroU32::MIN,
+            max_total_raw_transaction_bytes: std::num::NonZeroU64::MIN.saturating_add(99),
+        };
+        let admission = Arc::new(Mutex::new(MempoolSourceAdmission::new(limits)));
+        let (event_sender, _event_receiver) = mpsc::channel(4);
+
+        let outcome = poll_once(
+            &json_rpc,
+            &admission,
+            UnixTimestampMillis::new(1_750_000_000_000),
+            &event_sender,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Err(PollFailure::Source(
+                SourceError::MempoolTransactionCountLimitExceeded {
+                    transaction_count: 2,
+                    max_transaction_count: 1,
+                }
+            ))
+        ));
+        assert!(server.requests_for("getrawtransaction")?.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -661,12 +733,12 @@ mod tests {
             crate::NodeAuth::None,
             Duration::from_secs(5),
         )?;
-        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let admission = empty_admission();
         let (event_sender, mut event_receiver) = mpsc::channel(4);
         let poll_task = tokio::spawn(run_polling_loop(
             json_rpc,
             Duration::from_mins(1),
-            known_transaction_ids,
+            admission,
             event_sender,
         ));
 
@@ -720,12 +792,12 @@ mod tests {
             crate::NodeAuth::None,
             Duration::from_secs(5),
         )?;
-        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let admission = empty_admission();
         let (event_sender, mut event_receiver) = mpsc::channel(4);
 
         let outcome = poll_once(
             &json_rpc,
-            &known_transaction_ids,
+            &admission,
             UnixTimestampMillis::new(1_750_000_000_000),
             &event_sender,
             None,
@@ -741,7 +813,7 @@ mod tests {
             event_receiver.try_recv().is_err(),
             "a pending hydration must not emit a source event or completion marker"
         );
-        assert!(known_transaction_ids.lock().is_empty());
+        assert!(admission.lock().transaction_ids().next().is_none());
         Ok(())
     }
 
@@ -775,12 +847,12 @@ mod tests {
             crate::NodeAuth::None,
             Duration::from_secs(5),
         )?;
-        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let admission = empty_admission();
         let (event_sender, mut event_receiver) = mpsc::channel(4);
 
         let outcome = poll_once(
             &json_rpc,
-            &known_transaction_ids,
+            &admission,
             UnixTimestampMillis::new(1_750_000_000_000),
             &event_sender,
             None,
@@ -798,7 +870,7 @@ mod tests {
             "an unstable source snapshot must publish no partial transitions"
         );
         assert!(
-            known_transaction_ids.lock().is_empty(),
+            admission.lock().transaction_ids().next().is_none(),
             "an unstable source snapshot must not advance the polling baseline"
         );
         Ok(())
@@ -823,12 +895,12 @@ mod tests {
             crate::NodeAuth::None,
             Duration::from_secs(5),
         )?;
-        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let admission = empty_admission();
         let (event_sender, mut event_receiver) = mpsc::channel(4);
 
         let completion = poll_once(
             &json_rpc,
-            &known_transaction_ids,
+            &admission,
             UnixTimestampMillis::new(1_750_000_000_000),
             &event_sender,
             Some(certified_source_tip),
@@ -880,12 +952,12 @@ mod tests {
             crate::NodeAuth::None,
             Duration::from_secs(5),
         )?;
-        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let admission = empty_admission();
         let (event_sender, _event_receiver) = mpsc::channel(1);
         let poll_task = tokio::spawn(async move {
             poll_once(
                 &json_rpc,
-                &known_transaction_ids,
+                &admission,
                 UnixTimestampMillis::new(1_750_000_000_000),
                 &event_sender,
                 None,
@@ -950,12 +1022,12 @@ mod tests {
             crate::NodeAuth::None,
             Duration::from_secs(5),
         )?;
-        let known_transaction_ids = Arc::new(Mutex::new(HashSet::new()));
+        let admission = empty_admission();
         let (event_sender, mut event_receiver) = mpsc::channel(1);
         let poll_task = tokio::spawn(async move {
             poll_once(
                 &json_rpc,
-                &known_transaction_ids,
+                &admission,
                 UnixTimestampMillis::new(1_750_000_000_000),
                 &event_sender,
                 None,

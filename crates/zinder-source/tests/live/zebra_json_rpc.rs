@@ -255,6 +255,7 @@ async fn json_rpc_mempool_source_runs_one_poll_cycle_without_panic() -> Result<(
         JsonRpcMempoolSourceOptions {
             poll_interval: std::time::Duration::from_millis(100),
             event_channel_capacity: 16,
+            ..JsonRpcMempoolSourceOptions::default()
         },
     );
     assert_eq!(

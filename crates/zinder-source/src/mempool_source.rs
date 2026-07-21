@@ -10,7 +10,11 @@
 //! stamps the chain epoch visible at observation time and computes the
 //! compact-transaction bytes from the raw payload.
 
-use std::pin::Pin;
+use std::{
+    collections::HashMap,
+    num::{NonZeroU32, NonZeroU64},
+    pin::Pin,
+};
 
 use async_trait::async_trait;
 use tokio_stream::Stream;
@@ -20,6 +24,132 @@ use zinder_core::{
 };
 
 use crate::SourceError;
+
+/// Default maximum number of transactions admitted into one source generation.
+///
+/// Zebra's default 80,000,000 transaction-cost ceiling and 10,000 minimum
+/// per-transaction cost bound the default upstream mempool to 8,000 entries.
+pub const DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT: NonZeroU32 = NonZeroU32::MIN.saturating_add(7_999);
+
+/// Default maximum total raw transaction bytes admitted into one source generation.
+///
+/// This matches Zebra's default 80,000,000 transaction-cost ceiling. Zebra's
+/// cost is at least the serialized transaction size, so the default accepts
+/// every mempool that fits the upstream's default policy.
+pub const DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES: NonZeroU64 =
+    NonZeroU64::MIN.saturating_add(79_999_999);
+
+/// Resource limits applied to a mempool source generation.
+///
+/// Both limits describe the complete currently admitted set, not one hydration
+/// batch. A source withdraws its generation when either bound is exceeded; it
+/// never publishes a truncated snapshot as complete.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MempoolSourceAdmissionLimits {
+    /// Maximum number of distinct transactions in the admitted set.
+    pub max_transaction_count: NonZeroU32,
+    /// Maximum cumulative serialized bytes across the admitted set.
+    pub max_total_raw_transaction_bytes: NonZeroU64,
+}
+
+impl Default for MempoolSourceAdmissionLimits {
+    fn default() -> Self {
+        Self {
+            max_transaction_count: DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
+            max_total_raw_transaction_bytes: DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES,
+        }
+    }
+}
+
+/// Admission accounting shared by polling snapshots and streaming deltas.
+#[derive(Debug)]
+pub(crate) struct MempoolSourceAdmission {
+    limits: MempoolSourceAdmissionLimits,
+    raw_transaction_bytes_by_transaction_id: HashMap<TransactionId, u64>,
+    total_raw_transaction_bytes: u64,
+}
+
+impl MempoolSourceAdmission {
+    pub(crate) fn new(limits: MempoolSourceAdmissionLimits) -> Self {
+        Self {
+            limits,
+            raw_transaction_bytes_by_transaction_id: HashMap::new(),
+            total_raw_transaction_bytes: 0,
+        }
+    }
+
+    pub(crate) fn validate_snapshot_transaction_count(
+        &self,
+        transaction_count: usize,
+    ) -> Result<(), SourceError> {
+        let transaction_count = u64::try_from(transaction_count).unwrap_or(u64::MAX);
+        let max_transaction_count = u64::from(self.limits.max_transaction_count.get());
+        if transaction_count > max_transaction_count {
+            return Err(SourceError::MempoolTransactionCountLimitExceeded {
+                transaction_count,
+                max_transaction_count,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admit_added_entry(
+        &mut self,
+        entry: &MempoolSourceEntry,
+    ) -> Result<(), SourceError> {
+        let transaction_id = entry.transaction_id;
+        let raw_transaction_bytes =
+            u64::try_from(entry.raw_transaction_bytes.as_slice().len()).unwrap_or(u64::MAX);
+        let previous_raw_transaction_bytes = self
+            .raw_transaction_bytes_by_transaction_id
+            .get(&transaction_id)
+            .copied();
+        if previous_raw_transaction_bytes.is_some() {
+            return Ok(());
+        }
+        let transaction_count = self
+            .raw_transaction_bytes_by_transaction_id
+            .len()
+            .saturating_add(1);
+        self.validate_snapshot_transaction_count(transaction_count)?;
+
+        let total_raw_transaction_bytes = self
+            .total_raw_transaction_bytes
+            .saturating_add(raw_transaction_bytes);
+        let max_total_raw_transaction_bytes = self.limits.max_total_raw_transaction_bytes.get();
+        if total_raw_transaction_bytes > max_total_raw_transaction_bytes {
+            return Err(SourceError::MempoolRawTransactionBytesLimitExceeded {
+                total_raw_transaction_bytes,
+                max_total_raw_transaction_bytes,
+            });
+        }
+
+        self.raw_transaction_bytes_by_transaction_id
+            .insert(transaction_id, raw_transaction_bytes);
+        self.total_raw_transaction_bytes = total_raw_transaction_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn remove_transaction(&mut self, transaction_id: TransactionId) {
+        if let Some(raw_transaction_bytes) = self
+            .raw_transaction_bytes_by_transaction_id
+            .remove(&transaction_id)
+        {
+            self.total_raw_transaction_bytes = self
+                .total_raw_transaction_bytes
+                .saturating_sub(raw_transaction_bytes);
+        }
+    }
+
+    pub(crate) fn transaction_ids(&self) -> impl Iterator<Item = &TransactionId> {
+        self.raw_transaction_bytes_by_transaction_id.keys()
+    }
+
+    pub(crate) fn contains_transaction(&self, transaction_id: TransactionId) -> bool {
+        self.raw_transaction_bytes_by_transaction_id
+            .contains_key(&transaction_id)
+    }
+}
 
 /// Source-observed mempool transition.
 ///
@@ -232,7 +362,39 @@ pub trait MempoolSource: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use super::{MempoolSourceBackend, MempoolSourceCapabilities};
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    use zinder_core::{RawTransactionBytes, TransactionId, UnixTimestampMillis};
+
+    use super::{
+        MempoolSourceAdmission, MempoolSourceAdmissionLimits, MempoolSourceBackend,
+        MempoolSourceCapabilities, MempoolSourceEntry,
+    };
+    use crate::{SourceError, SourceFailureClass};
+
+    fn admission_limits(
+        max_transaction_count: u32,
+        max_total_raw_transaction_bytes: u64,
+    ) -> Result<MempoolSourceAdmissionLimits, &'static str> {
+        Ok(MempoolSourceAdmissionLimits {
+            max_transaction_count: NonZeroU32::new(max_transaction_count)
+                .ok_or("transaction limit must be nonzero")?,
+            max_total_raw_transaction_bytes: NonZeroU64::new(max_total_raw_transaction_bytes)
+                .ok_or("raw-byte limit must be nonzero")?,
+        })
+    }
+
+    fn source_entry(transaction_tag: u8, raw_transaction_bytes: usize) -> MempoolSourceEntry {
+        MempoolSourceEntry {
+            transaction_id: TransactionId::from_bytes([transaction_tag; 32]),
+            auth_digest: None,
+            raw_transaction_bytes: RawTransactionBytes::new(vec![
+                transaction_tag;
+                raw_transaction_bytes
+            ]),
+            observed_at_unix_millis: UnixTimestampMillis::new(1),
+        }
+    }
 
     #[test]
     fn streaming_capabilities_report_streaming_backend() {
@@ -246,5 +408,82 @@ mod tests {
         let capabilities = MempoolSourceCapabilities::polling();
         assert_eq!(capabilities.backend, MempoolSourceBackend::Polling);
         assert!(!capabilities.reports_mined_directly);
+    }
+
+    #[test]
+    fn admission_accepts_inclusive_limits_and_duplicate_observations() -> Result<(), &'static str> {
+        let mut admission = MempoolSourceAdmission::new(admission_limits(2, 5)?);
+        let first_entry = source_entry(1, 2);
+        let duplicate_with_different_bytes = source_entry(1, 5);
+        let second_entry = source_entry(2, 3);
+
+        admission
+            .admit_added_entry(&first_entry)
+            .map_err(|_| "first entry should be admitted")?;
+        admission
+            .admit_added_entry(&duplicate_with_different_bytes)
+            .map_err(|_| "duplicate entry should not consume capacity")?;
+        admission
+            .admit_added_entry(&second_entry)
+            .map_err(|_| "inclusive limits should be admitted")?;
+
+        assert_eq!(admission.transaction_ids().count(), 2);
+        assert_eq!(admission.total_raw_transaction_bytes, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_releases_entry_and_raw_byte_capacity_on_removal() -> Result<(), &'static str> {
+        let mut admission = MempoolSourceAdmission::new(admission_limits(1, 3)?);
+        let first_entry = source_entry(1, 3);
+        let replacement_entry = source_entry(2, 3);
+        admission
+            .admit_added_entry(&first_entry)
+            .map_err(|_| "first entry should be admitted")?;
+
+        admission.remove_transaction(first_entry.transaction_id);
+        admission
+            .admit_added_entry(&replacement_entry)
+            .map_err(|_| "removed entry should release capacity")?;
+
+        assert!(admission.contains_transaction(replacement_entry.transaction_id));
+        assert_eq!(admission.total_raw_transaction_bytes, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_reports_transaction_count_and_raw_byte_overflow() -> Result<(), &'static str> {
+        let mut count_admission = MempoolSourceAdmission::new(admission_limits(1, 10)?);
+        count_admission
+            .admit_added_entry(&source_entry(1, 1))
+            .map_err(|_| "first count fixture should be admitted")?;
+        assert!(matches!(
+            count_admission.admit_added_entry(&source_entry(2, 1)),
+            Err(SourceError::MempoolTransactionCountLimitExceeded {
+                transaction_count: 2,
+                max_transaction_count: 1,
+            })
+        ));
+
+        let mut byte_admission = MempoolSourceAdmission::new(admission_limits(2, 3)?);
+        byte_admission
+            .admit_added_entry(&source_entry(1, 2))
+            .map_err(|_| "first byte fixture should be admitted")?;
+        assert!(matches!(
+            byte_admission.admit_added_entry(&source_entry(2, 2)),
+            Err(SourceError::MempoolRawTransactionBytesLimitExceeded {
+                total_raw_transaction_bytes: 4,
+                max_total_raw_transaction_bytes: 3,
+            })
+        ));
+        let admission_error = SourceError::MempoolTransactionCountLimitExceeded {
+            transaction_count: 2,
+            max_transaction_count: 1,
+        };
+        assert_eq!(
+            admission_error.upstream_classification(),
+            SourceFailureClass::Configuration
+        );
+        Ok(())
     }
 }
