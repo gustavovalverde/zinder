@@ -5,16 +5,26 @@ use zinder_core::NetworkUpgradeActivations;
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
+use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
     ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, MaterializedViewStore,
     MaterializedViewStoreError, MaterializedViewStoreOptions, describe_request_metrics,
 };
+use zinder_proto::{
+    CONTRACT_REVISION,
+    capabilities::{
+        WALLET_READ_SERVER_INFO_V2, WALLET_READ_TRANSACTION_BY_ID_V2,
+        WALLET_READ_TRANSACTION_BYTES_V1, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
+        WALLET_READ_TRANSPARENT_SPENDS_V1,
+    },
+    v1::wallet::{self, wallet_query_client::WalletQueryClient},
+};
 use zinder_runtime::{
-    OpsEndpointHandle, Readiness, ReadinessState, RuntimeService, StartupPhase,
-    cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
-    spawn_ops_endpoint_for,
+    AuthenticatedChannel, OpsEndpointHandle, Readiness, ReadinessState, RuntimeService,
+    StartupPhase, cancel_on_terminating_signal, connect_zinder_grpc,
+    host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{ChainStoreOptions, SecondaryChainStore};
@@ -35,6 +45,35 @@ const MATERIALIZED_VIEW_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);
 /// probe.
 const DEFAULT_UPSTREAM_OBSERVATION_POLL_INTERVAL: Duration =
     Duration::from_millis(zinder_source::DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS);
+
+const REQUIRED_TRANSACTION_DETAIL_WALLET_CAPABILITIES: [&str; 5] = [
+    WALLET_READ_SERVER_INFO_V2,
+    WALLET_READ_TRANSACTION_BY_ID_V2,
+    WALLET_READ_TRANSACTION_BYTES_V1,
+    WALLET_READ_TRANSPARENT_OUTPUTS_V1,
+    WALLET_READ_TRANSPARENT_SPENDS_V1,
+];
+
+#[derive(Debug, Error)]
+pub(crate) enum WalletQueryContractError {
+    #[error("WalletQuery connection failed: {0}")]
+    Connect(#[source] zinder_runtime::BearerTokenConnectError),
+    #[error("WalletQuery ServerInfo RPC failed: {0}")]
+    Rpc(#[source] tonic::Status),
+    #[error("WalletQuery ServerInfo response omitted {field}")]
+    MissingDescriptor { field: &'static str },
+    #[error("WalletQuery service identity mismatch: expected zinder-query, received {actual}")]
+    ServiceIdentityMismatch { actual: String },
+    #[error("WalletQuery network mismatch: expected {expected}, received {actual}")]
+    NetworkMismatch {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("WalletQuery contract revision is too old: minimum {expected}, received {actual}")]
+    ContractRevisionMismatch { expected: u32, actual: u32 },
+    #[error("WalletQuery is missing required capability {capability}")]
+    MissingCapability { capability: &'static str },
+}
 
 #[derive(Parser)]
 #[command(name = "zinder-explorer")]
@@ -150,6 +189,16 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     };
     report_materialized_view_workload(&readiness, materialized_view_store.as_ref());
 
+    let admitted_transaction_detail_wallet_channel =
+        match preflight_wallet_query_contract(&explorer_config).await {
+            Ok(channel) => channel,
+            Err(error) => {
+                let error = ExplorerConfigError::WalletQueryContract(error);
+                start_api_phase.fail(&error);
+                return Err(error);
+            }
+        };
+
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
 
@@ -159,11 +208,17 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
             .map(|materialized_view_store| {
                 spawn_materialized_view_catchup_task(materialized_view_store, cancel.clone())
             });
-    let canonical_catchup_handle =
-        spawn_canonical_catchup_task(canonical_store.clone(), cancel.clone());
+    let canonical_catchup_handle = canonical_store
+        .clone()
+        .map(|canonical_store| spawn_canonical_catchup_task(canonical_store, cancel.clone()));
 
-    let grpc_adapter =
-        build_grpc_adapter(&explorer_config, canonical_store, materialized_view_store).await;
+    let grpc_adapter = build_grpc_adapter(
+        &explorer_config,
+        canonical_store,
+        materialized_view_store,
+        admitted_transaction_detail_wallet_channel,
+    )
+    .await;
     let upstream_observation_handle =
         spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, cancel.clone())?;
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
@@ -182,12 +237,16 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     StartupPhase::Ready.start().complete();
     readiness.set(ReadinessState::ready(None));
 
+    let storage_path = explorer_config.storage.as_ref().map_or_else(
+        || "stateless".to_owned(),
+        |storage| storage.path.display().to_string(),
+    );
     tracing::info!(
         target: "zinder::explorer",
         event = "explorer_started",
         network = encode_zinder_native_chain_name(explorer_config.network),
         listen_addr = %explorer_config.listen_addr,
-        storage_path = %explorer_config.storage.path.display(),
+        storage_path,
         "explorer query gRPC server started"
     );
 
@@ -235,7 +294,7 @@ fn report_materialized_view_workload(
 async fn shutdown_background_tasks(
     ops_handle: Option<OpsEndpointHandle>,
     upstream_observation_handle: Option<JoinHandle<()>>,
-    canonical_catchup_handle: JoinHandle<()>,
+    canonical_catchup_handle: Option<JoinHandle<()>>,
     materialized_view_catchup_handle: Option<JoinHandle<()>>,
 ) {
     if let Some(handle) = ops_handle {
@@ -244,7 +303,9 @@ async fn shutdown_background_tasks(
     if let Some(handle) = upstream_observation_handle {
         let _ = handle.await;
     }
-    let _ = canonical_catchup_handle.await;
+    if let Some(handle) = canonical_catchup_handle {
+        let _ = handle.await;
+    }
     if let Some(handle) = materialized_view_catchup_handle {
         let _ = handle.await;
     }
@@ -302,20 +363,23 @@ fn build_zebra_json_rpc_source(
 
 fn open_canonical_store(
     explorer_config: &ExplorerConfig,
-) -> Result<SecondaryChainStore, ExplorerConfigError> {
+) -> Result<Option<SecondaryChainStore>, ExplorerConfigError> {
+    let Some(storage) = explorer_config.storage.as_ref() else {
+        return Ok(None);
+    };
     let open_storage_phase = StartupPhase::OpenStorage.start();
     match SecondaryChainStore::open(
-        &explorer_config.storage.path,
-        &explorer_config.storage.secondary_path,
+        &storage.path,
+        &storage.secondary_path,
         ChainStoreOptions {
-            rocksdb_resource_budget: explorer_config.storage.canonical_rocksdb_budget,
+            rocksdb_resource_budget: storage.canonical_rocksdb_budget,
             ..ChainStoreOptions::for_network(explorer_config.network)
         },
     ) {
         Ok(handle) => {
             handle.try_catch_up()?;
             open_storage_phase.complete();
-            Ok(handle)
+            Ok(Some(handle))
         }
         Err(error) => {
             let wrapped = ExplorerConfigError::CanonicalStore(error);
@@ -328,12 +392,11 @@ fn open_canonical_store(
 fn open_materialized_view_store(
     explorer_config: &ExplorerConfig,
 ) -> Result<Option<MaterializedViewStore>, ExplorerConfigError> {
-    let materialized_view_path =
-        MaterializedViewStore::path_for_canonical(&explorer_config.storage.path);
-    let secondary_path = explorer_config
-        .storage
-        .secondary_path
-        .join("materialized-views");
+    let Some(storage) = explorer_config.storage.as_ref() else {
+        return Ok(None);
+    };
+    let materialized_view_path = MaterializedViewStore::path_for_canonical(&storage.path);
+    let secondary_path = storage.secondary_path.join("materialized-views");
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let materialized_view_preset =
         match MaterializedViewStore::detect_materialized_view_preset_at_path(
@@ -371,7 +434,7 @@ fn open_materialized_view_store(
         materialized_view_preset,
         MaterializedViewStoreOptions {
             sync_writes: false,
-            rocksdb_resource_budget: explorer_config.storage.materialized_view_rocksdb_budget,
+            rocksdb_resource_budget: storage.materialized_view_rocksdb_budget,
             ..MaterializedViewStoreOptions::default()
         },
     ) {
@@ -484,16 +547,19 @@ async fn fetch_network_upgrade_activations(
 
 async fn build_grpc_adapter(
     explorer_config: &ExplorerConfig,
-    canonical_store: SecondaryChainStore,
+    canonical_store: Option<SecondaryChainStore>,
     materialized_view_store: Option<MaterializedViewStore>,
+    admitted_transaction_detail_wallet_channel: Option<AuthenticatedChannel>,
 ) -> ExplorerQueryGrpcAdapter {
     let server_info = ExplorerServerInfoSettings {
         network: explorer_config.network,
     };
     let has_materialized_view_store = materialized_view_store.is_some();
     let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info)
-        .with_canonical_store(canonical_store)
         .with_prevout_resolution_online(has_materialized_view_store);
+    if let Some(canonical_store) = canonical_store {
+        grpc_adapter = grpc_adapter.with_canonical_store(canonical_store);
+    }
     if let Some(materialized_view_store) = materialized_view_store {
         grpc_adapter = grpc_adapter.with_materialized_view_store(materialized_view_store);
     }
@@ -503,10 +569,77 @@ async fn build_grpc_adapter(
     if let Some(endpoint) = explorer_config.wallet_query_endpoint.clone() {
         grpc_adapter = grpc_adapter.with_wallet_query_endpoint(endpoint);
     }
+    if let Some(channel) = admitted_transaction_detail_wallet_channel {
+        grpc_adapter = grpc_adapter.with_admitted_transaction_detail_wallet_channel(channel);
+    }
     if let Some(token) = explorer_config.bearer_token.clone() {
         grpc_adapter = grpc_adapter.with_bearer_token(token);
     }
     grpc_adapter
+}
+
+async fn preflight_wallet_query_contract(
+    explorer_config: &ExplorerConfig,
+) -> Result<Option<AuthenticatedChannel>, WalletQueryContractError> {
+    let Some(endpoint) = explorer_config.wallet_query_endpoint.as_deref() else {
+        return Ok(None);
+    };
+    let channel = connect_zinder_grpc(endpoint, explorer_config.bearer_token.as_ref())
+        .await
+        .map_err(WalletQueryContractError::Connect)?;
+    let response = WalletQueryClient::new(channel.clone())
+        .server_info(wallet::ServerInfoRequest {})
+        .await
+        .map_err(WalletQueryContractError::Rpc)?
+        .into_inner();
+    validate_wallet_query_contract(explorer_config.network, &response)?;
+    Ok(Some(channel))
+}
+
+fn validate_wallet_query_contract(
+    network: zinder_core::Network,
+    response: &wallet::ServerInfoResponse,
+) -> Result<(), WalletQueryContractError> {
+    let descriptor = response
+        .info
+        .as_ref()
+        .ok_or(WalletQueryContractError::MissingDescriptor { field: "info" })?
+        .common
+        .as_ref()
+        .ok_or(WalletQueryContractError::MissingDescriptor {
+            field: "info.common",
+        })?;
+    if descriptor.service_name != RuntimeService::Query.binary_name() {
+        return Err(WalletQueryContractError::ServiceIdentityMismatch {
+            actual: descriptor.service_name.clone(),
+        });
+    }
+    let expected_network = encode_zinder_native_chain_name(network);
+    if descriptor.network != expected_network {
+        return Err(WalletQueryContractError::NetworkMismatch {
+            expected: expected_network,
+            actual: descriptor.network.clone(),
+        });
+    }
+    if descriptor.contract_revision < CONTRACT_REVISION {
+        return Err(WalletQueryContractError::ContractRevisionMismatch {
+            expected: CONTRACT_REVISION,
+            actual: descriptor.contract_revision,
+        });
+    }
+    if let Some(capability) = REQUIRED_TRANSACTION_DETAIL_WALLET_CAPABILITIES
+        .iter()
+        .copied()
+        .find(|capability| {
+            !descriptor
+                .capabilities
+                .iter()
+                .any(|advertised| advertised == capability)
+        })
+    {
+        return Err(WalletQueryContractError::MissingCapability { capability });
+    }
+    Ok(())
 }
 
 fn emit_runtime_error(error: &ExplorerConfigError) -> ExitCode {
@@ -530,5 +663,102 @@ impl From<Cli> for ExplorerConfigOverrides {
             bearer_token_path: cli.bearer_token_path,
             wallet_query_endpoint: cli.wallet_query_endpoint,
         }
+    }
+}
+
+#[cfg(test)]
+mod wallet_query_contract_tests {
+    use zinder_core::Network;
+    use zinder_proto::v1::wallet;
+    use zinder_proto::{CONTRACT_REVISION, capabilities::WALLET_READ_TRANSACTION_BYTES_V1};
+
+    use super::{WalletQueryContractError, validate_wallet_query_contract};
+
+    fn admitted_response() -> wallet::ServerInfoResponse {
+        let info = zinder_query::build_wallet_server_info(&zinder_query::ServerInfoSettings {
+            network: "zcash-regtest".to_owned(),
+            transaction_blobs_retained: true,
+            transparent_outpoint_spend_available: true,
+            capability_profile: zinder_query::WalletCapabilityProfile::ExactPair,
+            ..zinder_query::ServerInfoSettings::default()
+        });
+        wallet::ServerInfoResponse { info: Some(info) }
+    }
+
+    fn common_descriptor_mut(
+        response: &mut wallet::ServerInfoResponse,
+    ) -> Result<&mut zinder_proto::v1::ops::ServerInfo, &'static str> {
+        response
+            .info
+            .as_mut()
+            .and_then(|info| info.common.as_mut())
+            .ok_or("test response must contain common descriptor")
+    }
+
+    #[test]
+    fn wallet_query_contract_rejects_a_missing_required_capability() -> Result<(), &'static str> {
+        let mut response = admitted_response();
+        common_descriptor_mut(&mut response)?
+            .capabilities
+            .retain(|capability| capability != WALLET_READ_TRANSACTION_BYTES_V1);
+
+        assert!(matches!(
+            validate_wallet_query_contract(Network::ZcashRegtest, &response),
+            Err(WalletQueryContractError::MissingCapability { capability })
+                if capability == WALLET_READ_TRANSACTION_BYTES_V1
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_query_contract_rejects_the_wrong_network() -> Result<(), &'static str> {
+        let mut response = admitted_response();
+        common_descriptor_mut(&mut response)?.network = "zcash-testnet".to_owned();
+
+        assert!(matches!(
+            validate_wallet_query_contract(Network::ZcashRegtest, &response),
+            Err(WalletQueryContractError::NetworkMismatch {
+                expected: "zcash-regtest",
+                actual,
+            }) if actual == "zcash-testnet"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_query_contract_accepts_a_newer_contract_revision() -> Result<(), &'static str> {
+        let mut response = admitted_response();
+        common_descriptor_mut(&mut response)?.contract_revision = CONTRACT_REVISION + 1;
+
+        assert!(validate_wallet_query_contract(Network::ZcashRegtest, &response).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_query_contract_rejects_an_older_contract_revision() -> Result<(), &'static str> {
+        let mut response = admitted_response();
+        common_descriptor_mut(&mut response)?.contract_revision = CONTRACT_REVISION - 1;
+
+        assert!(matches!(
+            validate_wallet_query_contract(Network::ZcashRegtest, &response),
+            Err(WalletQueryContractError::ContractRevisionMismatch {
+                expected: CONTRACT_REVISION,
+                actual,
+            }) if actual == CONTRACT_REVISION - 1
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_query_contract_rejects_the_wrong_service_identity() -> Result<(), &'static str> {
+        let mut response = admitted_response();
+        common_descriptor_mut(&mut response)?.service_name = "zinder-explorer".to_owned();
+
+        assert!(matches!(
+            validate_wallet_query_contract(Network::ZcashRegtest, &response),
+            Err(WalletQueryContractError::ServiceIdentityMismatch { actual })
+                if actual == "zinder-explorer"
+        ));
+        Ok(())
     }
 }

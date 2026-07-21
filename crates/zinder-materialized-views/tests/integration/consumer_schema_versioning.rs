@@ -7,6 +7,8 @@ use tempfile::TempDir;
 use zinder_materialized_views::{
     MaterializedViewConsumerName, MaterializedViewConsumerSchema, MaterializedViewStore,
     MaterializedViewStoreError, MaterializedViewStoreOptions, MaterializedViewStoreTable,
+    RECENT_TRANSACTIONS_COLUMN_FAMILY, RECENT_TRANSACTIONS_CONSUMER_NAME,
+    RECENT_TRANSACTIONS_SCHEMA,
 };
 use zinder_store::RocksDbResourceBudget;
 
@@ -41,6 +43,12 @@ const CONSUMER_A_ON_RESERVED_CF: MaterializedViewConsumerSchema =
         1,
         &[MaterializedViewStoreTable::ChainEventCursor.column_family_name()],
     );
+const RECENT_TRANSACTIONS_SCHEMA_V1: MaterializedViewConsumerSchema =
+    MaterializedViewConsumerSchema::new(
+        RECENT_TRANSACTIONS_CONSUMER_NAME,
+        1,
+        &[RECENT_TRANSACTIONS_COLUMN_FAMILY],
+    );
 
 const BOTH_V1: &[MaterializedViewConsumerSchema] = &[CONSUMER_A_V1, CONSUMER_B_V1];
 const A_AND_EMPTY_B_V1: &[MaterializedViewConsumerSchema] = &[CONSUMER_A_V1, CONSUMER_B_EMPTY_V1];
@@ -53,6 +61,10 @@ const ONLY_A_TWO_CFS_REORDERED_V1: &[MaterializedViewConsumerSchema] =
 const DUPLICATE_CF: &[MaterializedViewConsumerSchema] = &[CONSUMER_A_V1, CONSUMER_B_ON_A_CF];
 const RESERVED_CF: &[MaterializedViewConsumerSchema] = &[CONSUMER_A_ON_RESERVED_CF];
 const ONLY_C_ON_A_CF: &[MaterializedViewConsumerSchema] = &[CONSUMER_C_ON_A_CF];
+const ONLY_RECENT_TRANSACTIONS_V1: &[MaterializedViewConsumerSchema] =
+    &[RECENT_TRANSACTIONS_SCHEMA_V1];
+const ONLY_RECENT_TRANSACTIONS_V2: &[MaterializedViewConsumerSchema] =
+    &[RECENT_TRANSACTIONS_SCHEMA];
 
 fn options(consumers: &'static [MaterializedViewConsumerSchema]) -> MaterializedViewStoreOptions {
     MaterializedViewStoreOptions {
@@ -115,6 +127,43 @@ fn higher_declared_consumer_schema_rejects_lower_manifest_without_mutation() -> 
     assert_eq!(
         store.get_chain_event_cursor(CONSUMER_B)?,
         Some(b"cursor-b".to_vec())
+    );
+    Ok(())
+}
+
+#[test]
+fn recent_transactions_v2_rejects_v1_key_rows_without_mutation() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    {
+        let store = open(tempdir.path(), ONLY_RECENT_TRANSACTIONS_V1)?;
+        store.put_consumer(
+            RECENT_TRANSACTIONS_COLUMN_FAMILY,
+            b"version-one-key",
+            b"version-one-row",
+        )?;
+        store.put_chain_event_cursor(RECENT_TRANSACTIONS_CONSUMER_NAME, b"version-one-cursor")?;
+    }
+    let column_families_before = column_family_set(tempdir.path());
+
+    let outcome = MaterializedViewStore::open(tempdir.path(), options(ONLY_RECENT_TRANSACTIONS_V2));
+
+    assert!(matches!(
+        outcome,
+        Err(MaterializedViewStoreError::ConsumerSchemaMismatch {
+            consumer,
+            persisted: Some(1),
+            running: 2,
+        }) if consumer == RECENT_TRANSACTIONS_CONSUMER_NAME.as_str()
+    ));
+    assert_eq!(column_family_set(tempdir.path()), column_families_before);
+    let store = open(tempdir.path(), ONLY_RECENT_TRANSACTIONS_V1)?;
+    assert_eq!(
+        store.get_consumer(RECENT_TRANSACTIONS_COLUMN_FAMILY, b"version-one-key",)?,
+        Some(b"version-one-row".to_vec()),
+    );
+    assert_eq!(
+        store.get_chain_event_cursor(RECENT_TRANSACTIONS_CONSUMER_NAME)?,
+        Some(b"version-one-cursor".to_vec()),
     );
     Ok(())
 }

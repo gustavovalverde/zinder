@@ -235,6 +235,9 @@ impl CompactBlockArtifact {
         {
             return Err(CompactBlockArtifactError::InvalidTransactionOrder);
         }
+        // Finalized artifacts normalize away spare capacity so consumers can
+        // account the private transaction allocation from `transactions().len()`.
+        let transactions = transactions.into_boxed_slice().into_vec();
         Ok(Self {
             height: block_id.height,
             block_hash: block_id.hash,
@@ -316,4 +319,45 @@ pub enum CompactBlockArtifactError {
     /// Transaction indexes are duplicated or decrease.
     #[error("compact transaction indexes are not strictly increasing")]
     InvalidTransactionOrder,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompactBlockArtifact, CompactChainMetadata, CompactTransaction};
+    use crate::{BlockHash, BlockHeight, BlockId, CompactTransactionData, TransactionId};
+
+    #[test]
+    fn compact_block_constructor_discards_transaction_spare_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut transactions = Vec::with_capacity(16);
+        transactions.push(CompactTransaction {
+            index: 0,
+            transaction_id: TransactionId::from_bytes([0x33; 32]),
+            data: CompactTransactionData {
+                fee_zat: None,
+                sapling_spends: Vec::new(),
+                sapling_outputs: Vec::new(),
+                orchard_actions: Vec::new(),
+                ironwood_actions: Vec::new(),
+                transparent_inputs: Vec::new(),
+                transparent_outputs: Vec::new(),
+            },
+        });
+        assert!(transactions.capacity() > transactions.len());
+
+        let block = CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(7), BlockHash::from_bytes([0x11; 32])),
+            BlockHash::from_bytes([0x22; 32]),
+            1_700_000_000,
+            transactions,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        )?;
+
+        assert_eq!(block.transactions.capacity(), block.transactions.len());
+        Ok(())
+    }
 }

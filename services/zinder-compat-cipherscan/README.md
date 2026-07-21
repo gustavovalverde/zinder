@@ -21,12 +21,12 @@ defines the acceptance probes.
 ## Deployment status
 
 This service compiles in the workspace but is not a release image. The checked
-single-host composition publishes `zinder-ingest`, `zinder-projector`, and
-`zinder-compat-lightwalletd`; it does not publish standalone `WalletQuery` or
-`ExplorerQuery` endpoints. Running the Cipherscan adapter therefore requires a
-custom composition that supplies both native gRPC dependencies on the same
-network. Do not treat the checked wallet-serving Compose file as an end-to-end
-Cipherscan deployment.
+single-host composition publishes `zinder-ingest`, `zinder-projector`, the
+native `WalletQuery`, and `zinder-compat-lightwalletd`; it does not publish an
+`ExplorerQuery` endpoint or the Cipherscan adapter. Running the adapter
+therefore requires a custom composition that supplies both native gRPC
+dependencies on the same network. Do not treat the checked wallet-serving
+Compose file as an end-to-end Cipherscan deployment.
 
 ## Configuration
 
@@ -68,16 +68,40 @@ dependencies.
 
 ## Readiness
 
-`/healthz` proves the process is alive. `/readyz` proves startup dependencies
-were connected. Neither proves that every materialized view covers an
-arbitrary requested range. Deployment probes must include at least one
-data-bearing route and must preserve explicit unavailable or degraded results.
+`/healthz` proves the process is alive. `/readyz` proves both native query
+dependencies connected and passed startup admission for service identity,
+network, minimum contract revision, and the stateless retained-transaction baseline:
+Explorer server info plus transaction detail, and Wallet server info plus
+transaction status and retained transaction bytes. Readiness does not certify
+the adapter's block, address, fee, broadcast, or materialized-view routes.
+Those registered routes remain deployment-dependent and return `503` with
+`code = "capability_unavailable"` when the connected native service reports
+`UNIMPLEMENTED`; they must not return an empty success. Readiness also does not
+prove that a configured materialized view covers an arbitrary requested range.
+Deployment probes must include the data-bearing routes required by that
+deployment and must preserve explicit unavailable or degraded results.
+Coinbase transaction detail uses block detail only as optional enrichment for
+the full output total. A deployment that reports that method as
+`UNIMPLEMENTED` still serves the transaction with `totalOutput = null` and an
+explicit `zinderUnavailable` reason; other upstream failures continue through
+the normal error mapping.
+
+The root WebSocket is admitted separately because its Cipherscan contract needs
+`wallet.events.chain_v1` for `new_block` frames and
+`wallet.events.mempool_v2` for transaction frames. It also needs
+`explorer.block.production_series_v2` to hydrate visible commits into complete
+`new_block` frames. The exact-pair `zinder-query` runtime advertises the Wallet
+pair only when both native streams are operational. When any of the three
+capabilities is absent, `GET /` returns `503` with
+`code = "realtime_unavailable"` instead of accepting a WebSocket that cannot
+deliver the complete stream. This gate does not make realtime a REST readiness
+dependency.
 
 ```bash
 curl --fail http://127.0.0.1:9108/healthz
 curl --fail http://127.0.0.1:9108/readyz
-curl --fail http://127.0.0.1:9070/api/info
-curl --fail 'http://127.0.0.1:9070/api/mining/pool-distribution?period=7d'
+curl --fail http://127.0.0.1:9070/api/tx/<retained-transaction-id>
+curl --fail http://127.0.0.1:9070/api/tx/<retained-transaction-id>/raw
 ```
 
 The adapter keeps only bounded in-memory caches and can restart without a

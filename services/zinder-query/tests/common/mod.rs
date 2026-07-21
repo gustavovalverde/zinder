@@ -420,21 +420,21 @@ fn synthetic_block_compact(height: u32) -> CompactBlockArtifact {
 }
 
 /// Creates a compact block artifact whose payload encodes the given commitment-tree sizes.
-#[must_use]
 pub fn compact_block_with_tree_sizes(
-    height: BlockHeight,
-    block_hash: BlockHash,
+    block_header: &BlockHeaderArtifact,
     sapling_commitment_tree_size: u32,
     orchard_commitment_tree_size: u32,
-) -> CompactBlockArtifact {
-    CompactBlockArtifact::empty(
-        BlockId::new(height, block_hash),
-        block_hash_from_seed(height.value().saturating_sub(1)),
-        0,
+) -> eyre::Result<CompactBlockArtifact> {
+    let block_time = u32::try_from(block_header.block_time)
+        .map_err(|_| eyre::eyre!("fixture block time does not fit the compact-block contract"))?;
+    Ok(CompactBlockArtifact::empty(
+        BlockId::new(block_header.height, block_header.block_hash),
+        block_header.parent_hash,
+        block_time,
         CompactChainMetadata {
             sapling_commitment_tree_size,
             orchard_commitment_tree_size,
             ironwood_commitment_tree_size: 0,
         },
-    )
+    ))
 }

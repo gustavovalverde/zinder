@@ -116,6 +116,23 @@ fn transaction_history_policies_require_typed_projection_readiness_and_wallet_qu
 }
 
 #[test]
+fn transaction_detail_policy_requires_explicit_wallet_contract_admission() {
+    let endpoint_only = ExplorerReadiness {
+        wallet_query_online: true,
+        ..ExplorerReadiness::default()
+    };
+    assert!(
+        !AdvertisePolicy::RequiresAdmittedTransactionDetailWallet.explorer_satisfied(endpoint_only)
+    );
+
+    let admitted = ExplorerReadiness {
+        transaction_detail_wallet_admitted: true,
+        ..endpoint_only
+    };
+    assert!(AdvertisePolicy::RequiresAdmittedTransactionDetailWallet.explorer_satisfied(admitted));
+}
+
+#[test]
 fn retention_none_advertises_neither_full_block_nor_transaction_bytes() {
     let advertised = advertised_wallet_capabilities(false, false);
     assert!(!advertised.contains(WALLET_READ_FULL_BLOCK_AT_V1));

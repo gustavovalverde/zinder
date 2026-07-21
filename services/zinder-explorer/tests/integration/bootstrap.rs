@@ -25,33 +25,37 @@ use zinder_core::{
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_materialized_views::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer,
-    MaterializedViewStore, MaterializedViewStoreOptions, REORG_INCIDENTS_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY, TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
-    TransparentAddressDeltasConsumer,
+    MaterializedViewStore, MaterializedViewStoreOptions, RECENT_TRANSACTIONS_COLUMN_FAMILY,
+    RECENT_TRANSACTIONS_SCHEMA, REORG_INCIDENTS_CONSUMER_NAME, RecentTransactionsConsumer,
+    TRANSACTION_FEES_SCHEMA, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
+    TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, TransparentAddressDeltasConsumer,
 };
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
     EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_TRANSACTIONS_V2, EXPLORER_CHAIN_REORG_HISTORY_V1,
     EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V4,
-    EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
+    EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSACTION_RECENT_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
 };
 use zinder_proto::v1::explorer::{
     BlockActivityDistributionRequest, BlockDetailRequest, BlockProductionSeriesRequest,
     BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, BlockTransactionsResponse,
-    ChainReorgHistoryRequest, OverviewSnapshotRequest, PrevoutResolutionStatus, ServerInfoRequest,
-    TransactionDetailRequest, TransactionDetailResponse, TransparentAddressDeltasRecord,
-    TransparentAddressDeltasRequest, TransparentDeltaKind, block_detail_request,
-    explorer_query_client::ExplorerQueryClient,
+    ChainReorgHistoryRequest, OverviewSnapshotRequest, PrevoutResolutionStatus,
+    RecentTransactionEntry, RecentTransactionsRequest, ServerInfoRequest, TransactionDetailRequest,
+    TransactionDetailResponse, TransparentAddressDeltasRecord, TransparentAddressDeltasRequest,
+    TransparentDeltaKind, block_detail_request, explorer_query_client::ExplorerQueryClient,
 };
 use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_runtime::connect_zinder_grpc;
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainStoreOptions, ReorgWindowChange, SecondaryChainStore,
+    ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention, ReorgWindowChange,
+    SecondaryChainStore,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, StoreFixture, encode_fixture_block_replay,
@@ -246,6 +250,91 @@ async fn explorer_query_serves_block_summary_from_secondary_materialized_view_st
     assert_eq!(response.summaries.len(), 1);
     assert_eq!(response.summaries[0].block_height, 1);
     assert_eq!(response.summaries[0].confirmations, 1);
+
+    explorer_handle.abort();
+    let _ = explorer_handle.await;
+    wallet_handle.abort();
+    let _ = wallet_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recent_transactions_returns_exact_newest_hundred_in_descending_block_position()
+-> Result<()> {
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let (_store_fixture, wallet_addr, wallet_handle) =
+        spawn_wallet_query_server(&chain_fixture).await?;
+    let seeded_materialized_view_store =
+        seeded_recent_transactions_materialized_view_store(&chain_fixture)?;
+    let (mut client, explorer_handle) =
+        spawn_explorer_query_server(seeded_materialized_view_store.secondary_store, wallet_addr)
+            .await?;
+
+    let server_info = client.server_info(ServerInfoRequest {}).await?.into_inner();
+    let capabilities = server_info
+        .info
+        .as_ref()
+        .and_then(|info| info.common.as_ref())
+        .ok_or_else(|| eyre!("explorer server info missing common descriptor"))?
+        .capabilities
+        .as_slice();
+    assert_advertises_capability(capabilities, EXPLORER_TRANSACTION_RECENT_V1);
+
+    let mut first_stream = client
+        .recent_transactions(RecentTransactionsRequest {
+            max_entries: 100,
+            from_cursor: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    let first_chunk = first_stream
+        .message()
+        .await?
+        .ok_or_else(|| eyre!("recent-transactions stream ended before its first chunk"))?;
+    assert!(first_stream.message().await?.is_none());
+    assert_eq!(first_chunk.entries.len(), 100);
+    let expected_first_page = (1_u32..=100)
+        .rev()
+        .map(recent_transaction_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first_chunk
+            .entries
+            .iter()
+            .map(|entry| entry.transaction_id.clone())
+            .collect::<Vec<_>>(),
+        expected_first_page,
+    );
+    assert!(
+        first_chunk
+            .entries
+            .iter()
+            .all(|entry| entry.block_height == 2)
+    );
+
+    let mut resumed_stream = client
+        .recent_transactions(RecentTransactionsRequest {
+            max_entries: 10,
+            from_cursor: first_chunk.cursor,
+        })
+        .await?
+        .into_inner();
+    let resumed_chunk = resumed_stream
+        .message()
+        .await?
+        .ok_or_else(|| eyre!("resumed recent-transactions stream ended before its first chunk"))?;
+    assert!(resumed_stream.message().await?.is_none());
+    assert_eq!(resumed_chunk.entries.len(), 2);
+    assert_eq!(
+        resumed_chunk.entries[0].transaction_id,
+        recent_transaction_id(0)
+    );
+    assert_eq!(resumed_chunk.entries[0].block_height, 2);
+    assert_eq!(
+        resumed_chunk.entries[1].transaction_id,
+        recent_transaction_id(1_000),
+    );
+    assert_eq!(resumed_chunk.entries[1].block_height, 1);
 
     explorer_handle.abort();
     let _ = explorer_handle.await;
@@ -460,31 +549,169 @@ async fn explorer_query_serves_canonical_block_transactions_with_partial_fact_re
 
 #[tokio::test]
 async fn explorer_query_transaction_detail_preserves_canonical_transparent_rows() -> Result<()> {
-    let mut fixture = block_transactions_test_fixture().await?;
-    let first = fixture
-        .client
+    let (chain_fixture, transaction_id_strings) = stateless_transaction_detail_chain_fixture()?;
+    let (_wallet_store_fixture, wallet_addr, wallet_handle) =
+        spawn_wallet_query_server(&chain_fixture).await?;
+    let (mut client, explorer_handle) = spawn_stateless_explorer_query_server(wallet_addr).await?;
+    let first = client
         .transaction_detail(TransactionDetailRequest {
-            transaction_id: fixture.transaction_id_strings[0].clone(),
+            transaction_id: transaction_id_strings[0].clone(),
             at_epoch_id: Some(1),
         })
         .await?
         .into_inner();
-    assert_transaction_detail_output_spends(&first, &fixture.transaction_id_strings)?;
+    assert_transaction_detail_output_spends(&first, &transaction_id_strings)?;
 
-    let second = fixture
-        .client
+    let second = client
         .transaction_detail(TransactionDetailRequest {
-            transaction_id: fixture.transaction_id_strings[1].clone(),
+            transaction_id: transaction_id_strings[1].clone(),
             at_epoch_id: Some(1),
         })
         .await?
         .into_inner();
-    assert_transaction_detail_inputs(&second, &fixture.transaction_id_strings)?;
+    assert_transaction_detail_inputs(&second, &transaction_id_strings)?;
 
-    fixture.explorer_handle.abort();
-    let _ = fixture.explorer_handle.await;
-    fixture.wallet_handle.abort();
-    let _ = fixture.wallet_handle.await;
+    explorer_handle.abort();
+    let _ = explorer_handle.await;
+    wallet_handle.abort();
+    let _ = wallet_handle.await;
+    Ok(())
+}
+
+fn stateless_transaction_detail_chain_fixture() -> Result<(ChainFixture, Vec<String>)> {
+    let base_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(1);
+    let block = base_fixture
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("fixture block missing"))?;
+    let activations = sample_regtest_upgrade_activations();
+
+    let first_bytes = transparent_v1_transaction_bytes(
+        &[TransparentOutPoint::new(
+            TransactionId::from_bytes([0xA5; 32]),
+            0,
+        )],
+        &[(21_000, vec![0x51]), (34_000, vec![0x52])],
+    )?;
+    let first = parsed_transaction_rows(block.height, block.hash, 0, first_bytes, &activations)?;
+    let parent_bytes = transparent_v1_transaction_bytes(
+        &[TransparentOutPoint::new(
+            TransactionId::from_bytes([0xA1; 32]),
+            0,
+        )],
+        &[
+            (1_000, vec![0x51]),
+            (2_000, vec![0x51]),
+            (3_000, vec![0x51]),
+            (4_000, vec![0x51]),
+            (60_000, vec![0x53]),
+        ],
+    )?;
+    let parent = parsed_transaction_rows(block.height, block.hash, 2, parent_bytes, &activations)?;
+    let parent_transaction_id = parent.location.transaction_id;
+    let second_bytes = transparent_v1_transaction_bytes(
+        &[
+            TransparentOutPoint::new(parent_transaction_id, 4),
+            TransparentOutPoint::new(first.location.transaction_id, 0),
+        ],
+        &[],
+    )?;
+    let second = parsed_transaction_rows(block.height, block.hash, 1, second_bytes, &activations)?;
+    let spend = TransparentSpendFact::new(
+        TransparentOutPoint::new(first.location.transaction_id, 0),
+        1,
+        second.location.transaction_id,
+        1,
+        block.height,
+        block.hash,
+        21_000,
+        TransparentAddressScriptHash::of_script_pub_key(&[0x51]),
+        block.height,
+        block.hash,
+    );
+    let transaction_ids = vec![
+        encode_rpc_transaction_id_hex(first.location.transaction_id),
+        encode_rpc_transaction_id_hex(second.location.transaction_id),
+        encode_rpc_transaction_id_hex(parent_transaction_id),
+    ];
+    Ok((
+        base_fixture
+            .with_transaction_rows(first)
+            .with_transaction_rows(second)
+            .with_transaction_rows(parent)
+            .with_transparent_spend_fact(spend),
+        transaction_ids,
+    ))
+}
+
+fn parsed_transaction_rows(
+    block_height: BlockHeight,
+    block_hash: BlockHash,
+    transaction_index: u32,
+    raw_transaction_bytes: Vec<u8>,
+    activations: &zinder_core::NetworkUpgradeActivations,
+) -> Result<FixtureTransactionRows> {
+    let parsed = zinder_source::parse_transaction_public_fact_set(
+        &raw_transaction_bytes,
+        Some(block_height),
+        activations,
+    )?;
+    let transaction_id = parsed.public_facts.transaction_id;
+    let rows = FixtureTransactionRows::from_raw_transaction(
+        transaction_id,
+        block_height,
+        block_hash,
+        transaction_index,
+        raw_transaction_bytes,
+    );
+    Ok(FixtureTransactionRows {
+        facts: zinder_core::TransactionFactsArtifact::new(rows.location, parsed.public_facts)
+            .with_transparent_facts(parsed.transparent_inputs, parsed.transparent_outputs),
+        intrinsic_value_balances: Some(parsed.intrinsic_value_balances),
+        ..rows
+    })
+}
+
+fn transparent_v1_transaction_bytes(
+    inputs: &[TransparentOutPoint],
+    outputs: &[(u64, Vec<u8>)],
+) -> Result<Vec<u8>> {
+    let mut bytes = vec![1, 0, 0, 0];
+    append_compact_size(&mut bytes, inputs.len())?;
+    for input in inputs {
+        bytes.extend_from_slice(&input.transaction_id.as_bytes());
+        bytes.extend_from_slice(&input.output_index.to_le_bytes());
+        if input.is_coinbase_sentinel() {
+            bytes.extend_from_slice(&[2, 1, 1]);
+        } else {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+    }
+    append_compact_size(&mut bytes, outputs.len())?;
+    for (value_zat, script_pub_key) in outputs {
+        bytes.extend_from_slice(&value_zat.to_le_bytes());
+        append_compact_size(&mut bytes, script_pub_key.len())?;
+        bytes.extend_from_slice(script_pub_key);
+    }
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    Ok(bytes)
+}
+
+fn append_compact_size(bytes: &mut Vec<u8>, count: usize) -> Result<()> {
+    if count < 253 {
+        bytes.push(u8::try_from(count)?);
+    } else if let Ok(encoded_count) = u16::try_from(count) {
+        bytes.push(253);
+        bytes.extend_from_slice(&encoded_count.to_le_bytes());
+    } else if let Ok(encoded_count) = u32::try_from(count) {
+        bytes.push(254);
+        bytes.extend_from_slice(&encoded_count.to_le_bytes());
+    } else {
+        bytes.push(255);
+        bytes.extend_from_slice(&u64::try_from(count)?.to_le_bytes());
+    }
     Ok(())
 }
 
@@ -492,27 +719,9 @@ async fn explorer_query_transaction_detail_preserves_canonical_transparent_rows(
 async fn transaction_detail_batches_spent_output_lookup_beyond_wallet_request_limit() -> Result<()>
 {
     let (chain_fixture, transaction_ids) = many_output_spend_chain_fixture()?;
-    let (wallet_store_fixture, wallet_addr, wallet_handle) =
+    let (_wallet_store_fixture, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
-    let canonical_store = SecondaryChainStore::open(
-        wallet_store_fixture.tempdir_path(),
-        wallet_store_fixture
-            .tempdir_path()
-            .join("many-output-canonical-secondary"),
-        ChainStoreOptions::for_local_tests(),
-    )?;
-    canonical_store.try_catch_up()?;
-    let seeded_materialized_view_store =
-        seeded_block_summary_materialized_view_store_with_transaction_ids(
-            &chain_fixture,
-            &transaction_ids,
-        )?;
-    let (mut client, explorer_handle) = spawn_explorer_query_server_with_canonical_store(
-        seeded_materialized_view_store.secondary_store,
-        canonical_store,
-        wallet_addr,
-    )
-    .await?;
+    let (mut client, explorer_handle) = spawn_stateless_explorer_query_server(wallet_addr).await?;
 
     let detail = client
         .transaction_detail(TransactionDetailRequest {
@@ -552,53 +761,35 @@ async fn transaction_detail_batches_spent_output_lookup_beyond_wallet_request_li
 }
 
 fn many_output_spend_chain_fixture() -> Result<(ChainFixture, Vec<String>)> {
-    let base_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let base_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(1);
     let block = base_fixture
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre!("fixture block missing"))?;
-    let creating_transaction_id = TransactionId::from_bytes([0xD1; 32]);
-    let spending_transaction_id = TransactionId::from_bytes([0xD2; 32]);
     let output_count = MAX_TRANSPARENT_OUTPUTS_PER_REQUEST + 1;
     let outputs = (0..output_count)
-        .map(|output_index| {
-            Ok(transparent_output_fact(
-                u32::try_from(output_index)?,
-                u64::try_from(output_index)? + 1,
-                vec![0x51],
-            ))
-        })
+        .map(|output_index| Ok((u64::try_from(output_index)? + 1, vec![0x51])))
         .collect::<Result<Vec<_>>>()?;
-    let mut creating_facts = synthetic_transaction_public_facts(creating_transaction_id, 120);
-    creating_facts.is_coinbase = true;
-    creating_facts.counts.transparent_input_count = 1;
-    creating_facts.counts.transparent_output_count = u32::try_from(output_count)?;
-    let creating_transaction = FixtureTransactionRows::from_public_facts(
-        TransactionLocation::new(creating_transaction_id, block.height, block.hash, 0),
-        creating_facts,
-    );
-    let creating_transaction = FixtureTransactionRows {
-        facts: creating_transaction
-            .facts
-            .with_transparent_facts(Vec::new(), outputs),
-        ..creating_transaction
-    };
+    let activations = sample_regtest_upgrade_activations();
+    let creating_bytes = transparent_v1_transaction_bytes(
+        &[TransparentOutPoint::new(
+            TransactionId::from_bytes([0xD0; 32]),
+            0,
+        )],
+        &outputs,
+    )?;
+    let creating_transaction =
+        parsed_transaction_rows(block.height, block.hash, 0, creating_bytes, &activations)?;
+    let creating_transaction_id = creating_transaction.location.transaction_id;
     let spent_outpoint = TransparentOutPoint::new(
         creating_transaction_id,
         u32::try_from(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST)?,
     );
-    let mut spending_facts = synthetic_transaction_public_facts(spending_transaction_id, 80);
-    spending_facts.counts.transparent_input_count = 1;
-    let spending_transaction = FixtureTransactionRows::from_public_facts(
-        TransactionLocation::new(spending_transaction_id, block.height, block.hash, 1),
-        spending_facts,
-    );
-    let spending_transaction = FixtureTransactionRows {
-        facts: spending_transaction.facts.with_transparent_facts(
-            vec![TransparentInputFact::new(0, spent_outpoint)],
-            Vec::new(),
-        ),
-        ..spending_transaction
-    };
+    let spending_bytes = transparent_v1_transaction_bytes(&[spent_outpoint], &[])?;
+    let spending_transaction =
+        parsed_transaction_rows(block.height, block.hash, 1, spending_bytes, &activations)?;
+    let spending_transaction_id = spending_transaction.location.transaction_id;
     let final_output_value = u64::try_from(output_count)?;
     let spend = TransparentSpendFact::new(
         spent_outpoint,
@@ -629,7 +820,13 @@ fn assert_transaction_detail_output_spends(
     detail: &TransactionDetailResponse,
     transaction_ids: &[String],
 ) -> Result<()> {
-    assert_eq!(detail.transparent_inputs.len(), 0);
+    assert_eq!(detail.transparent_inputs.len(), 1);
+    assert!(detail.transparent_inputs[0].value_zat.is_none());
+    assert_eq!(
+        detail.prevout_resolution_status,
+        PrevoutResolutionStatus::Partial as i32
+    );
+    assert_eq!(detail.paid_fee_zat, None);
     assert_eq!(detail.transparent_outputs.len(), 2);
     assert_eq!(detail.transparent_outputs[0].output_index, 0);
     let first_output = detail.transparent_outputs[0]
@@ -671,10 +868,7 @@ fn assert_transaction_detail_inputs(
         .spent_outpoint
         .as_ref()
         .ok_or_else(|| eyre!("transaction detail input missing spent outpoint"))?;
-    assert_eq!(
-        spent_outpoint.transaction_id,
-        encode_rpc_transaction_id_hex(TransactionId::from_bytes([0xA1; 32]))
-    );
+    assert_eq!(spent_outpoint.transaction_id, transaction_ids[2]);
     assert_eq!(spent_outpoint.output_index, 4);
     assert_eq!(
         detail.prevout_resolution_status,
@@ -1477,6 +1671,74 @@ async fn spawn_wallet_query_server(
     Ok((store_fixture, addr, handle))
 }
 
+fn recent_transaction_id(marker: u32) -> String {
+    let mut bytes = [0_u8; 32];
+    bytes[..4].copy_from_slice(&marker.to_be_bytes());
+    encode_rpc_transaction_id_hex(TransactionId::from_bytes(bytes))
+}
+
+fn seeded_recent_transactions_materialized_view_store(
+    chain_fixture: &ChainFixture,
+) -> Result<SeededMaterializedViewStore> {
+    let tempdir = tempfile::tempdir()?;
+    let primary_path = tempdir.path().join("materialized-view-primary");
+    let secondary_path = tempdir.path().join("materialized-view-secondary");
+    let primary_store = MaterializedViewStore::open(
+        &primary_path,
+        MaterializedViewStoreOptions {
+            sync_writes: false,
+            consumers: &[RECENT_TRANSACTIONS_SCHEMA, TRANSACTION_FEES_SCHEMA],
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        },
+    )?;
+    let older_block = chain_fixture
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("fixture block 1 missing"))?;
+    let newer_block = chain_fixture
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre!("fixture block 2 missing"))?;
+    seed_recent_transaction_row(&primary_store, older_block, 0, 1_000)?;
+    for position in 0_u32..=100 {
+        seed_recent_transaction_row(&primary_store, newer_block, position, position)?;
+    }
+
+    let secondary_store = MaterializedViewStore::open_secondary(
+        &primary_path,
+        &secondary_path,
+        MaterializedViewStoreOptions {
+            sync_writes: false,
+            consumers: &[RECENT_TRANSACTIONS_SCHEMA, TRANSACTION_FEES_SCHEMA],
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        },
+    )?;
+    secondary_store.try_catch_up()?;
+    Ok(SeededMaterializedViewStore {
+        _tempdir: tempdir,
+        secondary_store,
+    })
+}
+
+fn seed_recent_transaction_row(
+    store: &MaterializedViewStore,
+    block: &zinder_testkit::FixtureBlock,
+    position: u32,
+    marker: u32,
+) -> Result<()> {
+    let entry = RecentTransactionEntry {
+        transaction_id: recent_transaction_id(marker),
+        block_height: block.height.value(),
+        block_hash: encode_rpc_block_hash_hex(block.hash),
+        block_time_unix_seconds: i64::from(block.block_time_seconds),
+        ..Default::default()
+    };
+    store.put_consumer(
+        RECENT_TRANSACTIONS_COLUMN_FAMILY,
+        &RecentTransactionsConsumer::key_for_row(block.height, position),
+        &entry.encode_to_vec(),
+    )?;
+    Ok(())
+}
+
 fn seeded_block_summary_materialized_view_store(
     chain_fixture: &ChainFixture,
 ) -> Result<SeededMaterializedViewStore> {
@@ -1574,12 +1836,37 @@ async fn spawn_explorer_query_server(
 ) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    let wallet_endpoint = format!("http://{wallet_addr}");
+    let wallet_channel = connect_zinder_grpc(&wallet_endpoint, None).await?;
     let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
         network: Network::ZcashRegtest,
     })
     .with_materialized_view_store(materialized_view_store)
-    .with_wallet_query_endpoint(format!("http://{wallet_addr}"))
+    .with_wallet_query_endpoint(wallet_endpoint)
+    .with_admitted_transaction_detail_wallet_channel(wallet_channel)
     .with_prevout_resolution_online(true);
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    let channel = await_with_retry(addr).await?;
+    Ok((ExplorerQueryClient::new(channel), handle))
+}
+
+async fn spawn_stateless_explorer_query_server(
+    wallet_addr: SocketAddr,
+) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let wallet_endpoint = format!("http://{wallet_addr}");
+    let wallet_channel = connect_zinder_grpc(&wallet_endpoint, None).await?;
+    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
+        network: Network::ZcashRegtest,
+    })
+    .with_network_upgrade_activations(Arc::new(sample_regtest_upgrade_activations()))
+    .with_admitted_transaction_detail_wallet_channel(wallet_channel);
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(adapter.into_server())
@@ -1597,12 +1884,15 @@ async fn spawn_explorer_query_server_with_canonical_store(
 ) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    let wallet_endpoint = format!("http://{wallet_addr}");
+    let wallet_channel = connect_zinder_grpc(&wallet_endpoint, None).await?;
     let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
         network: Network::ZcashRegtest,
     })
     .with_materialized_view_store(materialized_view_store)
     .with_canonical_store(canonical_store)
-    .with_wallet_query_endpoint(format!("http://{wallet_addr}"));
+    .with_wallet_query_endpoint(wallet_endpoint)
+    .with_admitted_transaction_detail_wallet_channel(wallet_channel);
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(adapter.into_server())

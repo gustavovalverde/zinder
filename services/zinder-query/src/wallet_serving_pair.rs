@@ -4,9 +4,10 @@ use std::{fmt, io, num::NonZeroU16, sync::Arc};
 
 use thiserror::Error;
 use zinder_core::{
-    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
     CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
     TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
+    TransparentOutPoint,
 };
 use zinder_store::{
     CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
@@ -15,7 +16,8 @@ use zinder_store::{
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
-    WalletProjectionReadyEvidence, WalletProjectionSourcePosition,
+    WalletProjectionReadyEvidence, WalletProjectionSourcePosition, WalletSpentOutput,
+    WalletUnspentOutput,
 };
 use zinder_wallet_rocksdb::{
     RocksDbWalletError, RocksDbWalletSecondary, WalletAddressTransactionHistoryPage,
@@ -49,6 +51,12 @@ pub trait CanonicalReader: Send + Sync + 'static {
         &self,
         height: BlockHeight,
     ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError>;
+
+    /// Resolves one canonical block identity by exact hash.
+    fn block_id_by_hash(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<BlockId>, CanonicalStoreError>;
 
     /// Reads one compact block by height.
     fn compact_block_at(
@@ -110,6 +118,18 @@ pub trait WalletProjectionReader: Send + Sync + 'static {
 
     /// Returns the complete READY evidence bound to this reader.
     fn ready_evidence(&self) -> &WalletProjectionReadyEvidence;
+
+    /// Returns one current output by exact outpoint.
+    fn find_unspent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<Option<WalletUnspentOutput>, RocksDbWalletError>;
+
+    /// Returns one historical spent output by exact outpoint.
+    fn find_spent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<Option<WalletSpentOutput>, RocksDbWalletError>;
 
     /// Reads one bounded page of unspent outputs for an address.
     fn address_unspent_outputs_page(
@@ -219,6 +239,13 @@ macro_rules! impl_canonical_read {
                 self.block_header_at(height)
             }
 
+            fn block_id_by_hash(
+                &self,
+                block_hash: BlockHash,
+            ) -> Result<Option<BlockId>, CanonicalStoreError> {
+                self.block_id_by_hash(block_hash)
+            }
+
             fn compact_block_at(
                 &self,
                 height: BlockHeight,
@@ -288,6 +315,20 @@ impl WalletProjectionReader for RocksDbWalletSecondary {
 
     fn ready_evidence(&self) -> &WalletProjectionReadyEvidence {
         self.ready_evidence()
+    }
+
+    fn find_unspent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<Option<WalletUnspentOutput>, RocksDbWalletError> {
+        self.find_unspent_output(outpoint)
+    }
+
+    fn find_spent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<Option<WalletSpentOutput>, RocksDbWalletError> {
+        self.find_spent_output(outpoint)
     }
 
     fn address_unspent_outputs_page(

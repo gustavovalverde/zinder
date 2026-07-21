@@ -151,6 +151,7 @@ pub struct ExplorerQueryGrpcAdapter {
     settings: ExplorerServerInfoSettings,
     wallet_query_endpoint: Option<String>,
     wallet_query_bearer_token: Option<BearerToken>,
+    admitted_transaction_detail_wallet_channel: Option<AuthenticatedChannel>,
     bearer_token: Option<BearerToken>,
     canonical_store: Option<SecondaryChainStore>,
     materialized_view_store: Option<MaterializedViewStore>,
@@ -171,6 +172,7 @@ impl ExplorerQueryGrpcAdapter {
             settings,
             wallet_query_endpoint: None,
             wallet_query_bearer_token: None,
+            admitted_transaction_detail_wallet_channel: None,
             bearer_token: None,
             canonical_store: None,
             materialized_view_store: None,
@@ -224,6 +226,20 @@ impl ExplorerQueryGrpcAdapter {
     #[must_use]
     pub fn with_wallet_query_endpoint(mut self, endpoint: String) -> Self {
         self.wallet_query_endpoint = Some(endpoint);
+        self
+    }
+
+    /// Retains the authenticated `WalletQuery` channel whose transaction-detail
+    /// dependency contract passed startup admission.
+    ///
+    /// Merely configuring an endpoint does not call this method and therefore
+    /// cannot advertise `explorer.transaction.detail_v4`.
+    #[must_use]
+    pub fn with_admitted_transaction_detail_wallet_channel(
+        mut self,
+        channel: AuthenticatedChannel,
+    ) -> Self {
+        self.admitted_transaction_detail_wallet_channel = Some(channel);
         self
     }
 
@@ -300,7 +316,8 @@ impl ExplorerQueryGrpcAdapter {
     }
 
     fn advertised_capability_readiness(&self) -> ExplorerReadiness {
-        let wallet_query_online = self.wallet_query_endpoint.is_some();
+        let wallet_query_online = self.wallet_query_endpoint.is_some()
+            || self.admitted_transaction_detail_wallet_channel.is_some();
         let transaction_history_readiness = self
             .transaction_history_materialized_view_reader
             .as_ref()
@@ -318,6 +335,9 @@ impl ExplorerQueryGrpcAdapter {
 
         ExplorerReadiness {
             wallet_query_online,
+            transaction_detail_wallet_admitted: self
+                .admitted_transaction_detail_wallet_channel
+                .is_some(),
             canonical_store_online: self.canonical_store.is_some(),
             materialized_view_store_online: self.materialized_view_preset
                 == Some(MaterializedViewPreset::Explorer),
@@ -512,13 +532,12 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            let mut client = self.wallet_client(OP.method).await?;
+            let mut client = self.transaction_detail_wallet_client()?;
             query_transaction_detail(
                 &mut client,
                 TransactionDetailContext {
-                    chain_store: self.canonical_store.as_ref(),
                     materialized_view_store: self.materialized_view_store.as_ref(),
-                    network: self.settings.network,
+                    network_upgrade_activations: &self.network_upgrade_activations,
                     upstream_observation_cache: &self.upstream_observation_cache,
                 },
                 request,
@@ -1552,6 +1571,9 @@ impl ExplorerQueryGrpcAdapter {
         &self,
         method: &'static str,
     ) -> Result<WalletQueryClient<AuthenticatedChannel>, Status> {
+        if let Some(channel) = self.admitted_transaction_detail_wallet_channel.clone() {
+            return Ok(WalletQueryClient::new(channel));
+        }
         let endpoint = self.require_wallet_endpoint(method)?;
         let token = self.wallet_query_bearer_token.clone();
         let channel = self
@@ -1563,6 +1585,20 @@ impl ExplorerQueryGrpcAdapter {
             })
             .await?;
         Ok(WalletQueryClient::new(channel.clone()))
+    }
+
+    fn transaction_detail_wallet_client(
+        &self,
+    ) -> Result<WalletQueryClient<AuthenticatedChannel>, Status> {
+        self.admitted_transaction_detail_wallet_channel
+            .clone()
+            .map(WalletQueryClient::new)
+            .ok_or_else(|| {
+                ExplorerError::dependency_not_configured(
+                    "TransactionDetail requires an admitted WalletQuery dependency contract",
+                )
+                .into()
+            })
     }
 }
 

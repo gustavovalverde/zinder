@@ -14,14 +14,14 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion, ChainEpoch,
     ChainEpochId, MinedTransaction, MinedTransactionChainContext, NetworkUpgradeActivations,
     RawTransactionBytes, ShieldedProtocol, TransactionId, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentUnspentOutput,
-    TxStatus,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
+    TransparentOutput, TransparentOutputEntry, TransparentOutputsByOutpointResponse,
+    TransparentSpendEntry, TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    TransparentUnspentOutputsByOutpointResponse, TxStatus,
 };
 use zinder_proto::capabilities::{
     WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
-    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-    WALLET_READ_TRANSPARENT_SPENDS_V1, WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-    WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
+    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
 };
 use zinder_source::{TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
@@ -441,10 +441,11 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
             BlockSelector::Height(height) if height <= chain_epoch.visible_tip_height => {
                 Self::block_id_at(pair, height)?
             }
-            BlockSelector::Hash(hash) if hash == chain_epoch.visible_tip_hash => {
-                BlockId::new(chain_epoch.visible_tip_height, hash)
-            }
-            BlockSelector::Height(_) | BlockSelector::Hash(_) => {
+            BlockSelector::Hash(hash) => pair
+                .canonical()
+                .block_id_by_hash(hash)?
+                .ok_or(QueryError::BlockNotInBestChain)?,
+            BlockSelector::Height(_) => {
                 return Err(QueryError::BlockNotInBestChain);
             }
             _ => {
@@ -658,26 +659,88 @@ where
 
     async fn transparent_outputs_by_outpoint(
         &self,
-        _outpoints: Vec<zinder_core::TransparentOutPoint>,
-        _at_epoch_id: Option<ChainEpochId>,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentOutputsByOutpointResponse, QueryError> {
-        Err(unavailable(WALLET_READ_TRANSPARENT_OUTPUTS_V1))
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        let mut entries = Vec::with_capacity(outpoints.len());
+        for outpoint in outpoints {
+            let output = match pair.wallet().find_unspent_output(outpoint)? {
+                Some(output) => Some(output),
+                None => pair
+                    .wallet()
+                    .find_spent_output(outpoint)?
+                    .map(|spent| spent.output),
+            }
+            .map(|output| TransparentOutput {
+                value_zat: output.value_zat,
+                script_pub_key: output.script_pub_key,
+            });
+            entries.push(TransparentOutputEntry { outpoint, output });
+        }
+        Ok(TransparentOutputsByOutpointResponse {
+            chain_epoch,
+            entries,
+        })
     }
 
     async fn transparent_spends_by_outpoint(
         &self,
-        _outpoints: Vec<zinder_core::TransparentOutPoint>,
-        _at_epoch_id: Option<ChainEpochId>,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentSpendsByOutpointResponse, QueryError> {
-        Err(unavailable(WALLET_READ_TRANSPARENT_SPENDS_V1))
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        let mut seen_outpoints = HashSet::with_capacity(outpoints.len());
+        let mut spends = Vec::with_capacity(outpoints.len());
+        for outpoint in outpoints {
+            if !seen_outpoints.insert(outpoint) {
+                continue;
+            }
+            if let Some(spent) = pair.wallet().find_spent_output(outpoint)? {
+                spends.push(TransparentSpendEntry {
+                    spent_outpoint: outpoint,
+                    spending_transaction_id: spent.spent_at.transaction_id,
+                    input_index: spent.input_index,
+                    spending_block_height: spent.spent_at.block.height,
+                    spending_block_hash: spent.spent_at.block.hash,
+                });
+            }
+        }
+        Ok(TransparentSpendsByOutpointResponse {
+            chain_epoch,
+            spends,
+        })
     }
 
     async fn transparent_unspent_outputs_by_outpoint(
         &self,
-        _outpoints: Vec<zinder_core::TransparentOutPoint>,
-        _at_epoch_id: Option<ChainEpochId>,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentUnspentOutputsByOutpointResponse, QueryError> {
-        Err(unavailable(WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1))
+        let pair = self.capture_pair();
+        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+        let mut seen_outpoints = HashSet::with_capacity(outpoints.len());
+        let mut entries = Vec::with_capacity(outpoints.len());
+        for outpoint in outpoints {
+            if !seen_outpoints.insert(outpoint) {
+                continue;
+            }
+            if let Some(output) = pair.wallet().find_unspent_output(outpoint)? {
+                entries.push(TransparentOutputEntry {
+                    outpoint,
+                    output: Some(TransparentOutput {
+                        value_zat: output.value_zat,
+                        script_pub_key: output.script_pub_key,
+                    }),
+                });
+            }
+        }
+        Ok(TransparentUnspentOutputsByOutpointResponse {
+            chain_epoch,
+            entries,
+        })
     }
 
     async fn transparent_address_unspent_outputs(

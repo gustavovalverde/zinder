@@ -6,7 +6,8 @@ use zinder_core::{
     ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, ChainEpoch,
     ChainTipMetadata, CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact,
     SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
-    UnixTimestampMillis, wire::encode_internal_transaction_id,
+    UnixTimestampMillis,
+    wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
 use super::{
@@ -18,8 +19,8 @@ use super::{
     },
     publication::column_family,
     rocksdb::{
-        BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
+        COMPACT_BLOCK_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
         TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
     subtree_load::{decode_subtree_root, encode_subtree_root_key},
@@ -99,6 +100,14 @@ macro_rules! impl_canonical_typed_reads {
                 height: BlockHeight,
             ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
                 read_block_header_at(self, height)
+            }
+
+            /// Resolves one canonical block identity by exact hash.
+            pub fn block_id_by_hash(
+                &self,
+                block_hash: BlockHash,
+            ) -> Result<Option<BlockId>, CanonicalStoreError> {
+                read_block_id_by_hash(self, block_hash)
             }
 
             /// Reads one compact block by height.
@@ -187,6 +196,33 @@ fn read_block_header_at(
     )?
     .map(|encoded| decode_block_header(height, &encoded))
     .transpose()
+}
+
+fn read_block_id_by_hash(
+    store: &impl CanonicalServingRead,
+    block_hash: BlockHash,
+) -> Result<Option<BlockId>, CanonicalStoreError> {
+    let Some(encoded_height) = read_optional(
+        store,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY,
+        &encode_internal_block_hash(block_hash),
+        "block hash index read",
+    )?
+    else {
+        return Ok(None);
+    };
+    let height_bytes = <[u8; 4]>::try_from(encoded_height.as_slice())
+        .map_err(|_| CanonicalStoreError::publication("block hash index height must be 4 bytes"))?;
+    let height = BlockHeight::new(u32::from_be_bytes(height_bytes));
+    let header = read_block_header_at(store, height)?.ok_or_else(|| {
+        CanonicalStoreError::publication("block hash index points to an absent canonical header")
+    })?;
+    if header.block_hash != block_hash {
+        return Err(CanonicalStoreError::publication(
+            "block hash index points to a different canonical header",
+        ));
+    }
+    Ok(Some(BlockId::new(height, block_hash)))
 }
 
 fn read_compact_block_at(

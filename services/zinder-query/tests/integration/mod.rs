@@ -13,3 +13,5 @@ mod transparent_outputs_by_outpoint;
 mod transparent_spends_by_outpoint;
 mod transparent_unspent_outputs_by_outpoint;
 mod transparent_utxo_set_summary;
+mod wallet_serving_block_selectors;
+mod wallet_serving_transaction;

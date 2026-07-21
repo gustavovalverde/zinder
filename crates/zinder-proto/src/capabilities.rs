@@ -128,6 +128,9 @@ pub const WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1: &str =
 /// Capability advertised for `WalletQuery.BroadcastTransaction`.
 pub const WALLET_BROADCAST_TRANSACTION_V1: &str = "wallet.broadcast.transaction_v1";
 /// Capability advertised for `WalletQuery.ChainEvents`.
+///
+/// This complete contract includes both visible and settled families and
+/// address-filtered subscriptions.
 pub const WALLET_EVENTS_CHAIN_V1: &str = "wallet.events.chain_v1";
 /// Capability advertised for `WalletQuery.MempoolSnapshot`.
 pub const WALLET_SNAPSHOT_MEMPOOL_V2: &str = "wallet.snapshot.mempool_v2";
@@ -161,9 +164,10 @@ pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 ///
 /// Signals that the response carries the full `TransactionPublicFacts` shape
 /// plus ordered transparent inputs that combine their spent outpoint with
-/// independently resolved canonical prevout values and scripts. The always-on
-/// wallet capability for raw transaction lookup remains
-/// [`WALLET_READ_TRANSACTION_BY_ID_V2`].
+/// independently resolved canonical prevout values and scripts. Explorer
+/// advertises this capability only after admitting one exact `WalletQuery`
+/// contract for retained transaction bytes, transparent prevouts, and
+/// transparent spends.
 pub const EXPLORER_TRANSACTION_DETAIL_V4: &str = "explorer.transaction.detail_v4";
 /// Capability advertised for `ExplorerQuery.BlockSummariesInRange`.
 ///
@@ -549,6 +553,9 @@ pub enum AdvertisePolicy {
     RequiresChainValuePools,
     /// Explorer: advertised when a `WalletQuery` endpoint is wired.
     RequiresWalletQuery,
+    /// Explorer: advertised only after the `WalletQuery` transaction-detail
+    /// dependency contract has been admitted.
+    RequiresAdmittedTransactionDetailWallet,
     /// Explorer: advertised when the canonical secondary store is online.
     RequiresCanonicalStore,
     /// Explorer: advertised when the materialized-view store is online.
@@ -609,6 +616,7 @@ impl AdvertisePolicy {
             Self::RequiresTransparentAddressHistory => inputs.transparent_address_history_available,
             Self::RequiresTransparentOutpointSpend => inputs.transparent_outpoint_spend_available,
             Self::RequiresWalletQuery
+            | Self::RequiresAdmittedTransactionDetailWallet
             | Self::RequiresCanonicalStore
             | Self::RequiresMaterializedViewStore
             | Self::RequiresWalletQueryAndCanonicalStore
@@ -630,6 +638,9 @@ impl AdvertisePolicy {
         match self {
             Self::AlwaysOn => true,
             Self::RequiresWalletQuery => readiness.wallet_query_online,
+            Self::RequiresAdmittedTransactionDetailWallet => {
+                readiness.transaction_detail_wallet_admitted
+            }
             Self::RequiresCanonicalStore => readiness.canonical_store_online,
             Self::RequiresMaterializedViewStore => readiness.materialized_view_store_online,
             Self::RequiresWalletQueryAndCanonicalStore => {
@@ -678,6 +689,7 @@ impl AdvertisePolicy {
             | Self::RequiresCanonicalStore
             | Self::RequiresMaterializedViewStore
             | Self::RequiresWalletQuery
+            | Self::RequiresAdmittedTransactionDetailWallet
             | Self::RequiresWalletQueryAndCanonicalStore
             | Self::RequiresMaterializedViewStoreAndWalletQuery
             | Self::RequiresMaterializedViewStoreAndCanonicalStore
@@ -737,6 +749,10 @@ pub struct WalletAdvertiseInputs {
 pub struct ExplorerReadiness {
     /// A `WalletQuery` endpoint is wired.
     pub wallet_query_online: bool,
+    /// The exact `WalletQuery` dependency contract required by transaction
+    /// detail has passed startup admission and its authenticated channel is
+    /// retained by the Explorer adapter.
+    pub transaction_detail_wallet_admitted: bool,
     /// The canonical secondary store is open.
     pub canonical_store_online: bool,
     /// The materialized-view store is open.
@@ -1003,7 +1019,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_TRANSACTION_DETAIL_V4,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransactionDetail"),
-        AdvertisePolicy::RequiresWalletQueryAndCanonicalStore,
+        AdvertisePolicy::RequiresAdmittedTransactionDetailWallet,
     ),
     CapabilitySpec::new(
         EXPLORER_BLOCK_SUMMARY_V1,

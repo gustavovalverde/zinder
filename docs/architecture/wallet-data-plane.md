@@ -198,15 +198,23 @@ serialized bytes, the mined block hash and height, the block time, and
 epoch-bound confirmations in one response, which is the shape a
 `getrawtransaction verbose` consumer needs. The bytes are filled from the same
 `TransactionBlobArtifact` the canonical reader resolves; they are not a separate
-RPC. The field rides on the existing `wallet.read.transaction_by_id_v2`
-capability rather than a new one, because the bytes are not unconditionally
-present: ingest writes transaction blobs only when `raw_blob_policy` is
-`transactions` or `all`. When the policy is `none`, the field is empty and the
-location plus enrichment fields are still returned. Wallet-serving ingest defaults
-an omitted policy to `transactions` and rejects an explicit `none`, because its
-lightwalletd transaction and transparent-history methods require retained bytes.
-A consumer that requires the serialized form runs against a deployment configured to retain transaction
-blobs.
+RPC. `wallet.read.transaction_by_id_v2` identifies the typed status response;
+the independently probed `wallet.read.transaction_bytes_v1` capability makes
+the optional mined bytes authoritative.
+
+The standalone exact-pair `zinder-query` runtime opens only READY
+`CanonicalStoreWorkload::Wallet` secondaries, so the native canonical writer's
+Wallet workload is the retention authority. Construction requires an
+authenticated transaction-location row and transaction-blob row for every
+retained source transaction. The READY construction manifest authenticates
+that both row counts equal the retained source-transaction count. Live append
+and replacement validate the same paired coverage and write both row families
+in one canonical atomic batch. Consequently this production composition
+advertises `wallet.read.transaction_bytes_v1` and serves the retained row
+directly; it does not fall back to an upstream node. Other library
+compositions advertise the capability only when their persisted contract
+provides equivalent coverage. Without that capability, a mined response may
+omit the bytes while retaining its location and chain context.
 
 A response builder must not call the upstream node or latest tip again during
 response construction.
@@ -234,7 +242,7 @@ The contract:
 
 `ChainCommitted` and `ChainReorged` are the two event variants. `ChainReorged` carries both the reverted range and the replacement range, so a wallet receiving a reorg event truncates its local view at the reverted boundary and resumes from the replacement range without making additional indexer calls. If a client reconnects with a cursor whose branch was reorged out, the server resolves the fork point from the cursor's back-spaced locator against the canonical block index and delivers a `ChainReorged` envelope before resuming, synthesizing it when the real reorg event has aged out of retention. A wallet recovers from a reconnect reorg without a full re-derive and never observes silent branch changes. A divergence deeper than the locator cap degrades to the typed `EventCursorExpired`. See [ADR-0025](../adrs/0025-chain-event-reconnect-reorg-locator.md).
 
-Two cursor varieties are advertised under capability string `wallet.events.chain_v1`: `Visible` and `Settled`. Visible consumers receive every envelope including reorgs. Settled consumers receive only non-reorg commits entirely at or below the settled tip. The settled cursor family is represented in the cursor body, not by a separate RPC.
+The complete contract is advertised under capability string `wallet.events.chain_v1`: it serves both `Visible` and `Settled` families and supports address filters. Visible consumers receive every envelope including reorgs. Settled consumers receive only non-reorg commits entirely at or below the settled tip. The settled cursor family is represented in the cursor body, not by a separate RPC.
 
 The lightwalletd compatibility shim does not expose this subscription. The vendored `CompactTxStreamer` proto has no equivalent method, and ADR-0004 forbids inventing parallel surfaces in the compat layer. Wallet clients on the lightwalletd contract use `GetLatestBlock` polling, while native Zinder clients use the subscription contract.
 
