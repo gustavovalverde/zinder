@@ -60,8 +60,8 @@ Fresh construction, source recovery, schema admission, and reorg refusal keep
 it unready. The canonical follower owns the one process-readiness state; the
 mempool owner communicates only through its hydration prerequisite, so source
 and retention tasks cannot overwrite a canonical failure. The private control
-server and live mempool owner are supervised with the writer; an unexpected
-exit from either terminates the runtime.
+server, live mempool owner, and mempool retention task are supervised with the
+writer; an unexpected exit from any of them terminates the runtime.
 
 ### Projector
 

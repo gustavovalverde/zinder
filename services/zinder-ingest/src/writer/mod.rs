@@ -105,6 +105,13 @@ pub enum CanonicalWriterError {
         /// Bounded task-completion diagnostic.
         reason: String,
     },
+    /// Durable mempool-event retention stopped while the canonical writer was
+    /// still running.
+    #[error("mempool retention task failed: {reason}")]
+    MempoolRetention {
+        /// Bounded task-completion diagnostic.
+        reason: String,
+    },
 }
 
 /// Opens or freshly constructs the canonical store, then follows Zebra.
