@@ -61,6 +61,15 @@ before `InitialSnapshotComplete` are provisional: the live owner stages them
 privately and discards the generation if hydration fails or its source tip
 changes. Polling verifies the source tip between bounded-size hydration batches;
 the streaming source verifies it before publishing the completion marker.
+Normal source-tip movement emits a typed, non-durable `SourceTipChanged`
+control event: the owner withdraws exact-tip certification, discards any
+provisional generation, and immediately opens a replacement generation. It is
+not a source failure or durable-state rebuild and therefore adds no source-error
+telemetry or recovery backoff. Transport, monitor, hydration, admission, and
+protocol failures continue through the bounded rebuild path. When the
+replacement snapshot completes before canonical ingest reaches the same tip,
+the owner keeps it private, continues staging source transitions, and certifies
+it as soon as the canonical tip catches up.
 
 Every polling and streaming generation also has source-admission ceilings for
 distinct transaction count and cumulative raw transaction bytes. The defaults

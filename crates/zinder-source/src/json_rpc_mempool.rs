@@ -148,14 +148,13 @@ async fn run_polling_loop(
             }
             Ok(PollCompletion::RetryNeeded) => {}
             Ok(PollCompletion::SourceTipChanged {
-                certified_source_tip,
+                generation_source_tip,
                 observed_source_tip,
             }) => {
                 let _send_outcome = event_sender
-                    .send(Err(SourceError::MempoolStreamUnavailable {
-                        reason: format!(
-                            "mempool source tip changed from {certified_source_tip:?} to {observed_source_tip:?}"
-                        ),
+                    .send(Ok(MempoolSourceEvent::SourceTipChanged {
+                        generation_source_tip,
+                        observed_source_tip,
                     }))
                     .await;
                 return;
@@ -187,7 +186,7 @@ enum PollCompletion {
     /// The upstream best chain differs from the tip that certified the
     /// currently exposed generation.
     SourceTipChanged {
-        certified_source_tip: zinder_core::BlockId,
+        generation_source_tip: zinder_core::BlockId,
         observed_source_tip: zinder_core::BlockId,
     },
 }
@@ -225,7 +224,7 @@ async fn poll_once(
         && certified_source_tip != source_tip_before
     {
         return Ok(PollCompletion::SourceTipChanged {
-            certified_source_tip,
+            generation_source_tip: certified_source_tip,
             observed_source_tip: source_tip_before,
         });
     }
@@ -267,11 +266,11 @@ async fn poll_once(
                 PollBatchCompletion::SourceTipChanged {
                     observed_source_tip,
                 } => {
-                    return source_tip_change_outcome(
+                    return Ok(source_tip_change_outcome(
                         certified_source_tip,
                         source_tip_before,
                         observed_source_tip,
-                    );
+                    ));
                 }
             }
         }
@@ -305,11 +304,11 @@ async fn certify_poll_completion(
     };
     let source_tip_after = json_rpc.tip_id().await.map_err(PollFailure::Source)?;
     if source_tip_before != source_tip_after {
-        return source_tip_change_outcome(
+        return Ok(source_tip_change_outcome(
             certified_source_tip,
             source_tip_before,
             source_tip_after,
-        );
+        ));
     }
     if pending_retry && certified_source_tip.is_none() {
         return Err(PollFailure::Source(SourceError::MempoolStreamUnavailable {
@@ -334,22 +333,11 @@ fn source_tip_change_outcome(
     certified_source_tip: Option<zinder_core::BlockId>,
     source_tip_before: zinder_core::BlockId,
     observed_source_tip: zinder_core::BlockId,
-) -> Result<PollCompletion, PollFailure> {
-    certified_source_tip.map_or_else(
-        || {
-            Err(PollFailure::Source(SourceError::MempoolStreamUnavailable {
-                reason: format!(
-                    "source tip changed from {source_tip_before:?} to {observed_source_tip:?} while constructing the initial mempool snapshot"
-                ),
-            }))
-        },
-        |certified_source_tip| {
-            Ok(PollCompletion::SourceTipChanged {
-                certified_source_tip,
-                observed_source_tip,
-            })
-        },
-    )
+) -> PollCompletion {
+    PollCompletion::SourceTipChanged {
+        generation_source_tip: certified_source_tip.unwrap_or(source_tip_before),
+        observed_source_tip,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -818,8 +806,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_rejects_an_initial_generation_when_its_source_tip_changes() -> eyre::Result<()>
-    {
+    async fn polling_ends_an_initial_generation_when_its_source_tip_changes() -> eyre::Result<()> {
         let transaction_id_hex = "11".repeat(32);
         let server = zinder_testkit::JsonRpcTestServer::start([
             zinder_testkit::method("getbestblockheightandhash").reply(
@@ -850,25 +837,25 @@ mod tests {
         let admission = empty_admission();
         let (event_sender, mut event_receiver) = mpsc::channel(4);
 
-        let outcome = poll_once(
-            &json_rpc,
-            &admission,
-            UnixTimestampMillis::new(1_750_000_000_000),
-            &event_sender,
-            None,
-        )
-        .await;
+        run_polling_loop(json_rpc, Duration::ZERO, admission.clone(), event_sender).await;
 
-        assert!(matches!(
-            outcome,
-            Err(PollFailure::Source(
-                SourceError::MempoolStreamUnavailable { .. }
-            ))
-        ));
-        assert!(
-            event_receiver.try_recv().is_err(),
-            "an unstable source snapshot must publish no partial transitions"
+        let generation_source_tip = zinder_core::BlockId::new(
+            zinder_core::BlockHeight::new(7),
+            zinder_core::BlockHash::from_bytes([0x07; 32]),
         );
+        let observed_source_tip = zinder_core::BlockId::new(
+            zinder_core::BlockHeight::new(8),
+            zinder_core::BlockHash::from_bytes([0x08; 32]),
+        );
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(Ok(MempoolSourceEvent::SourceTipChanged {
+                generation_source_tip: event_generation_tip,
+                observed_source_tip: event_observed_tip,
+            })) if event_generation_tip == generation_source_tip
+                && event_observed_tip == observed_source_tip
+        ));
+        assert!(event_receiver.recv().await.is_none());
         assert!(
             admission.lock().transaction_ids().next().is_none(),
             "an unstable source snapshot must not advance the polling baseline"
@@ -877,18 +864,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_stops_before_observing_a_new_source_tip_generation() -> eyre::Result<()> {
+    async fn polling_emits_tip_change_after_a_certified_generation() -> eyre::Result<()> {
         let certified_source_tip = zinder_core::BlockId::new(
             zinder_core::BlockHeight::new(7),
             zinder_core::BlockHash::from_bytes([0x07; 32]),
         );
-        let server = zinder_testkit::JsonRpcTestServer::start([zinder_testkit::method(
-            "getbestblockheightandhash",
-        )
-        .reply(zinder_testkit::RpcReply::result(serde_json::json!({
-            "height": 8,
-            "hash": vec![0x08; 32],
-        })))])?;
+        let observed_source_tip = zinder_core::BlockId::new(
+            zinder_core::BlockHeight::new(8),
+            zinder_core::BlockHash::from_bytes([0x08; 32]),
+        );
+        let certified_tip_response = serde_json::json!({
+            "height": 7,
+            "hash": vec![0x07; 32],
+        });
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(certified_tip_response.clone()),
+            ),
+            zinder_testkit::method("getrawmempool")
+                .reply(zinder_testkit::RpcReply::result(serde_json::json!([]))),
+            zinder_testkit::method("getbestblockheightandhash")
+                .reply(zinder_testkit::RpcReply::result(certified_tip_response)),
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(serde_json::json!({
+                    "height": 8,
+                    "hash": vec![0x08; 32],
+                })),
+            ),
+        ])?;
         let json_rpc = ZebraJsonRpcSource::new(
             zinder_core::Network::ZcashRegtest,
             server.url(),
@@ -898,22 +901,23 @@ mod tests {
         let admission = empty_admission();
         let (event_sender, mut event_receiver) = mpsc::channel(4);
 
-        let completion = poll_once(
-            &json_rpc,
-            &admission,
-            UnixTimestampMillis::new(1_750_000_000_000),
-            &event_sender,
-            Some(certified_source_tip),
-        )
-        .await
-        .map_err(|_| eyre::eyre!("a new source tip must end the generation cleanly"))?;
+        run_polling_loop(json_rpc, Duration::ZERO, admission, event_sender).await;
 
         assert!(matches!(
-            completion,
-            PollCompletion::SourceTipChanged { .. }
+            event_receiver.recv().await,
+            Some(Ok(MempoolSourceEvent::InitialSnapshotComplete { source_tip }))
+                if source_tip == certified_source_tip
         ));
-        assert!(event_receiver.try_recv().is_err());
-        assert!(server.requests_for("getrawmempool")?.is_empty());
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(Ok(MempoolSourceEvent::SourceTipChanged {
+                generation_source_tip,
+                observed_source_tip: event_observed_tip,
+            })) if generation_source_tip == certified_source_tip
+                && event_observed_tip == observed_source_tip
+        ));
+        assert!(event_receiver.recv().await.is_none());
+        assert_eq!(server.requests_for("getrawmempool")?.len(), 1);
         Ok(())
     }
 
@@ -1043,9 +1047,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            Err(PollFailure::Source(
-                SourceError::MempoolStreamUnavailable { .. }
-            ))
+            Ok(PollCompletion::SourceTipChanged { .. })
         ));
         assert!(event_receiver.try_recv().is_err());
         Ok(())

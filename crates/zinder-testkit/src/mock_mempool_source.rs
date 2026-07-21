@@ -3,8 +3,9 @@
 //! `MockMempoolSource` records how many times a consumer opens its event
 //! stream and forwards scripted events into the most recently opened
 //! stream. The mock exposes a control handle ([`MockMempoolSourceControl`])
-//! that tests use to push [`MempoolSourceEvent`] values, push
-//! [`SourceError`] errors, and close the stream.
+//! that tests use to push lifecycle and generation-control
+//! [`MempoolSourceEvent`] values, push [`SourceError`] errors, and close the
+//! stream.
 
 use std::sync::{
     Arc,
@@ -93,6 +94,19 @@ impl MockMempoolSourceControl {
     ) -> Result<(), MockMempoolSourceClosed> {
         self.push_result(Ok(MempoolSourceEvent::InitialSnapshotComplete {
             source_tip,
+        }))
+    }
+
+    /// Ends the provisional or certified generation because its source tip
+    /// changed.
+    pub fn change_source_tip(
+        &self,
+        generation_source_tip: BlockId,
+        observed_source_tip: BlockId,
+    ) -> Result<(), MockMempoolSourceClosed> {
+        self.push_result(Ok(MempoolSourceEvent::SourceTipChanged {
+            generation_source_tip,
+            observed_source_tip,
         }))
     }
 
@@ -243,6 +257,28 @@ mod tests {
             MempoolEvictionReason::Conflict,
         );
         assert_eq!(outcome, Err(MockMempoolSourceClosed));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn control_pushes_source_tip_change_marker() -> Result<(), Box<dyn Error>> {
+        let (mock, control) = MockMempoolSource::streaming();
+        let mut stream = mock.events().await?;
+        let generation_source_tip =
+            BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([0x10; 32]));
+        let observed_source_tip =
+            BlockId::new(BlockHeight::new(101), BlockHash::from_bytes([0x11; 32]));
+
+        control.change_source_tip(generation_source_tip, observed_source_tip)?;
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(MempoolSourceEvent::SourceTipChanged {
+                generation_source_tip: event_generation_tip,
+                observed_source_tip: event_observed_tip,
+            })) if event_generation_tip == generation_source_tip
+                && event_observed_tip == observed_source_tip
+        ));
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]

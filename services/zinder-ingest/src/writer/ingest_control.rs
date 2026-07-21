@@ -1234,7 +1234,7 @@ mod tests {
             .await?;
         let source_tip =
             zinder_core::BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
-        owner.complete_hydration(&canonical, source_tip).await?;
+        let _certification = owner.try_complete_hydration(&canonical, source_tip).await?;
 
         let bearer_token = BearerToken::from_str("fixture-control-token")?;
         let node_source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(

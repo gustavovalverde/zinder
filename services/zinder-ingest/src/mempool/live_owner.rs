@@ -12,8 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::FutureExt as _;
 use parking_lot::{Mutex as ParkingMutex, RwLock};
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::MissedTickBehavior};
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
@@ -42,6 +43,7 @@ use super::{
 
 const MEMPOOL_EVENT_PAGE_SIZE: u32 = 64;
 const MEMPOOL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const MEMPOOL_CANONICAL_TIP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS: usize = 256;
 const MEMPOOL_LIFECYCLE_STATUS_LABELS: &[&str] = &["hydrating", "serving", "rebuild_required"];
 /// Default raw transaction payload budget for one durable reconciliation append.
@@ -550,11 +552,13 @@ impl LiveMempoolOwner {
         self.set_status(MempoolOwnerStatus::Hydrating);
     }
 
-    pub(crate) async fn complete_hydration(
+    /// Reconciles a complete source snapshot once its tip matches canonical
+    /// ingest, or keeps the snapshot private while canonical ingest catches up.
+    pub(crate) async fn try_complete_hydration(
         &self,
         canonical: &CanonicalControlHandle,
         source_tip: BlockId,
-    ) -> Result<(), Status> {
+    ) -> Result<SnapshotCertification, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
         if !matches!(*self.status.read(), MempoolOwnerStatus::Hydrating) {
             return Err(Status::failed_precondition(
@@ -565,10 +569,7 @@ impl LiveMempoolOwner {
         let visible_tip =
             BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
         if source_tip != visible_tip {
-            self.mark_rebuild_required();
-            return Err(Status::unavailable(
-                "mempool snapshot source tip does not match the canonical visible tip",
-            ));
+            return Ok(SnapshotCertification::PendingCanonicalTip);
         }
         let staged_generation = self.staged_generation.lock().take().ok_or_else(|| {
             Status::failed_precondition("mempool source completion marker has no staged snapshot")
@@ -580,7 +581,7 @@ impl LiveMempoolOwner {
             snapshot_certified_at: UnixTimestampMillis::now(),
         });
         record_mempool_size_gauge(&self.index);
-        Ok(())
+        Ok(SnapshotCertification::Certified)
     }
 
     async fn reconcile_staged_generation_locked(
@@ -798,6 +799,15 @@ enum MempoolOwnerLoopOutcome {
     Rebuild { reconnect_backoff: Duration },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Whether a complete source snapshot can become the serving generation.
+pub(crate) enum SnapshotCertification {
+    /// The source snapshot is complete but canonical ingest has not reached its tip.
+    PendingCanonicalTip,
+    /// The snapshot was reconciled and can serve against its exact source tip.
+    Certified,
+}
+
 async fn restore_durable_mempool_index(
     owner: &LiveMempoolOwner,
     canonical: &CanonicalControlHandle,
@@ -863,75 +873,196 @@ async fn consume_source_events(
     mempool_ready_signal: &MempoolReadySignal,
     cancel: &CancellationToken,
 ) -> MempoolOwnerLoopOutcome {
+    let context = SourceGenerationContext {
+        canonical,
+        owner,
+        mempool_ready_signal,
+        cancel,
+    };
+    let mut pending_source_tip = None;
+    let mut canonical_tip_poll = tokio::time::interval(MEMPOOL_CANONICAL_TIP_POLL_INTERVAL);
+    canonical_tip_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         let source_event = tokio::select! {
             () = cancel.cancelled() => return MempoolOwnerLoopOutcome::Shutdown,
+            _ = canonical_tip_poll.tick(), if pending_source_tip.is_some() => {
+                if let Some(ready_source_event) = event_stream.next().now_or_never() {
+                    let Some(ready_source_event) = ready_source_event else {
+                        return rebuild_after_source_closed();
+                    };
+                    if let Some(outcome) = handle_source_event(
+                        ready_source_event,
+                        &context,
+                        &mut pending_source_tip,
+                    ).await {
+                        return outcome;
+                    }
+                    continue;
+                }
+                let Some(source_tip) = pending_source_tip else {
+                    continue;
+                };
+                match certify_source_snapshot(canonical, owner, mempool_ready_signal, source_tip).await {
+                    Ok(SnapshotCertification::PendingCanonicalTip) => continue,
+                    Ok(SnapshotCertification::Certified) => {
+                        pending_source_tip = None;
+                        continue;
+                    }
+                    Err(status) => return rejected_snapshot_outcome(&status),
+                }
+            }
             source_event = event_stream.next() => source_event,
         };
         let Some(source_event) = source_event else {
-            tracing::warn!(
-                target: "zinder::ingest",
-                event = "mempool_source_closed",
-                "live mempool source stream closed; reconnecting"
-            );
-            return MempoolOwnerLoopOutcome::Rebuild {
-                reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
-            };
+            return rebuild_after_source_closed();
         };
-        match source_event {
-            Ok(MempoolSourceEvent::InitialSnapshotComplete { source_tip }) => {
-                if let Err(status) = owner.complete_hydration(canonical, source_tip).await {
-                    tracing::warn!(
-                        target: "zinder::ingest",
-                        event = "mempool_snapshot_marker_rejected",
-                        code = ?status.code(),
-                        "live mempool source completion marker was rejected"
-                    );
-                    return MempoolOwnerLoopOutcome::Rebuild {
-                        reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
-                    };
-                }
-                mempool_ready_signal.certify_source_tip(source_tip);
-                tracing::info!(
-                    target: "zinder::ingest",
-                    event = "mempool_snapshot_complete",
-                    "live mempool snapshot completed; live reads are available"
-                );
-            }
-            Ok(source_event) => {
-                if let Err(status) =
-                    apply_source_event(owner, canonical, cancel, source_event).await
-                {
-                    tracing::warn!(
-                        target: "zinder::ingest",
-                        event = "mempool_event_rejected",
-                        code = ?status.code(),
-                        "live mempool source event was not published"
-                    );
-                    return MempoolOwnerLoopOutcome::Rebuild {
-                        reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
-                    };
-                }
-            }
-            Err(error) => {
-                metrics::counter!(
-                    "zinder_mempool_source_errors_total",
-                    "kind" => "stream_item",
-                    "failure_class" => error.upstream_classification().label()
-                )
-                .increment(1);
-                tracing::warn!(
-                    target: "zinder::ingest",
-                    event = "mempool_source_item_error",
-                    error = %error,
-                    "live mempool source emitted an error item"
-                );
-                return MempoolOwnerLoopOutcome::Rebuild {
-                    reconnect_backoff: mempool_source_reconnect_backoff(&error),
-                };
-            }
+        if let Some(outcome) =
+            handle_source_event(source_event, &context, &mut pending_source_tip).await
+        {
+            return outcome;
         }
     }
+}
+
+struct SourceGenerationContext<'a> {
+    canonical: &'a CanonicalControlHandle,
+    owner: &'a LiveMempoolOwner,
+    mempool_ready_signal: &'a MempoolReadySignal,
+    cancel: &'a CancellationToken,
+}
+
+async fn handle_source_event(
+    source_event: Result<MempoolSourceEvent, SourceError>,
+    context: &SourceGenerationContext<'_>,
+    pending_source_tip: &mut Option<BlockId>,
+) -> Option<MempoolOwnerLoopOutcome> {
+    match source_event {
+        Ok(MempoolSourceEvent::SourceTipChanged {
+            generation_source_tip,
+            observed_source_tip,
+        }) => {
+            rehydrate_after_source_tip_change(
+                context.owner,
+                context.mempool_ready_signal,
+                generation_source_tip,
+                observed_source_tip,
+            )
+            .await;
+            Some(MempoolOwnerLoopOutcome::Rehydrate)
+        }
+        Ok(MempoolSourceEvent::InitialSnapshotComplete { source_tip }) => {
+            *pending_source_tip = Some(source_tip);
+            None
+        }
+        Ok(source_event) => apply_source_event(
+            context.owner,
+            context.canonical,
+            context.cancel,
+            source_event,
+        )
+        .await
+        .err()
+        .map(|status| rejected_source_event_outcome(&status)),
+        Err(error) => Some(source_item_error_outcome(&error)),
+    }
+}
+
+async fn certify_source_snapshot(
+    canonical: &CanonicalControlHandle,
+    owner: &LiveMempoolOwner,
+    mempool_ready_signal: &MempoolReadySignal,
+    source_tip: BlockId,
+) -> Result<SnapshotCertification, Status> {
+    let certification = owner.try_complete_hydration(canonical, source_tip).await?;
+    match certification {
+        SnapshotCertification::PendingCanonicalTip => {
+            tracing::debug!(
+                target: "zinder::ingest",
+                event = "mempool_snapshot_waiting_for_canonical_tip",
+                source_tip = ?source_tip,
+                "complete mempool snapshot remains private until canonical ingest catches up"
+            );
+        }
+        SnapshotCertification::Certified => {
+            mempool_ready_signal.certify_source_tip(source_tip);
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "mempool_snapshot_complete",
+                "live mempool snapshot completed; live reads are available"
+            );
+        }
+    }
+    Ok(certification)
+}
+
+fn rejected_snapshot_outcome(status: &Status) -> MempoolOwnerLoopOutcome {
+    tracing::warn!(
+        target: "zinder::ingest",
+        event = "mempool_snapshot_marker_rejected",
+        code = ?status.code(),
+        "live mempool source completion marker was rejected"
+    );
+    MempoolOwnerLoopOutcome::Rebuild {
+        reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
+    }
+}
+
+fn rejected_source_event_outcome(status: &Status) -> MempoolOwnerLoopOutcome {
+    tracing::warn!(
+        target: "zinder::ingest",
+        event = "mempool_event_rejected",
+        code = ?status.code(),
+        "live mempool source event was not published"
+    );
+    MempoolOwnerLoopOutcome::Rebuild {
+        reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
+    }
+}
+
+fn source_item_error_outcome(error: &SourceError) -> MempoolOwnerLoopOutcome {
+    metrics::counter!(
+        "zinder_mempool_source_errors_total",
+        "kind" => "stream_item",
+        "failure_class" => error.upstream_classification().label()
+    )
+    .increment(1);
+    tracing::warn!(
+        target: "zinder::ingest",
+        event = "mempool_source_item_error",
+        error = %error,
+        "live mempool source emitted an error item"
+    );
+    MempoolOwnerLoopOutcome::Rebuild {
+        reconnect_backoff: mempool_source_reconnect_backoff(error),
+    }
+}
+
+fn rebuild_after_source_closed() -> MempoolOwnerLoopOutcome {
+    tracing::warn!(
+        target: "zinder::ingest",
+        event = "mempool_source_closed",
+        "live mempool source stream closed; reconnecting"
+    );
+    MempoolOwnerLoopOutcome::Rebuild {
+        reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
+    }
+}
+
+async fn rehydrate_after_source_tip_change(
+    owner: &LiveMempoolOwner,
+    mempool_ready_signal: &MempoolReadySignal,
+    generation_source_tip: zinder_core::BlockId,
+    observed_source_tip: zinder_core::BlockId,
+) {
+    mempool_ready_signal.withdraw_certification();
+    owner.begin_hydration().await;
+    tracing::debug!(
+        target: "zinder::ingest",
+        event = "mempool_source_tip_changed",
+        generation_source_tip = ?generation_source_tip,
+        observed_source_tip = ?observed_source_tip,
+        "mempool source generation ended at a normal chain-tip boundary"
+    );
 }
 
 async fn withdraw_and_wait_for_mempool_rebuild(
@@ -1249,6 +1380,7 @@ mod tests {
     };
 
     use metrics_exporter_prometheus::PrometheusBuilder;
+    use parking_lot::Mutex as ParkingMutex;
     use tokio_util::sync::CancellationToken;
     use tonic::Code;
     use zebra_chain::{
@@ -1258,24 +1390,27 @@ mod tests {
         AuthDigest, ChainEpoch, CompactTransactionData, MempoolEntry, MempoolEvictionReason,
         MempoolObservation, RawTransactionBytes, TransactionId, UnixTimestampMillis,
     };
-    use zinder_source::MempoolSourceEntry;
+    use zinder_source::{MempoolSource as _, MempoolSourceEntry};
     use zinder_store::{
         MempoolEvent, MempoolEventRetentionConfig, MempoolEventRetentionStepBudget,
+        RocksDbCanonicalStore,
     };
     use zinder_testkit::{MockMempoolSource, MockMempoolSourceControl};
 
     use crate::{
         MempoolReadyGate, mempool_ready_channel,
         writer::control::{
-            CanonicalControlCommand, CanonicalControlHandle, apply_canonical_control_command,
-            canonical_control_channel, test_support::published_fixture_store,
+            CanonicalControlCommand, CanonicalControlHandle, CanonicalWriterSnapshot,
+            apply_canonical_control_command, canonical_control_channel,
+            test_support::published_fixture_store,
         },
     };
 
     use super::{
-        LiveMempoolOwner, MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS, MempoolOwnerStatus,
-        MempoolRetentionSettings, record_mempool_lifecycle_status, record_mempool_retention_pass,
-        run_live_mempool_owner, run_mempool_retention,
+        LiveMempoolOwner, MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS, MempoolOwnerLoopOutcome,
+        MempoolOwnerStatus, MempoolRetentionSettings, SnapshotCertification, consume_source_events,
+        record_mempool_lifecycle_status, record_mempool_retention_pass, run_live_mempool_owner,
+        run_mempool_retention,
     };
 
     #[test]
@@ -1387,8 +1522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_marker_with_a_different_source_tip_remains_private()
-    -> Result<(), Box<dyn Error>> {
+    async fn snapshot_marker_waits_when_the_canonical_tip_differs() -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::TempDir::new()?;
         let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
         let (canonical, mut commands) = canonical_control_channel();
@@ -1404,13 +1538,14 @@ mod tests {
         );
 
         let outcome = owner
-            .complete_hydration(&canonical, mismatched_source_tip)
-            .await;
+            .try_complete_hydration(&canonical, mismatched_source_tip)
+            .await?;
 
-        assert_eq!(
-            outcome.err().map(|status| status.code()),
-            Some(Code::Unavailable)
-        );
+        assert_eq!(outcome, SnapshotCertification::PendingCanonicalTip);
+        assert!(matches!(
+            *owner.status.read(),
+            MempoolOwnerStatus::Hydrating
+        ));
         assert!(!owner.is_serving());
         assert!(
             canonical
@@ -1468,9 +1603,12 @@ mod tests {
             }
         });
         let owner = LiveMempoolOwner::default();
-        owner
-            .complete_hydration(&canonical, fixture_source_tip())
-            .await?;
+        assert_eq!(
+            owner
+                .try_complete_hydration(&canonical, fixture_source_tip())
+                .await?,
+            SnapshotCertification::Certified
+        );
         let mut newer_chain_epoch = canonical.chain_epoch().await?.chain_epoch;
         newer_chain_epoch.visible_tip_hash = zinder_core::BlockHash::from_bytes([2; 32]);
 
@@ -1565,6 +1703,182 @@ mod tests {
         owner_task.await?;
         command_task.abort();
         let _ = command_task.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn source_tip_change_rehydrates_without_reconnect_backoff() -> Result<(), Box<dyn Error>>
+    {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let MutableEpochCanonicalControl {
+            canonical,
+            canonical_epoch,
+            command_task,
+        } = mutable_epoch_canonical_control(store)?;
+        let (source, source_control) = MockMempoolSource::streaming();
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let owner_task = tokio::spawn(run_live_mempool_owner(
+            Arc::new(source),
+            canonical.clone(),
+            owner.clone(),
+            ready_signal,
+            cancel.clone(),
+        ));
+        let generation_source_tip = fixture_source_tip();
+        let observed_source_tip = fixture_tip(2);
+        let next_source_tip = fixture_tip(3);
+        let final_source_tip = fixture_tip(4);
+
+        wait_for_source_open(&source_control, 1).await?;
+        source_control.complete_initial_snapshot(generation_source_tip)?;
+        wait_for_serving(&owner, true).await?;
+        source_control.change_source_tip(generation_source_tip, observed_source_tip)?;
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            wait_for_source_open(&source_control, 2),
+        )
+        .await??;
+        assert_eq!(ready_gate.certified_source_tip(), None);
+        assert!(matches!(
+            *owner.status.read(),
+            MempoolOwnerStatus::Hydrating
+        ));
+
+        source_control.complete_initial_snapshot(observed_source_tip)?;
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(matches!(
+            *owner.status.read(),
+            MempoolOwnerStatus::Hydrating
+        ));
+        assert_eq!(source_control.open_count(), 2);
+
+        set_canonical_visible_tip(&canonical_epoch, observed_source_tip);
+        tokio::time::timeout(Duration::from_millis(250), wait_for_serving(&owner, true)).await??;
+        assert_eq!(ready_gate.certified_source_tip(), Some(observed_source_tip));
+        assert_eq!(source_control.open_count(), 2);
+
+        source_control.change_source_tip(observed_source_tip, next_source_tip)?;
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            wait_for_source_open(&source_control, 3),
+        )
+        .await??;
+        source_control.push_added(source_entry(0xB2)?)?;
+        wait_for_staged_entries(&owner, 1).await?;
+        source_control.change_source_tip(next_source_tip, final_source_tip)?;
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            wait_for_source_open(&source_control, 4),
+        )
+        .await??;
+        assert_eq!(owner.staged_entry_count(), 0);
+        assert!(
+            canonical
+                .mempool_event_page(
+                    None,
+                    NonZeroU32::new(8).ok_or("mempool page size must be nonzero")?,
+                )
+                .await?
+                .is_empty(),
+            "tip-change control markers and abandoned staging must not become durable events"
+        );
+
+        cancel.cancel();
+        owner_task.await?;
+        command_task.abort();
+        let _join_result = command_task.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_snapshot_certifies_during_sustained_source_traffic()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let MutableEpochCanonicalControl {
+            canonical,
+            canonical_epoch,
+            command_task,
+        } = mutable_epoch_canonical_control(store)?;
+        let (source, source_control) = MockMempoolSource::streaming();
+        let event_stream = source.events().await?;
+        let owner = LiveMempoolOwner::default();
+        let owner_for_task = owner.clone();
+        let (ready_signal, ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let canonical_for_task = canonical.clone();
+        let owner_task = tokio::spawn(async move {
+            consume_source_events(
+                event_stream,
+                &canonical_for_task,
+                &owner_for_task,
+                &ready_signal,
+                &task_cancel,
+            )
+            .await
+        });
+        let source_tip = fixture_tip(2);
+        let repeated_entry = source_entry(0xB5)?;
+
+        source_control.complete_initial_snapshot(source_tip)?;
+        source_control.push_added(repeated_entry.clone())?;
+        wait_for_staged_entries(&owner, 1).await?;
+        set_canonical_visible_tip(&canonical_epoch, source_tip);
+        let traffic_control = source_control.clone();
+        let traffic_task = tokio::spawn(async move {
+            for _ in 0..100 {
+                traffic_control.push_added(repeated_entry.clone())?;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Ok::<(), zinder_testkit::MockMempoolSourceClosed>(())
+        });
+
+        tokio::time::timeout(Duration::from_millis(150), wait_for_serving(&owner, true)).await??;
+        assert_eq!(ready_gate.certified_source_tip(), Some(source_tip));
+        traffic_task.await??;
+        cancel.cancel();
+        assert_eq!(owner_task.await?, MempoolOwnerLoopOutcome::Shutdown);
+        command_task.abort();
+        let _join_result = command_task.await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_tip_change_precedes_pending_snapshot_certification()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let MutableEpochCanonicalControl {
+            canonical,
+            canonical_epoch,
+            command_task,
+        } = mutable_epoch_canonical_control(store)?;
+        let (source, source_control) = MockMempoolSource::streaming();
+        let event_stream = source.events().await?;
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let source_tip = fixture_tip(2);
+        let next_tip = fixture_tip(3);
+        set_canonical_visible_tip(&canonical_epoch, source_tip);
+        source_control.complete_initial_snapshot(source_tip)?;
+        source_control.change_source_tip(source_tip, next_tip)?;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(150),
+            consume_source_events(event_stream, &canonical, &owner, &ready_signal, &cancel),
+        )
+        .await?;
+
+        assert_eq!(outcome, MempoolOwnerLoopOutcome::Rehydrate);
+        assert!(!owner.is_serving());
+        assert_eq!(ready_gate.certified_source_tip(), None);
+        command_task.abort();
+        let _join_result = command_task.await;
         Ok(())
     }
 
@@ -2091,10 +2405,62 @@ mod tests {
     }
 
     fn fixture_source_tip() -> zinder_core::BlockId {
+        fixture_tip(1)
+    }
+
+    fn fixture_tip(height: u8) -> zinder_core::BlockId {
         zinder_core::BlockId::new(
-            zinder_core::BlockHeight::new(1),
-            zinder_core::BlockHash::from_bytes([1; 32]),
+            zinder_core::BlockHeight::new(u32::from(height)),
+            zinder_core::BlockHash::from_bytes([height; 32]),
         )
+    }
+
+    struct MutableEpochCanonicalControl {
+        canonical: CanonicalControlHandle,
+        canonical_epoch: Arc<ParkingMutex<ChainEpoch>>,
+        command_task: tokio::task::JoinHandle<()>,
+    }
+
+    fn set_canonical_visible_tip(
+        canonical_epoch: &ParkingMutex<ChainEpoch>,
+        visible_tip: zinder_core::BlockId,
+    ) {
+        let mut epoch = canonical_epoch.lock();
+        epoch.visible_tip_height = visible_tip.height;
+        epoch.visible_tip_hash = visible_tip.hash;
+    }
+
+    fn mutable_epoch_canonical_control(
+        mut store: RocksDbCanonicalStore,
+    ) -> Result<MutableEpochCanonicalControl, Box<dyn Error>> {
+        let canonical_epoch = Arc::new(ParkingMutex::new(store.chain_epoch()?));
+        let command_epoch = canonical_epoch.clone();
+        let canonical_fence = store.event_fence();
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "the test overrides only epoch reads and delegates the full control contract"
+                )]
+                match command {
+                    CanonicalControlCommand::ChainEpoch { reply } => {
+                        let _send_outcome = reply.send(Ok(CanonicalWriterSnapshot {
+                            chain_epoch: *command_epoch.lock(),
+                            fence: canonical_fence,
+                        }));
+                    }
+                    command => {
+                        apply_canonical_control_command(&mut store, command);
+                    }
+                }
+            }
+        });
+        Ok(MutableEpochCanonicalControl {
+            canonical,
+            canonical_epoch,
+            command_task,
+        })
     }
 
     fn synthetic_v4_tx_bytes(transaction_nonce: u32) -> Vec<u8> {

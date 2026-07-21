@@ -153,9 +153,10 @@ impl MempoolSourceAdmission {
 
 /// Source-observed mempool transition.
 ///
-/// Variants correspond directly to Zebra's `MempoolChange::ChangeType`. A
-/// polling backend that observes a txid disappear without a chain commit
-/// emits [`MempoolSourceEvent::Invalidated`] with
+/// Lifecycle variants correspond directly to Zebra's
+/// `MempoolChange::ChangeType`; control-plane variants delimit a coherent
+/// stream generation. A polling backend that observes a txid disappear
+/// without a chain commit emits [`MempoolSourceEvent::Invalidated`] with
 /// [`MempoolEvictionReason::Unknown`]; the streaming backend always emits
 /// `Unknown` because Zebra's `MempoolChange` does not carry a reason on the
 /// wire.
@@ -176,6 +177,21 @@ pub enum MempoolSourceEvent {
         /// Exact upstream best-chain tip that remained stable while the
         /// source constructed this complete snapshot generation.
         source_tip: BlockId,
+    },
+    /// Control-plane marker that ends the current stream generation because
+    /// the upstream best-chain tip moved normally.
+    ///
+    /// This is not a mempool lifecycle transition and must never be persisted
+    /// in the canonical mempool-event log. Consumers discard provisional
+    /// state or retire the certified generation, then reconnect to build a
+    /// snapshot against the newly observed tip. Source monitor, transport,
+    /// and hydration failures remain [`SourceError`] stream items rather than
+    /// this marker.
+    SourceTipChanged {
+        /// Tip against which the ending generation was constructed.
+        generation_source_tip: BlockId,
+        /// New tip observed by the source.
+        observed_source_tip: BlockId,
     },
     /// New transaction admitted to the upstream mempool, with hydrated raw
     /// bytes.
@@ -350,13 +366,15 @@ pub trait MempoolSource: Send + Sync + 'static {
     ///
     /// Returns a [`MempoolSourceEventStream`] that yields hydrated
     /// [`MempoolSourceEvent`] values until the underlying source closes or
-    /// fails permanently. Each healthy stream generation emits exactly one
-    /// [`MempoolSourceEvent::InitialSnapshotComplete`] marker after its
-    /// initial snapshot is complete. Transient transport failures are
-    /// signalled by a [`SourceError`] item in the stream; callers should
-    /// reconnect and keep the previous snapshot unavailable until the next
-    /// generation's completion marker because the underlying broadcast
-    /// channel may have lagged events.
+    /// fails permanently. A generation that reaches certification emits
+    /// exactly one [`MempoolSourceEvent::InitialSnapshotComplete`] marker
+    /// after its initial snapshot is complete. Normal source-tip movement
+    /// emits one [`MempoolSourceEvent::SourceTipChanged`] marker and ends the
+    /// generation; transient monitor, transport, and hydration failures are
+    /// signalled by a [`SourceError`] item instead. Callers should reconnect
+    /// and keep the previous snapshot unavailable until the next generation's
+    /// completion marker because the underlying broadcast channel may have
+    /// lagged events.
     async fn events(&self) -> Result<MempoolSourceEventStream, SourceError>;
 }
 

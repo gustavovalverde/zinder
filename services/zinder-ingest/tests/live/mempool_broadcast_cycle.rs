@@ -35,7 +35,7 @@ use zinder_core::{
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceEvent,
-    NodeSource, SourceError, TransactionBroadcaster, UpstreamTransactionLookup, ZebraJsonRpcSource,
+    NodeSource, TransactionBroadcaster, UpstreamTransactionLookup, ZebraJsonRpcSource,
     ZebraJsonRpcSourceOptions,
 };
 use zinder_testkit::live::{init, require_live_for};
@@ -389,12 +389,12 @@ async fn wait_for_generation_end_on_tip_change(
         let remaining = deadline.saturating_sub(started.elapsed());
         let outcome = tokio::time::timeout(remaining, event_stream.next()).await;
         match outcome {
+            Ok(Some(Ok(MempoolSourceEvent::SourceTipChanged { .. }))) => return Ok(()),
             Ok(Some(Ok(_other))) => {}
-            Ok(Some(Err(SourceError::MempoolStreamUnavailable { .. }))) => return Ok(()),
             Ok(Some(Err(error))) => return Err(eyre!("unexpected source error: {error}")),
             Ok(None) => {
                 return Err(eyre!(
-                    "mempool generation closed without its tip-change error"
+                    "mempool generation closed without its tip-change marker"
                 ));
             }
             Err(_elapsed) => break,

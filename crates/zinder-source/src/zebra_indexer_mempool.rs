@@ -243,7 +243,22 @@ fn spawn_certified_event_aggregator(
             match resnapshot_current_mempool(snapshot_json_rpc, admission_limits, &event_sender)
                 .await
             {
-                Ok(snapshot) => snapshot,
+                Ok(ResnapshotOutcome::Complete {
+                    source_tip,
+                    admission,
+                }) => (source_tip, admission),
+                Ok(ResnapshotOutcome::SourceTipChanged {
+                    generation_source_tip,
+                    observed_source_tip,
+                }) => {
+                    let _ = forward_source_tip_changed(
+                        generation_source_tip,
+                        observed_source_tip,
+                        &event_sender,
+                    )
+                    .await;
+                    return;
+                }
                 Err(source_error) => {
                     let _ = forward_error(source_error, &event_sender).await;
                     return;
@@ -258,14 +273,14 @@ fn spawn_certified_event_aggregator(
                 &event_sender,
             )
             .await,
-            ForwardOutcome::ChannelClosed
+            GenerationOutcome::Ended
         ) {
             return;
         }
         if matches!(
             publish_certified_snapshot_marker(source_tip, &mut chain_tip_stream, &event_sender,)
                 .await,
-            ForwardOutcome::ChannelClosed
+            GenerationOutcome::Ended
         ) {
             return;
         }
@@ -286,18 +301,34 @@ async fn flush_certification_prefix(
     chain_tip_stream: &mut crate::ChainTipNotificationStream,
     wire_receiver: &mut mpsc::Receiver<Result<MempoolSourceEvent, SourceError>>,
     event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
-) -> ForwardOutcome {
+) -> GenerationOutcome {
     loop {
+        match validate_pending_tip_notifications(source_tip, chain_tip_stream) {
+            Ok(TipCoherence::Stable) => {}
+            Ok(TipCoherence::Changed {
+                observed_source_tip,
+            }) => {
+                let _ =
+                    forward_source_tip_changed(source_tip, observed_source_tip, event_sender).await;
+                return GenerationOutcome::Ended;
+            }
+            Err(source_error) => {
+                let _ = forward_error(source_error, event_sender).await;
+                return GenerationOutcome::Ended;
+            }
+        }
         match wire_receiver.try_recv() {
             Ok(wire_event) => {
                 if matches!(
                     forward_admitted_result(wire_event, admission, event_sender).await,
                     ForwardOutcome::ChannelClosed
                 ) {
-                    return ForwardOutcome::ChannelClosed;
+                    return GenerationOutcome::Ended;
                 }
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                return GenerationOutcome::Continue;
+            }
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                 let _ = forward_error(
                     SourceError::MempoolStreamUnavailable {
@@ -306,15 +337,8 @@ async fn flush_certification_prefix(
                     event_sender,
                 )
                 .await;
-                return ForwardOutcome::ChannelClosed;
+                return GenerationOutcome::Ended;
             }
-        }
-    }
-    match validate_pending_tip_notifications(source_tip, chain_tip_stream) {
-        Ok(()) => ForwardOutcome::Continue,
-        Err(source_error) => {
-            let _ = forward_error(source_error, event_sender).await;
-            ForwardOutcome::ChannelClosed
         }
     }
 }
@@ -323,30 +347,45 @@ async fn publish_certified_snapshot_marker(
     source_tip: BlockId,
     chain_tip_stream: &mut crate::ChainTipNotificationStream,
     event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
-) -> ForwardOutcome {
+) -> GenerationOutcome {
     let Ok(marker_permit) = event_sender.reserve().await else {
-        return ForwardOutcome::ChannelClosed;
+        return GenerationOutcome::Ended;
     };
-    if let Err(source_error) = validate_pending_tip_notifications(source_tip, chain_tip_stream) {
-        drop(marker_permit);
-        let _ = forward_error(source_error, event_sender).await;
-        return ForwardOutcome::ChannelClosed;
+    match validate_pending_tip_notifications(source_tip, chain_tip_stream) {
+        Ok(TipCoherence::Stable) => {}
+        Ok(TipCoherence::Changed {
+            observed_source_tip,
+        }) => {
+            marker_permit.send(Ok(MempoolSourceEvent::SourceTipChanged {
+                generation_source_tip: source_tip,
+                observed_source_tip,
+            }));
+            return GenerationOutcome::Ended;
+        }
+        Err(source_error) => {
+            drop(marker_permit);
+            let _ = forward_error(source_error, event_sender).await;
+            return GenerationOutcome::Ended;
+        }
     }
     marker_permit.send(Ok(MempoolSourceEvent::InitialSnapshotComplete {
         source_tip,
     }));
-    ForwardOutcome::Continue
+    GenerationOutcome::Continue
 }
 
 fn validate_pending_tip_notifications(
     source_tip: BlockId,
     chain_tip_stream: &mut crate::ChainTipNotificationStream,
-) -> Result<(), SourceError> {
+) -> Result<TipCoherence, SourceError> {
     loop {
         match chain_tip_stream.next().now_or_never() {
-            None => return Ok(()),
+            None => return Ok(TipCoherence::Stable),
             Some(Some(chain_tip_result)) => {
-                coherent_tip_notification(source_tip, chain_tip_result)?;
+                match coherent_tip_notification(source_tip, chain_tip_result)? {
+                    TipCoherence::Stable => {}
+                    changed @ TipCoherence::Changed { .. } => return Ok(changed),
+                }
             }
             Some(None) => {
                 return Err(SourceError::MempoolStreamUnavailable {
@@ -372,23 +411,42 @@ async fn forward_certified_generation(
             // owner reads still fail closed when the canonical tip advances.
             biased;
             chain_tip_result = chain_tip_stream.next() => {
-                let source_error = match chain_tip_result {
+                match chain_tip_result {
                     Some(chain_tip_result) => match coherent_tip_notification(
                         source_tip,
                         chain_tip_result,
                     ) {
-                        Ok(()) => continue,
-                        Err(source_error) => source_error,
+                        Ok(TipCoherence::Stable) => continue,
+                        Ok(TipCoherence::Changed { observed_source_tip }) => {
+                            let _ = forward_source_tip_changed(
+                                source_tip,
+                                observed_source_tip,
+                                event_sender,
+                            ).await;
+                        }
+                        Err(source_error) => {
+                            let _ = forward_error(source_error, event_sender).await;
+                        }
                     },
-                    None => SourceError::MempoolStreamUnavailable {
-                        reason: "indexer chain-tip monitor ended while serving a certified mempool generation".to_owned(),
-                    },
-                };
-                let _ = forward_error(source_error, event_sender).await;
+                    None => {
+                        let _ = forward_error(
+                            SourceError::MempoolStreamUnavailable {
+                                reason: "indexer chain-tip monitor ended while serving a certified mempool generation".to_owned(),
+                            },
+                            event_sender,
+                        ).await;
+                    }
+                }
                 return;
             }
             wire_event = wire_receiver.recv() => {
                 let Some(wire_event) = wire_event else {
+                    let _ = forward_error(
+                        SourceError::MempoolStreamUnavailable {
+                            reason: "indexer mempool-change stream ended while serving a certified mempool generation".to_owned(),
+                        },
+                        event_sender,
+                    ).await;
                     return;
                 };
                 if matches!(
@@ -403,19 +461,25 @@ async fn forward_certified_generation(
 }
 
 fn coherent_tip_notification(
-    certified_source_tip: BlockId,
+    generation_source_tip: BlockId,
     chain_tip_result: Result<ChainTipNotification, SourceError>,
-) -> Result<(), SourceError> {
+) -> Result<TipCoherence, SourceError> {
     let notification =
         chain_tip_result.map_err(|source_error| SourceError::MempoolStreamUnavailable {
             reason: format!("indexer chain-tip monitor failed: {source_error}"),
         })?;
-    if notification.tip_id == certified_source_tip {
-        return Ok(());
+    if notification.tip_id == generation_source_tip {
+        return Ok(TipCoherence::Stable);
     }
-    Err(SourceError::MempoolStreamUnavailable {
-        reason: "source tip changed after the mempool generation was certified".to_owned(),
+    Ok(TipCoherence::Changed {
+        observed_source_tip: notification.tip_id,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TipCoherence {
+    Stable,
+    Changed { observed_source_tip: BlockId },
 }
 
 /// Emits a synthetic `Added` event for every transaction already sitting in
@@ -430,7 +494,7 @@ async fn resnapshot_current_mempool(
     hydration_json_rpc: ZebraJsonRpcSource,
     admission_limits: MempoolSourceAdmissionLimits,
     event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
-) -> Result<(BlockId, MempoolSourceAdmission), SourceError> {
+) -> Result<ResnapshotOutcome, SourceError> {
     let source_tip_before = hydration_json_rpc.tip_id().await?;
     let observed_at = UnixTimestampMillis::now();
     let mut transaction_ids = hydration_json_rpc
@@ -450,7 +514,23 @@ async fn resnapshot_current_mempool(
                 }
             })
             .try_buffer_unordered(MEMPOOL_RESNAPSHOT_HYDRATION_CONCURRENCY);
-    while let Some(source_event) = source_events.try_next().await? {
+    loop {
+        let source_event = match source_events.try_next().await {
+            Ok(Some(source_event)) => source_event,
+            Ok(None) => break,
+            Err(source_error) => {
+                if matches!(&source_error, SourceError::MempoolHydrationFailed { .. }) {
+                    let observed_source_tip = hydration_json_rpc.tip_id().await?;
+                    if source_tip_before != observed_source_tip {
+                        return Ok(ResnapshotOutcome::SourceTipChanged {
+                            generation_source_tip: source_tip_before,
+                            observed_source_tip,
+                        });
+                    }
+                }
+                return Err(source_error);
+            }
+        };
         admit_source_event(&mut admission, &source_event)?;
         if matches!(
             forward_event(source_event, event_sender).await,
@@ -463,11 +543,31 @@ async fn resnapshot_current_mempool(
     }
     let source_tip_after = hydration_json_rpc.tip_id().await?;
     if source_tip_before != source_tip_after {
-        return Err(SourceError::MempoolStreamUnavailable {
-            reason: "source tip changed while constructing the mempool snapshot".to_owned(),
+        return Ok(ResnapshotOutcome::SourceTipChanged {
+            generation_source_tip: source_tip_before,
+            observed_source_tip: source_tip_after,
         });
     }
-    Ok((source_tip_after, admission))
+    Ok(ResnapshotOutcome::Complete {
+        source_tip: source_tip_after,
+        admission,
+    })
+}
+
+enum ResnapshotOutcome {
+    Complete {
+        source_tip: BlockId,
+        admission: MempoolSourceAdmission,
+    },
+    SourceTipChanged {
+        generation_source_tip: BlockId,
+        observed_source_tip: BlockId,
+    },
+}
+
+enum GenerationOutcome {
+    Continue,
+    Ended,
 }
 
 /// Whether the consumer is still listening to the source-event channel.
@@ -533,6 +633,21 @@ async fn forward_error(
     }
 }
 
+async fn forward_source_tip_changed(
+    generation_source_tip: BlockId,
+    observed_source_tip: BlockId,
+    event_sender: &mpsc::Sender<Result<MempoolSourceEvent, SourceError>>,
+) -> ForwardOutcome {
+    forward_event(
+        MempoolSourceEvent::SourceTipChanged {
+            generation_source_tip,
+            observed_source_tip,
+        },
+        event_sender,
+    )
+    .await
+}
+
 async fn forward_admitted_result(
     source_result: Result<MempoolSourceEvent, SourceError>,
     admission: &mut MempoolSourceAdmission,
@@ -561,7 +676,8 @@ fn admit_source_event(
             admission.remove_transaction(*transaction_id);
             Ok(())
         }
-        MempoolSourceEvent::InitialSnapshotComplete { .. } => Ok(()),
+        MempoolSourceEvent::InitialSnapshotComplete { .. }
+        | MempoolSourceEvent::SourceTipChanged { .. } => Ok(()),
     }
 }
 
@@ -670,10 +786,10 @@ mod tests {
             zinder_core::BlockHeight::new(7),
             zinder_core::BlockHash::from_bytes([7; 32]),
         );
-        assert!(
-            coherent_tip_notification(source_tip, Ok(ChainTipNotification { tip_id: source_tip }))
-                .is_ok()
-        );
+        assert!(matches!(
+            coherent_tip_notification(source_tip, Ok(ChainTipNotification { tip_id: source_tip })),
+            Ok(TipCoherence::Stable)
+        ));
 
         let next_tip = BlockId::new(
             zinder_core::BlockHeight::new(8),
@@ -681,7 +797,7 @@ mod tests {
         );
         assert!(matches!(
             coherent_tip_notification(source_tip, Ok(ChainTipNotification { tip_id: next_tip })),
-            Err(SourceError::MempoolStreamUnavailable { .. })
+            Ok(TipCoherence::Changed { observed_source_tip }) if observed_source_tip == next_tip
         ));
     }
 
@@ -735,9 +851,107 @@ mod tests {
         let _channel_filler = event_receiver.recv().await;
         let outcome = publish_task.await?;
 
-        assert!(matches!(outcome, ForwardOutcome::ChannelClosed));
-        assert!(matches!(event_receiver.recv().await, Some(Err(_))));
+        assert!(matches!(outcome, GenerationOutcome::Ended));
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(Ok(MempoolSourceEvent::SourceTipChanged {
+                generation_source_tip,
+                observed_source_tip,
+            })) if generation_source_tip == source_tip && observed_source_tip == next_tip
+        ));
         assert!(event_receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn certification_prefix_prioritizes_a_queued_tip_change() -> eyre::Result<()> {
+        let source_tip = BlockId::new(
+            zinder_core::BlockHeight::new(7),
+            zinder_core::BlockHash::from_bytes([7; 32]),
+        );
+        let next_tip = BlockId::new(
+            zinder_core::BlockHeight::new(8),
+            zinder_core::BlockHash::from_bytes([8; 32]),
+        );
+        let (tip_sender, tip_receiver) = mpsc::channel(1);
+        let mut chain_tip_stream: crate::ChainTipNotificationStream =
+            Box::pin(ReceiverStream::new(tip_receiver));
+        let (wire_sender, mut wire_receiver) = mpsc::channel(1);
+        let (event_sender, mut event_receiver) = mpsc::channel(1);
+        let mut admission = MempoolSourceAdmission::new(MempoolSourceAdmissionLimits::default());
+        tip_sender
+            .send(Ok(ChainTipNotification { tip_id: next_tip }))
+            .await?;
+        wire_sender
+            .send(Err(SourceError::MempoolStreamUnavailable {
+                reason: "queued wire event must not outrun a queued tip change".to_owned(),
+            }))
+            .await?;
+
+        let outcome = flush_certification_prefix(
+            source_tip,
+            &mut admission,
+            &mut chain_tip_stream,
+            &mut wire_receiver,
+            &event_sender,
+        )
+        .await;
+
+        assert!(matches!(outcome, GenerationOutcome::Ended));
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(Ok(MempoolSourceEvent::SourceTipChanged {
+                generation_source_tip,
+                observed_source_tip,
+            })) if generation_source_tip == source_tip && observed_source_tip == next_tip
+        ));
+        assert!(event_receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn certified_generation_emits_tip_change_marker_and_ends() -> eyre::Result<()> {
+        let source_tip = BlockId::new(
+            zinder_core::BlockHeight::new(7),
+            zinder_core::BlockHash::from_bytes([7; 32]),
+        );
+        let next_tip = BlockId::new(
+            zinder_core::BlockHeight::new(8),
+            zinder_core::BlockHash::from_bytes([8; 32]),
+        );
+        let (tip_sender, tip_receiver) = mpsc::channel(1);
+        let chain_tip_stream: crate::ChainTipNotificationStream =
+            Box::pin(ReceiverStream::new(tip_receiver));
+        let (_wire_sender, wire_receiver) = mpsc::channel(1);
+        let (event_sender, mut event_receiver) = mpsc::channel(1);
+        let generation_task = tokio::spawn(async move {
+            let mut admission =
+                MempoolSourceAdmission::new(MempoolSourceAdmissionLimits::default());
+            let mut chain_tip_stream = chain_tip_stream;
+            let mut wire_receiver = wire_receiver;
+            forward_certified_generation(
+                source_tip,
+                &mut admission,
+                &mut chain_tip_stream,
+                &mut wire_receiver,
+                &event_sender,
+            )
+            .await;
+        });
+
+        tip_sender
+            .send(Ok(ChainTipNotification { tip_id: next_tip }))
+            .await?;
+
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(Ok(MempoolSourceEvent::SourceTipChanged {
+                generation_source_tip,
+                observed_source_tip,
+            })) if generation_source_tip == source_tip && observed_source_tip == next_tip
+        ));
+        generation_task.await?;
+        assert!(event_receiver.recv().await.is_none());
         Ok(())
     }
 
@@ -850,13 +1064,23 @@ mod tests {
         )?;
 
         let (event_sender, mut event_receiver) = mpsc::channel(8);
-        let (source_tip, _admission) = resnapshot_current_mempool(
+        let snapshot = resnapshot_current_mempool(
             hydration_json_rpc,
             MempoolSourceAdmissionLimits::default(),
             &event_sender,
         )
         .await?;
         drop(event_sender);
+
+        let ResnapshotOutcome::Complete {
+            source_tip,
+            admission: _admission,
+        } = snapshot
+        else {
+            return Err(eyre::eyre!(
+                "stable source tip must complete the resnapshot"
+            ));
+        };
 
         assert_eq!(
             source_tip,
@@ -969,7 +1193,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resnapshot_rejects_completion_when_the_source_tip_changes() -> eyre::Result<()> {
+    async fn resnapshot_ends_provisional_generation_when_the_source_tip_changes() -> eyre::Result<()>
+    {
         let txid_hex = "11".repeat(32);
         let server = zinder_testkit::JsonRpcTestServer::start([
             zinder_testkit::method("getbestblockheightandhash").reply(
@@ -1008,12 +1233,190 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            Err(SourceError::MempoolStreamUnavailable { .. })
+            Ok(ResnapshotOutcome::SourceTipChanged {
+                generation_source_tip,
+                observed_source_tip,
+            }) if generation_source_tip == BlockId::new(
+                zinder_core::BlockHeight::new(7),
+                zinder_core::BlockHash::from_bytes([0x07; 32]),
+            ) && observed_source_tip == BlockId::new(
+                zinder_core::BlockHeight::new(8),
+                zinder_core::BlockHash::from_bytes([0x08; 32]),
+            )
         ));
         assert!(matches!(
             event_receiver.try_recv(),
             Ok(Ok(MempoolSourceEvent::Added(_)))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_backend_emits_tip_change_after_provisional_hydration() -> eyre::Result<()> {
+        let txid_hex = "11".repeat(32);
+        let generation_source_tip = BlockId::new(
+            zinder_core::BlockHeight::new(7),
+            zinder_core::BlockHash::from_bytes([0x07; 32]),
+        );
+        let observed_source_tip = BlockId::new(
+            zinder_core::BlockHeight::new(8),
+            zinder_core::BlockHash::from_bytes([0x08; 32]),
+        );
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(serde_json::json!({
+                    "height": 7,
+                    "hash": vec![0x07; 32],
+                })),
+            ),
+            zinder_testkit::method("getrawmempool").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!([txid_hex]),
+            )),
+            zinder_testkit::method("getrawtransaction").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!("deadbeef"),
+            )),
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(serde_json::json!({
+                    "height": 8,
+                    "hash": vec![0x08; 32],
+                })),
+            ),
+        ])?;
+        let hydration_json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+        let (_tip_sender, tip_receiver) = mpsc::channel(1);
+        let chain_tip_stream: crate::ChainTipNotificationStream =
+            Box::pin(ReceiverStream::new(tip_receiver));
+        let (_wire_sender, wire_receiver) = mpsc::channel(1);
+        let (event_sender, mut event_receiver) = mpsc::channel(4);
+
+        spawn_certified_event_aggregator(
+            hydration_json_rpc,
+            MempoolSourceAdmissionLimits::default(),
+            chain_tip_stream,
+            wire_receiver,
+            event_sender,
+        );
+
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(Ok(MempoolSourceEvent::Added(_)))
+        ));
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(Ok(MempoolSourceEvent::SourceTipChanged {
+                generation_source_tip: event_generation_tip,
+                observed_source_tip: event_observed_tip,
+            })) if event_generation_tip == generation_source_tip
+                && event_observed_tip == observed_source_tip
+        ));
+        assert!(event_receiver.recv().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisional_missing_hydration_is_tip_change_when_the_tip_moved() -> eyre::Result<()> {
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(serde_json::json!({
+                    "height": 7,
+                    "hash": vec![0x07; 32],
+                })),
+            ),
+            zinder_testkit::method("getrawmempool").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!(["11".repeat(32)]),
+            )),
+            zinder_testkit::method("getrawtransaction").reply(
+                zinder_testkit::RpcReply::error_with_code(
+                    -5,
+                    "No such mempool or blockchain transaction",
+                ),
+            ),
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(serde_json::json!({
+                    "height": 8,
+                    "hash": vec![0x08; 32],
+                })),
+            ),
+        ])?;
+        let hydration_json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+        let (event_sender, mut event_receiver) = mpsc::channel(1);
+
+        let outcome = resnapshot_current_mempool(
+            hydration_json_rpc,
+            MempoolSourceAdmissionLimits::default(),
+            &event_sender,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Ok(ResnapshotOutcome::SourceTipChanged {
+                generation_source_tip,
+                observed_source_tip,
+            }) if generation_source_tip == BlockId::new(
+                zinder_core::BlockHeight::new(7),
+                zinder_core::BlockHash::from_bytes([0x07; 32]),
+            ) && observed_source_tip == BlockId::new(
+                zinder_core::BlockHeight::new(8),
+                zinder_core::BlockHash::from_bytes([0x08; 32]),
+            )
+        ));
+        assert!(event_receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisional_missing_hydration_remains_an_error_at_the_same_tip() -> eyre::Result<()> {
+        let source_tip_response = serde_json::json!({
+            "height": 7,
+            "hash": vec![0x07; 32],
+        });
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            zinder_testkit::method("getbestblockheightandhash").reply(
+                zinder_testkit::RpcReply::result(source_tip_response.clone()),
+            ),
+            zinder_testkit::method("getrawmempool").reply(zinder_testkit::RpcReply::result(
+                serde_json::json!(["11".repeat(32)]),
+            )),
+            zinder_testkit::method("getrawtransaction").reply(
+                zinder_testkit::RpcReply::error_with_code(
+                    -5,
+                    "No such mempool or blockchain transaction",
+                ),
+            ),
+            zinder_testkit::method("getbestblockheightandhash")
+                .reply(zinder_testkit::RpcReply::result(source_tip_response)),
+        ])?;
+        let hydration_json_rpc = ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashRegtest,
+            server.url(),
+            crate::NodeAuth::None,
+            Duration::from_secs(5),
+        )?;
+        let (event_sender, mut event_receiver) = mpsc::channel(1);
+
+        let outcome = resnapshot_current_mempool(
+            hydration_json_rpc,
+            MempoolSourceAdmissionLimits::default(),
+            &event_sender,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Err(SourceError::MempoolHydrationFailed { .. })
+        ));
+        assert!(event_receiver.try_recv().is_err());
         Ok(())
     }
 
