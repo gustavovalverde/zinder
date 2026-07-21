@@ -19,7 +19,7 @@ The decisions to record here are:
 
 1. The split between in-memory `MempoolIndex` (live state) and durable mempool event history (cursor-resumable history) and why the canonical store carries the latter but not the former.
 2. The `IngestControlMempoolSurface` topology: secondary readers and the lightwalletd compat shim consume the writer's mempool through the same `IngestControl` endpoint that already serves chain events, instead of opening a second source connection.
-3. The two-tier retention windows, their defaults, and the readiness causes they emit when retention is approaching exhaustion.
+3. The two-tier retention windows, their defaults, their metrics-only operational diagnostics, and the exact-tip hydration prerequisite that keeps ingest `syncing` until the mempool and canonical tips agree.
 4. The `TxStatus::InMempool(MempoolEntry)` typed shape that carries the hydrated mempool entry, the chain epoch at first observation, the transparent overlay, and the precomputed compact-tx bytes; clients receive the typed status directly rather than parsing error strings.
 
 ## Decision
@@ -32,8 +32,9 @@ for output and spend lookups. The ordered primary index makes snapshot paging
 and source-generation reconciliation use working memory bounded by the page
 size rather than cloning and sorting the full mempool. Total reconciliation
 work remains proportional to the old and staged entry counts. It is not a
-column family. Crashes drop the live index; the next restart rebuilds it from
-the source's snapshot.
+column family. Crashes drop the live index; the next restart rebuilds it by
+replaying retained durable events before reconciling with a fresh source
+generation.
 
 The canonical store persists durable mempool event history in its `mempool_event` column family. Every typed `Added` / `Invalidated` / `Mined` envelope is committed there before consumers see it. The retention floor is stored with the canonical control records, so cursor expiration is a single durable read rather than a column-family scan.
 
@@ -82,7 +83,7 @@ can increase durable event-log and reconciliation work; lowering them provides
 a fail-closed resource ceiling at the cost of availability during unusually
 large mempool bursts.
 
-The split exists because the live index needs to answer transparent lookups in microseconds without a RocksDB round-trip, and because it can be reconstructed deterministically from a source snapshot at startup. The event log needs to answer cursor resume and rebroadcast detection with millisecond latency over hours of history, which RocksDB does well and an in-process ring buffer does not.
+The split exists because the live index needs to answer transparent lookups in microseconds without a RocksDB round-trip, and because it can be reconstructed deterministically by replaying retained durable events before reconciling with the source at startup. The event log needs to answer cursor resume and rebroadcast detection with millisecond latency over hours of history, which RocksDB does well and an in-process ring buffer does not.
 
 ### Compatibility and native adapters reach the writer through `IngestControl`, not a second source connection
 
@@ -176,7 +177,7 @@ The `MempoolEntry` carries the hydrated transaction, the chain epoch at first ob
 
 - One privileged path (`IngestControl`) serves writer status, visible chain events, mempool snapshots, and mempool events. Bearer-token auth from ADR-0006 covers every method.
 - Operators tune mempool retention separately from chain-event retention. Default `mined_window = 60 minutes` and `invalidated_window = 24 hours` are shipped values; production deployments with longer wallet reconnect SLAs raise them and accept the larger `mempool_event` column-family footprint.
-- A `mempool_*` readiness cause never fails a load balancer probe. They are drain-not-fail signals, identical posture to the existing `cursor_at_risk` cause.
+- Mempool lifecycle, source, hydration, and retention conditions are metrics-only diagnostics and add no readiness causes. Ingest remains `syncing` until a certified hydrated generation matches the exact canonical tip.
 
 ## Alternatives Considered
 
@@ -190,7 +191,7 @@ Rejected. `Mined` and `Invalidated` events have different shelf lives because th
 
 ### Persist the live `MempoolIndex` as a column family
 
-Rejected. The live index needs microsecond-latency transparent-overlay lookups. RocksDB cannot match that. Persisting also means every transparent index change causes a commit, multiplying write amplification on a hot path that has no recovery requirement (the source snapshot reseeds it).
+Rejected. The live index needs microsecond-latency transparent-overlay lookups. RocksDB cannot match that. Persisting also means every transparent index change causes a commit, multiplying write amplification on a hot path that has no recovery requirement (retained durable events rebuild it before source reconciliation).
 
 ### Skip `TipChangeWatcher`; let consumers handle stream-end semantics
 

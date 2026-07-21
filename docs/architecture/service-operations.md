@@ -37,16 +37,13 @@ version and commit appear in the `zinder_build_info` metric and native
 | `replica_lagging` | A RocksDB secondary exceeds the admitted epoch lag. |
 | `writer_status_unavailable` | A trusted reader cannot reach the writer control API. |
 | `cursor_at_risk` | Canonical event retention is approaching an active cursor. |
-| `mempool_cursor_at_risk` | Mempool retention is approaching an active cursor. |
-| `mempool_source_unavailable` | The live mempool source is unavailable; traffic is blocked if this reserved typed cause is published. |
-| `mempool_hydration_lagging` | Mempool transaction hydration is falling behind; traffic is blocked if this reserved typed cause is published. |
 | `shutting_down` | New traffic has been drained for termination. |
 
 Payload-bearing causes include structured detail. `node_unavailable` carries a
 bounded failure class, sanitized reason, consecutive-failure count, and outage
 duration. `upstream_not_ready` carries source heights, verification progress,
-and the health-probe source. Reorg, replica, and retention causes carry the
-numeric boundary that failed.
+and the health-probe source. Reorg, replica, and canonical-retention causes
+carry the numeric boundary that failed.
 
 Readiness detail is operational data, not a place for raw node responses,
 authorization material, filesystem paths, transaction identifiers, or other

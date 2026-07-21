@@ -11,7 +11,7 @@ groups:
           description: "{{ $labels.service }} has not been scrapeable for 30 seconds."
 
       - alert: ZinderServiceNotReady
-        expr: zinder_readiness_state{cause!~"^(ready|cursor_at_risk|mempool_cursor_at_risk)$"} == 1
+        expr: zinder_readiness_state{cause!~"^(ready|cursor_at_risk)$"} == 1
         for: 1m
         labels:
           severity: warning
@@ -20,7 +20,7 @@ groups:
           description: "{{ $labels.service }} reports readiness cause {{ $labels.cause }}."
 
       - alert: ZinderReadinessWarning
-        expr: zinder_readiness_state{cause=~"^(cursor_at_risk|mempool_cursor_at_risk)$"} == 1
+        expr: zinder_readiness_state{cause=~"^cursor_at_risk$"} == 1
         for: 5m
         labels:
           severity: warning

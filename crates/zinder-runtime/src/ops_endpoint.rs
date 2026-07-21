@@ -403,9 +403,6 @@ fn readiness_sync_lag_blocks(cause: &crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::ReplicaLagging { .. }
         | crate::ReadinessCause::WriterStatusUnavailable
         | crate::ReadinessCause::CursorAtRisk { .. }
-        | crate::ReadinessCause::MempoolCursorAtRisk { .. }
-        | crate::ReadinessCause::MempoolSourceUnavailable
-        | crate::ReadinessCause::MempoolHydrationLagging { .. }
         | crate::ReadinessCause::ShuttingDown
         | crate::ReadinessCause::UpstreamNotReady(_) => 0.0,
     }
@@ -424,9 +421,6 @@ fn readiness_replica_lag_chain_epochs(cause: &crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::ReorgWindowExceeded { .. }
         | crate::ReadinessCause::WriterStatusUnavailable
         | crate::ReadinessCause::CursorAtRisk { .. }
-        | crate::ReadinessCause::MempoolCursorAtRisk { .. }
-        | crate::ReadinessCause::MempoolSourceUnavailable
-        | crate::ReadinessCause::MempoolHydrationLagging { .. }
         | crate::ReadinessCause::ShuttingDown
         | crate::ReadinessCause::UpstreamNotReady(_) => 0.0,
     }

@@ -119,19 +119,6 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
         "{metrics_text}"
     );
 
-    readiness.set(ReadinessState::mempool_cursor_at_risk(50, 60, Some(7)));
-    let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
-    assert_eq!(status, 200);
-    assert_eq!(readyz_value["status"], "ready");
-    assert_eq!(
-        readyz_value["cause"]["mempool_cursor_at_risk"]["oldest_retained_age_minutes"],
-        50
-    );
-    assert_eq!(
-        readyz_value["cause"]["mempool_cursor_at_risk"]["retention_minutes"],
-        60
-    );
-
     server_handle.shutdown().await;
 
     Ok(())

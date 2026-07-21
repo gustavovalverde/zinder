@@ -240,7 +240,7 @@ The lightwalletd compatibility shim does not expose this subscription. The vendo
 
 ## Mempool Snapshot and Subscription
 
-Mempool surfaces are owned by [ADR-0007](../adrs/0007-mempool-topology-and-retention.md), which records the source, live index, event-log, API, compatibility, retention windows, and readiness causes.
+Mempool surfaces are owned by [ADR-0007](../adrs/0007-mempool-topology-and-retention.md), which records the source, live index, event log, API, compatibility, retention windows, metrics-only diagnostics, and exact-tip readiness prerequisite.
 
 The unconfirmed-transaction contract serves several Zcash ecosystem products,
 but each product consumes a different boundary. This table is the canonical
