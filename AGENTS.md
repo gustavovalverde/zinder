@@ -1,5 +1,8 @@
 # Repository Guidelines
 
+[CLAUDE.md](CLAUDE.md) contains the canonical repository instructions. Read and
+follow it before making changes; this file is a concise project reference.
+
 ## Project Structure & Module Organization
 
 This is a Rust 2024 workspace. Domain crates live under `crates/`: `zinder-core` for shared types, `zinder-store` for RocksDB-backed canonical storage, `zinder-source` for upstream node adapters and the shared `NodeTarget` config type, `zinder-proto` for generated protocol modules, `zinder-runtime` for the operational HTTP surface and config loader, and `zinder-testkit` for fixtures and the `live::` test-helper module. Service crates live under `services/`: `zinder-ingest` owns bulk catchup and canonical writes, `zinder-query` owns wallet-facing read APIs, `zinder-compat-lightwalletd` translates the lightwalletd protocol. Integration tests sit beside each crate in `tests/{integration,live,perf}/` as documented in the [Testing Runbook](docs/runbooks/testing.md). Architecture, ADRs, references, and runbooks live under `docs/`; update them when a change alters boundaries, protocol bytes, storage semantics, or public vocabulary.
@@ -30,7 +33,13 @@ Tests should exercise public boundaries and contract shapes: append, reorg, sett
 
 ## Commit & Pull Request Guidelines
 
-Use concise imperative commits with an optional scope, for example `store: reject invalid reorg replacement`. Pull requests should summarize behavior changes, list validation commands run, link related docs or ADR updates, and call out any deferred production gap.
+Use full Conventional Commits syntax for commits and pull request titles, for
+example `fix(store): reject invalid reorg replacement`. Every pull request must
+follow the [release-note instructions](CLAUDE.md#pull-request-release-notes) and
+provide either a present `.changes/unreleased/*.yaml` fragment or the exact
+no-note waiver. Pull requests should summarize behavior changes, list
+validation commands run, link related docs or ADR updates, and call out any
+deferred production gap.
 
 ## Security & Configuration Tips
 

@@ -11,6 +11,7 @@ Zinder is a service-oriented Zcash indexer. Architecture, vocabulary, and bounda
 - [docs/architecture/public-interfaces.md](docs/architecture/public-interfaces.md): the vocabulary spine (types, errors, config fields, capability strings).
 - [docs/architecture/chain-ingestion.md](docs/architecture/chain-ingestion.md): the canonical commit pipeline.
 - [docs/adrs/0003-canonical-storage-access-boundary.md](docs/adrs/0003-canonical-storage-access-boundary.md): the epoch-bound storage API, writer/reader topology, secondary catchup, and writer-status RPC.
+- [.changes/README.md](.changes/README.md): the pull request release-note workflow and fragment-writing guidance.
 
 Before changing public types, storage layouts, protocol bytes, or service boundaries, read the relevant doc above and amend it in the same change.
 
@@ -28,6 +29,8 @@ cargo nextest run --profile=ci-perf
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 cargo deny check
 cargo machete
+scripts/test-changelog.sh
+scripts/validate-changelog.sh fragments
 git diff --check
 ```
 
@@ -45,6 +48,41 @@ cargo mutants --workspace --all-features \
 ```
 
 Single-test execution under nextest: `cargo nextest run -p <crate> -E 'test(<test_name>)'`. Tier filter: `-E 'test(/^integration::cli::/)'`. Integration tests live in each crate's `tests/{integration,live,perf}/` submodules; the per-crate binary is `tests/acceptance.rs`.
+
+## Pull Request Release Notes
+
+Every pull request must provide one of 2 declarations:
+
+1. Add or update a `.changes/unreleased/*.yaml` fragment for a change that
+   affects operators, API consumers, deployment behavior, compatibility,
+   security, or supported workflows.
+2. Check the exact `- [x] No release note required` line in the pull request
+   body for an internal-only change.
+
+Install the repository-pinned Changie version and run `changie new` to create a
+fragment:
+
+```bash
+go install github.com/miniscruff/changie@v1.25.1
+changie new
+```
+
+Choose the changelog category and SemVer impact independently, use the real
+pull request number, and write the body for a Zinder user or operator. When a
+task includes publishing a new pull request and its number is not known, create
+the pull request first, then add its fragment and push the follow-up commit. Do
+not guess a future pull request number.
+
+The required `dependency hygiene` CI job runs
+`scripts/validate-changelog.sh pr`. It accepts a changed fragment only when the
+file exists at the pull request head, validates all pending fragments with
+Changie, and otherwise requires the exact waiver line. Adding and then deleting
+a fragment does not satisfy the check.
+
+Do not edit `CHANGELOG.md` for an ordinary pull request. Release preparation is
+the only workflow that batches fragments into the changelog; follow the
+[release runbook](docs/runbooks/releasing.md) and use
+`scripts/prepare-changelog-release.sh` for that change.
 
 ## Live Node Tests (T3)
 

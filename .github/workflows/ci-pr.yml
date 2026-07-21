@@ -117,7 +117,7 @@ jobs:
       - name: Test changelog policy
         run: scripts/test-changelog.sh
 
-      - name: Verify pull request changelog declaration
+      - name: Require release note fragment or waiver
         if: github.event_name == 'pull_request'
         env:
           BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
