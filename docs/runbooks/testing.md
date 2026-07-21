@@ -953,7 +953,7 @@ wallet.read.server_info_v2
 wallet.read.network_upgrade_activations_v1
 wallet.broadcast.transaction_v1
 wallet.events.chain_v1
-wallet.snapshot.mempool_v2
+wallet.snapshot.mempool_v3
 wallet.events.mempool_v2
 wallet.mempool.transparent_outputs_by_address_v1
 wallet.mempool.transparent_spends_by_outpoint_v1

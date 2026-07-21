@@ -130,7 +130,7 @@ pub const WALLET_BROADCAST_TRANSACTION_V1: &str = "wallet.broadcast.transaction_
 /// Capability advertised for `WalletQuery.ChainEvents`.
 pub const WALLET_EVENTS_CHAIN_V1: &str = "wallet.events.chain_v1";
 /// Capability advertised for `WalletQuery.MempoolSnapshot`.
-pub const WALLET_SNAPSHOT_MEMPOOL_V2: &str = "wallet.snapshot.mempool_v2";
+pub const WALLET_SNAPSHOT_MEMPOOL_V3: &str = "wallet.snapshot.mempool_v3";
 /// Capability advertised for `WalletQuery.MempoolEvents`.
 pub const WALLET_EVENTS_MEMPOOL_V2: &str = "wallet.events.mempool_v2";
 /// Capability advertised for `WalletQuery.TransparentMempoolOutputsByAddress`.
@@ -482,7 +482,7 @@ pub const INGEST_CONTROL_WRITER_STATUS_V1: &str = "ingest.control.writer_status_
 /// Capability advertised for `IngestControl.VisibleChainEvents`.
 pub const INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1: &str = "ingest.control.visible_chain_events_v1";
 /// Capability advertised for `IngestControl.MempoolSnapshot`.
-pub const INGEST_CONTROL_MEMPOOL_SNAPSHOT_V2: &str = "ingest.control.mempool_snapshot_v2";
+pub const INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3: &str = "ingest.control.mempool_snapshot_v3";
 /// Capability advertised for `IngestControl.MempoolTransaction`.
 pub const INGEST_CONTROL_MEMPOOL_TRANSACTION_V2: &str = "ingest.control.mempool_transaction_v2";
 /// Capability advertised for `IngestControl.MempoolEvents`.
@@ -934,7 +934,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresChainEvents,
     ),
     CapabilitySpec::new(
-        WALLET_SNAPSHOT_MEMPOOL_V2,
+        WALLET_SNAPSHOT_MEMPOOL_V3,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.MempoolSnapshot"),
         AdvertisePolicy::AlwaysOn,
@@ -1282,7 +1282,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        INGEST_CONTROL_MEMPOOL_SNAPSHOT_V2,
+        INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.MempoolSnapshot"),
         AdvertisePolicy::AlwaysOn,
@@ -1372,7 +1372,7 @@ pub enum Capability {
     Broadcast,
     /// Cursor-resumable chain-event stream (`wallet.events.chain_v1`).
     ChainEvents,
-    /// Bounded mempool snapshot (`wallet.snapshot.mempool_v2`).
+    /// Tip-certified bounded mempool snapshot (`wallet.snapshot.mempool_v3`).
     MempoolSnapshot,
     /// Replayable mempool-event stream (`wallet.events.mempool_v2`).
     MempoolEvents,
@@ -1390,7 +1390,7 @@ impl Capability {
         match self {
             Self::Broadcast => WALLET_BROADCAST_TRANSACTION_V1,
             Self::ChainEvents => WALLET_EVENTS_CHAIN_V1,
-            Self::MempoolSnapshot => WALLET_SNAPSHOT_MEMPOOL_V2,
+            Self::MempoolSnapshot => WALLET_SNAPSHOT_MEMPOOL_V3,
             Self::MempoolEvents => WALLET_EVENTS_MEMPOOL_V2,
             Self::ChainValuePools => WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
             Self::TransparentAddressBalance => WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,

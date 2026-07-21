@@ -17,9 +17,9 @@ use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::{
-    ChainEpoch, MempoolEntry, MempoolEvictionReason, TransactionId, TransparentAddressScriptHash,
-    TransparentMempoolOutput, TransparentMempoolSpend, TransparentOutPoint, TransparentOutputEntry,
-    UnixTimestampMillis,
+    BlockId, ChainEpoch, MempoolEntry, MempoolEvictionReason, TransactionId,
+    TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
+    TransparentOutPoint, TransparentOutputEntry, UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet;
 use zinder_source::{
@@ -81,6 +81,7 @@ impl StagedMempoolGeneration {
 /// Snapshot page read under the same gate as durable event append and index mutation.
 #[derive(Clone, Debug)]
 pub(crate) struct LiveMempoolSnapshotPage {
+    pub(crate) source_tip: BlockId,
     pub(crate) entries: Vec<Arc<MempoolEntry>>,
     pub(crate) events_resume_cursor: Vec<u8>,
     pub(crate) snapshot_age_millis: u64,
@@ -89,12 +90,12 @@ pub(crate) struct LiveMempoolSnapshotPage {
 
 /// Live mempool ownership state visible to the private control surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MempoolOwnerState {
+enum MempoolOwnerStatus {
     /// A source generation is building an in-memory snapshot that must not be
     /// exposed until its completion marker arrives.
     Hydrating,
     /// The durable log and process-local index have a verified transition path.
-    Serving,
+    Serving { source_tip: BlockId },
     /// A defensive post-append divergence was detected and the index must be reseeded.
     RebuildRequired,
 }
@@ -107,7 +108,7 @@ pub struct LiveMempoolOwner {
     /// and snapshot anchoring. No public response can observe an event between
     /// durable append and its verified in-memory mutation.
     mutation_gate: Arc<Mutex<()>>,
-    state: Arc<RwLock<MempoolOwnerState>>,
+    status: Arc<RwLock<MempoolOwnerStatus>>,
     staged_generation: Arc<ParkingMutex<Option<StagedMempoolGeneration>>>,
 }
 
@@ -118,52 +119,81 @@ impl LiveMempoolOwner {
         Self {
             index: MempoolIndex::new(),
             mutation_gate: Arc::new(Mutex::new(())),
-            state: Arc::new(RwLock::new(MempoolOwnerState::Hydrating)),
+            status: Arc::new(RwLock::new(MempoolOwnerStatus::Hydrating)),
             staged_generation: Arc::new(ParkingMutex::new(Some(StagedMempoolGeneration::new()))),
         }
     }
 
     /// Returns a durable/index consistency error while a source reseed is required.
+    #[cfg(test)]
     pub(crate) fn require_serving(&self) -> Result<(), Status> {
-        let state = *self.state.read();
-        match state {
-            MempoolOwnerState::Serving => Ok(()),
-            MempoolOwnerState::Hydrating => Err(Status::unavailable(
+        let status = *self.status.read();
+        match status {
+            MempoolOwnerStatus::Serving { .. } => Ok(()),
+            MempoolOwnerStatus::Hydrating => Err(Status::unavailable(
                 "live mempool index is hydrating from an upstream snapshot",
             )),
-            MempoolOwnerState::RebuildRequired => Err(Status::unavailable(
+            MempoolOwnerStatus::RebuildRequired => Err(Status::unavailable(
+                "live mempool index is rebuilding after a durable transition mismatch",
+            )),
+        }
+    }
+
+    fn coherent_source_tip_for(&self, chain_epoch: ChainEpoch) -> Result<BlockId, Status> {
+        let status = *self.status.read();
+        match status {
+            MempoolOwnerStatus::Serving { source_tip } => {
+                let visible_tip =
+                    BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+                if source_tip != visible_tip {
+                    return Err(Status::unavailable(
+                        "live mempool index is not coherent with the requested chain epoch",
+                    ));
+                }
+                Ok(source_tip)
+            }
+            MempoolOwnerStatus::Hydrating => Err(Status::unavailable(
+                "live mempool index is hydrating from an upstream snapshot",
+            )),
+            MempoolOwnerStatus::RebuildRequired => Err(Status::unavailable(
                 "live mempool index is rebuilding after a durable transition mismatch",
             )),
         }
     }
 
     /// Returns the live entry for a transaction when it is currently visible.
-    pub(crate) fn entry_for(
+    pub(crate) async fn entry_for(
         &self,
+        chain_epoch: ChainEpoch,
         transaction_id: TransactionId,
     ) -> Result<Option<Arc<MempoolEntry>>, Status> {
-        self.require_serving()?;
+        let _mutation_guard = self.mutation_gate.lock().await;
+        self.coherent_source_tip_for(chain_epoch)?;
         Ok(self.index.entry_for(transaction_id))
     }
 
     /// Returns live transparent outputs for one script-hash selector.
-    pub(crate) fn transparent_outputs_by_address(
+    pub(crate) async fn transparent_outputs_by_address(
         &self,
+        chain_epoch: ChainEpoch,
         address_script_hash: TransparentAddressScriptHash,
         max_entries: u32,
     ) -> Result<Vec<TransparentMempoolOutput>, Status> {
-        self.require_serving()?;
+        let _mutation_guard = self.mutation_gate.lock().await;
+        self.coherent_source_tip_for(chain_epoch)?;
         Ok(self
             .index
             .transparent_outputs_by_address(address_script_hash, max_entries))
     }
 
     /// Returns live mempool spends for requested transparent outpoints.
-    pub(crate) fn transparent_spends_by_outpoint(
+    pub(crate) async fn transparent_spends_by_outpoint(
         &self,
+        chain_epoch: ChainEpoch,
         outpoints: impl IntoIterator<Item = TransparentOutPoint>,
     ) -> Result<Vec<TransparentMempoolSpend>, Status> {
-        self.require_serving()?;
+        let _mutation_guard = self.mutation_gate.lock().await;
+        self.coherent_source_tip_for(chain_epoch)?;
         Ok(outpoints
             .into_iter()
             .filter_map(|outpoint| self.index.transparent_spend_by_outpoint(outpoint))
@@ -171,11 +201,13 @@ impl LiveMempoolOwner {
     }
 
     /// Resolves live mempool-created outputs for requested outpoints.
-    pub(crate) fn transparent_outputs_by_outpoints(
+    pub(crate) async fn transparent_outputs_by_outpoints(
         &self,
+        chain_epoch: ChainEpoch,
         outpoints: &[TransparentOutPoint],
     ) -> Result<Vec<TransparentOutputEntry>, Status> {
-        self.require_serving()?;
+        let _mutation_guard = self.mutation_gate.lock().await;
+        self.coherent_source_tip_for(chain_epoch)?;
         Ok(self.index.transparent_outputs_by_outpoints(outpoints))
     }
 
@@ -183,12 +215,12 @@ impl LiveMempoolOwner {
     pub(crate) async fn snapshot_page(
         &self,
         canonical: &CanonicalControlHandle,
+        chain_epoch: ChainEpoch,
         max_entries: u32,
         from_cursor: Vec<u8>,
     ) -> Result<LiveMempoolSnapshotPage, Status> {
-        self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
-        self.require_serving()?;
+        let source_tip = self.coherent_source_tip_for(chain_epoch)?;
         let start = canonical.begin_mempool_snapshot(from_cursor).await?;
         let snapshot = self
             .index
@@ -208,6 +240,7 @@ impl LiveMempoolOwner {
             .value()
             .saturating_sub(snapshot.last_updated_at.value());
         Ok(LiveMempoolSnapshotPage {
+            source_tip,
             entries: snapshot.entries,
             events_resume_cursor: start
                 .events_resume_cursor()
@@ -223,9 +256,7 @@ impl LiveMempoolOwner {
         canonical: &CanonicalControlHandle,
         start: EventStreamStartPosition,
     ) -> Result<Option<StreamCursorTokenV1>, Status> {
-        self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
-        self.require_serving()?;
         canonical.resolve_mempool_event_start(start).await
     }
 
@@ -235,9 +266,7 @@ impl LiveMempoolOwner {
         canonical: &CanonicalControlHandle,
         after_cursor: Option<StreamCursorTokenV1>,
     ) -> Result<Vec<wallet::MempoolEventEnvelope>, Status> {
-        self.require_serving()?;
         let _mutation_guard = self.mutation_gate.lock().await;
-        self.require_serving()?;
         canonical
             .mempool_event_page(
                 after_cursor.map(|cursor| cursor.as_bytes().to_vec()),
@@ -267,14 +296,14 @@ impl LiveMempoolOwner {
         observed_at: UnixTimestampMillis,
     ) -> Result<MempoolApplyOutcome, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
-        let state = *self.state.read();
+        let state = *self.status.read();
         match state {
-            MempoolOwnerState::Hydrating => self.stage_event_locked(event, observed_at),
-            MempoolOwnerState::Serving => {
+            MempoolOwnerStatus::Hydrating => self.stage_event_locked(event, observed_at),
+            MempoolOwnerStatus::Serving { .. } => {
                 self.append_and_apply_locked(canonical, event, observed_at)
                     .await
             }
-            MempoolOwnerState::RebuildRequired => Err(Status::unavailable(
+            MempoolOwnerStatus::RebuildRequired => Err(Status::unavailable(
                 "live mempool index is rebuilding after a durable transition mismatch",
             )),
         }
@@ -422,23 +451,33 @@ impl LiveMempoolOwner {
     }
 
     fn mark_rebuild_required(&self) {
-        *self.state.write() = MempoolOwnerState::RebuildRequired;
+        *self.status.write() = MempoolOwnerStatus::RebuildRequired;
     }
 
     async fn begin_hydration(&self) {
         let _mutation_guard = self.mutation_gate.lock().await;
         *self.staged_generation.lock() = Some(StagedMempoolGeneration::new());
-        *self.state.write() = MempoolOwnerState::Hydrating;
+        *self.status.write() = MempoolOwnerStatus::Hydrating;
     }
 
     pub(crate) async fn complete_hydration(
         &self,
         canonical: &CanonicalControlHandle,
+        source_tip: BlockId,
     ) -> Result<(), Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
-        if *self.state.read() != MempoolOwnerState::Hydrating {
+        if !matches!(*self.status.read(), MempoolOwnerStatus::Hydrating) {
             return Err(Status::failed_precondition(
                 "mempool source emitted an unexpected snapshot-complete marker",
+            ));
+        }
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let visible_tip =
+            BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+        if source_tip != visible_tip {
+            self.mark_rebuild_required();
+            return Err(Status::unavailable(
+                "mempool snapshot source tip does not match the canonical visible tip",
             ));
         }
         let staged_generation = self.staged_generation.lock().take().ok_or_else(|| {
@@ -446,7 +485,7 @@ impl LiveMempoolOwner {
         })?;
         self.reconcile_staged_generation_locked(canonical, staged_generation)
             .await?;
-        *self.state.write() = MempoolOwnerState::Serving;
+        *self.status.write() = MempoolOwnerStatus::Serving { source_tip };
         record_mempool_size_gauge(&self.index);
         Ok(())
     }
@@ -520,7 +559,7 @@ impl LiveMempoolOwner {
         let _mutation_guard = self.mutation_gate.lock().await;
         self.index.reset();
         *self.staged_generation.lock() = Some(StagedMempoolGeneration::new());
-        *self.state.write() = MempoolOwnerState::Hydrating;
+        *self.status.write() = MempoolOwnerStatus::Hydrating;
         let mut after_cursor = None;
         loop {
             let page = canonical
@@ -567,7 +606,7 @@ impl LiveMempoolOwner {
 
     #[cfg(test)]
     fn is_serving(&self) -> bool {
-        *self.state.read() == MempoolOwnerState::Serving
+        matches!(*self.status.read(), MempoolOwnerStatus::Serving { .. })
     }
 
     #[cfg(test)]
@@ -703,8 +742,8 @@ async fn consume_source_events(
             return MempoolOwnerLoopOutcome::Rebuild;
         };
         match source_event {
-            Ok(MempoolSourceEvent::InitialSnapshotComplete) => {
-                if let Err(status) = owner.complete_hydration(canonical).await {
+            Ok(MempoolSourceEvent::InitialSnapshotComplete { source_tip }) => {
+                if let Err(status) = owner.complete_hydration(canonical, source_tip).await {
                     tracing::warn!(
                         target: "zinder::ingest",
                         event = "mempool_snapshot_marker_rejected",
@@ -802,7 +841,7 @@ async fn apply_source_event(
         MempoolSourceEvent::Invalidated { .. } | MempoolSourceEvent::Mined { .. } => {
             UnixTimestampMillis::now()
         }
-        MempoolSourceEvent::InitialSnapshotComplete | _ => UnixTimestampMillis::now(),
+        MempoolSourceEvent::InitialSnapshotComplete { .. } | _ => UnixTimestampMillis::now(),
     };
     let event = match source_event {
         MempoolSourceEvent::Added(source_entry) => {
@@ -832,7 +871,7 @@ async fn apply_source_event(
             mined_height,
             block_hash,
         },
-        MempoolSourceEvent::InitialSnapshotComplete | _ => {
+        MempoolSourceEvent::InitialSnapshotComplete { .. } | _ => {
             record_hydration_failure(MempoolHydrationFailureReason::UnknownSourceEventVariant);
             return Err(Status::failed_precondition(
                 "mempool source event variant is unsupported",
@@ -973,6 +1012,77 @@ mod tests {
 
     use super::{LiveMempoolOwner, run_live_mempool_owner};
 
+    #[tokio::test]
+    async fn snapshot_marker_with_a_different_source_tip_remains_private()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let owner = LiveMempoolOwner::default();
+        let mismatched_source_tip = zinder_core::BlockId::new(
+            zinder_core::BlockHeight::new(1),
+            zinder_core::BlockHash::from_bytes([2; 32]),
+        );
+
+        let outcome = owner
+            .complete_hydration(&canonical, mismatched_source_tip)
+            .await;
+
+        assert_eq!(
+            outcome.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+        assert!(!owner.is_serving());
+        assert!(
+            canonical
+                .mempool_event_page(
+                    None,
+                    NonZeroU32::new(8).ok_or("mempool page size must be nonzero")?,
+                )
+                .await?
+                .is_empty()
+        );
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn point_read_rejects_a_chain_epoch_newer_than_its_certified_source_tip()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let owner = LiveMempoolOwner::default();
+        owner
+            .complete_hydration(&canonical, fixture_source_tip())
+            .await?;
+        let mut newer_chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        newer_chain_epoch.visible_tip_hash = zinder_core::BlockHash::from_bytes([2; 32]);
+
+        let outcome = owner
+            .entry_for(newer_chain_epoch, TransactionId::from_bytes([0xA5; 32]))
+            .await;
+
+        assert_eq!(
+            outcome.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn source_snapshot_marker_hides_partial_hydration_and_reconnect_gap()
     -> Result<(), Box<dyn Error>> {
@@ -1070,7 +1180,7 @@ mod tests {
         ready_gate: &MempoolReadyGate,
         canonical: &CanonicalControlHandle,
     ) -> Result<zinder_store::StreamCursorTokenV1, Box<dyn Error>> {
-        source_control.complete_initial_snapshot()?;
+        source_control.complete_initial_snapshot(fixture_source_tip())?;
         wait_for_serving(owner, true).await?;
         wait_for_hydration(ready_gate, true).await?;
         assert_eq!(owner.index.entry_count(), 2);
@@ -1112,7 +1222,7 @@ mod tests {
         // The old index stays private until an empty replacement snapshot's
         // marker makes its terminal events durable.
         assert_eq!(owner.index.entry_count(), 2);
-        source_control.complete_initial_snapshot()?;
+        source_control.complete_initial_snapshot(fixture_source_tip())?;
         wait_for_serving(owner, true).await?;
         wait_for_hydration(ready_gate, true).await?;
         assert_eq!(owner.index.entry_count(), 0);
@@ -1155,7 +1265,7 @@ mod tests {
 
         source_control.close_stream();
         wait_for_source_open(source_control, 4).await?;
-        source_control.complete_initial_snapshot()?;
+        source_control.complete_initial_snapshot(fixture_source_tip())?;
         wait_for_serving(owner, true).await?;
         wait_for_hydration(ready_gate, true).await?;
         assert_eq!(owner.index.entry_count(), 0);
@@ -1200,7 +1310,7 @@ mod tests {
         wait_for_source_open(&first_source_control, 1).await?;
         first_source_control.push_added(source_entry(0xC1)?)?;
         wait_for_staged_entries(&first_owner, 1).await?;
-        first_source_control.complete_initial_snapshot()?;
+        first_source_control.complete_initial_snapshot(fixture_source_tip())?;
         wait_for_serving(&first_owner, true).await?;
         wait_for_hydration(&first_ready_gate, true).await?;
         let first_history = canonical
@@ -1237,7 +1347,7 @@ mod tests {
             Some(Code::Unavailable),
             "durable replay must stay private until the replacement snapshot completes"
         );
-        second_source_control.complete_initial_snapshot()?;
+        second_source_control.complete_initial_snapshot(fixture_source_tip())?;
         wait_for_serving(&second_owner, true).await?;
         wait_for_hydration(&second_ready_gate, true).await?;
         assert_eq!(second_owner.index.entry_count(), 0);
@@ -1272,6 +1382,13 @@ mod tests {
             raw_transaction_bytes: RawTransactionBytes::new(raw_transaction_bytes),
             observed_at_unix_millis: UnixTimestampMillis::new(1_750_000_000_000),
         })
+    }
+
+    fn fixture_source_tip() -> zinder_core::BlockId {
+        zinder_core::BlockId::new(
+            zinder_core::BlockHeight::new(1),
+            zinder_core::BlockHash::from_bytes([1; 32]),
+        )
     }
 
     fn synthetic_v4_tx_bytes(transaction_tag: u8) -> Vec<u8> {

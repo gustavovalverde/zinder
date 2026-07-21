@@ -203,6 +203,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             .mempool
             .snapshot_page(
                 &self.canonical,
+                snapshot.chain_epoch,
                 bounded_snapshot_page_size(request.max_entries),
                 request.from_cursor,
             )
@@ -217,6 +218,10 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 .map(|entry| mempool_entry_message(entry.as_ref()))
                 .collect(),
             next_cursor: page.next_cursor,
+            source_tip: Some(block_tip_message(
+                page.source_tip.height,
+                page.source_tip.hash,
+            )),
         }))
     }
 
@@ -225,10 +230,14 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         request: Request<MempoolTransactionRequest>,
     ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
         let transaction_id = transaction_id_from_rpc_hex(&request.into_inner().transaction_id)?;
-        let entry = self.mempool.entry_for(transaction_id)?.ok_or_else(|| {
-            Status::not_found("transaction is not visible in the live mempool index")
-        })?;
         let snapshot = self.current_chain_epoch().await?;
+        let entry = self
+            .mempool
+            .entry_for(snapshot.chain_epoch, transaction_id)
+            .await?
+            .ok_or_else(|| {
+                Status::not_found("transaction is not visible in the live mempool index")
+            })?;
         Ok(Response::new(wallet::TransactionStatusResponse {
             chain_view: Some(chain_view_message(snapshot.chain_epoch)),
             location: Some(wallet::TransactionLocation {
@@ -263,16 +272,18 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
     ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
         let request = request.into_inner();
         let address_script_hash = script_hash_from_lookup(request.address)?;
+        let snapshot = self.current_chain_epoch().await?;
         let outputs = self
             .mempool
             .transparent_outputs_by_address(
+                snapshot.chain_epoch,
                 address_script_hash,
                 bounded_point_lookup_max_entries(request.max_entries),
-            )?
+            )
+            .await?
             .iter()
             .map(transparent_mempool_output_message)
             .collect();
-        let snapshot = self.current_chain_epoch().await?;
         Ok(Response::new(
             wallet::TransparentMempoolOutputsByAddressResponse {
                 chain_view: Some(chain_view_message(snapshot.chain_epoch)),
@@ -291,13 +302,14 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             .into_iter()
             .map(|outpoint| outpoint_from_request_message(Some(outpoint)))
             .collect::<Result<Vec<_>, _>>()?;
+        let snapshot = self.current_chain_epoch().await?;
         let spends = self
             .mempool
-            .transparent_spends_by_outpoint(outpoints)?
+            .transparent_spends_by_outpoint(snapshot.chain_epoch, outpoints)
+            .await?
             .iter()
             .map(transparent_mempool_spend_message)
             .collect();
-        let snapshot = self.current_chain_epoch().await?;
         Ok(Response::new(
             wallet::TransparentMempoolSpendsByOutpointResponse {
                 chain_view: Some(chain_view_message(snapshot.chain_epoch)),
@@ -316,13 +328,14 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             .into_iter()
             .map(|outpoint| outpoint_from_request_message(Some(outpoint)))
             .collect::<Result<Vec<_>, _>>()?;
+        let snapshot = self.current_chain_epoch().await?;
         let entries = self
             .mempool
-            .transparent_outputs_by_outpoints(&outpoints)?
+            .transparent_outputs_by_outpoints(snapshot.chain_epoch, &outpoints)
+            .await?
             .into_iter()
             .map(transparent_output_entry_message)
             .collect();
-        let snapshot = self.current_chain_epoch().await?;
         Ok(Response::new(
             wallet::TransparentOutputsByOutpointResponse {
                 chain_view: Some(chain_view_message(snapshot.chain_epoch)),
@@ -1205,7 +1218,9 @@ mod tests {
                 UnixTimestampMillis::new(1_750_000_000_100),
             )
             .await?;
-        owner.complete_hydration(&canonical).await?;
+        let source_tip =
+            zinder_core::BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+        owner.complete_hydration(&canonical, source_tip).await?;
 
         let bearer_token = BearerToken::from_str("fixture-control-token")?;
         let node_source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(

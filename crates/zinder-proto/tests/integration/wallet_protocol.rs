@@ -1071,12 +1071,17 @@ fn mempool_snapshot_response_round_trips_events_resume_cursor() -> eyre::Result<
         snapshot_age_millis: 250,
         entries: Vec::new(),
         next_cursor: vec![0xD5; 114],
+        source_tip: Some(wallet::BlockTip {
+            height: 100,
+            hash: "11".repeat(32),
+        }),
     };
     let decoded = round_trip(&response)?;
 
     assert_eq!(decoded.events_resume_cursor, vec![0xC4; 82]);
     assert_eq!(decoded.snapshot_age_millis, 250);
     assert_eq!(decoded.next_cursor, vec![0xD5; 114]);
+    assert_eq!(decoded.source_tip.map(|tip| tip.height), Some(100));
     Ok(())
 }
 
@@ -1129,7 +1134,7 @@ fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
     let decoded = round_trip(&server_info)?;
 
     assert_eq!(decoded.contract_revision, zinder_proto::CONTRACT_REVISION);
-    assert_eq!(decoded.contract_revision, 2);
+    assert_eq!(decoded.contract_revision, 3);
     assert_eq!(
         decoded.build_git_commit,
         "0123456789abcdef0123456789abcdef01234567"

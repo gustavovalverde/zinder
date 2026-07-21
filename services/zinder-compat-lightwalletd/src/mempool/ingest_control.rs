@@ -34,7 +34,7 @@ use tokio::sync::{OnceCell, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
-use zinder_core::ChainEpochId;
+use zinder_core::{BlockHeight, BlockId, ChainEpochId};
 use zinder_proto::v1::{ingest::ingest_control_client::IngestControlClient, wallet};
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 use zinder_store::{
@@ -145,13 +145,41 @@ impl MempoolSurface for IngestControlMempoolSurface {
         } else {
             Some(response.next_cursor)
         };
-        let chain_epoch_id = response
+        let chain_epoch = response
             .chain_view
             .and_then(|chain_view| chain_view.chain_epoch)
-            .map(|chain_epoch| ChainEpochId::new(chain_epoch.chain_epoch_id))
             .ok_or_else(|| MempoolSurfaceError::Unavailable {
                 reason: "ingest-control mempool_snapshot omitted chain_view.chain_epoch".to_owned(),
             })?;
+        let visible_tip =
+            chain_epoch
+                .visible_tip
+                .ok_or_else(|| MempoolSurfaceError::Unavailable {
+                    reason: "ingest-control mempool_snapshot omitted chain_view visible tip"
+                        .to_owned(),
+                })?;
+        let source_tip = response
+            .source_tip
+            .ok_or_else(|| MempoolSurfaceError::Unavailable {
+                reason: "ingest-control mempool_snapshot omitted source_tip".to_owned(),
+            })?;
+        let visible_tip_hash = zinder_core::wire::decode_rpc_block_hash_hex(&visible_tip.hash)
+            .map_err(|error| MempoolSurfaceError::Unavailable {
+                reason: format!("ingest-control mempool_snapshot visible tip is invalid: {error}"),
+            })?;
+        let source_tip_hash = zinder_core::wire::decode_rpc_block_hash_hex(&source_tip.hash)
+            .map_err(|error| MempoolSurfaceError::Unavailable {
+                reason: format!("ingest-control mempool_snapshot source tip is invalid: {error}"),
+            })?;
+        if BlockId::new(BlockHeight::new(visible_tip.height), visible_tip_hash)
+            != BlockId::new(BlockHeight::new(source_tip.height), source_tip_hash)
+        {
+            return Err(MempoolSurfaceError::Unavailable {
+                reason: "ingest-control mempool_snapshot source tip differs from its chain view"
+                    .to_owned(),
+            });
+        }
+        let chain_epoch_id = ChainEpochId::new(chain_epoch.chain_epoch_id);
         let events_resume_cursor = stream_cursor_from_message_bytes(response.events_resume_cursor);
         Ok(MempoolSnapshotPage {
             chain_epoch_id,

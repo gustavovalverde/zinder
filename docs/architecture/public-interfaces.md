@@ -27,7 +27,7 @@ and wire contracts that actually carry versions.
 | `MaterializedViewStore` | Independent store for materialized-view rows, cursors, coverage, and schemas |
 | `ChainEvent` | Durable canonical append or replacement transition |
 | `MempoolEvent` | Typed live-pool transition: added, invalidated, or mined |
-| `MempoolSnapshotView` | Bounded live-pool page with a mempool-resume cursor and canonical `ChainEpoch` fence |
+| `MempoolSnapshotView` | Bounded live-pool page with a mempool-resume cursor, canonical `ChainEpoch` fence, and matching certified source tip |
 
 Use `canonical` for chain truth, `wallet projection` for wallet query state,
 and `materialized view` for optional explorer aggregates. `fact` is appropriate
@@ -85,10 +85,13 @@ describing an actual consensus rule.
 `MempoolSnapshotView` keeps two independent monotonic positions. Its
 `events_resume_cursor` resumes `MempoolEvents` without a delivery gap. Its
 `chain_epoch.id` proves which canonical chain fence was captured before the
-page read. Epoch ids and chain-event sequences share one identity space, so a
-tip-coherent consumer restarts when it observes a larger chain-event sequence.
-The mempool cursor and chain epoch do not substitute for each other; live
-mempool-event consumers resume from the opaque cursor.
+page read. Its `source_tip` must exactly equal that epoch's `visible_tip` by
+height and hash; the server returns `UNAVAILABLE` instead of exposing an empty
+or stale answer when the certified mempool generation differs. Epoch ids and
+chain-event sequences share one identity space, so a tip-coherent consumer
+restarts when it observes a larger chain-event sequence. The mempool cursor and
+chain epoch do not substitute for each other; live mempool-event consumers
+resume from the opaque cursor.
 
 ## Canonical writer vocabulary
 
@@ -339,7 +342,7 @@ wallet.read.server_info_v2
 wallet.read.network_upgrade_activations_v1
 wallet.broadcast.transaction_v1
 wallet.events.chain_v1
-wallet.snapshot.mempool_v2
+wallet.snapshot.mempool_v3
 wallet.events.mempool_v2
 wallet.mempool.transparent_outputs_by_address_v1
 wallet.mempool.transparent_spends_by_outpoint_v1

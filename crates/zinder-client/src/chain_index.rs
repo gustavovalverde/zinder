@@ -208,6 +208,8 @@ impl MempoolSnapshotCursor {
 pub struct MempoolSnapshotView {
     /// Chain epoch visible at snapshot time.
     pub chain_epoch: ChainEpoch,
+    /// Upstream source tip under which the mempool generation was certified.
+    pub source_tip: BlockId,
     /// `MempoolEvents` after-cursor anchored at the moment the snapshot walk
     /// began; identical on every page of one paged walk. `None` when the
     /// server had applied no mempool event yet, in which case a consumer

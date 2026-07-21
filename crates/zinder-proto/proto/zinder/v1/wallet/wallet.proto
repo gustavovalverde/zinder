@@ -1082,6 +1082,10 @@ message MempoolSnapshotResponse {
 
   // Next-page cursor when the response was truncated.
   bytes next_cursor = 5;
+
+  // Upstream source tip under which this mempool snapshot was certified.
+  // It exactly matches `chain_view.chain_epoch.visible_tip`.
+  BlockTip source_tip = 6;
 }
 
 // Bounded request for unmined transparent outputs at one transparent address.

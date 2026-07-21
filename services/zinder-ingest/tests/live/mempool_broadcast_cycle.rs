@@ -35,7 +35,8 @@ use zinder_core::{
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceEvent,
-    NodeSource, TransactionBroadcaster, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+    NodeSource, SourceError, TransactionBroadcaster, UpstreamTransactionLookup, ZebraJsonRpcSource,
+    ZebraJsonRpcSourceOptions,
 };
 use zinder_testkit::live::{init, require_live_for};
 use zinder_testkit::{
@@ -378,41 +379,51 @@ async fn wait_for_added(
     ))
 }
 
-/// Waits for `MempoolSourceEvent::Mined { transaction_id, .. }` matching
-/// `expected_txid`. Used by the reorg gate to confirm Zebra mined the
-/// broadcast tx into a block before we invalidate it.
-async fn wait_for_mined(
+async fn wait_for_generation_end_on_tip_change(
     event_stream: &mut zinder_source::MempoolSourceEventStream,
-    expected_txid: TransactionId,
     deadline: Duration,
-) -> Result<zinder_core::BlockHeight> {
+) -> Result<()> {
     let started = Instant::now();
     while started.elapsed() < deadline {
         let remaining = deadline.saturating_sub(started.elapsed());
         let outcome = tokio::time::timeout(remaining, event_stream.next()).await;
         match outcome {
-            Ok(Some(Ok(MempoolSourceEvent::Mined {
-                transaction_id,
-                mined_height,
-                ..
-            }))) if transaction_id == expected_txid => {
-                return Ok(mined_height);
-            }
             Ok(Some(Ok(_other))) => {}
-            Ok(Some(Err(error))) => {
-                return Err(eyre!("mempool source emitted error item: {error}"));
-            }
+            Ok(Some(Err(SourceError::MempoolStreamUnavailable { .. }))) => return Ok(()),
+            Ok(Some(Err(error))) => return Err(eyre!("unexpected source error: {error}")),
             Ok(None) => {
                 return Err(eyre!(
-                    "mempool source stream closed before observing Mined for the broadcast txid"
+                    "mempool generation closed without its tip-change error"
                 ));
             }
             Err(_elapsed) => break,
         }
     }
     Err(eyre!(
-        "deadline elapsed without observing Mined for the broadcast txid"
+        "deadline elapsed without ending the old-tip mempool generation"
     ))
+}
+
+async fn wait_for_upstream_mined(
+    json_rpc: &ZebraJsonRpcSource,
+    transaction_id: TransactionId,
+    deadline: Duration,
+) -> Result<BlockHeight> {
+    let started = Instant::now();
+    loop {
+        if let UpstreamTransactionLookup::Mined { mined_height, .. } = json_rpc
+            .fetch_upstream_transaction_lookup(transaction_id)
+            .await?
+        {
+            return Ok(mined_height);
+        }
+        if started.elapsed() >= deadline {
+            return Err(eyre!(
+                "deadline elapsed before Zebra reported the transaction mined"
+            ));
+        }
+        tokio::time::sleep(MEMPOOL_POLL_INTERVAL).await;
+    }
 }
 
 async fn wait_for_canonical_tip(
@@ -520,9 +531,9 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
         .ok_or_else(|| eyre!("regtest_generate_blocks(1) returned no hashes"))?
         .clone();
 
-    let mined_height = wait_for_mined(&mut event_stream, broadcast_txid, MEMPOOL_OBSERVE_TIMEOUT)
-        .await
-        .map_err(|error| eyre!("polling source did not emit Mined for broadcast txid: {error}"))?;
+    wait_for_generation_end_on_tip_change(&mut event_stream, MEMPOOL_OBSERVE_TIMEOUT).await?;
+    let mined_height =
+        wait_for_upstream_mined(&json_rpc, broadcast_txid, MEMPOOL_OBSERVE_TIMEOUT).await?;
     tracing::info!(
         target: "zinder::live",
         event = "reorg_gate_mined",
@@ -545,6 +556,7 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
         // rollback instead of treating the first read as authoritative.
         let expected_tip = BlockHeight::new(mined_height.value().saturating_sub(1));
         wait_for_canonical_tip(&json_rpc, expected_tip, MEMPOOL_OBSERVE_TIMEOUT).await?;
+        event_stream = mempool_source.events().await?;
 
         // Re-broadcast the same signed tx. Zebra's mempool accepts it (its
         // inputs are still spendable now that the mining block is gone), and

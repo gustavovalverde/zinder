@@ -15,8 +15,8 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
-    AuthDigest, BlockHash, BlockHeight, MempoolEvictionReason, RawTransactionBytes, TransactionId,
-    UnixTimestampMillis,
+    AuthDigest, BlockHash, BlockHeight, BlockId, MempoolEvictionReason, RawTransactionBytes,
+    TransactionId, UnixTimestampMillis,
 };
 
 use crate::SourceError;
@@ -42,7 +42,11 @@ pub enum MempoolSourceEvent {
     /// taking the snapshot and emit this marker only after replaying the
     /// snapshot and the buffered change-stream prefix. Polling sources emit
     /// it after their first fully successful poll.
-    InitialSnapshotComplete,
+    InitialSnapshotComplete {
+        /// Exact upstream best-chain tip that remained stable while the
+        /// source constructed this complete snapshot generation.
+        source_tip: BlockId,
+    },
     /// New transaction admitted to the upstream mempool, with hydrated raw
     /// bytes.
     Added(MempoolSourceEntry),

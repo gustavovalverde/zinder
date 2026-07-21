@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use zinder_core::{BlockHash, BlockHeight, MempoolEvictionReason, TransactionId};
+use zinder_core::{BlockHash, BlockHeight, BlockId, MempoolEvictionReason, TransactionId};
 use zinder_source::{
     MempoolSource, MempoolSourceBackend, MempoolSourceCapabilities, MempoolSourceEntry,
     MempoolSourceEvent, MempoolSourceEventStream, SourceError,
@@ -87,8 +87,13 @@ impl MockMempoolSourceControl {
     /// The marker is a source-control event. It is intentionally distinct
     /// from `Added`, `Invalidated`, and `Mined` so tests can prove that
     /// consumers do not append it to durable mempool lifecycle history.
-    pub fn complete_initial_snapshot(&self) -> Result<(), MockMempoolSourceClosed> {
-        self.push_result(Ok(MempoolSourceEvent::InitialSnapshotComplete))
+    pub fn complete_initial_snapshot(
+        &self,
+        source_tip: BlockId,
+    ) -> Result<(), MockMempoolSourceClosed> {
+        self.push_result(Ok(MempoolSourceEvent::InitialSnapshotComplete {
+            source_tip,
+        }))
     }
 
     /// Pushes an `Invalidated` event into the open stream.
@@ -179,7 +184,7 @@ mod tests {
     use std::error::Error;
     use tokio_stream::StreamExt;
     use zinder_core::{
-        AuthDigest, BlockHash, BlockHeight, MempoolEvictionReason, RawTransactionBytes,
+        AuthDigest, BlockHash, BlockHeight, BlockId, MempoolEvictionReason, RawTransactionBytes,
         TransactionId, UnixTimestampMillis,
     };
     use zinder_source::{
@@ -202,7 +207,10 @@ mod tests {
         let mut stream = mock.events().await?;
 
         control.push_added(sample_entry(0x10))?;
-        control.complete_initial_snapshot()?;
+        control.complete_initial_snapshot(BlockId::new(
+            BlockHeight::new(100),
+            BlockHash::from_bytes([0x10; 32]),
+        ))?;
         control.push_mined(
             TransactionId::from_bytes([0x11; 32]),
             BlockHeight::new(101),
@@ -216,7 +224,7 @@ mod tests {
         let second_event = stream.next().await.ok_or("expected second event")??;
         assert!(matches!(
             second_event,
-            MempoolSourceEvent::InitialSnapshotComplete
+            MempoolSourceEvent::InitialSnapshotComplete { .. }
         ));
 
         let third_event = stream.next().await.ok_or("expected third event")??;
