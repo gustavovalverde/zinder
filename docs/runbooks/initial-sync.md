@@ -134,6 +134,29 @@ fence, and wallet digest.
 `schema_mismatch`, `reorg_window_exceeded`, corrupt store errors, and source
 identity mismatches require operator action.
 
+### Reorg-window sizing
+
+The default 100-block reorg window is an operating baseline, not a consensus
+finality guarantee. Size the window above the longest plausible competing-branch
+duration for the deployed network, expressed in blocks, and include headroom for
+same-height mining races. Hashpower concentration increases this risk: a dominant
+miner can extend one branch while a minority branch remains visible long enough
+for the trailing settled-tip boundary to advance past their common parent.
+
+On 2026-07-20, a Zcash testnet mining race produced a 114-block reorg after the
+losing branch had remained visible for more than an hour; a 100-block window was
+insufficient, and operators increased the production testnet window to 300. Use
+that incident as sizing evidence for similarly concentrated test networks, not
+as a universal value. Larger windows retain more replaceable state and wallet
+undo data, so capacity planning must cover the selected headroom. Configure the
+same window for ingest, projector, native query, and compatibility admission.
+
+When a replacement exceeds the configured window, ingest drains readiness and
+parks for operator inspection until termination. Restarting does not make the
+settled store replaceable. Confirm the authoritative branch, choose an approved
+window from observed network behavior, and rebuild or restore a coherent state
+bundle under that policy before returning the service to traffic.
+
 ## Memory and storage pressure
 
 Watch cgroup memory, RocksDB block cache, memtables, WAL bytes, pending
