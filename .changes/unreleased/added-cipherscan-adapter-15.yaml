@@ -1,0 +1,6 @@
+kind: added
+body: Add the optional Cipherscan-compatible explorer API adapter.
+time: 2026-07-13T09:00:03Z
+custom:
+  Bump: minor
+  PR: "15"

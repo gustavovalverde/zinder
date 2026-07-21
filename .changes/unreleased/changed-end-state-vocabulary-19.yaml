@@ -1,0 +1,6 @@
+kind: changed
+body: Replace transitional service and configuration names with the final ingest, projector, query, and compatibility vocabulary.
+time: 2026-07-20T16:34:24Z
+custom:
+  Bump: minor
+  PR: "19"

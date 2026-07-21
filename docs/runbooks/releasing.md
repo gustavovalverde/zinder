@@ -20,6 +20,14 @@ tag must equal `v` followed by the workspace version. Stable versions use
 `v0.5.0-rc.1`. Build metadata is rejected because `+` cannot be represented in
 an OCI image tag without changing the version.
 
+Every user-visible pull request records its release note as an independent
+Changie fragment under `.changes/unreleased/`. Each fragment separates its
+changelog category from its SemVer impact, so fixes, features, and breaking
+changes can describe their behavior accurately while still driving the next
+product version. Pull requests without a user-visible effect must check the
+exact `No release note required` declaration in the pull request template.
+Contributor instructions live in [`.changes/README.md`](../../.changes/README.md).
+
 Every user-invokable executable supports `--version`. Runtime health responses,
 the `zinder_build_info` metric, native `ServerInfo`, and lightwalletd
 `LightdInfo` report the same product version and embedded Git commit. Local
@@ -31,6 +39,8 @@ Run the local release-policy checks before opening the version change:
 ```console
 bash scripts/test-release-tag.sh
 bash scripts/test-deployment-admission.sh
+scripts/test-changelog.sh
+scripts/validate-changelog.sh fragments
 cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 ```
@@ -39,10 +49,39 @@ The protocol workflow runs `buf lint`, `buf generate`, and `buf build` whenever
 the native schemas or Buf configuration change. A release cannot begin if API
 generation fails.
 
+## Prepare a release
+
+After all intended changes and their fragments have merged, ask Changie for
+the version implied by their SemVer impacts:
+
+```console
+next_version="$(changie next auto)"
+printf '%s\n' "$next_version"
+```
+
+Set `[workspace.package].version` in `Cargo.toml` to that version without its
+`v` prefix, then prepare the changelog:
+
+```console
+scripts/prepare-changelog-release.sh "${next_version#v}"
+cargo check --workspace --all-targets --all-features
+git diff -- Cargo.toml Cargo.lock CHANGELOG.md .changes
+```
+
+The preparation command fails unless the requested version matches both the
+fragment-derived version and the version inherited by every first-party Cargo
+package. It batches the pending fragments into one dated `CHANGELOG.md`
+section, preserves the fragments in the version archive, and is idempotent
+when rerun after a successful batch.
+
+Merge the release-preparation change through `main`. Because this pull request
+only consumes notes recorded by earlier changes, check `No release note
+required` in its pull request template.
+
 ## Publish a release
 
-Merge the version change through `main`, wait for required checks to pass, and
-create an annotated tag at that commit:
+After the release-preparation change merges, wait for required checks to pass,
+then create an annotated tag at that commit:
 
 ```console
 git switch main
@@ -52,16 +91,18 @@ git push origin v0.5.0
 ```
 
 The tag must be reachable from `main`. The `release` workflow validates the tag
-against Cargo metadata before it logs in to GitHub Container Registry (GHCR).
-The `release` environment then requires approval before the first registry
-write.
+against Cargo metadata, requires a matching non-empty changelog section, and
+rejects pending fragments before it logs in to GitHub Container Registry
+(GHCR). The `release` environment then requires approval before the first
+registry write.
 
 After approval, the workflow performs these operations in order:
 
 1. Generate and validate the OpenAPI documents and descriptor set.
 2. Build the 4 runtime images natively for Linux amd64 and arm64.
 3. Publish exact `vX.Y.Z` and `sha-<commit>` multi-architecture manifests.
-4. Create a draft GitHub Release and attach the API artifacts.
+4. Create a draft GitHub Release from the exact versioned changelog section and
+   attach the API artifacts.
 5. Publish the GitHub Release after every exact image manifest succeeds.
 6. For a stable release, verify all 4 exact manifests and promote their
    `latest` tags in one final job.
