@@ -1211,6 +1211,25 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       than zero. Defaults to 30000.",
     },
     EnvVarDoc {
+        name: "ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_MAX_EVENTS_PER_STEP",
+        toml_path: "retention.mempool_event_retention_max_events_per_step",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum event rows examined by one bounded mempool-retention step. Must be \
+                      greater than zero. Defaults to 1024.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_MAX_ENCODED_BYTES_PER_STEP",
+        toml_path: "retention.mempool_event_retention_max_encoded_bytes_per_step",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Target maximum encoded event bytes examined by one bounded \
+                      mempool-retention step. The first row may exceed the target to guarantee \
+                      progress. Must be greater than zero. Defaults to 16000000.",
+    },
+    EnvVarDoc {
         name: "ZINDER_EXPLORER__BEARER_TOKEN_PATH",
         toml_path: "explorer.bearer_token_path",
         used_by: &["zinder-explorer"],

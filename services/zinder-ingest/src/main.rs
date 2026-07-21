@@ -385,8 +385,11 @@ fn spawn_canonical_control_tasks(
         let mempool_retention_task = tokio::spawn(run_mempool_retention(
             canonical_control_handle.clone(),
             mempool_owner.clone(),
-            mempool_retention,
-            command_config.retention.mempool_check_interval(),
+            zinder_ingest::MempoolRetentionSettings {
+                retention: mempool_retention,
+                budget: command_config.retention.mempool_step_budget(),
+                check_interval: command_config.retention.mempool_check_interval(),
+            },
             cancel.clone(),
         ));
         let canonical_adapter = CanonicalControlGrpcAdapter::new(
@@ -883,7 +886,7 @@ async fn run_runtime(cli: Cli) -> ExitCode {
         Some(Command::VerifyCanonicalReplay(args)) => {
             run_canonical_replay_verification(config_path, args)
         }
-        None => run_ingest(config_path, overrides).await,
+        None => Box::pin(run_ingest(config_path, overrides)).await,
     };
 
     match runtime_result {

@@ -1003,15 +1003,29 @@ mod tests {
         drop(events);
         let mined_cursor = mined_cursor.ok_or("fixture did not emit a mined event")?;
 
-        let report = fixture
-            .mempool
-            .prune_events(
-                &fixture.canonical,
-                UnixTimestampMillis::now(),
-                MempoolEventRetentionConfig::new(Some(Duration::from_millis(1)), None),
-            )
-            .await?;
-        assert!(report.pruned_mined_count >= 1);
+        let retention = MempoolEventRetentionConfig::new(Some(Duration::from_millis(1)), None);
+        let budget = zinder_store::MempoolEventRetentionStepBudget::new(
+            std::num::NonZeroU32::new(8).ok_or("retention event budget must be nonzero")?,
+            std::num::NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+        );
+        let mut pruned_mined_count = 0_u64;
+        for _step in 0..4 {
+            let outcome = fixture
+                .mempool
+                .prune_events(
+                    &fixture.canonical,
+                    UnixTimestampMillis::now(),
+                    retention,
+                    budget,
+                )
+                .await?;
+            pruned_mined_count =
+                pruned_mined_count.saturating_add(outcome.report.pruned_mined_count);
+            if !outcome.has_immediate_work() {
+                break;
+            }
+        }
+        assert!(pruned_mined_count >= 1);
 
         let status = fixture
             .ingest_client

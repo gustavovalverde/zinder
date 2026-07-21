@@ -13,6 +13,6 @@ pub(crate) use index::MempoolIndexPreflight;
 pub use index::{MempoolApplyOutcome, MempoolIndex, MempoolSnapshotPage};
 pub use live_owner::{
     DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES, LiveMempoolOwner,
-    run_live_mempool_owner, run_mempool_retention,
+    MempoolRetentionSettings, run_live_mempool_owner, run_mempool_retention,
 };
 pub use ready_gate::{MempoolReadyGate, MempoolReadySignal, mempool_ready_channel};

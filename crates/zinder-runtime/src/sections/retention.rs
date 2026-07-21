@@ -8,9 +8,13 @@
 //! `[retention]` section so the writer's enforcement and the reader's
 //! advertisement cannot drift.
 
-use std::time::Duration;
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
+use zinder_store::MempoolEventRetentionStepBudget;
 
 use crate::ConfigError;
 
@@ -20,6 +24,8 @@ const DEFAULT_CURSOR_AT_RISK_WARNING_HOURS: u64 = 24;
 const DEFAULT_MEMPOOL_MINED_RETENTION_MINUTES: u64 = 60;
 const DEFAULT_MEMPOOL_INVALIDATED_RETENTION_HOURS: u64 = 24;
 const DEFAULT_MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS: u64 = 30_000;
+const DEFAULT_MEMPOOL_EVENT_RETENTION_MAX_EVENTS_PER_STEP: u32 = 1_024;
+const DEFAULT_MEMPOOL_EVENT_RETENTION_MAX_ENCODED_BYTES_PER_STEP: u64 = 16_000_000;
 
 /// Raw `[retention]` config section.
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -37,6 +43,10 @@ pub struct RetentionSection {
     pub mempool_invalidated_retention_hours: Option<u64>,
     /// Mempool-event retention sweep cadence in milliseconds. Must be > 0.
     pub mempool_event_retention_check_interval_ms: Option<u64>,
+    /// Maximum event rows examined by one mempool-retention step. Must be > 0.
+    pub mempool_event_retention_max_events_per_step: Option<u32>,
+    /// Target maximum encoded bytes examined by one mempool-retention step. Must be > 0.
+    pub mempool_event_retention_max_encoded_bytes_per_step: Option<u64>,
 }
 
 /// Fully resolved retention configuration with all defaults applied.
@@ -54,6 +64,10 @@ pub struct ResolvedRetention {
     pub mempool_invalidated_retention_hours: u64,
     /// Mempool-event retention sweep cadence in milliseconds.
     pub mempool_event_retention_check_interval_ms: u64,
+    /// Maximum event rows examined by one mempool-retention step.
+    pub mempool_event_retention_max_events_per_step: NonZeroU32,
+    /// Target maximum encoded bytes examined by one mempool-retention step.
+    pub mempool_event_retention_max_encoded_bytes_per_step: NonZeroU64,
 }
 
 impl ResolvedRetention {
@@ -98,6 +112,15 @@ impl ResolvedRetention {
     pub fn mempool_check_interval(&self) -> Duration {
         Duration::from_millis(self.mempool_event_retention_check_interval_ms)
     }
+
+    /// Work budget for one bounded mempool-event retention step.
+    #[must_use]
+    pub const fn mempool_step_budget(&self) -> MempoolEventRetentionStepBudget {
+        MempoolEventRetentionStepBudget::new(
+            self.mempool_event_retention_max_events_per_step,
+            self.mempool_event_retention_max_encoded_bytes_per_step,
+        )
+    }
 }
 
 /// Redacted TOML projection of the `[retention]` section.
@@ -115,6 +138,10 @@ pub struct RetentionToml {
     pub mempool_invalidated_retention_hours: u64,
     /// Mempool-event retention sweep cadence in milliseconds.
     pub mempool_event_retention_check_interval_ms: u64,
+    /// Maximum event rows examined by one mempool-retention step.
+    pub mempool_event_retention_max_events_per_step: u32,
+    /// Target maximum encoded bytes examined by one mempool-retention step.
+    pub mempool_event_retention_max_encoded_bytes_per_step: u64,
 }
 
 impl RetentionToml {
@@ -130,6 +157,12 @@ impl RetentionToml {
             mempool_invalidated_retention_hours: retention.mempool_invalidated_retention_hours,
             mempool_event_retention_check_interval_ms: retention
                 .mempool_event_retention_check_interval_ms,
+            mempool_event_retention_max_events_per_step: retention
+                .mempool_event_retention_max_events_per_step
+                .get(),
+            mempool_event_retention_max_encoded_bytes_per_step: retention
+                .mempool_event_retention_max_encoded_bytes_per_step
+                .get(),
         }
     }
 }
@@ -160,6 +193,26 @@ pub fn resolve_retention(section: RetentionSection) -> Result<ResolvedRetention,
         mempool_event_retention_check_interval_ms: section
             .mempool_event_retention_check_interval_ms
             .unwrap_or(DEFAULT_MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS),
+        mempool_event_retention_max_events_per_step: NonZeroU32::new(
+            section
+                .mempool_event_retention_max_events_per_step
+                .unwrap_or(DEFAULT_MEMPOOL_EVENT_RETENTION_MAX_EVENTS_PER_STEP),
+        )
+        .ok_or_else(|| {
+            ConfigError::invalid(
+                "retention.mempool_event_retention_max_events_per_step must be greater than zero",
+            )
+        })?,
+        mempool_event_retention_max_encoded_bytes_per_step: NonZeroU64::new(
+            section
+                .mempool_event_retention_max_encoded_bytes_per_step
+                .unwrap_or(DEFAULT_MEMPOOL_EVENT_RETENTION_MAX_ENCODED_BYTES_PER_STEP),
+        )
+        .ok_or_else(|| {
+            ConfigError::invalid(
+                "retention.mempool_event_retention_max_encoded_bytes_per_step must be greater than zero",
+            )
+        })?,
     };
 
     if resolved.chain_event_retention_check_interval_ms == 0 {
@@ -194,6 +247,16 @@ mod tests {
             resolved.chain_event_retention_hours,
             DEFAULT_CHAIN_EVENT_RETENTION_HOURS
         );
+        assert_eq!(
+            resolved.mempool_event_retention_max_events_per_step.get(),
+            DEFAULT_MEMPOOL_EVENT_RETENTION_MAX_EVENTS_PER_STEP
+        );
+        assert_eq!(
+            resolved
+                .mempool_event_retention_max_encoded_bytes_per_step
+                .get(),
+            DEFAULT_MEMPOOL_EVENT_RETENTION_MAX_ENCODED_BYTES_PER_STEP
+        );
         Ok(())
     }
 
@@ -222,5 +285,24 @@ mod tests {
             toml::from_str::<RetentionSection>("mempool_cursor_at_risk_warning_minutes = 12");
 
         assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn zero_mempool_retention_step_budgets_are_rejected() {
+        for section in [
+            RetentionSection {
+                mempool_event_retention_max_events_per_step: Some(0),
+                ..RetentionSection::default()
+            },
+            RetentionSection {
+                mempool_event_retention_max_encoded_bytes_per_step: Some(0),
+                ..RetentionSection::default()
+            },
+        ] {
+            assert!(matches!(
+                resolve_retention(section),
+                Err(ConfigError::Invalid { .. })
+            ));
+        }
     }
 }

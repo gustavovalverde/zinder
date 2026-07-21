@@ -28,7 +28,8 @@ use zinder_source::{
 };
 use zinder_store::{
     EventStreamStartPosition, MempoolEvent, MempoolEventPosition, MempoolEventRetentionConfig,
-    MempoolEventRetentionReport, StreamCursorTokenV1, mempool_event_envelope_message,
+    MempoolEventRetentionStepBudget, MempoolEventRetentionStepOutcome,
+    MempoolEventRetentionStepStop, StreamCursorTokenV1, mempool_event_envelope_message,
 };
 
 use crate::source_recovery::default_recovery_backoff;
@@ -528,9 +529,10 @@ impl LiveMempoolOwner {
         canonical: &CanonicalControlHandle,
         now: UnixTimestampMillis,
         retention: MempoolEventRetentionConfig,
-    ) -> Result<MempoolEventRetentionReport, Status> {
+        budget: MempoolEventRetentionStepBudget,
+    ) -> Result<MempoolEventRetentionStepOutcome, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
-        canonical.prune_mempool_events(now, retention).await
+        canonical.prune_mempool_events(now, retention, budget).await
     }
 
     fn mark_rebuild_required(&self) {
@@ -952,31 +954,53 @@ fn mempool_source_reconnect_backoff(error: &SourceError) -> Duration {
     default_recovery_backoff().for_class(error.upstream_classification())
 }
 
+/// Scheduling and work limits for durable mempool-event retention.
+#[derive(Clone, Copy, Debug)]
+pub struct MempoolRetentionSettings {
+    /// Per-event retention windows.
+    pub retention: MempoolEventRetentionConfig,
+    /// Event-count and encoded-byte budget for one maintenance step.
+    pub budget: MempoolEventRetentionStepBudget,
+    /// Delay between complete retention scans.
+    pub check_interval: Duration,
+}
+
 /// Runs the durable mempool-event retention loop through the canonical writer.
 pub async fn run_mempool_retention(
     canonical: CanonicalControlHandle,
     owner: LiveMempoolOwner,
-    retention: MempoolEventRetentionConfig,
-    check_interval: Duration,
+    settings: MempoolRetentionSettings,
     cancel: CancellationToken,
 ) {
+    let mut has_immediate_work = false;
     loop {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            () = tokio::time::sleep(check_interval) => {
-                let now = UnixTimestampMillis::now();
-                let started_at = Instant::now();
-                let retention_outcome = owner.prune_events(&canonical, now, retention).await;
-                record_mempool_retention_pass(started_at, now, &retention_outcome);
-                if let Err(status) = retention_outcome {
-                    tracing::warn!(
-                        target: "zinder::ingest",
-                        event = "mempool_event_retention_failed",
-                        code = ?status.code(),
-                        "durable mempool-event retention pass failed"
-                    );
-                }
+        if has_immediate_work {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::task::yield_now() => {}
             }
+        } else {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(settings.check_interval) => {}
+            }
+        }
+        let now = UnixTimestampMillis::now();
+        let started_at = Instant::now();
+        let retention_outcome = owner
+            .prune_events(&canonical, now, settings.retention, settings.budget)
+            .await;
+        record_mempool_retention_pass(started_at, now, &retention_outcome);
+        has_immediate_work = retention_outcome
+            .as_ref()
+            .is_ok_and(|outcome| outcome.has_immediate_work());
+        if let Err(status) = retention_outcome {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "mempool_event_retention_failed",
+                code = ?status.code(),
+                "durable mempool-event retention step failed"
+            );
         }
     }
 }
@@ -1159,22 +1183,25 @@ fn record_mempool_lifecycle_status(status: MempoolOwnerStatus) {
 fn record_mempool_retention_pass(
     started_at: Instant,
     now: UnixTimestampMillis,
-    retention_outcome: &Result<MempoolEventRetentionReport, Status>,
+    retention_outcome: &Result<MempoolEventRetentionStepOutcome, Status>,
 ) {
-    let status = if retention_outcome.is_ok() {
-        "success"
-    } else {
-        "error"
-    };
+    let status = retention_outcome
+        .as_ref()
+        .map_or("error", |outcome| retention_step_stop_label(outcome.stop));
     metrics::histogram!(
         "zinder_mempool_event_pruning_duration_seconds",
         "status" => status
     )
     .record(started_at.elapsed());
 
-    let Ok(report) = retention_outcome else {
+    let Ok(outcome) = retention_outcome else {
         return;
     };
+    let report = &outcome.report;
+    metrics::histogram!("zinder_mempool_event_retention_examined_events")
+        .record(f64::from(outcome.examined_event_count));
+    metrics::histogram!("zinder_mempool_event_retention_examined_encoded_bytes")
+        .record(u64_to_f64(outcome.examined_encoded_bytes));
     for (kind, pruned_count) in [
         ("added", report.pruned_added_count),
         ("mined", report.pruned_mined_count),
@@ -1191,6 +1218,15 @@ fn record_mempool_retention_pass(
     });
     metrics::gauge!("zinder_mempool_event_retention_oldest_age_seconds")
         .set(u64_to_f64(oldest_retained_age_seconds));
+}
+
+const fn retention_step_stop_label(stop: MempoolEventRetentionStepStop) -> &'static str {
+    match stop {
+        MempoolEventRetentionStepStop::BudgetExhausted => "budget_exhausted",
+        MempoolEventRetentionStepStop::ReachedHead => "reached_head",
+        MempoolEventRetentionStepStop::ReachedUnexpiredEvent => "reached_unexpired_event",
+        MempoolEventRetentionStepStop::RetentionDisabled => "retention_disabled",
+    }
 }
 
 #[allow(
@@ -1259,7 +1295,16 @@ mod tests {
                 source_tip: fixture_source_tip(),
                 snapshot_certified_at: now,
             });
-            record_mempool_retention_pass(Instant::now(), now, &Ok(retention_report));
+            record_mempool_retention_pass(
+                Instant::now(),
+                now,
+                &Ok(zinder_store::MempoolEventRetentionStepOutcome {
+                    report: retention_report,
+                    examined_event_count: 4,
+                    examined_encoded_bytes: 4_096,
+                    stop: zinder_store::MempoolEventRetentionStepStop::ReachedHead,
+                }),
+            );
         });
 
         let exposition = handle.render();
@@ -1273,7 +1318,9 @@ mod tests {
             "zinder_mempool_events_retained 6",
             "zinder_mempool_event_retention_oldest_sequence 7",
             "zinder_mempool_event_retention_oldest_age_seconds 5",
-            "zinder_mempool_event_pruning_duration_seconds_count{status=\"success\"} 1",
+            "zinder_mempool_event_pruning_duration_seconds_count{status=\"reached_head\"} 1",
+            "zinder_mempool_event_retention_examined_events_count 1",
+            "zinder_mempool_event_retention_examined_encoded_bytes_count 1",
         ] {
             assert!(
                 exposition.contains(expected_sample),

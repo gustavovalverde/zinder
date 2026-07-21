@@ -28,7 +28,9 @@ use crate::{
     writer::construction::{
         canonical_build_block, compact_block_commitments, register_prohibited_read_metrics,
     },
-    writer::control::{CanonicalControlCommand, apply_canonical_control_command},
+    writer::control::{
+        CanonicalControlCommand, CanonicalControlScheduling, apply_canonical_control_command,
+    },
 };
 
 /// Polling and bounded-source settings for canonical following.
@@ -360,7 +362,11 @@ where
     loop {
         if let Some(control_commands) = control_commands.as_mut() {
             while let Ok(command) = control_commands.try_recv() {
-                apply_canonical_control_command(&mut store, command);
+                if apply_canonical_control_command(&mut store, command)
+                    == CanonicalControlScheduling::YieldToCanonical
+                {
+                    break;
+                }
             }
         }
         if follower.cancel.is_cancelled() {

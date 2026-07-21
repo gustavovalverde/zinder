@@ -131,12 +131,18 @@ block-local boundary.
   floor after each retention pass.
 - `zinder_mempool_events_pruned_total{kind}` and
   `zinder_mempool_event_pruning_duration_seconds{status}` report per-kind
-  deletion counts and sweep outcomes with the closed `success` / `error` label
-  set.
+  deletion counts and step outcomes. The closed status set is
+  `budget_exhausted`, `reached_head`, `reached_unexpired_event`,
+  `retention_disabled`, and `error`.
+- `zinder_mempool_event_retention_examined_events` and
+  `zinder_mempool_event_retention_examined_encoded_bytes` report bounded work
+  performed by each step.
 
 Mempool retention metrics describe stored history, not active consumer
 cursors. Retention is contiguous-prefix based, and active `Added` replay
 anchors can keep later rows beyond their individual minimum residence window.
+Budget-exhausted steps resume without the normal interval delay, with one
+canonical source turn between consecutive maintenance commands.
 
 ### Projector and wallet store
 

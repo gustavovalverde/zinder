@@ -125,11 +125,22 @@ windows. This is required for restart reconstruction and cursor continuity,
 and it makes retained-row count and pruning duration important capacity
 signals.
 
+The canonical store advances retention through resumable process-local steps,
+bounded by both event rows and encoded bytes. A step scans forward from the
+durable floor, tracks unmatched `Added` anchors, and deletes only an inspected
+prefix that is older than every active anchor while retaining the captured
+head. Floor advancement and row deletion remain one atomic synced batch.
+Restart discards only scan progress and safely resumes from the durable floor.
+Budget exhaustion schedules another step immediately, but the writer yields a
+canonical source turn between maintenance steps. The byte target permits one
+row to exceed it so an individually large admitted envelope cannot prevent
+progress.
+
 Retention does not manufacture a cursor-at-risk readiness state from the age
 of the oldest row. Zinder has no consumer cursor registration or lease, so row
 age is not evidence that an active consumer is about to expire. The retention
 loop instead reports retained rows, floor sequence and age, per-kind prune
-counts, and sweep duration with bounded success/error labels through metrics. Source and
+counts, bounded work, and typed step outcomes through metrics. Source and
 hydration failures remain source-owner diagnostics. The canonical follower is
 the only publisher of ingest readiness and treats the mempool hydration gate
 as a hard prerequisite. The gate carries the source tip certified by the

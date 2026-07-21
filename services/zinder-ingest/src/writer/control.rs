@@ -38,14 +38,23 @@ use zinder_store::{
     CanonicalMempoolSnapshotStart, CanonicalOwnerCheckpointAdmission,
     CanonicalOwnerCheckpointEvidence, CanonicalStoreError, EventStreamStartPosition, MempoolEvent,
     MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventPosition,
-    MempoolEventRetentionConfig, MempoolEventRetentionReport, ProjectionBuildAnchor,
-    ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalStore, RocksDbResourceBudget,
-    StreamCursorTokenV1,
+    MempoolEventRetentionConfig, MempoolEventRetentionStepBudget, MempoolEventRetentionStepOutcome,
+    ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalStore,
+    RocksDbResourceBudget, StreamCursorTokenV1,
 };
 
 /// Bounded number of RPCs that may wait while the follower is preparing source work.
 pub const CANONICAL_CONTROL_COMMAND_CAPACITY: usize = 64;
 const CANONICAL_CONTROL_MAX_PAGE_EVENTS: u32 = 1_024;
+
+/// Scheduling decision returned after one owner command is applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanonicalControlScheduling {
+    /// Continue draining already queued control commands.
+    ContinueDraining,
+    /// Give canonical source work one turn before another maintenance step.
+    YieldToCanonical,
+}
 const CANONICAL_CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// Covers one bounded upstream request plus a command handoff without making
 /// projectors reopen the primary during a transient follower busy period.
@@ -384,10 +393,12 @@ impl CanonicalControlHandle {
         &self,
         now: UnixTimestampMillis,
         retention: MempoolEventRetentionConfig,
-    ) -> Result<MempoolEventRetentionReport, Status> {
+        budget: MempoolEventRetentionStepBudget,
+    ) -> Result<MempoolEventRetentionStepOutcome, Status> {
         self.request(|reply| CanonicalControlCommand::PruneMempoolEvents {
             now,
             retention,
+            budget,
             reply,
         })
         .await
@@ -569,8 +580,10 @@ pub enum CanonicalControlCommand {
         now: UnixTimestampMillis,
         /// Per-variant retention windows.
         retention: MempoolEventRetentionConfig,
+        /// Bounded event-count and encoded-byte work budget.
+        budget: MempoolEventRetentionStepBudget,
         /// One-shot response carrying the resulting retention report.
-        reply: oneshot::Sender<Result<MempoolEventRetentionReport, Status>>,
+        reply: oneshot::Sender<Result<MempoolEventRetentionStepOutcome, Status>>,
     },
     /// Read one ordered bounded retained-event page.
     EventPage {
@@ -632,7 +645,12 @@ pub enum CanonicalControlCommand {
 pub(crate) fn apply_canonical_control_command(
     store: &mut RocksDbCanonicalStore,
     command: CanonicalControlCommand,
-) {
+) -> CanonicalControlScheduling {
+    let scheduling = if matches!(&command, CanonicalControlCommand::PruneMempoolEvents { .. }) {
+        CanonicalControlScheduling::YieldToCanonical
+    } else {
+        CanonicalControlScheduling::ContinueDraining
+    };
     match command {
         CanonicalControlCommand::WriterStatus { reply } => {
             send_control_response(reply, writer_status_response(store));
@@ -685,9 +703,10 @@ pub(crate) fn apply_canonical_control_command(
         CanonicalControlCommand::PruneMempoolEvents {
             now,
             retention,
+            budget,
             reply,
         } => {
-            prune_mempool_events(store, now, retention, reply);
+            prune_mempool_events(store, now, retention, budget, reply);
         }
         CanonicalControlCommand::EventPage { request, reply } => {
             send_control_response(reply, event_page_response(store, &request));
@@ -726,6 +745,7 @@ pub(crate) fn apply_canonical_control_command(
             send_control_response(reply, release_lease_response(store, &lease));
         }
     }
+    scheduling
 }
 
 fn read_ingest_event_page(
@@ -823,12 +843,13 @@ fn prune_mempool_events(
     store: &RocksDbCanonicalStore,
     now: UnixTimestampMillis,
     retention: MempoolEventRetentionConfig,
-    reply: oneshot::Sender<Result<MempoolEventRetentionReport, Status>>,
+    budget: MempoolEventRetentionStepBudget,
+    reply: oneshot::Sender<Result<MempoolEventRetentionStepOutcome, Status>>,
 ) {
     send_control_response(
         reply,
         store
-            .prune_mempool_events_before(now, retention)
+            .advance_mempool_event_retention(now, retention, budget)
             .map_err(|error| map_store_error(&error)),
     );
 }
@@ -1462,7 +1483,12 @@ fn map_store_error(error: &CanonicalStoreError) -> Status {
 /// Fixture-backed canonical control helpers and loopback coverage shared by
 /// canonical writer control-plane tests.
 pub(crate) mod test_support {
-    use std::{fs, num::NonZeroU32, str::FromStr as _, time::Duration};
+    use std::{
+        fs,
+        num::{NonZeroU32, NonZeroU64},
+        str::FromStr as _,
+        time::Duration,
+    };
 
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -1488,8 +1514,9 @@ pub(crate) mod test_support {
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
         CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, MempoolEvent,
-        MempoolEventHistoryRequest, MempoolEventRetentionConfig, RocksDbCanonicalBuilder,
-        RocksDbCanonicalStore, RocksDbResourceBudget,
+        MempoolEventHistoryRequest, MempoolEventRetentionConfig, MempoolEventRetentionReport,
+        MempoolEventRetentionStepStop, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
+        RocksDbResourceBudget,
     };
 
     use super::*;
@@ -1522,6 +1549,32 @@ pub(crate) mod test_support {
         let history =
             store.mempool_event_history(MempoolEventHistoryRequest::with_default_limit(None))?;
         assert_eq!(history, envelopes);
+        Ok(())
+    }
+
+    #[test]
+    fn retention_control_step_yields_before_more_control_commands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (reply, _response) = oneshot::channel();
+        let scheduling = apply_canonical_control_command(
+            &mut store,
+            CanonicalControlCommand::PruneMempoolEvents {
+                now: UnixTimestampMillis::new(10_000),
+                retention: MempoolEventRetentionConfig::new(
+                    Some(Duration::from_millis(1)),
+                    Some(Duration::from_millis(1)),
+                ),
+                budget: MempoolEventRetentionStepBudget::new(
+                    NonZeroU32::new(1).ok_or("retention event budget must be nonzero")?,
+                    NonZeroU64::new(1).ok_or("retention byte budget must be nonzero")?,
+                ),
+                reply,
+            },
+        );
+
+        assert_eq!(scheduling, CanonicalControlScheduling::YieldToCanonical);
         Ok(())
     }
 
@@ -2062,13 +2115,26 @@ pub(crate) mod test_support {
         assert_eq!(retained.len(), 2, "restart must retain appended history");
         assert_eq!(retained[0].cursor, first.cursor);
 
-        let report = reopened.prune_mempool_events_before(
-            UnixTimestampMillis::new(10_000),
-            MempoolEventRetentionConfig::new(
-                Some(Duration::from_millis(1)),
-                Some(Duration::from_millis(1)),
-            ),
-        )?;
+        let retention = MempoolEventRetentionConfig::new(
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(1)),
+        );
+        let budget = MempoolEventRetentionStepBudget::new(
+            NonZeroU32::new(8).ok_or("retention event budget must be nonzero")?,
+            NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+        );
+        let mut report = MempoolEventRetentionReport::default();
+        for _step in 0..4 {
+            let outcome = reopened.advance_mempool_event_retention(
+                UnixTimestampMillis::new(10_000),
+                retention,
+                budget,
+            )?;
+            report = outcome.report;
+            if !outcome.has_immediate_work() {
+                break;
+            }
+        }
         assert_eq!(report.oldest_retained_sequence, Some(2));
         let expired = reopened
             .mempool_event_history(MempoolEventHistoryRequest::new(
@@ -2081,6 +2147,393 @@ pub(crate) mod test_support {
             expired,
             CanonicalStoreError::MempoolEventCursorExpired { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_retention_preserves_active_anchor_until_its_terminal_event_is_scanned()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let chain_epoch = store.chain_epoch()?;
+        let active_transaction_id = TransactionId::from_bytes([0xA1; 32]);
+        let head_transaction_id = TransactionId::from_bytes([0xA2; 32]);
+        for event in [
+            MempoolEvent::Added {
+                entry: retention_test_entry(active_transaction_id, 0xA1, chain_epoch)?,
+            },
+            MempoolEvent::Invalidated {
+                transaction_id: TransactionId::from_bytes([0xB2; 32]),
+                reason: MempoolEvictionReason::Unknown,
+            },
+            MempoolEvent::Invalidated {
+                transaction_id: TransactionId::from_bytes([0xB3; 32]),
+                reason: MempoolEvictionReason::Unknown,
+            },
+            MempoolEvent::Invalidated {
+                transaction_id: TransactionId::from_bytes([0xB4; 32]),
+                reason: MempoolEvictionReason::Unknown,
+            },
+            MempoolEvent::Invalidated {
+                transaction_id: active_transaction_id,
+                reason: MempoolEvictionReason::Unknown,
+            },
+            MempoolEvent::Added {
+                entry: retention_test_entry(head_transaction_id, 0xA2, chain_epoch)?,
+            },
+        ] {
+            let _envelope = store.append_mempool_event(event, UnixTimestampMillis::new(1_000))?;
+        }
+        let retention = MempoolEventRetentionConfig::new(
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(1)),
+        );
+        let budget = MempoolEventRetentionStepBudget::new(
+            NonZeroU32::new(2).ok_or("retention event budget must be nonzero")?,
+            NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+        );
+
+        for _step in 0..2 {
+            let outcome = store.advance_mempool_event_retention(
+                UnixTimestampMillis::new(10_000),
+                retention,
+                budget,
+            )?;
+            assert_eq!(outcome.stop, MempoolEventRetentionStepStop::BudgetExhausted);
+            assert_eq!(outcome.report.oldest_retained_sequence, Some(1));
+            assert!(outcome.examined_event_count <= 2);
+        }
+
+        let mut pruned_total = 0_u64;
+        let mut final_report = MempoolEventRetentionReport::default();
+        for _step in 0..6 {
+            let outcome = store.advance_mempool_event_retention(
+                UnixTimestampMillis::new(10_000),
+                retention,
+                budget,
+            )?;
+            assert!(outcome.examined_event_count <= 2);
+            assert!(outcome.report.pruned_total() <= 2);
+            pruned_total = pruned_total.saturating_add(outcome.report.pruned_total());
+            final_report = outcome.report;
+            if !outcome.has_immediate_work() {
+                break;
+            }
+        }
+
+        assert_eq!(pruned_total, 5);
+        assert_eq!(final_report.oldest_retained_sequence, Some(6));
+        let retained = store.mempool_event_history(MempoolEventHistoryRequest::new(
+            None,
+            NonZeroU32::new(8).ok_or("mempool history limit must be nonzero")?,
+        ))?;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].transaction_id(), head_transaction_id);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_retention_restart_rescans_from_the_durable_floor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_fixture_store(&store_path)?;
+        for transaction_tag in 1_u8..=5 {
+            let _envelope = store.append_mempool_event(
+                MempoolEvent::Invalidated {
+                    transaction_id: TransactionId::from_bytes([transaction_tag; 32]),
+                    reason: MempoolEvictionReason::Unknown,
+                },
+                UnixTimestampMillis::new(1_000),
+            )?;
+        }
+        let retention = MempoolEventRetentionConfig::new(
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(1)),
+        );
+        let budget = MempoolEventRetentionStepBudget::new(
+            NonZeroU32::new(2).ok_or("retention event budget must be nonzero")?,
+            NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+        );
+
+        let first_step = store.advance_mempool_event_retention(
+            UnixTimestampMillis::new(10_000),
+            retention,
+            budget,
+        )?;
+        assert!(first_step.has_immediate_work());
+        assert_eq!(first_step.report.oldest_retained_sequence, Some(2));
+        drop(store);
+
+        let activations = fixture_activations()?;
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalReorgPolicy::new(1)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let mut final_report = MempoolEventRetentionReport::default();
+        for _step in 0..10 {
+            let outcome = reopened.advance_mempool_event_retention(
+                UnixTimestampMillis::new(10_000),
+                retention,
+                budget,
+            )?;
+            assert!(outcome.examined_event_count <= 2);
+            final_report = outcome.report;
+            if !outcome.has_immediate_work() {
+                break;
+            }
+        }
+
+        assert_eq!(final_report.oldest_retained_sequence, Some(5));
+        let retained = reopened.mempool_event_history(MempoolEventHistoryRequest::new(
+            None,
+            NonZeroU32::new(8).ok_or("mempool history limit must be nonzero")?,
+        ))?;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].position().event_sequence, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_retention_interleaved_readd_becomes_the_new_replay_anchor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let chain_epoch = store.chain_epoch()?;
+        let transaction_id = TransactionId::from_bytes([0xD1; 32]);
+        append_retention_test_events(
+            &store,
+            [
+                MempoolEvent::Added {
+                    entry: retention_test_entry(transaction_id, 0xD1, chain_epoch)?,
+                },
+                MempoolEvent::Invalidated {
+                    transaction_id: TransactionId::from_bytes([0xD2; 32]),
+                    reason: MempoolEvictionReason::Unknown,
+                },
+                MempoolEvent::Invalidated {
+                    transaction_id: TransactionId::from_bytes([0xD3; 32]),
+                    reason: MempoolEvictionReason::Unknown,
+                },
+            ],
+        )?;
+        let retention = MempoolEventRetentionConfig::new(
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(1)),
+        );
+        let budget = MempoolEventRetentionStepBudget::new(
+            NonZeroU32::new(2).ok_or("retention event budget must be nonzero")?,
+            NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+        );
+
+        let first_step = store.advance_mempool_event_retention(
+            UnixTimestampMillis::new(10_000),
+            retention,
+            budget,
+        )?;
+        assert!(first_step.has_immediate_work());
+        append_retention_test_events(
+            &store,
+            [
+                MempoolEvent::Invalidated {
+                    transaction_id,
+                    reason: MempoolEvictionReason::Unknown,
+                },
+                MempoolEvent::Added {
+                    entry: retention_test_entry(transaction_id, 0xD4, chain_epoch)?,
+                },
+                MempoolEvent::Invalidated {
+                    transaction_id: TransactionId::from_bytes([0xD5; 32]),
+                    reason: MempoolEvictionReason::Unknown,
+                },
+            ],
+        )?;
+
+        let captured_head_step = store.advance_mempool_event_retention(
+            UnixTimestampMillis::new(10_000),
+            retention,
+            budget,
+        )?;
+        assert!(!captured_head_step.has_immediate_work());
+        assert_eq!(captured_head_step.report.oldest_retained_sequence, Some(1));
+
+        let mut final_report = MempoolEventRetentionReport::default();
+        for _step in 0..12 {
+            let outcome = store.advance_mempool_event_retention(
+                UnixTimestampMillis::new(10_000),
+                retention,
+                budget,
+            )?;
+            final_report = outcome.report;
+            if !outcome.has_immediate_work() {
+                break;
+            }
+        }
+
+        assert_eq!(final_report.oldest_retained_sequence, Some(5));
+        let retained = store.mempool_event_history(MempoolEventHistoryRequest::new(
+            None,
+            NonZeroU32::new(8).ok_or("mempool history limit must be nonzero")?,
+        ))?;
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].position().event_sequence, 5);
+        assert_eq!(retained[0].transaction_id(), transaction_id);
+        assert_eq!(retained[1].position().event_sequence, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn first_unexpired_event_blocks_pruning_of_later_expired_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        for (transaction_tag, observed_at) in
+            [(0xE1, 1_000), (0xE2, 9_999), (0xE3, 1_000), (0xE4, 1_000)]
+        {
+            let _envelope = store.append_mempool_event(
+                MempoolEvent::Invalidated {
+                    transaction_id: TransactionId::from_bytes([transaction_tag; 32]),
+                    reason: MempoolEvictionReason::Unknown,
+                },
+                UnixTimestampMillis::new(observed_at),
+            )?;
+        }
+        let retention = MempoolEventRetentionConfig::new(
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(100)),
+        );
+        let budget = MempoolEventRetentionStepBudget::new(
+            NonZeroU32::new(8).ok_or("retention event budget must be nonzero")?,
+            NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+        );
+
+        let outcome = store.advance_mempool_event_retention(
+            UnixTimestampMillis::new(10_000),
+            retention,
+            budget,
+        )?;
+        assert_eq!(
+            outcome.stop,
+            MempoolEventRetentionStepStop::ReachedUnexpiredEvent
+        );
+        assert_eq!(outcome.report.oldest_retained_sequence, Some(2));
+        let retained = store.mempool_event_history(MempoolEventHistoryRequest::new(
+            None,
+            NonZeroU32::new(8).ok_or("mempool history limit must be nonzero")?,
+        ))?;
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained[0].position().event_sequence, 2);
+        assert_eq!(retained[2].position().event_sequence, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn retention_step_uses_remaining_budget_after_a_terminal_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let chain_epoch = store.chain_epoch()?;
+        for transaction_tag in 1_u8..=3 {
+            let transaction_id = TransactionId::from_bytes([transaction_tag; 32]);
+            for event in [
+                MempoolEvent::Added {
+                    entry: retention_test_entry(transaction_id, transaction_tag, chain_epoch)?,
+                },
+                MempoolEvent::Invalidated {
+                    transaction_id,
+                    reason: MempoolEvictionReason::Unknown,
+                },
+            ] {
+                let _envelope =
+                    store.append_mempool_event(event, UnixTimestampMillis::new(1_000))?;
+            }
+        }
+        let _head = store.append_mempool_event(
+            MempoolEvent::Invalidated {
+                transaction_id: TransactionId::from_bytes([0xF0; 32]),
+                reason: MempoolEvictionReason::Unknown,
+            },
+            UnixTimestampMillis::new(1_000),
+        )?;
+
+        let outcome = store.advance_mempool_event_retention(
+            UnixTimestampMillis::new(10_000),
+            MempoolEventRetentionConfig::new(
+                Some(Duration::from_millis(1)),
+                Some(Duration::from_millis(1)),
+            ),
+            MempoolEventRetentionStepBudget::new(
+                NonZeroU32::new(16).ok_or("retention event budget must be nonzero")?,
+                NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+            ),
+        )?;
+
+        assert_eq!(outcome.stop, MempoolEventRetentionStepStop::ReachedHead);
+        assert_eq!(outcome.report.pruned_total(), 6);
+        assert_eq!(outcome.report.oldest_retained_sequence, Some(7));
+        assert!(outcome.examined_event_count > 2);
+        assert!(outcome.examined_event_count <= 16);
+        Ok(())
+    }
+
+    #[test]
+    fn retention_byte_target_allows_one_row_overshoot_for_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let _head = store.append_mempool_event(
+            MempoolEvent::Invalidated {
+                transaction_id: TransactionId::from_bytes([0xC1; 32]),
+                reason: MempoolEvictionReason::Unknown,
+            },
+            UnixTimestampMillis::new(1_000),
+        )?;
+        let outcome = store.advance_mempool_event_retention(
+            UnixTimestampMillis::new(10_000),
+            MempoolEventRetentionConfig::new(
+                Some(Duration::from_millis(1)),
+                Some(Duration::from_millis(1)),
+            ),
+            MempoolEventRetentionStepBudget::new(
+                NonZeroU32::new(1).ok_or("retention event budget must be nonzero")?,
+                NonZeroU64::new(1).ok_or("retention byte budget must be nonzero")?,
+            ),
+        )?;
+
+        assert_eq!(outcome.examined_event_count, 1);
+        assert!(outcome.examined_encoded_bytes > 1);
+        assert_eq!(outcome.stop, MempoolEventRetentionStepStop::ReachedHead);
+        assert_eq!(outcome.report.oldest_retained_sequence, Some(1));
+        Ok(())
+    }
+
+    fn retention_test_entry(
+        transaction_id: TransactionId,
+        transaction_tag: u8,
+        chain_epoch: ChainEpoch,
+    ) -> Result<MempoolEntry, zinder_core::MempoolEntryBuildError> {
+        MempoolEntry::new(
+            transaction_id,
+            None,
+            RawTransactionBytes::new(vec![transaction_tag; 8]),
+            CompactTransactionData::default(),
+            MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_000),
+                first_seen_chain_epoch: chain_epoch,
+            },
+        )
+    }
+
+    fn append_retention_test_events(
+        store: &RocksDbCanonicalStore,
+        events: impl IntoIterator<Item = MempoolEvent>,
+    ) -> Result<(), CanonicalStoreError> {
+        for event in events {
+            let _envelope = store.append_mempool_event(event, UnixTimestampMillis::new(1_000))?;
+        }
         Ok(())
     }
 
