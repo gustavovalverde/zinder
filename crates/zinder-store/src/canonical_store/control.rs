@@ -795,7 +795,7 @@ mod tests {
                 encoded[identity_end..identity_end + 2].copy_from_slice(&1_u16.to_le_bytes());
                 (
                     encoded,
-                    "store schema version 1 does not equal required version 5",
+                    "store schema version 1 does not equal required version 6",
                 )
             },
             {

@@ -1,14 +1,12 @@
 //! Production-store fixtures for the immutable wallet-serving boundary.
 
 use eyre::{Context as _, ensure, eyre};
-use prost::Message as _;
 use tempfile::TempDir;
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockReplayEnvelope, ChainTipMetadata, CommitmentTreeCheckpoint,
     CommitmentTreeFrontiers, NetworkUpgradeActivations, UnixTimestampMillis,
     decode_canonical_block_replay,
 };
-use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
     CanonicalStoreBuildPlan, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
@@ -192,19 +190,7 @@ fn canonical_build_block(
             )
         })?
         .into_facts();
-    let compact_payload = CompactBlock::decode(compact_block.payload_bytes.as_slice())
-        .wrap_err_with(|| {
-            format!(
-                "decode compact fixture block at height {}",
-                fixture_block.height.value()
-            )
-        })?;
-    let metadata = compact_payload.chain_metadata.ok_or_else(|| {
-        eyre!(
-            "compact fixture block at height {} has no chain metadata",
-            fixture_block.height.value()
-        )
-    })?;
+    let metadata = compact_block.chain_metadata();
     let tip_metadata = ChainTipMetadata::new(
         metadata.sapling_commitment_tree_size,
         metadata.orchard_commitment_tree_size,

@@ -229,13 +229,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             chain_view: Some(chain_view_message(snapshot.chain_epoch)),
             location: Some(wallet::TransactionLocation {
                 location: Some(wallet::transaction_location::Location::InMempool(
-                    wallet::MempoolTransaction {
-                        payload_bytes: entry.raw_transaction_bytes.as_slice().to_vec(),
-                        first_seen_unix_seconds: i64::try_from(
-                            entry.first_seen_unix_millis.value() / 1_000,
-                        )
-                        .unwrap_or(i64::MAX),
-                    },
+                    zinder_proto::wire::mempool_entry_message(&entry),
                 )),
             }),
         }))
@@ -635,10 +629,10 @@ mod tests {
     use tonic::{Code, Request, transport::Server};
     use zinder_core::{
         ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
-        ChainEpochId, ChainTipMetadata, ChainValuePool, ChainValuePools, MempoolEntry,
+        ChainEpochId, ChainTipMetadata, ChainValuePool, ChainValuePools, CompactTransactionData,
+        CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolObservation,
         RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, TransactionId,
-        TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
-        TransparentOutPoint, UnixTimestampMillis, wire::encode_rpc_transaction_id_hex,
+        UnixTimestampMillis, wire::encode_rpc_transaction_id_hex,
     };
     use zinder_proto::{
         capabilities::INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1,
@@ -750,7 +744,7 @@ mod tests {
                 .apply_event(
                     &fixture.canonical,
                     MempoolEvent::Added {
-                        entry: fixture_mempool_entry_with_id(transaction_id_byte, chain_epoch),
+                        entry: fixture_mempool_entry_with_id(transaction_id_byte, chain_epoch)?,
                     },
                     UnixTimestampMillis::new(1_750_000_000_200),
                 )
@@ -769,7 +763,7 @@ mod tests {
         assert!(!first_page.next_cursor.is_empty());
         let resume_cursor = first_page.events_resume_cursor.clone();
 
-        let late_entry = fixture_mempool_entry_with_id(0xD4, chain_epoch);
+        let late_entry = fixture_mempool_entry_with_id(0xD4, chain_epoch)?;
         fixture
             .mempool
             .apply_event(
@@ -798,7 +792,7 @@ mod tests {
         let transaction = fixture
             .ingest_client
             .mempool_transaction(authenticated(MempoolTransactionRequest {
-                transaction_id: encode_rpc_transaction_id_hex(late_entry.transaction_id),
+                transaction_id: encode_rpc_transaction_id_hex(late_entry.transaction_id()),
             }))
             .await?
             .into_inner();
@@ -808,8 +802,8 @@ mod tests {
             return Err("expected the late transaction in the live mempool".into());
         };
         assert_eq!(
-            transaction.payload_bytes,
-            late_entry.raw_transaction_bytes.as_slice()
+            transaction.raw_transaction_bytes,
+            late_entry.raw_transaction_bytes().as_slice()
         );
 
         let mut events = fixture
@@ -853,7 +847,13 @@ mod tests {
             .transparent_mempool_outputs_by_address(authenticated(
                 TransparentMempoolOutputsByAddressRequest {
                     address: Some(AddressLookup {
-                        selector: Some(address_lookup::Selector::ScriptHash(vec![0xA1; 32])),
+                        selector: Some(address_lookup::Selector::ScriptHash(
+                            zinder_core::TransparentAddressScriptHash::of_script_pub_key(
+                                &[0xA1; 25],
+                            )
+                            .as_bytes()
+                            .to_vec(),
+                        )),
                     }),
                     max_entries: None,
                 },
@@ -939,7 +939,7 @@ mod tests {
                 observed_at,
             )
             .await?;
-        let entry = fixture_mempool_entry_with_id(0xE5, chain_epoch);
+        let entry = fixture_mempool_entry_with_id(0xE5, chain_epoch)?;
         fixture
             .mempool
             .apply_event(
@@ -955,7 +955,7 @@ mod tests {
             .apply_event(
                 &fixture.canonical,
                 MempoolEvent::Mined {
-                    transaction_id: entry.transaction_id,
+                    transaction_id: entry.transaction_id(),
                     mined_height: BlockHeight::new(42),
                     block_hash: BlockHash::from_bytes([0xE5; 32]),
                 },
@@ -1192,7 +1192,7 @@ mod tests {
             .apply_event(
                 &canonical,
                 MempoolEvent::Added {
-                    entry: fixture_mempool_entry(chain_epoch),
+                    entry: fixture_mempool_entry(chain_epoch)?,
                 },
                 UnixTimestampMillis::new(1_750_000_000_100),
             )
@@ -1364,42 +1364,43 @@ mod tests {
         request
     }
 
-    fn fixture_mempool_entry(chain_epoch: zinder_core::ChainEpoch) -> MempoolEntry {
+    fn fixture_mempool_entry(
+        chain_epoch: zinder_core::ChainEpoch,
+    ) -> Result<MempoolEntry, zinder_core::MempoolEntryBuildError> {
         fixture_mempool_entry_with_id(0xA1, chain_epoch)
     }
 
     fn fixture_mempool_entry_with_id(
         transaction_id_byte: u8,
         chain_epoch: ChainEpoch,
-    ) -> MempoolEntry {
+    ) -> Result<MempoolEntry, zinder_core::MempoolEntryBuildError> {
         let transaction_id = TransactionId::from_bytes([transaction_id_byte; 32]);
-        MempoolEntry {
+        MempoolEntry::new(
             transaction_id,
-            auth_digest: None,
-            raw_transaction_bytes: RawTransactionBytes::new(vec![transaction_id_byte; 8]),
-            compact_transaction_bytes: vec![transaction_id_byte; 4],
-            first_seen_unix_millis: UnixTimestampMillis::new(1_750_000_000_100),
-            first_seen_chain_epoch: chain_epoch,
-            transparent_outputs: vec![TransparentMempoolOutput {
-                address_script_hash: TransparentAddressScriptHash::from_bytes([0xA1; 32]),
-                script_pub_key: vec![0xA1; 25],
-                outpoint: TransparentOutPoint::new(transaction_id, 0),
-                value_zat: 1_000,
-            }],
-            transparent_spends: vec![TransparentMempoolSpend {
-                spent_outpoint: TransparentOutPoint::new(
-                    TransactionId::from_bytes(
+            None,
+            RawTransactionBytes::new(vec![transaction_id_byte; 8]),
+            CompactTransactionData {
+                transparent_outputs: vec![CompactTransparentOutput {
+                    value_zat: 1_000,
+                    script_pub_key: vec![0xA1; 25],
+                }],
+                transparent_inputs: vec![CompactTransparentInput {
+                    previous_transaction_id: TransactionId::from_bytes(
                         [if transaction_id_byte == 0xA1 {
                             0x55
                         } else {
                             transaction_id_byte
                         }; 32],
                     ),
-                    0,
-                ),
-                spending_transaction_id: transaction_id,
-            }],
-        }
+                    previous_output_index: 0,
+                }],
+                ..CompactTransactionData::default()
+            },
+            MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_750_000_000_100),
+                first_seen_chain_epoch: chain_epoch,
+            },
+        )
     }
 
     fn fixture_epoch(id: u64, height: u32, hash_byte: u8) -> ChainEpoch {

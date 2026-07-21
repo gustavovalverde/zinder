@@ -2,7 +2,7 @@
 
 Zinder can replace the server role of lightwalletd only for clients that speak
 the vendored `CompactTxStreamer` protocol. It remains an adapter over
-`LightwalletdQueryApi`; it must not introduce a second chain-data model, wallet
+`WalletQueryApi`; it must not introduce a second chain-data model, wallet
 state, or key-management surface.
 
 ## Claim boundary
@@ -26,7 +26,8 @@ the claimed RPC set, and the highest evidence-backed level.
 ## Architecture
 
 - `zinder-proto` owns the vendored protocol and its provenance.
-- `zinder-query` owns the native wallet contract and `LightwalletdQueryApi`.
+- `zinder-query` owns the native `WalletQueryApi`, `WalletServingQuery`, and the
+  shared exact-fence serving-pair publisher.
 - `zinder-compat-lightwalletd` translates protocol messages, query values, and
   errors over an admitted exact-fence canonical/wallet-projection reader pair.
 - `zinder-ingest` and `zinder-store` own compact blocks, tree states, subtree

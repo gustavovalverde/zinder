@@ -3,7 +3,6 @@
 use std::{num::NonZeroU32, pin::Pin, sync::Arc};
 
 use arc_swap::ArcSwap;
-use prost::Message;
 use serde_json::Value;
 use tokio_stream::StreamExt as _;
 use tokio_stream::{self as stream};
@@ -13,9 +12,10 @@ use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpochId,
-    CompactBlockArtifact, Network, NetworkUpgradeActivations, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
-    TransactionLocation, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TxStatus,
+    CompactBlockArtifact, CompactTransaction, CompactTransactionData, Network,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionLocation,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
         encode_internal_block_hash, encode_internal_transaction_id, encode_rpc_block_hash_hex,
@@ -27,9 +27,9 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    LightwalletdQueryApi, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletServingReadPair, address_lookup_to_script_hash, status_from_query_error,
+    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingReadPair,
+    address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
 use zinder_store::MempoolEvent;
@@ -84,7 +84,7 @@ impl Default for LightwalletdCompatibilityOptions {
     }
 }
 
-/// gRPC adapter from [`LightwalletdQueryApi`] to lightwalletd `CompactTxStreamer`.
+/// gRPC adapter from [`WalletQueryApi`] to lightwalletd `CompactTxStreamer`.
 #[derive(Clone)]
 pub struct LightwalletdGrpcAdapter<QueryApi> {
     query_api: QueryApi,
@@ -212,7 +212,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
 
 impl<QueryApi> LightwalletdGrpcAdapter<QueryApi>
 where
-    QueryApi: LightwalletdQueryApi + Send + Sync + 'static,
+    QueryApi: WalletQueryApi + Send + Sync + 'static,
 {
     /// Resolves the visible chain epoch id at call time.
     ///
@@ -289,7 +289,7 @@ where
             .compact_block_at(height, Some(chain_view.epoch_id))
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let compact_block = decode_compact_block(&compact_block.compact_block.payload_bytes)?;
+        let compact_block = compact_block_to_lightwalletd(&compact_block.compact_block)?;
 
         if !block_id.hash.is_empty() && block_id.hash != compact_block.hash {
             return Err(Status::not_found(
@@ -438,7 +438,7 @@ fn lightwalletd_balance_value_zat(
 #[tonic::async_trait]
 impl<QueryApi> compact_tx_streamer_server::CompactTxStreamer for LightwalletdGrpcAdapter<QueryApi>
 where
-    QueryApi: LightwalletdQueryApi + Send + Sync + 'static,
+    QueryApi: WalletQueryApi + Send + Sync + 'static,
 {
     async fn get_latest_block(
         &self,
@@ -634,18 +634,16 @@ where
         while let Some(entry_outcome) = entries.next().await {
             let entry = entry_outcome?;
             if txid_matches_excluded_suffix(
-                &encode_internal_transaction_id(entry.transaction_id),
+                &encode_internal_transaction_id(entry.transaction_id()),
                 &exclude_txid_suffixes,
             ) {
                 continue;
             }
-            let compact_message =
-                lightwalletd::CompactTx::decode(entry.compact_transaction_bytes.as_slice())
-                    .map_err(|error| {
-                        Status::data_loss(format!(
-                            "stored compact transaction bytes failed to decode: {error}"
-                        ))
-                    })?;
+            let compact_message = compact_transaction_data_to_lightwalletd(
+                0,
+                entry.transaction_id(),
+                entry.compact_transaction_data(),
+            )?;
             let pruned = prune_mempool_compact_transaction(
                 compact_message,
                 pool_selection,
@@ -834,7 +832,7 @@ async fn transparent_address_tx_history<QueryApi>(
     mut request: TransparentAddressTxIdsInRangeRequest,
 ) -> Result<Vec<TransparentAddressTxIndexArtifact>, Status>
 where
-    QueryApi: LightwalletdQueryApi + ?Sized,
+    QueryApi: WalletQueryApi + ?Sized,
 {
     let mut artifacts = Vec::new();
     loop {
@@ -896,17 +894,115 @@ fn stream_compact_blocks(
     };
 
     Box::pin(stream::iter(compact_blocks.map(move |compact_block| {
-        decode_compact_block(&compact_block.payload_bytes)
+        compact_block_to_lightwalletd(&compact_block)
             .map(|compact_block| prune_compact_block(compact_block, pool_selection, payload_mode))
     })))
 }
 
-fn decode_compact_block(payload_bytes: &[u8]) -> Result<lightwalletd::CompactBlock, Status> {
-    lightwalletd::CompactBlock::decode(payload_bytes).map_err(|source| {
-        Status::data_loss(format!(
-            "indexed compact block payload is not a lightwalletd CompactBlock: {source}"
-        ))
+fn compact_block_to_lightwalletd(
+    compact_block: &CompactBlockArtifact,
+) -> Result<lightwalletd::CompactBlock, Status> {
+    let transactions = compact_block
+        .transactions()
+        .iter()
+        .map(compact_transaction_to_lightwalletd)
+        .collect::<Result<Vec<_>, _>>()?;
+    let metadata = compact_block.chain_metadata();
+    Ok(lightwalletd::CompactBlock {
+        height: u64::from(compact_block.height().value()),
+        hash: encode_internal_block_hash(compact_block.block_hash()).to_vec(),
+        prev_hash: encode_internal_block_hash(compact_block.previous_block_hash()).to_vec(),
+        time: compact_block.time(),
+        header: Vec::new(),
+        vtx: transactions,
+        chain_metadata: Some(lightwalletd::ChainMetadata {
+            sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
+            orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
+            ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
+        }),
     })
+}
+
+fn compact_transaction_to_lightwalletd(
+    transaction: &CompactTransaction,
+) -> Result<lightwalletd::CompactTx, Status> {
+    compact_transaction_data_to_lightwalletd(
+        transaction.index,
+        transaction.transaction_id,
+        &transaction.data,
+    )
+}
+
+fn compact_transaction_data_to_lightwalletd(
+    index: u64,
+    transaction_id: zinder_core::TransactionId,
+    transaction_data: &CompactTransactionData,
+) -> Result<lightwalletd::CompactTx, Status> {
+    let fee = transaction_data
+        .fee_zat
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| Status::data_loss("compact transaction fee exceeds u32"))?
+        .unwrap_or_default();
+    Ok(lightwalletd::CompactTx {
+        index,
+        txid: encode_internal_transaction_id(transaction_id).to_vec(),
+        fee,
+        spends: transaction_data
+            .sapling_spends
+            .iter()
+            .map(|spend| lightwalletd::CompactSaplingSpend {
+                nf: spend.nullifier.to_vec(),
+            })
+            .collect(),
+        outputs: transaction_data
+            .sapling_outputs
+            .iter()
+            .map(|output| lightwalletd::CompactSaplingOutput {
+                cmu: output.commitment.to_vec(),
+                ephemeral_key: output.ephemeral_key.to_vec(),
+                ciphertext: output.ciphertext.to_vec(),
+            })
+            .collect(),
+        actions: transaction_data
+            .orchard_actions
+            .iter()
+            .map(compact_shielded_action_to_lightwalletd)
+            .collect(),
+        vin: transaction_data
+            .transparent_inputs
+            .iter()
+            .map(|input| lightwalletd::CompactTxIn {
+                prevout_txid: encode_internal_transaction_id(input.previous_transaction_id)
+                    .to_vec(),
+                prevout_index: input.previous_output_index,
+            })
+            .collect(),
+        vout: transaction_data
+            .transparent_outputs
+            .iter()
+            .map(|output| lightwalletd::TxOut {
+                value: output.value_zat,
+                script_pub_key: output.script_pub_key.clone(),
+            })
+            .collect(),
+        ironwood_actions: transaction_data
+            .ironwood_actions
+            .iter()
+            .map(compact_shielded_action_to_lightwalletd)
+            .collect(),
+    })
+}
+
+fn compact_shielded_action_to_lightwalletd(
+    action: &zinder_core::CompactShieldedAction,
+) -> lightwalletd::CompactOrchardAction {
+    lightwalletd::CompactOrchardAction {
+        nullifier: action.nullifier.to_vec(),
+        cmx: action.commitment.to_vec(),
+        ephemeral_key: action.ephemeral_key.to_vec(),
+        ciphertext: action.ciphertext.to_vec(),
+    }
 }
 
 fn prune_compact_transaction(
@@ -1051,7 +1147,7 @@ fn mined_location_from_status(status: TxStatus) -> Result<TransactionLocation, S
     }
 }
 
-async fn raw_transaction_from_location<Q: LightwalletdQueryApi + ?Sized>(
+async fn raw_transaction_from_location<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     chain_epoch_id: ChainEpochId,
     location: TransactionLocation,
@@ -1249,24 +1345,11 @@ fn lightwalletd_tree_state(tree_state: &TreeState) -> Result<lightwalletd::TreeS
         network: encode_bip70_chain_name(tree_state.chain_epoch.network).to_owned(),
         height: u64::from(tree_state.height.value()),
         hash: encode_rpc_block_hash_hex(tree_state.block_hash),
-        time: tree_state_time(&payload)?,
+        time: tree_state.block_time_seconds,
         sapling_tree: tree_state_pool_final_state(&payload, "sapling")?,
         orchard_tree: tree_state_pool_final_state(&payload, "orchard")?,
         ironwood_tree: tree_state_pool_final_state(&payload, "ironwood")?,
     })
-}
-
-fn tree_state_time(payload: &Value) -> Result<u32, Status> {
-    let Some(time_value) = payload.get("time") else {
-        return Err(Status::data_loss("tree-state payload is missing time"));
-    };
-    let Some(time) = time_value.as_u64() else {
-        return Err(Status::data_loss(
-            "tree-state time must be a non-negative integer",
-        ));
-    };
-
-    u32::try_from(time).map_err(|_| Status::data_loss("tree-state time exceeds u32"))
 }
 
 fn tree_state_pool_final_state(payload: &Value, pool_name: &'static str) -> Result<String, Status> {
@@ -1586,7 +1669,7 @@ fn project_added_to_raw_transaction(
 
 fn mempool_raw_transaction(entry: &zinder_core::MempoolEntry) -> lightwalletd::RawTransaction {
     lightwalletd::RawTransaction {
-        data: entry.raw_transaction_bytes.as_slice().to_vec(),
+        data: entry.raw_transaction_bytes().as_slice().to_vec(),
         // Reference lightwalletd reports pending mempool transactions with
         // height 0. The observed chain epoch stays native-only metadata.
         height: 0,
@@ -1597,8 +1680,9 @@ fn mempool_raw_transaction(entry: &zinder_core::MempoolEntry) -> lightwalletd::R
 mod tests {
     use super::*;
     use zinder_core::{
-        ArtifactSchemaVersion, ChainEpoch, ChainTipMetadata, TransparentAddressBalance,
-        UnixTimestampMillis,
+        ArtifactSchemaVersion, ChainEpoch, ChainTipMetadata, CompactSaplingOutput,
+        CompactSaplingSpend, CompactShieldedAction, CompactTransparentInput,
+        CompactTransparentOutput, TransparentAddressBalance, UnixTimestampMillis,
     };
 
     fn test_chain_epoch() -> ChainEpoch {
@@ -1710,5 +1794,68 @@ mod tests {
         );
         assert!(pruned.ironwood_actions.is_empty());
         assert_eq!(pruned.actions.len(), 1);
+    }
+
+    #[test]
+    fn structured_scan_data_maps_every_pool_exactly() -> Result<(), Status> {
+        let transaction_id = zinder_core::TransactionId::from_bytes([0x41; 32]);
+        let previous_transaction_id = zinder_core::TransactionId::from_bytes([0x42; 32]);
+        let data = CompactTransactionData {
+            fee_zat: Some(23),
+            sapling_spends: vec![CompactSaplingSpend {
+                nullifier: [0x11; 32],
+            }],
+            sapling_outputs: vec![CompactSaplingOutput {
+                commitment: [0x12; 32],
+                ephemeral_key: [0x13; 32],
+                ciphertext: [0x14; 52],
+            }],
+            orchard_actions: vec![CompactShieldedAction {
+                nullifier: [0x21; 32],
+                commitment: [0x22; 32],
+                ephemeral_key: [0x23; 32],
+                ciphertext: [0x24; 52],
+            }],
+            ironwood_actions: vec![CompactShieldedAction {
+                nullifier: [0x31; 32],
+                commitment: [0x32; 32],
+                ephemeral_key: [0x33; 32],
+                ciphertext: [0x34; 52],
+            }],
+            transparent_inputs: vec![CompactTransparentInput {
+                previous_transaction_id,
+                previous_output_index: 7,
+            }],
+            transparent_outputs: vec![CompactTransparentOutput {
+                value_zat: 99,
+                script_pub_key: vec![0x51, 0x21],
+            }],
+        };
+
+        let mapped = compact_transaction_data_to_lightwalletd(5, transaction_id, &data)?;
+
+        assert_eq!(mapped.index, 5);
+        assert_eq!(mapped.txid, encode_internal_transaction_id(transaction_id));
+        assert_eq!(mapped.fee, 23);
+        assert_eq!(mapped.spends[0].nf, vec![0x11; 32]);
+        assert_eq!(mapped.outputs[0].cmu, vec![0x12; 32]);
+        assert_eq!(mapped.outputs[0].ephemeral_key, vec![0x13; 32]);
+        assert_eq!(mapped.outputs[0].ciphertext, vec![0x14; 52]);
+        assert_eq!(mapped.actions[0].nullifier, vec![0x21; 32]);
+        assert_eq!(mapped.actions[0].cmx, vec![0x22; 32]);
+        assert_eq!(mapped.actions[0].ephemeral_key, vec![0x23; 32]);
+        assert_eq!(mapped.actions[0].ciphertext, vec![0x24; 52]);
+        assert_eq!(mapped.ironwood_actions[0].nullifier, vec![0x31; 32]);
+        assert_eq!(mapped.ironwood_actions[0].cmx, vec![0x32; 32]);
+        assert_eq!(mapped.ironwood_actions[0].ephemeral_key, vec![0x33; 32]);
+        assert_eq!(mapped.ironwood_actions[0].ciphertext, vec![0x34; 52]);
+        assert_eq!(
+            mapped.vin[0].prevout_txid,
+            encode_internal_transaction_id(previous_transaction_id)
+        );
+        assert_eq!(mapped.vin[0].prevout_index, 7);
+        assert_eq!(mapped.vout[0].value, 99);
+        assert_eq!(mapped.vout[0].script_pub_key, vec![0x51, 0x21]);
+        Ok(())
     }
 }

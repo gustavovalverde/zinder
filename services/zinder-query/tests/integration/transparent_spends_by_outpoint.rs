@@ -54,7 +54,7 @@ fn commit_spent_outpoint_fixture(
     );
     let spend = TransparentSpendFact::new(
         spent_outpoint,
-        2,
+        0,
         TransactionId::from_bytes([0x33; 32]),
         0,
         block_two.height,
@@ -70,14 +70,14 @@ fn commit_spent_outpoint_fixture(
         vec![compact_one],
         &[output],
         Vec::new(),
-    ))?;
+    )?)?;
     store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
         epoch_two,
         vec![block_two],
         vec![compact_two],
         &[],
         vec![spend.clone()],
-    ))?;
+    )?)?;
 
     Ok((spent_outpoint, spend))
 }
@@ -266,7 +266,7 @@ fn commit_swept_transparent_spend(
     );
     let spend = TransparentSpendFact::new(
         outpoint,
-        2,
+        0,
         TransactionId::from_bytes([0x33; 32]),
         0,
         BlockHeight::new(2),
@@ -282,7 +282,7 @@ fn commit_swept_transparent_spend(
         compact_blocks,
         &[output],
         vec![spend.clone()],
-    ))?;
+    )?)?;
 
     store.set_transparent_retention_release_height(BlockHeight::new(3))?;
     let sweep_epoch = synthetic_multi_block_epoch(2, 3, 2).0;

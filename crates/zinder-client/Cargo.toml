@@ -10,20 +10,40 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["local", "remote"]
+local = [
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:tracing",
+    "dep:zinder-materialized-views",
+    "dep:zinder-store",
+]
+remote = [
+    "dep:arc-swap",
+    "dep:futures-util",
+    "dep:tokio",
+    "dep:tonic",
+    "dep:tonic-types",
+    "dep:tracing",
+    "dep:zinder-proto",
+]
+
 [dependencies]
-arc-swap.workspace = true
+arc-swap = { workspace = true, optional = true }
 async-trait.workspace = true
+futures-util = { workspace = true, optional = true }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"], optional = true }
 tokio-stream.workspace = true
-tokio-util.workspace = true
-tonic = { workspace = true, features = ["transport", "tls-ring", "tls-native-roots"] }
-tonic-types.workspace = true
-tracing.workspace = true
-zinder-core.workspace = true
-zinder-materialized-views.workspace = true
-zinder-proto.workspace = true
-zinder-store.workspace = true
+tokio-util = { workspace = true, optional = true }
+tonic = { workspace = true, features = ["transport", "tls-ring", "tls-native-roots"], optional = true }
+tonic-types = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+zinder-core = { path = "../zinder-core", default-features = false }
+zinder-materialized-views = { workspace = true, optional = true }
+zinder-proto = { workspace = true, optional = true }
+zinder-store = { workspace = true, optional = true }
 
 [dev-dependencies]
 eyre.workspace = true
@@ -33,18 +53,25 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "time"] }
 toml.workspace = true
 tonic = { workspace = true, features = ["server", "transport"] }
+tonic-prost.workspace = true
 zebra-chain.workspace = true
-zinder-compat-lightwalletd.workspace = true
 zinder-query.workspace = true
 zinder-testkit.workspace = true
 
 [[example]]
 name = "observe_transparent_address"
 path = "examples/observe_transparent_address.rs"
+required-features = ["remote"]
+
+[[test]]
+name = "acceptance"
+path = "tests/acceptance.rs"
+required-features = ["local", "remote"]
 
 [[example]]
 name = "observe_mempool_to_confirmed"
 path = "examples/observe_mempool_to_confirmed.rs"
+required-features = ["remote"]
 
 [lints]
 workspace = true

@@ -8,9 +8,9 @@ use std::{sync::Arc, thread};
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
-    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionId,
-    TreeStateArtifact, UnixTimestampMillis,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
+    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, CompactTransaction,
+    CompactTransactionData, Network, TransactionId, TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_store::{
     ChainEvent, ChainEventHistoryRequest, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
@@ -237,11 +237,72 @@ fn concurrent_same_epoch_commits_do_not_both_publish() -> eyre::Result<()> {
 }
 
 #[test]
+fn first_commit_requires_chain_epoch_one() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (mut epoch, block, compact_block) = synthetic_epoch(1, 1);
+    epoch.id = ChainEpochId::new(2);
+
+    let error = store
+        .commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
+            epoch,
+            vec![block],
+            vec![compact_block],
+        ))
+        .err()
+        .ok_or_else(|| eyre!("first commit with epoch id 2 was accepted"))?;
+
+    assert!(matches!(
+        error,
+        StoreError::InvalidChainEpochArtifacts {
+            reason: "first chain epoch id must be 1",
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn commit_requires_the_next_chain_epoch_id() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (first_epoch, first_block, first_compact_block) = synthetic_epoch(1, 1);
+    store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
+        first_epoch,
+        vec![first_block],
+        vec![first_compact_block],
+    ))?;
+    let (mut skipped_epoch, skipped_block, skipped_compact_block) = synthetic_epoch(2, 2);
+    skipped_epoch.id = ChainEpochId::new(3);
+
+    let error = store
+        .commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
+            skipped_epoch,
+            vec![skipped_block],
+            vec![skipped_compact_block],
+        ))
+        .err()
+        .ok_or_else(|| eyre!("commit that skipped epoch id 2 was accepted"))?;
+
+    assert!(matches!(
+        error,
+        StoreError::InvalidChainEpochArtifacts {
+            reason: "chain epoch id must increase by exactly one",
+        }
+    ));
+    Ok(())
+}
+
+#[test]
 fn commit_rejects_compact_block_without_matching_block() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let (chain_epoch, block, mut compact_block) = synthetic_epoch(1, 1);
-    compact_block.block_hash = BlockHash::from_bytes([99; 32]);
+    let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+    let compact_block = CompactBlockArtifact::empty(
+        BlockId::new(compact_block.height(), BlockHash::from_bytes([99; 32])),
+        compact_block.previous_block_hash(),
+        compact_block.time(),
+        compact_block.chain_metadata(),
+    );
 
     let error = match store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         chain_epoch,
@@ -257,6 +318,86 @@ fn commit_rejects_compact_block_without_matching_block() -> eyre::Result<()> {
         StoreError::InvalidChainEpochArtifacts { .. }
     ));
 
+    Ok(())
+}
+
+#[test]
+fn commit_rejects_compact_block_parent_or_time_mismatch() -> eyre::Result<()> {
+    for (previous_block_hash, time) in [
+        (BlockHash::from_bytes([99; 32]), 0),
+        (BlockHash::from_bytes([0; 32]), 1),
+    ] {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+        let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+        let compact_block = CompactBlockArtifact::empty(
+            BlockId::new(compact_block.height(), compact_block.block_hash()),
+            previous_block_hash,
+            time,
+            compact_block.chain_metadata(),
+        );
+
+        let error = store
+            .commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
+                chain_epoch,
+                vec![block],
+                vec![compact_block],
+            ))
+            .err()
+            .ok_or_else(|| eyre!("compact parent/time mismatch must be rejected"))?;
+        assert!(matches!(
+            error,
+            StoreError::InvalidChainEpochArtifacts { .. }
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn commit_rejects_compact_transaction_index_or_id_mismatch() -> eyre::Result<()> {
+    for (compact_index, compact_transaction_id) in [
+        (1, TransactionId::from_bytes([1; 32])),
+        (0, TransactionId::from_bytes([2; 32])),
+    ] {
+        let tempdir = tempdir()?;
+        let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+        let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+        let canonical_transaction_id = TransactionId::from_bytes([1; 32]);
+        let (transaction_index, transaction_location, transaction_facts, transaction_blob) =
+            super::synthetic_transaction_rows(
+                canonical_transaction_id,
+                block.height,
+                block.block_hash,
+                0,
+                b"tx",
+            );
+        let compact_block = CompactBlockArtifact::new(
+            BlockId::new(compact_block.height(), compact_block.block_hash()),
+            compact_block.previous_block_hash(),
+            compact_block.time(),
+            vec![CompactTransaction {
+                index: compact_index,
+                transaction_id: compact_transaction_id,
+                data: CompactTransactionData::default(),
+            }],
+            compact_block.chain_metadata(),
+        )?;
+        let artifacts =
+            super::synthetic_chain_epoch_artifacts(chain_epoch, vec![block], vec![compact_block])
+                .with_block_transaction_index(vec![transaction_index])
+                .with_transaction_locations(vec![transaction_location])
+                .with_transaction_facts(vec![transaction_facts])
+                .with_transaction_blobs(vec![transaction_blob]);
+
+        let error = store
+            .commit_chain_epoch(artifacts)
+            .err()
+            .ok_or_else(|| eyre!("compact transaction mismatch must be rejected"))?;
+        assert!(matches!(
+            error,
+            StoreError::InvalidChainEpochArtifacts { .. }
+        ));
+    }
     Ok(())
 }
 
@@ -355,6 +496,7 @@ fn commit_rejects_tree_state_above_tip() -> eyre::Result<()> {
     let tree_state = TreeStateArtifact::new(
         BlockHeight::new(2),
         block.block_hash,
+        u32::try_from(block.block_time)?,
         b"tree-state".to_vec(),
     );
 
@@ -382,6 +524,7 @@ fn commit_rejects_tree_state_for_wrong_block_hash() -> eyre::Result<()> {
     let tree_state = TreeStateArtifact::new(
         BlockHeight::new(1),
         BlockHash::from_bytes([99; 32]),
+        u32::try_from(block.block_time)?,
         b"tree-state".to_vec(),
     );
 
@@ -396,6 +539,36 @@ fn commit_rejects_tree_state_for_wrong_block_hash() -> eyre::Result<()> {
     assert!(matches!(
         error,
         StoreError::InvalidChainEpochArtifacts { .. }
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn commit_rejects_tree_state_with_wrong_block_time() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (chain_epoch, block, compact_block) = synthetic_epoch(1, 1);
+    let tree_state = TreeStateArtifact::new(
+        block.height,
+        block.block_hash,
+        u32::try_from(block.block_time)?.saturating_add(1),
+        b"tree-state".to_vec(),
+    );
+
+    let error = match store.commit_chain_epoch(
+        super::synthetic_chain_epoch_artifacts(chain_epoch, vec![block], vec![compact_block])
+            .with_tree_states(vec![tree_state]),
+    ) {
+        Ok(outcome) => return Err(eyre!("expected invalid artifacts, got {outcome:?}")),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        StoreError::InvalidChainEpochArtifacts {
+            reason: "tree-state artifact block time must match its block artifact"
+        }
     ));
 
     Ok(())
@@ -417,7 +590,7 @@ fn empty_store_accepts_bootstrap_commit_with_finalize_through_and_no_artifacts()
         visible_tip_hash: bootstrap_hash,
         settled_tip_height: bootstrap_height,
         settled_tip_hash: bootstrap_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: bootstrap_tip_metadata,
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -465,7 +638,7 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         visible_tip_hash: checkpoint_hash,
         settled_tip_height: checkpoint_height,
         settled_tip_hash: checkpoint_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::new(130_002, 39_758, 0),
         created_at: UnixTimestampMillis::new(1_774_668_000_000),
     };
@@ -485,7 +658,7 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         visible_tip_hash: replaced_tip_hash,
         settled_tip_height: checkpoint_height,
         settled_tip_hash: replaced_tip_hash,
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::new(130_002, 39_758, 0),
         created_at: UnixTimestampMillis::new(1_774_668_000_001),
     };
@@ -495,10 +668,9 @@ fn bootstrap_epoch_rejects_replace_below_checkpoint_height() -> eyre::Result<()>
         block_hash(checkpoint_height.value().saturating_sub(1)),
         b"raw-replaced-block",
     );
-    let replaced_compact_block = CompactBlockArtifact::new(
-        checkpoint_height,
-        replaced_tip_hash,
-        b"compact-replaced-block".to_vec(),
+    let replaced_compact_block = super::empty_compact_block_for_header(
+        &replaced_block,
+        replacement_chain_epoch.tip_metadata,
     );
     let outcome = store.commit_chain_epoch(
         super::synthetic_chain_epoch_artifacts(
@@ -542,6 +714,13 @@ fn synthetic_epoch(
     let source_hash = block_hash(height);
     let parent_hash = block_hash(height.saturating_sub(1));
     let block_height = BlockHeight::new(height);
+    let block = super::synthetic_block_header(
+        block_height,
+        source_hash,
+        parent_hash,
+        format!("raw-block-{height}").as_bytes(),
+    );
+    let compact = super::empty_compact_block_for_header(&block, ChainTipMetadata::empty());
 
     (
         ChainEpoch {
@@ -551,21 +730,12 @@ fn synthetic_epoch(
             visible_tip_hash: source_hash,
             settled_tip_height: block_height,
             settled_tip_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },
-        super::synthetic_block_header(
-            block_height,
-            source_hash,
-            parent_hash,
-            format!("raw-block-{height}").as_bytes(),
-        ),
-        CompactBlockArtifact::new(
-            block_height,
-            source_hash,
-            format!("compact-block-{height}").into_bytes(),
-        ),
+        block,
+        compact,
     )
 }
 

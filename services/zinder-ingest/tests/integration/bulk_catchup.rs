@@ -176,7 +176,7 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
         compact_block.chain_epoch.visible_tip_height,
         source_block.height
     );
-    assert_eq!(compact_block.compact_block.height, source_block.height);
+    assert_eq!(compact_block.compact_block.height(), source_block.height);
     let tree_state = wallet_query
         .tree_state_at(source_block.height, None)
         .await?;
@@ -584,7 +584,11 @@ impl NodeSource for FixtureCheckpointSource {
             block_id.height.value(),
             self.block.block_time_seconds
         );
-        Ok(SourceTreeState::new(block_id, payload.into_bytes()))
+        Ok(SourceTreeState::new(
+            block_id,
+            self.block.block_time_seconds,
+            payload.into_bytes(),
+        ))
     }
 
     async fn fetch_subtree_roots(

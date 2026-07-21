@@ -293,7 +293,7 @@ where
                 .map(move |compact_block| {
                     Ok(wallet::CompactBlocksInRangeChunk {
                         chain_view: Some(chain_view.clone()),
-                        compact_block: Some(build_compact_block_message(compact_block)),
+                        compact_block: Some(build_compact_block_message(&compact_block)),
                     })
                 });
 

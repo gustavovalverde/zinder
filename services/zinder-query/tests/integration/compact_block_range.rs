@@ -6,13 +6,14 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use eyre::eyre;
 use prost::Message;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
-    BlockHeight, BlockHeightRange, ChainEpoch, ChainTipMetadata, CompactBlockArtifact,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
-    TreeStateArtifact,
+    BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainTipMetadata, CompactBlockArtifact,
+    CompactChainMetadata, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    SubtreeRootRange, TreeStateArtifact,
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
@@ -20,12 +21,29 @@ use zinder_query::{
     latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
     visible_tip_block_response,
 };
+use zinder_source::{SourceError, SourceTreeState, TreeStateUpstream};
 use zinder_store::{ArtifactFamily, ChainEpochArtifacts};
 use zinder_testkit::{
     StoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
 };
 
-use crate::common::{compact_block_with_tree_sizes, synthetic_chain_epoch};
+use crate::common::{
+    chain_epoch_artifacts_with_sapling_outputs, compact_block_with_tree_sizes,
+    synthetic_chain_epoch,
+};
+
+#[derive(Clone)]
+struct FixedTreeStateUpstream(SourceTreeState);
+
+#[async_trait]
+impl TreeStateUpstream for FixedTreeStateUpstream {
+    async fn fetch_tree_state_for_block(
+        &self,
+        _block_id: BlockId,
+    ) -> Result<SourceTreeState, SourceError> {
+        Ok(self.0.clone())
+    }
+}
 
 #[tokio::test]
 async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
@@ -96,7 +114,7 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
         .into_iter()
         .next()
         .ok_or_else(|| eyre!("missing compact block"))?;
-    let chunk = compact_block_range_chunk(compact_block_range.chain_epoch, response_compact_block);
+    let chunk = compact_block_range_chunk(compact_block_range.chain_epoch, &response_compact_block);
     let encoded_chunk = chunk.encode_to_vec();
     let decoded_chunk = wallet::CompactBlocksInRangeChunk::decode(encoded_chunk.as_slice())?;
     let response_chain_epoch = decoded_chunk
@@ -146,14 +164,9 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
         response_chain_epoch.created_at_millis,
         chain_epoch.created_at.value()
     );
-    assert_eq!(response_compact_block.height, compact_block.height.value());
     assert_eq!(
-        response_compact_block.block_hash,
-        encode_rpc_block_hash_hex(compact_block.block_hash)
-    );
-    assert_eq!(
-        response_compact_block.payload_bytes,
-        compact_block.payload_bytes
+        response_compact_block,
+        &zinder_proto::wire::compact_block_message(&compact_block)
     );
 
     Ok(())
@@ -208,6 +221,7 @@ async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre
     let tree_state = TreeStateArtifact::new(
         BlockHeight::new(1),
         chain_epoch.visible_tip_hash,
+        u32::try_from(block.block_time)?,
         b"tree-state-1".to_vec(),
     );
     let replay = encode_fixture_block_replay(&block, &[]);
@@ -246,6 +260,7 @@ async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Re
     let tree_state = TreeStateArtifact::new(
         BlockHeight::new(1),
         chain_epoch.visible_tip_hash,
+        u32::try_from(block.block_time)?,
         b"tree-state-1".to_vec(),
     );
     let replay = encode_fixture_block_replay(&block, &[]);
@@ -266,6 +281,82 @@ async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Re
         encode_rpc_block_hash_hex(tree_state.block_hash)
     );
     assert_eq!(decoded_response.payload_bytes, tree_state.payload_bytes);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_tree_state_rejects_upstream_time_that_disagrees_with_canonical_header()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let block_id = BlockId::new(block.height, block.block_hash);
+    let canonical_block_time = u32::try_from(block.block_time)?;
+    let replay = encode_fixture_block_replay(&block, &[]);
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        chain_epoch,
+        vec![block],
+        vec![replay],
+        vec![compact_block],
+    ))?;
+    let upstream = FixedTreeStateUpstream(SourceTreeState::new(
+        block_id,
+        canonical_block_time.saturating_add(1),
+        br#"{"sapling":{"commitments":{"finalState":"aa"}}}"#.to_vec(),
+    ));
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_tree_state_upstream(Arc::new(upstream));
+
+    let error = match wallet_query.tree_state_at(block_id.height, None).await {
+        Ok(tree_state) => {
+            return Err(eyre!(
+                "conflicting upstream time must fail closed, got {tree_state:?}"
+            ));
+        }
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        QueryError::Node(SourceError::SourceProtocolMismatch {
+            reason: "tree-state source time does not match the canonical block"
+        })
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_tree_state_uses_canonical_identity_and_time_with_frontier_only_payload()
+-> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
+    let block_id = BlockId::new(block.height, block.block_hash);
+    let canonical_block_time = u32::try_from(block.block_time)?;
+    let replay = encode_fixture_block_replay(&block, &[]);
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        chain_epoch,
+        vec![block],
+        vec![replay],
+        vec![compact_block],
+    ))?;
+    let payload = br#"{"sapling":{"commitments":{"finalState":"aa"}}}"#.to_vec();
+    let upstream = FixedTreeStateUpstream(SourceTreeState::new(
+        block_id,
+        canonical_block_time,
+        payload.clone(),
+    ));
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_tree_state_upstream(Arc::new(upstream));
+
+    let tree_state = wallet_query.tree_state_at(block_id.height, None).await?;
+
+    assert_eq!(tree_state.height, block_id.height);
+    assert_eq!(tree_state.block_hash, block_id.hash);
+    assert_eq!(tree_state.block_time_seconds, canonical_block_time);
+    assert_eq!(tree_state.payload_bytes, payload);
 
     Ok(())
 }
@@ -312,15 +403,11 @@ async fn subtree_roots_response_reports_unavailable_when_completed_root_is_missi
     let store = store_fixture.chain_store().clone();
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
     chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 65_536, 0);
-    let replay = encode_fixture_block_replay(&block, &[]);
-
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(chain_epoch_artifacts_with_sapling_outputs(
         chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
+        block,
+        65_536,
+    )?)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let error = match subtree_roots_response(
@@ -358,7 +445,6 @@ async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result
     let store = store_fixture.chain_store().clone();
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
     chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 65_536, 0);
     let subtree_root = SubtreeRootArtifact::new(
         ShieldedProtocol::Sapling,
         SubtreeRootIndex::new(0),
@@ -366,10 +452,8 @@ async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result
         block.height,
         block.block_hash,
     );
-    let replay = encode_fixture_block_replay(&block, &[]);
-
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
+        chain_epoch_artifacts_with_sapling_outputs(chain_epoch, block, 65_536)?
             .with_subtree_roots(vec![subtree_root.clone()]),
     )?;
 
@@ -422,42 +506,33 @@ async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result
 }
 
 #[tokio::test]
-async fn subtree_roots_response_uses_stored_tip_metadata_not_compact_block_payload()
--> eyre::Result<()> {
+async fn chain_epoch_rejects_tip_metadata_that_disagrees_with_compact_block() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
     chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let compact_block =
-        CompactBlockArtifact::new(block.height, block.block_hash, b"not-protobuf".to_vec());
-    let subtree_root = SubtreeRootArtifact::new(
-        ShieldedProtocol::Sapling,
-        SubtreeRootIndex::new(0),
-        SubtreeRootHash::from_bytes([0x71; 32]),
-        block.height,
-        block.block_hash,
+    let compact_block = CompactBlockArtifact::empty(
+        BlockId::new(block.height, block.block_hash),
+        block.parent_hash,
+        u32::try_from(block.block_time).unwrap_or_default(),
+        CompactChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
     );
     let replay = encode_fixture_block_replay(&block, &[]);
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
-            .with_subtree_roots(vec![subtree_root.clone()]),
-    )?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let response = wallet_query
-        .subtree_roots(
-            SubtreeRootRange::new(
-                ShieldedProtocol::Sapling,
-                SubtreeRootIndex::new(0),
-                NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
-            ),
-            None,
-        )
-        .await?;
-
-    assert_eq!(response.chain_epoch, chain_epoch);
-    assert_eq!(response.subtree_roots, vec![subtree_root]);
+    let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
+        chain_epoch,
+        vec![block],
+        vec![replay],
+        vec![compact_block],
+    )) {
+        Ok(outcome) => return Err(eyre!("expected metadata rejection, got {outcome:?}")),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("visible-tip compact metadata"));
 
     Ok(())
 }
@@ -601,7 +676,7 @@ async fn compact_block_range_rejects_ranges_above_configured_limit() -> eyre::Re
 
 fn compact_block_range_chunk(
     chain_epoch: ChainEpoch,
-    compact_block: CompactBlockArtifact,
+    compact_block: &CompactBlockArtifact,
 ) -> wallet::CompactBlocksInRangeChunk {
     wallet::CompactBlocksInRangeChunk {
         chain_view: Some(wallet::ChainView {
@@ -628,10 +703,6 @@ fn compact_block_range_chunk(
             upstream_tip: None,
             materialized_views: None,
         }),
-        compact_block: Some(wallet::CompactBlock {
-            height: compact_block.height.value(),
-            block_hash: encode_rpc_block_hash_hex(compact_block.block_hash),
-            payload_bytes: compact_block.payload_bytes,
-        }),
+        compact_block: Some(zinder_proto::wire::compact_block_message(compact_block)),
     }
 }

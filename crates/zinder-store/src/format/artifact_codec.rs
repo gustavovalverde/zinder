@@ -8,16 +8,17 @@ use zinder_core::{
     ArtifactSchemaVersion, AuthDigest, BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash,
     BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, BlockTransactionIndexArtifact,
     BlockValuePoolBalances, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
+    CompactChainMetadata, CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction,
+    CompactTransaction, CompactTransactionData, CompactTransparentInput, CompactTransparentOutput,
     ConsensusBranchId, DisplacedBlock, DisplacedBlockArchiveCoverage, DisplacedBlockCoinbaseOutput,
     FinalNoteCommitmentRoot, LockTime, MempoolEntry, MempoolEvictionReason, Network, PrivacyShape,
     RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
     TransactionBlobArtifact, TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
     TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
     TransactionLocation, TransactionPublicFacts, TransactionVersion, TransparentAddressScriptHash,
-    TransparentInputFact, TransparentMempoolOutput, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentOutputArtifact, TransparentOutputFact, TransparentSpendFact,
-    TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis, UnsupportedSection,
-    ValuePoolBalance, Wtxid,
+    TransparentInputFact, TransparentOutPoint, TransparentOutputArtifact, TransparentOutputFact,
+    TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis,
+    UnsupportedSection, ValuePoolBalance, Wtxid,
 };
 
 use crate::{
@@ -121,13 +122,15 @@ pub(crate) fn decode_chain_event_envelope(
     ))
 }
 
-pub(crate) fn encode_mempool_event_envelope(event_envelope: &MempoolEventEnvelope) -> Vec<u8> {
-    MempoolEventEnvelopeRecord {
+pub(crate) fn encode_mempool_event_envelope(
+    event_envelope: &MempoolEventEnvelope,
+) -> Result<Vec<u8>, StoreError> {
+    Ok(MempoolEventEnvelopeRecord {
         event_sequence: event_envelope.event_sequence,
         source_observed_unix_millis: event_envelope.source_observed_unix_millis,
-        event: Some(mempool_event_record(&event_envelope.event)),
+        event: Some(mempool_event_record(&event_envelope.event)?),
     }
-    .encode_to_vec()
+    .encode_to_vec())
 }
 
 pub(crate) fn decode_mempool_event_envelope(
@@ -280,8 +283,8 @@ impl MempoolEventKind {
     }
 }
 
-fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
-    match event {
+fn mempool_event_record(event: &MempoolEvent) -> Result<MempoolEventRecord, StoreError> {
+    Ok(match event {
         MempoolEvent::Added { entry } => MempoolEventRecord {
             event_kind: MEMPOOL_EVENT_KIND_ADDED,
             added: Some(mempool_entry_record(entry)),
@@ -296,7 +299,7 @@ fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
             added: None,
             invalidated: Some(MempoolInvalidatedRecord {
                 transaction_id: transaction_id.as_bytes().to_vec(),
-                reason_id: mempool_eviction_reason_id(*reason),
+                reason_id: mempool_eviction_reason_id(*reason)?,
             }),
             mined: None,
         },
@@ -317,7 +320,7 @@ fn mempool_event_record(event: &MempoolEvent) -> MempoolEventRecord {
         // The Rust enum is `#[non_exhaustive]`; future variants force a
         // build error in this match because the encoder is not behind
         // `unreachable_patterns`.
-    }
+    })
 }
 
 fn decode_mempool_event_record(
@@ -384,24 +387,16 @@ fn decode_mempool_event_record(
 
 fn mempool_entry_record(entry: &MempoolEntry) -> MempoolEntryRecord {
     MempoolEntryRecord {
-        transaction_id: entry.transaction_id.as_bytes().to_vec(),
+        transaction_id: entry.transaction_id().as_bytes().to_vec(),
         auth_digest: entry
-            .auth_digest
+            .auth_digest()
             .map_or_else(Vec::new, |digest| digest.as_bytes().to_vec()),
-        raw_transaction_bytes: entry.raw_transaction_bytes.as_slice().to_vec(),
-        compact_transaction_bytes: entry.compact_transaction_bytes.clone(),
-        first_seen_unix_millis: entry.first_seen_unix_millis.value(),
-        first_seen_chain_epoch: Some(chain_epoch_record(&entry.first_seen_chain_epoch)),
-        transparent_outputs: entry
-            .transparent_outputs
-            .iter()
-            .map(transparent_mempool_output_record)
-            .collect(),
-        transparent_spends: entry
-            .transparent_spends
-            .iter()
-            .map(transparent_mempool_spend_record)
-            .collect(),
+        raw_transaction_bytes: entry.raw_transaction_bytes().as_slice().to_vec(),
+        compact_transaction_data: Some(compact_transaction_data_record(
+            entry.compact_transaction_data(),
+        )),
+        first_seen_unix_millis: entry.first_seen_unix_millis().value(),
+        first_seen_chain_epoch: Some(chain_epoch_record(&entry.first_seen_chain_epoch())),
     }
 }
 
@@ -430,123 +425,57 @@ fn decode_mempool_entry_record(
         Some(AuthDigest::from_bytes(auth_digest_bytes))
     };
 
-    Ok(MempoolEntry {
-        transaction_id: decode_transaction_id_for_family(
-            ArtifactFamily::MempoolEvent,
-            key,
-            &record.transaction_id,
-        )?,
+    let transaction_id = decode_transaction_id_for_family(
+        ArtifactFamily::MempoolEvent,
+        key,
+        &record.transaction_id,
+    )?;
+    let compact_transaction_data = decode_compact_transaction_data_record(
+        ArtifactFamily::MempoolEvent,
+        key,
+        record
+            .compact_transaction_data
+            .ok_or(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::MempoolEvent,
+                key: key.clone().into(),
+                reason: "mempool entry record is missing compact transaction data",
+            })?,
+    )?;
+    MempoolEntry::new(
+        transaction_id,
         auth_digest,
-        raw_transaction_bytes: RawTransactionBytes::new(record.raw_transaction_bytes),
-        compact_transaction_bytes: record.compact_transaction_bytes,
-        first_seen_unix_millis: UnixTimestampMillis::new(record.first_seen_unix_millis),
-        first_seen_chain_epoch: decode_chain_epoch_record(
-            ArtifactFamily::MempoolEvent,
-            key,
-            &chain_epoch_record,
-        )?,
-        transparent_outputs: record
-            .transparent_outputs
-            .iter()
-            .map(|record| decode_transparent_mempool_output_record(key, record))
-            .collect::<Result<Vec<_>, _>>()?,
-        transparent_spends: record
-            .transparent_spends
-            .iter()
-            .map(|record| decode_transparent_mempool_spend_record(key, record))
-            .collect::<Result<Vec<_>, _>>()?,
-    })
-}
-
-fn transparent_mempool_output_record(
-    transparent_output: &TransparentMempoolOutput,
-) -> TransparentMempoolOutputRecord {
-    TransparentMempoolOutputRecord {
-        address_script_hash: transparent_output.address_script_hash.as_bytes().to_vec(),
-        script_pub_key: transparent_output.script_pub_key.clone(),
-        spending_transaction_id: transparent_output
-            .outpoint
-            .transaction_id
-            .as_bytes()
-            .to_vec(),
-        output_index: transparent_output.outpoint.output_index,
-        value_zat: transparent_output.value_zat,
-    }
-}
-
-fn decode_transparent_mempool_output_record(
-    key: &StoreKey,
-    record: &TransparentMempoolOutputRecord,
-) -> Result<TransparentMempoolOutput, StoreError> {
-    Ok(TransparentMempoolOutput {
-        address_script_hash: decode_transparent_address_script_hash_for_family(
-            ArtifactFamily::MempoolEvent,
-            key,
-            &record.address_script_hash,
-        )?,
-        script_pub_key: record.script_pub_key.clone(),
-        outpoint: TransparentOutPoint::new(
-            decode_transaction_id_for_family(
+        RawTransactionBytes::new(record.raw_transaction_bytes),
+        compact_transaction_data,
+        zinder_core::MempoolObservation {
+            first_seen_unix_millis: UnixTimestampMillis::new(record.first_seen_unix_millis),
+            first_seen_chain_epoch: decode_chain_epoch_record(
                 ArtifactFamily::MempoolEvent,
                 key,
-                &record.spending_transaction_id,
+                &chain_epoch_record,
             )?,
-            record.output_index,
-        ),
-        value_zat: record.value_zat,
-    })
-}
-
-fn transparent_mempool_spend_record(
-    transparent_spend: &TransparentMempoolSpend,
-) -> TransparentMempoolSpendRecord {
-    TransparentMempoolSpendRecord {
-        spent_transaction_id: transparent_spend
-            .spent_outpoint
-            .transaction_id
-            .as_bytes()
-            .to_vec(),
-        spent_output_index: transparent_spend.spent_outpoint.output_index,
-        spending_transaction_id: transparent_spend
-            .spending_transaction_id
-            .as_bytes()
-            .to_vec(),
-    }
-}
-
-fn decode_transparent_mempool_spend_record(
-    key: &StoreKey,
-    record: &TransparentMempoolSpendRecord,
-) -> Result<TransparentMempoolSpend, StoreError> {
-    Ok(TransparentMempoolSpend {
-        spent_outpoint: TransparentOutPoint::new(
-            decode_transaction_id_for_family(
-                ArtifactFamily::MempoolEvent,
-                key,
-                &record.spent_transaction_id,
-            )?,
-            record.spent_output_index,
-        ),
-        spending_transaction_id: decode_transaction_id_for_family(
-            ArtifactFamily::MempoolEvent,
-            key,
-            &record.spending_transaction_id,
-        )?,
+        },
+    )
+    .map_err(|_| StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::MempoolEvent,
+        key: key.clone().into(),
+        reason: "mempool entry transparent output count exceeds u32::MAX",
     })
 }
 
 #[allow(
-    clippy::match_same_arms,
-    reason = "MempoolEvictionReason is #[non_exhaustive]; the wildcard arm intentionally projects future variants onto the Unknown id so storage stays forward-compatible."
+    unreachable_patterns,
+    reason = "MempoolEvictionReason is non-exhaustive; persistence must reject future variants until the durable contract assigns them an id."
 )]
-const fn mempool_eviction_reason_id(reason: MempoolEvictionReason) -> u32 {
+fn mempool_eviction_reason_id(reason: MempoolEvictionReason) -> Result<u32, StoreError> {
     match reason {
-        MempoolEvictionReason::Conflict => 1,
-        MempoolEvictionReason::Expired => 2,
-        MempoolEvictionReason::LowFee => 3,
-        MempoolEvictionReason::NodeRejected => 4,
-        MempoolEvictionReason::Unknown => 5,
-        _ => 5,
+        MempoolEvictionReason::Conflict => Ok(1),
+        MempoolEvictionReason::Expired => Ok(2),
+        MempoolEvictionReason::LowFee => Ok(3),
+        MempoolEvictionReason::NodeRejected => Ok(4),
+        MempoolEvictionReason::Unknown => Ok(5),
+        _ => Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "mempool eviction reason is unsupported by the durable event contract",
+        }),
     }
 }
 
@@ -559,20 +488,6 @@ const fn mempool_eviction_reason_from_id(reason_id: u32) -> Option<MempoolEvicti
         5 => Some(MempoolEvictionReason::Unknown),
         _ => None,
     }
-}
-
-fn decode_transparent_address_script_hash_for_family(
-    family: ArtifactFamily,
-    key: &StoreKey,
-    hash_bytes: &[u8],
-) -> Result<TransparentAddressScriptHash, StoreError> {
-    let hash_bytes = <[u8; 32]>::try_from(hash_bytes).map_err(|_| StoreError::ArtifactCorrupt {
-        family,
-        key: key.clone().into(),
-        reason: "transparent address script hash must be 32 bytes",
-    })?;
-
-    Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
 }
 
 pub(crate) fn encode_block_header_artifact(
@@ -858,15 +773,248 @@ pub(crate) fn decode_block_blob_artifact(
     ))
 }
 
+fn compact_chain_metadata_record(metadata: CompactChainMetadata) -> CompactChainMetadataRecord {
+    CompactChainMetadataRecord {
+        sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
+        orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
+        ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
+    }
+}
+
+fn compact_transaction_record(transaction: &CompactTransaction) -> CompactTransactionRecord {
+    CompactTransactionRecord {
+        index: transaction.index,
+        transaction_id: transaction.transaction_id.as_bytes().to_vec(),
+        data: Some(compact_transaction_data_record(&transaction.data)),
+    }
+}
+
+fn compact_transaction_data_record(
+    scan_data: &CompactTransactionData,
+) -> CompactTransactionDataRecord {
+    CompactTransactionDataRecord {
+        fee_zat: scan_data.fee_zat,
+        sapling_spends: scan_data
+            .sapling_spends
+            .iter()
+            .map(|spend| CompactSaplingSpendRecord {
+                nullifier: spend.nullifier.to_vec(),
+            })
+            .collect(),
+        sapling_outputs: scan_data
+            .sapling_outputs
+            .iter()
+            .map(|output| CompactSaplingOutputRecord {
+                commitment: output.commitment.to_vec(),
+                ephemeral_key: output.ephemeral_key.to_vec(),
+                ciphertext: output.ciphertext.to_vec(),
+            })
+            .collect(),
+        orchard_actions: scan_data
+            .orchard_actions
+            .iter()
+            .map(compact_shielded_action_record)
+            .collect(),
+        ironwood_actions: scan_data
+            .ironwood_actions
+            .iter()
+            .map(compact_shielded_action_record)
+            .collect(),
+        transparent_inputs: scan_data
+            .transparent_inputs
+            .iter()
+            .map(|input| CompactTransparentInputRecord {
+                previous_transaction_id: input.previous_transaction_id.as_bytes().to_vec(),
+                previous_output_index: input.previous_output_index,
+            })
+            .collect(),
+        transparent_outputs: scan_data
+            .transparent_outputs
+            .iter()
+            .map(|output| CompactTransparentOutputRecord {
+                value_zat: output.value_zat,
+                script_pub_key: output.script_pub_key.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn compact_shielded_action_record(action: &CompactShieldedAction) -> CompactShieldedActionRecord {
+    CompactShieldedActionRecord {
+        nullifier: action.nullifier.to_vec(),
+        commitment: action.commitment.to_vec(),
+        ephemeral_key: action.ephemeral_key.to_vec(),
+        ciphertext: action.ciphertext.to_vec(),
+    }
+}
+
+fn decode_compact_transaction_record(
+    key: &StoreKey,
+    record: CompactTransactionRecord,
+) -> Result<CompactTransaction, StoreError> {
+    Ok(CompactTransaction {
+        index: record.index,
+        transaction_id: TransactionId::from_bytes(decode_compact_fixed(
+            ArtifactFamily::CompactBlock,
+            key,
+            record.transaction_id,
+            "compact transaction id must be 32 bytes",
+        )?),
+        data: decode_compact_transaction_data_record(
+            ArtifactFamily::CompactBlock,
+            key,
+            record.data.ok_or(StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                key: key.clone().into(),
+                reason: "compact transaction record is missing scan data",
+            })?,
+        )?,
+    })
+}
+
+fn decode_compact_transaction_data_record(
+    family: ArtifactFamily,
+    key: &StoreKey,
+    record: CompactTransactionDataRecord,
+) -> Result<CompactTransactionData, StoreError> {
+    Ok(CompactTransactionData {
+        fee_zat: record.fee_zat,
+        sapling_spends: record
+            .sapling_spends
+            .into_iter()
+            .map(|spend| {
+                Ok(CompactSaplingSpend {
+                    nullifier: decode_compact_fixed(
+                        family,
+                        key,
+                        spend.nullifier,
+                        "compact Sapling nullifier must be 32 bytes",
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?,
+        sapling_outputs: record
+            .sapling_outputs
+            .into_iter()
+            .map(|output| {
+                Ok(CompactSaplingOutput {
+                    commitment: decode_compact_fixed(
+                        family,
+                        key,
+                        output.commitment,
+                        "compact Sapling commitment must be 32 bytes",
+                    )?,
+                    ephemeral_key: decode_compact_fixed(
+                        family,
+                        key,
+                        output.ephemeral_key,
+                        "compact Sapling ephemeral key must be 32 bytes",
+                    )?,
+                    ciphertext: decode_compact_fixed(
+                        family,
+                        key,
+                        output.ciphertext,
+                        "compact Sapling ciphertext must be 52 bytes",
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?,
+        orchard_actions: decode_compact_actions(family, key, record.orchard_actions)?,
+        ironwood_actions: decode_compact_actions(family, key, record.ironwood_actions)?,
+        transparent_inputs: record
+            .transparent_inputs
+            .into_iter()
+            .map(|input| {
+                Ok(CompactTransparentInput {
+                    previous_transaction_id: TransactionId::from_bytes(decode_compact_fixed(
+                        family,
+                        key,
+                        input.previous_transaction_id,
+                        "compact transparent previous transaction id must be 32 bytes",
+                    )?),
+                    previous_output_index: input.previous_output_index,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?,
+        transparent_outputs: record
+            .transparent_outputs
+            .into_iter()
+            .map(|output| CompactTransparentOutput {
+                value_zat: output.value_zat,
+                script_pub_key: output.script_pub_key,
+            })
+            .collect(),
+    })
+}
+
+fn decode_compact_actions(
+    family: ArtifactFamily,
+    key: &StoreKey,
+    records: Vec<CompactShieldedActionRecord>,
+) -> Result<Vec<CompactShieldedAction>, StoreError> {
+    records
+        .into_iter()
+        .map(|action| {
+            Ok(CompactShieldedAction {
+                nullifier: decode_compact_fixed(
+                    family,
+                    key,
+                    action.nullifier,
+                    "compact action nullifier must be 32 bytes",
+                )?,
+                commitment: decode_compact_fixed(
+                    family,
+                    key,
+                    action.commitment,
+                    "compact action commitment must be 32 bytes",
+                )?,
+                ephemeral_key: decode_compact_fixed(
+                    family,
+                    key,
+                    action.ephemeral_key,
+                    "compact action ephemeral key must be 32 bytes",
+                )?,
+                ciphertext: decode_compact_fixed(
+                    family,
+                    key,
+                    action.ciphertext,
+                    "compact action ciphertext must be 52 bytes",
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn decode_compact_fixed<const N: usize>(
+    family: ArtifactFamily,
+    key: &StoreKey,
+    bytes: Vec<u8>,
+    reason: &'static str,
+) -> Result<[u8; N], StoreError> {
+    bytes.try_into().map_err(|_| StoreError::ArtifactCorrupt {
+        family,
+        key: key.clone().into(),
+        reason,
+    })
+}
+
 pub(crate) fn encode_compact_block_artifact(
     block: CompactBlockArtifact,
 ) -> Result<Vec<u8>, StoreError> {
+    let parts = block.into_parts();
     encode_artifact_record(
-        PayloadFormat::ZinderCompactBlockArtifactV1,
+        PayloadFormat::ZinderCompactBlockArtifactV2,
         &CompactBlockArtifactRecord {
-            height: block.height.value(),
-            block_hash: block.block_hash.as_bytes().to_vec(),
-            payload_bytes: Bytes::from(block.payload_bytes),
+            height: parts.block_id.height.value(),
+            block_hash: parts.block_id.hash.as_bytes().to_vec(),
+            previous_block_hash: parts.previous_block_hash.as_bytes().to_vec(),
+            time: parts.time,
+            transactions: parts
+                .transactions
+                .iter()
+                .map(compact_transaction_record)
+                .collect(),
+            chain_metadata: Some(compact_chain_metadata_record(parts.chain_metadata)),
         },
     )
 }
@@ -879,7 +1027,7 @@ pub(crate) fn decode_compact_block_artifact(
         ArtifactFamily::CompactBlock,
         key,
         envelope_bytes,
-        PayloadFormat::ZinderCompactBlockArtifactV1,
+        PayloadFormat::ZinderCompactBlockArtifactV2,
     )?;
     let record = CompactBlockArtifactRecord::decode(payload_bytes).map_err(|_| {
         StoreError::ArtifactCorrupt {
@@ -889,11 +1037,39 @@ pub(crate) fn decode_compact_block_artifact(
         }
     })?;
 
-    Ok(CompactBlockArtifact::new(
-        BlockHeight::new(record.height),
-        decode_block_hash(ArtifactFamily::CompactBlock, key, &record.block_hash)?,
-        record.payload_bytes.to_vec(),
-    ))
+    let metadata = record.chain_metadata.ok_or(StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::CompactBlock,
+        key: key.clone().into(),
+        reason: "compact block artifact record is missing chain metadata",
+    })?;
+    let transactions = record
+        .transactions
+        .into_iter()
+        .map(|transaction| decode_compact_transaction_record(key, transaction))
+        .collect::<Result<Vec<_>, _>>()?;
+    CompactBlockArtifact::new(
+        BlockId::new(
+            BlockHeight::new(record.height),
+            decode_block_hash(ArtifactFamily::CompactBlock, key, &record.block_hash)?,
+        ),
+        decode_block_hash(
+            ArtifactFamily::CompactBlock,
+            key,
+            &record.previous_block_hash,
+        )?,
+        record.time,
+        transactions,
+        CompactChainMetadata {
+            sapling_commitment_tree_size: metadata.sapling_commitment_tree_size,
+            orchard_commitment_tree_size: metadata.orchard_commitment_tree_size,
+            ironwood_commitment_tree_size: metadata.ironwood_commitment_tree_size,
+        },
+    )
+    .map_err(|_| StoreError::ArtifactCorrupt {
+        family: ArtifactFamily::CompactBlock,
+        key: key.clone().into(),
+        reason: "compact transaction indexes are not strictly increasing",
+    })
 }
 
 pub(crate) fn encode_block_transaction_index_artifact(
@@ -1134,6 +1310,7 @@ pub(crate) fn encode_tree_state_artifact(
             height: tree_state.height.value(),
             block_hash: tree_state.block_hash.as_bytes().to_vec(),
             payload_bytes: Bytes::from(tree_state.payload_bytes),
+            block_time_seconds: tree_state.block_time_seconds,
         },
     )
 }
@@ -1159,6 +1336,7 @@ pub(crate) fn decode_tree_state_artifact(
     Ok(TreeStateArtifact::new(
         BlockHeight::new(record.height),
         decode_block_hash(ArtifactFamily::TreeState, key, &record.block_hash)?,
+        record.block_time_seconds,
         record.payload_bytes.to_vec(),
     ))
 }
@@ -2365,7 +2543,7 @@ fn encode_artifact_record(
 const fn artifact_family_for_payload_format(payload_format: PayloadFormat) -> ArtifactFamily {
     match payload_format {
         PayloadFormat::ZinderBlockHeaderArtifactV1 => ArtifactFamily::BlockHeader,
-        PayloadFormat::ZinderCompactBlockArtifactV1 => ArtifactFamily::CompactBlock,
+        PayloadFormat::ZinderCompactBlockArtifactV2 => ArtifactFamily::CompactBlock,
         PayloadFormat::ZinderTransactionFactsArtifactV1 => ArtifactFamily::TransactionFacts,
         PayloadFormat::ZinderTreeStateArtifactV1 => ArtifactFamily::TreeState,
         PayloadFormat::ZinderBlockFinalNoteCommitmentRootsV1 => {
@@ -2613,8 +2791,100 @@ struct CompactBlockArtifactRecord {
     height: u32,
     #[prost(bytes, tag = "2")]
     block_hash: Vec<u8>,
-    #[prost(bytes = "bytes", tag = "3")]
-    payload_bytes: Bytes,
+    #[prost(bytes, tag = "3")]
+    previous_block_hash: Vec<u8>,
+    #[prost(uint32, tag = "4")]
+    time: u32,
+    #[prost(message, repeated, tag = "5")]
+    transactions: Vec<CompactTransactionRecord>,
+    #[prost(message, optional, tag = "6")]
+    chain_metadata: Option<CompactChainMetadataRecord>,
+}
+
+#[allow(
+    clippy::struct_field_names,
+    reason = "The durable record intentionally repeats the protocol name on each exact commitment-tree size field."
+)]
+#[derive(Clone, PartialEq, Message)]
+struct CompactChainMetadataRecord {
+    #[prost(uint32, tag = "1")]
+    sapling_commitment_tree_size: u32,
+    #[prost(uint32, tag = "2")]
+    orchard_commitment_tree_size: u32,
+    #[prost(uint32, tag = "3")]
+    ironwood_commitment_tree_size: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CompactTransactionRecord {
+    #[prost(uint64, tag = "1")]
+    index: u64,
+    #[prost(bytes, tag = "2")]
+    transaction_id: Vec<u8>,
+    #[prost(message, optional, tag = "3")]
+    data: Option<CompactTransactionDataRecord>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CompactTransactionDataRecord {
+    #[prost(uint64, optional, tag = "1")]
+    fee_zat: Option<u64>,
+    #[prost(message, repeated, tag = "2")]
+    sapling_spends: Vec<CompactSaplingSpendRecord>,
+    #[prost(message, repeated, tag = "3")]
+    sapling_outputs: Vec<CompactSaplingOutputRecord>,
+    #[prost(message, repeated, tag = "4")]
+    orchard_actions: Vec<CompactShieldedActionRecord>,
+    #[prost(message, repeated, tag = "5")]
+    ironwood_actions: Vec<CompactShieldedActionRecord>,
+    #[prost(message, repeated, tag = "6")]
+    transparent_inputs: Vec<CompactTransparentInputRecord>,
+    #[prost(message, repeated, tag = "7")]
+    transparent_outputs: Vec<CompactTransparentOutputRecord>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CompactSaplingSpendRecord {
+    #[prost(bytes, tag = "1")]
+    nullifier: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CompactSaplingOutputRecord {
+    #[prost(bytes, tag = "1")]
+    commitment: Vec<u8>,
+    #[prost(bytes, tag = "2")]
+    ephemeral_key: Vec<u8>,
+    #[prost(bytes, tag = "3")]
+    ciphertext: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CompactShieldedActionRecord {
+    #[prost(bytes, tag = "1")]
+    nullifier: Vec<u8>,
+    #[prost(bytes, tag = "2")]
+    commitment: Vec<u8>,
+    #[prost(bytes, tag = "3")]
+    ephemeral_key: Vec<u8>,
+    #[prost(bytes, tag = "4")]
+    ciphertext: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CompactTransparentInputRecord {
+    #[prost(bytes, tag = "1")]
+    previous_transaction_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    previous_output_index: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CompactTransparentOutputRecord {
+    #[prost(uint64, tag = "1")]
+    value_zat: u64,
+    #[prost(bytes, tag = "2")]
+    script_pub_key: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -2841,6 +3111,8 @@ struct TreeStateArtifactRecord {
     block_hash: Vec<u8>,
     #[prost(bytes = "bytes", tag = "3")]
     payload_bytes: Bytes,
+    #[prost(uint32, tag = "4")]
+    block_time_seconds: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -3037,16 +3309,12 @@ struct MempoolEntryRecord {
     auth_digest: Vec<u8>,
     #[prost(bytes, tag = "3")]
     raw_transaction_bytes: Vec<u8>,
-    #[prost(bytes, tag = "4")]
-    compact_transaction_bytes: Vec<u8>,
+    #[prost(message, optional, tag = "4")]
+    compact_transaction_data: Option<CompactTransactionDataRecord>,
     #[prost(uint64, tag = "5")]
     first_seen_unix_millis: u64,
     #[prost(message, optional, tag = "6")]
     first_seen_chain_epoch: Option<ChainEpochRecord>,
-    #[prost(message, repeated, tag = "7")]
-    transparent_outputs: Vec<TransparentMempoolOutputRecord>,
-    #[prost(message, repeated, tag = "8")]
-    transparent_spends: Vec<TransparentMempoolSpendRecord>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -3065,30 +3333,6 @@ struct MempoolMinedRecord {
     mined_height: u32,
     #[prost(bytes, tag = "3")]
     block_hash: Vec<u8>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct TransparentMempoolOutputRecord {
-    #[prost(bytes, tag = "1")]
-    address_script_hash: Vec<u8>,
-    #[prost(bytes, tag = "2")]
-    script_pub_key: Vec<u8>,
-    #[prost(bytes, tag = "3")]
-    spending_transaction_id: Vec<u8>,
-    #[prost(uint32, tag = "4")]
-    output_index: u32,
-    #[prost(uint64, tag = "5")]
-    value_zat: u64,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct TransparentMempoolSpendRecord {
-    #[prost(bytes, tag = "1")]
-    spent_transaction_id: Vec<u8>,
-    #[prost(uint32, tag = "2")]
-    spent_output_index: u32,
-    #[prost(bytes, tag = "3")]
-    spending_transaction_id: Vec<u8>,
 }
 
 #[cfg(test)]

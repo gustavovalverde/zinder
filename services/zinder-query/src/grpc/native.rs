@@ -20,11 +20,12 @@ use zinder_core::{
 };
 use zinder_materialized_views::MaterializedViewPreset;
 use zinder_proto::capabilities::{
-    CapabilitySurface, WalletAdvertiseInputs, capabilities_for_surface,
+    self, CapabilitySurface, WalletAdvertiseInputs, capabilities_for_surface,
 };
-use zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT;
 use zinder_proto::v1::{ops, wallet};
-use zinder_proto::wire::encode_transparent_utxo_set_commitment;
+use zinder_proto::wire::{
+    compact_block_message, encode_transparent_utxo_set_commitment, mempool_entry_message,
+};
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
@@ -113,6 +114,68 @@ pub struct ServerInfoSettings {
     pub transparent_outpoint_spend_available: bool,
     /// Closed materialized-view workload when this service has an attached store.
     pub materialized_view_preset: Option<MaterializedViewPreset>,
+    /// Typed implementation profile applied before deployment-specific gates.
+    pub capability_profile: WalletCapabilityProfile,
+}
+
+/// Native wallet capability implementation profile.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WalletCapabilityProfile {
+    /// Complete native query implementation used by the primary-store composition.
+    #[default]
+    Complete,
+    /// Exact-pair secondary implementation used by the standalone native runtime.
+    ExactPair,
+}
+
+impl WalletCapabilityProfile {
+    /// Returns the implementation support decision for a registered wallet capability.
+    ///
+    /// `None` means the central table gained a capability without an explicit
+    /// decision for the exact-pair profile. Descriptor construction fails
+    /// closed by treating that capability as unsupported.
+    #[must_use]
+    pub fn supports(self, capability: &str) -> Option<bool> {
+        if self == Self::Complete {
+            return Some(true);
+        }
+        match capability {
+            capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1
+            | capabilities::WALLET_READ_SETTLED_TIP_BLOCK_V1
+            | capabilities::WALLET_READ_BLOCK_ID_BY_SELECTOR_V1
+            | capabilities::WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1
+            | capabilities::WALLET_READ_COMPACT_BLOCK_AT_V2
+            | capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V2
+            | capabilities::WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2
+            | capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2
+            | capabilities::WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2
+            | capabilities::WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1
+            | capabilities::WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1
+            | capabilities::WALLET_READ_TRANSACTION_BY_ID_V2
+            | capabilities::WALLET_READ_TRANSACTION_BYTES_V1
+            | capabilities::WALLET_READ_SERVER_INFO_V2
+            | capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1
+            | capabilities::WALLET_BROADCAST_TRANSACTION_V1
+            | capabilities::WALLET_SNAPSHOT_MEMPOOL_V2
+            | capabilities::WALLET_EVENTS_MEMPOOL_V2
+            | capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1
+            | capabilities::WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1
+            | capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1
+            | capabilities::WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1
+            | capabilities::WALLET_ADDRESS_TRANSPARENT_BALANCE_V1
+            | capabilities::WALLET_READ_FULL_BLOCK_AT_V1
+            | capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
+            | capabilities::WALLET_READ_TRANSPARENT_OUTPUTS_V1
+            | capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1
+            | capabilities::WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1
+            | capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1
+            | capabilities::WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1
+            | capabilities::WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1
+            | capabilities::WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
+            | capabilities::WALLET_EVENTS_CHAIN_V1 => Some(true),
+            _ => None,
+        }
+    }
 }
 
 /// Snapshot of the upstream-node capability probe used by `ServerInfo`.
@@ -152,6 +215,7 @@ impl Default for ServerInfoSettings {
             transparent_address_history_available: false,
             transparent_outpoint_spend_available: false,
             materialized_view_preset: None,
+            capability_profile: WalletCapabilityProfile::Complete,
         }
     }
 }
@@ -165,7 +229,6 @@ impl Default for ServerInfoSettings {
 pub fn build_wallet_server_info(settings: &ServerInfoSettings) -> wallet::WalletServerInfo {
     wallet::WalletServerInfo {
         common: Some(build_ops_server_info(settings)),
-        lightwalletd_protocol_commit: LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
         schema_version: settings.schema_version,
         reorg_window_blocks: settings.reorg_window_blocks,
         chain_event_retention_seconds: settings.chain_event_retention_seconds,
@@ -188,22 +251,9 @@ fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
         service_name: env!("CARGO_PKG_NAME").to_owned(),
         service_version: settings.service_version.clone(),
         contract_revision: zinder_proto::CONTRACT_REVISION,
-        capabilities: capabilities_for_surface(CapabilitySurface::Wallet)
-            .filter(|spec| {
-                spec.policy.wallet_satisfied(WalletAdvertiseInputs {
-                    broadcaster_enabled: settings.transaction_broadcast_enabled,
-                    chain_events_enabled: settings.chain_events_enabled,
-                    chain_value_pools_enabled: settings.chain_value_pools_enabled,
-                    block_blobs_retained: settings.block_blobs_retained,
-                    transaction_blobs_retained: settings.transaction_blobs_retained,
-                    utxo_set_commitment_enabled: settings.utxo_set_commitment_enabled,
-                    transparent_address_history_available: settings
-                        .transparent_address_history_available,
-                    transparent_outpoint_spend_available: settings
-                        .transparent_outpoint_spend_available,
-                })
-            })
-            .map(|spec| spec.string.to_owned())
+        capabilities: wallet_capability_strings(settings)
+            .into_iter()
+            .map(str::to_owned)
             .collect(),
         materialized_view_preset: settings
             .materialized_view_preset
@@ -219,6 +269,33 @@ fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
             },
         ),
     }
+}
+
+/// Returns the exact capability snapshot advertised by a wallet runtime.
+#[must_use]
+pub fn wallet_capability_strings(settings: &ServerInfoSettings) -> Vec<&'static str> {
+    capabilities_for_surface(CapabilitySurface::Wallet)
+        .filter(|spec| {
+            settings
+                .capability_profile
+                .supports(spec.string)
+                .unwrap_or(false)
+        })
+        .filter(|spec| {
+            spec.policy.wallet_satisfied(WalletAdvertiseInputs {
+                broadcaster_enabled: settings.transaction_broadcast_enabled,
+                chain_events_enabled: settings.chain_events_enabled,
+                chain_value_pools_enabled: settings.chain_value_pools_enabled,
+                block_blobs_retained: settings.block_blobs_retained,
+                transaction_blobs_retained: settings.transaction_blobs_retained,
+                utxo_set_commitment_enabled: settings.utxo_set_commitment_enabled,
+                transparent_address_history_available: settings
+                    .transparent_address_history_available,
+                transparent_outpoint_spend_available: settings.transparent_outpoint_spend_available,
+            })
+        })
+        .map(|spec| spec.string)
+        .collect()
 }
 
 fn build_node_capabilities_descriptor(
@@ -273,21 +350,27 @@ pub(super) async fn transparent_utxo_set_summary_response<Q: WalletQueryApi + ?S
     query_api
         .transparent_utxo_set_summary(at_epoch_id, commitment_enabled)
         .await
-        .map(build_transparent_utxo_set_summary_response)
+        .and_then(|summary| build_transparent_utxo_set_summary_response(&summary))
 }
 
 fn build_transparent_utxo_set_summary_response(
-    summary: TransparentUtxoSetSummary,
-) -> wallet::TransparentUtxoSetSummaryResponse {
-    wallet::TransparentUtxoSetSummaryResponse {
+    summary: &TransparentUtxoSetSummary,
+) -> Result<wallet::TransparentUtxoSetSummaryResponse, QueryError> {
+    let commitment = summary
+        .commitment
+        .as_ref()
+        .map(encode_transparent_utxo_set_commitment)
+        .transpose()
+        .map_err(|_| QueryError::UnsupportedWalletEncoding {
+            value_kind: "utxo-set commitment scheme",
+        })?;
+    Ok(wallet::TransparentUtxoSetSummaryResponse {
         chain_view: Some(build_chain_view_message(summary.chain_epoch)),
         utxo_count: summary.utxo_count,
         total_value_zat: summary.total_value_zat,
         summarized_height: summary.summarized_height.value(),
-        commitment: summary
-            .commitment
-            .map(|commitment| encode_transparent_utxo_set_commitment(&commitment)),
-    }
+        commitment,
+    })
 }
 
 /// Reads the compact block at `height` and encodes the native wallet response.
@@ -299,7 +382,7 @@ pub async fn compact_block_response<Q: WalletQueryApi + ?Sized>(
     query_api
         .compact_block_at(height, at_epoch_id)
         .await
-        .map(build_compact_block_response)
+        .map(|compact_block| build_compact_block_response(&compact_block))
 }
 
 /// Reads the full block at `height` and encodes the native wallet response.
@@ -400,7 +483,7 @@ pub async fn broadcast_transaction_response<Q: WalletQueryApi + ?Sized>(
     query_api
         .broadcast_transaction(raw_transaction)
         .await
-        .map(build_broadcast_transaction_response)
+        .and_then(build_broadcast_transaction_response)
 }
 
 /// Reads one bounded chain-event page and encodes the native wallet messages.
@@ -684,10 +767,10 @@ fn build_block_header_response(response: &BlockHeaderAtEpoch) -> wallet::BlockHe
     }
 }
 
-fn build_compact_block_response(compact_block: CompactBlock) -> wallet::CompactBlockResponse {
+fn build_compact_block_response(compact_block: &CompactBlock) -> wallet::CompactBlockResponse {
     wallet::CompactBlockResponse {
         chain_view: Some(build_chain_view_message(compact_block.chain_epoch)),
-        compact_block: Some(build_compact_block_message(compact_block.compact_block)),
+        compact_block: Some(build_compact_block_message(&compact_block.compact_block)),
     }
 }
 
@@ -717,11 +800,7 @@ fn build_transaction_status_response(
             })
         }
         TxStatus::InMempool(entry) => {
-            wallet::transaction_location::Location::InMempool(wallet::MempoolTransaction {
-                payload_bytes: entry.raw_transaction_bytes.as_slice().to_vec(),
-                first_seen_unix_seconds: i64::try_from(entry.first_seen_unix_millis.value() / 1000)
-                    .unwrap_or(i64::MAX),
-            })
+            wallet::transaction_location::Location::InMempool(mempool_entry_message(&entry))
         }
         TxStatus::NotFound => return Ok(None),
         _ => {
@@ -765,6 +844,7 @@ fn build_tree_state_response(tree_state: TreeState) -> wallet::TreeStateResponse
         height: tree_state.height.value(),
         block_hash: encode_rpc_block_hash_hex(tree_state.block_hash),
         payload_bytes: tree_state.payload_bytes,
+        block_time_seconds: Some(tree_state.block_time_seconds),
     }
 }
 
@@ -785,7 +865,7 @@ fn build_subtree_roots_response(
 
 fn build_broadcast_transaction_response(
     broadcast_outcome: TransactionBroadcastOutcome,
-) -> wallet::BroadcastTransactionResponse {
+) -> Result<wallet::BroadcastTransactionResponse, QueryError> {
     use wallet::broadcast_transaction_response::Outcome;
 
     let outcome = match broadcast_outcome {
@@ -802,20 +882,21 @@ fn build_broadcast_transaction_response(
             Outcome::Queued(build_broadcast_queued_message(queued))
         }
         TransactionBroadcastOutcome::Rejected(rejected) => {
-            Outcome::Rejected(build_broadcast_rejected_message(rejected))
+            Outcome::Rejected(build_broadcast_rejected_message(rejected)?)
         }
         TransactionBroadcastOutcome::Unknown(unknown) => {
             Outcome::Unknown(build_broadcast_unknown_message(unknown))
         }
-        _ => Outcome::Unknown(wallet::BroadcastUnknown {
-            error_code: None,
-            message: "unknown transaction broadcast outcome variant".to_owned(),
-        }),
+        _ => {
+            return Err(QueryError::UnsupportedWalletEncoding {
+                value_kind: "transaction broadcast outcome",
+            });
+        }
     };
 
-    wallet::BroadcastTransactionResponse {
+    Ok(wallet::BroadcastTransactionResponse {
         outcome: Some(outcome),
-    }
+    })
 }
 
 fn build_broadcast_accepted_message(accepted: BroadcastAccepted) -> wallet::BroadcastAccepted {
@@ -840,12 +921,14 @@ fn build_broadcast_invalid_encoding_message(
     }
 }
 
-fn build_broadcast_rejected_message(rejected: BroadcastRejected) -> wallet::BroadcastRejected {
-    wallet::BroadcastRejected {
+fn build_broadcast_rejected_message(
+    rejected: BroadcastRejected,
+) -> Result<wallet::BroadcastRejected, QueryError> {
+    Ok(wallet::BroadcastRejected {
         error_code: rejected.error_code,
         message: rejected.message,
-        kind: broadcast_rejection_reason_to_message(rejected.kind) as i32,
-    }
+        kind: broadcast_rejection_reason_to_message(rejected.kind)? as i32,
+    })
 }
 
 fn build_broadcast_queued_message(queued: BroadcastQueued) -> wallet::BroadcastQueued {
@@ -855,26 +938,27 @@ fn build_broadcast_queued_message(queued: BroadcastQueued) -> wallet::BroadcastQ
 }
 
 #[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "BroadcastRejectionReason is #[non_exhaustive]; new variants must be wired into the proto enum in a deliberate change."
+    unreachable_patterns,
+    reason = "BroadcastRejectionReason is non-exhaustive; the encoder fails closed for future variants."
 )]
 fn broadcast_rejection_reason_to_message(
     kind: BroadcastRejectionReason,
-) -> wallet::BroadcastRejectionReason {
+) -> Result<wallet::BroadcastRejectionReason, QueryError> {
     match kind {
         BroadcastRejectionReason::InvalidSignature => {
-            wallet::BroadcastRejectionReason::InvalidSignature
+            Ok(wallet::BroadcastRejectionReason::InvalidSignature)
         }
         BroadcastRejectionReason::BadExpiryHeight => {
-            wallet::BroadcastRejectionReason::BadExpiryHeight
+            Ok(wallet::BroadcastRejectionReason::BadExpiryHeight)
         }
         BroadcastRejectionReason::BadConsensusBranch => {
-            wallet::BroadcastRejectionReason::BadConsensusBranch
+            Ok(wallet::BroadcastRejectionReason::BadConsensusBranch)
         }
-        BroadcastRejectionReason::MempoolFull => wallet::BroadcastRejectionReason::MempoolFull,
-        // BroadcastRejectionReason::Unknown and every future non-exhaustive
-        // variant both collapse to the wire's Unknown enumerator.
-        _ => wallet::BroadcastRejectionReason::Unknown,
+        BroadcastRejectionReason::MempoolFull => Ok(wallet::BroadcastRejectionReason::MempoolFull),
+        BroadcastRejectionReason::Unknown => Ok(wallet::BroadcastRejectionReason::Unknown),
+        _ => Err(QueryError::UnsupportedWalletEncoding {
+            value_kind: "transaction broadcast rejection reason",
+        }),
     }
 }
 
@@ -902,8 +986,13 @@ fn map_chain_event_encode_error(error: ChainEventEncodeError) -> QueryError {
         ChainEventEncodeError::UnsupportedChainEvent { event } => {
             QueryError::UnsupportedChainEvent { event }
         }
-        _ => QueryError::UnsupportedChainEvent {
-            event: "unknown chain event encode error",
+        ChainEventEncodeError::UnsupportedMempoolEvictionReason => {
+            QueryError::UnsupportedWalletEncoding {
+                value_kind: "mempool eviction reason",
+            }
+        }
+        _ => QueryError::UnsupportedWalletEncoding {
+            value_kind: "chain event",
         },
     }
 }
@@ -919,13 +1008,9 @@ fn build_block_id_message(
 }
 
 pub(crate) fn build_compact_block_message(
-    compact_block: CompactBlockArtifact,
+    compact_block: &CompactBlockArtifact,
 ) -> wallet::CompactBlock {
-    wallet::CompactBlock {
-        height: compact_block.height.value(),
-        block_hash: encode_rpc_block_hash_hex(compact_block.block_hash),
-        payload_bytes: compact_block.payload_bytes,
-    }
+    compact_block_message(compact_block)
 }
 
 pub(crate) fn build_full_block_message(block_blob: BlockBlobArtifact) -> wallet::FullBlock {
@@ -964,14 +1049,17 @@ fn native_shielded_protocol(
 #[cfg(test)]
 mod server_info_tests {
     use zinder_proto::capabilities::{
-        WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_READ_FULL_BLOCK_AT_V1,
-        WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_TRANSACTION_BY_ID_V1,
-        WALLET_READ_TRANSACTION_BYTES_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
+        CAPABILITIES, CapabilitySurface, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+        WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_FULL_BLOCK_AT_V1,
+        WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_SETTLED_TIP_BLOCK_V1,
+        WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1,
+        WALLET_READ_TRANSPARENT_OUTPUTS_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
+        WALLET_READ_VISIBLE_TIP_BLOCK_V1,
     };
 
     use super::{
         MaterializedViewPreset, ServerInfoSettings, UpstreamNodeCapabilities,
-        build_wallet_server_info,
+        WalletCapabilityProfile, build_wallet_server_info,
     };
 
     #[test]
@@ -1077,7 +1165,7 @@ mod server_info_tests {
                 advertises(&capabilities, WALLET_READ_TRANSACTION_BYTES_V1),
                 transaction_retained
             );
-            assert!(advertises(&capabilities, WALLET_READ_TRANSACTION_BY_ID_V1));
+            assert!(advertises(&capabilities, WALLET_READ_TRANSACTION_BY_ID_V2));
         }
     }
 
@@ -1095,5 +1183,53 @@ mod server_info_tests {
             &capabilities,
             WALLET_READ_TRANSPARENT_SPENDS_V1
         ));
+    }
+
+    #[test]
+    fn exact_pair_profile_advertises_implemented_sync_methods() {
+        let settings = ServerInfoSettings {
+            capability_profile: WalletCapabilityProfile::ExactPair,
+            transparent_address_history_available: true,
+            ..ServerInfoSettings::default()
+        };
+        let capabilities = build_wallet_server_info(&settings)
+            .common
+            .map(|common| common.capabilities)
+            .unwrap_or_default();
+
+        assert!(advertises(&capabilities, WALLET_READ_VISIBLE_TIP_BLOCK_V1));
+        assert!(advertises(&capabilities, WALLET_READ_SETTLED_TIP_BLOCK_V1));
+        assert!(advertises(
+            &capabilities,
+            WALLET_READ_COMPACT_BLOCK_RANGE_V2
+        ));
+        assert!(advertises(&capabilities, WALLET_READ_TRANSACTION_BY_ID_V2));
+        assert!(advertises(
+            &capabilities,
+            WALLET_READ_TRANSPARENT_OUTPUTS_V1
+        ));
+        assert!(advertises(
+            &capabilities,
+            WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
+        ));
+    }
+
+    #[test]
+    fn exact_pair_profile_decides_every_registered_wallet_capability() {
+        let undecided = CAPABILITIES
+            .iter()
+            .filter(|spec| spec.surface == CapabilitySurface::Wallet)
+            .filter(|spec| {
+                WalletCapabilityProfile::ExactPair
+                    .supports(spec.string)
+                    .is_none()
+            })
+            .map(|spec| spec.string)
+            .collect::<Vec<_>>();
+
+        assert!(
+            undecided.is_empty(),
+            "exact-pair capability profile lacks decisions for {undecided:?}"
+        );
     }
 }

@@ -811,6 +811,13 @@ fn synthetic_epoch_with_settled_tip(
 ) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let parent_hash = block_hash(height.saturating_sub(1));
     let block_height = BlockHeight::new(height);
+    let block = super::synthetic_block_header(
+        block_height,
+        source_hash,
+        parent_hash,
+        format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
+    );
+    let compact = super::empty_compact_block_for_header(&block, ChainTipMetadata::empty());
 
     (
         ChainEpoch {
@@ -824,17 +831,8 @@ fn synthetic_epoch_with_settled_tip(
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_200_000 + u64::from(height)),
         },
-        super::synthetic_block_header(
-            block_height,
-            source_hash,
-            parent_hash,
-            format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
-        ),
-        CompactBlockArtifact::new(
-            block_height,
-            source_hash,
-            format!("compact-block-{chain_epoch_id}-{height}").into_bytes(),
-        ),
+        block,
+        compact,
     )
 }
 

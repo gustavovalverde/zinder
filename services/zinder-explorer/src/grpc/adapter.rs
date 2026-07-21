@@ -1706,7 +1706,7 @@ mod tests {
 
         let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(20);
         let store_fixture =
-            StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(7))?;
+            StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
         let chain_epoch = *store_fixture
             .committed_chain_epoch()
             .ok_or("fixture chain epoch missing")?;

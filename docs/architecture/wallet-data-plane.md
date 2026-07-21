@@ -4,10 +4,12 @@ The wallet data plane is the part of Zinder that wallets and wallet-like applica
 
 ## Responsibility
 
-The `zinder-query` library owns the wallet request, adapter, and error contract.
-`zinder-projector` owns the durable wallet state, and
-`zinder-compat-lightwalletd` is the only deployed wallet-facing runtime in the
-current release. The standalone native query binary is deleted.
+The `zinder-query` crate owns the wallet request, adapter, and error contract,
+and its binary serves the native `zinder.v1.wallet.WalletQuery` protocol.
+`zinder-projector` owns the durable wallet state.
+`zinder-compat-lightwalletd` separately serves wallets that require the
+lightwalletd protocol. Both wallet-facing runtimes are deployed and admit
+independent secondary generations at the same canonical fence contract.
 
 Per [ADR-0005](../adrs/0005-consumer-neutral-wallet-data-plane.md),
 this plane is consumer-neutral. Mobile SDKs, lightwalletd clients, native
@@ -56,7 +58,12 @@ Required privacy rules:
 
 The compact block builder belongs to ingestion. The wallet data plane serves compact block artifacts through `ChainEpochReadApi` or through a query-owned store fed by canonical artifacts.
 
-Compact block payload bytes follow [ADR-0002](../adrs/0002-boundary-specific-serialization.md): store protobuf-compatible payload bytes inside a fixed artifact envelope. The protobuf payload shape is the pinned lightwallet protocol contract recorded by `zinder-proto`, not whichever version a contributor happens to remember. `zinder-query` may decode and re-encode through generated tonic messages until a raw protobuf serving path is proven, but it must not translate compact blocks into a Zinder-only durable format.
+Compact blocks are stored as the structured, consumer-neutral
+`CompactBlockArtifact` defined by `zinder-core`. Native WalletQuery response
+builders and the lightwalletd adapter translate that one semantic artifact at
+their protocol boundaries. The durable format is versioned independently from
+either RPC schema, so compatibility message changes do not redefine canonical
+wallet facts.
 
 This avoids two problems:
 
@@ -146,12 +153,12 @@ mempool; a non-best-chain lookup must add its own named API surface.
 Native transaction lookup returns typed transaction status. The public Rust shape is
 `zinder_core::TxStatus` and the native gRPC surface mirrors it through
 `WalletQuery.Transaction(TransactionRequest) returns (TransactionStatusResponse)`
-under capability `wallet.read.transaction_by_id_v1`. The response carries the
+under capability `wallet.read.transaction_by_id_v2`. The response carries the
 shared `TransactionLocation` oneof on its `location` field; the oneof has two
 arms. `NotFound` is gRPC `NOT_FOUND`, not an oneof slot, because typed errors do not consume oneof variants:
 
 - `mined`: `MinedTransaction { MinedBlockLocation location; MinedTransactionChainContext chain_context; bytes raw_transaction_bytes }`.
-- `in_mempool`: `MempoolTransaction { bytes payload_bytes; int64 first_seen_unix_seconds }`.
+- `in_mempool`: `MempoolEntry { string transaction_id; string auth_digest; bytes raw_transaction_bytes; CompactTransactionData compact_transaction_data; uint64 first_seen_unix_millis; ChainEpoch first_seen_chain_epoch; repeated TransparentMempoolOutput transparent_outputs; repeated TransparentMempoolSpend transparent_spends }`.
 
 `TransactionLocation` is one message defined in `wallet.proto` and embedded by
 every read surface that answers "where does this transaction live", including
@@ -185,13 +192,13 @@ they derive active versus pending status against the epoch-pinned latest block
 rather than trusting a second node query.
 
 The mined arm also carries `raw_transaction_bytes`: the serialized consensus
-transaction bytes, symmetric with the mempool arm's `payload_bytes`. This makes
+transaction bytes, symmetric with the mempool arm's `raw_transaction_bytes`. This makes
 `WalletQuery.Transaction` a verbose mined-transaction read that returns the
 serialized bytes, the mined block hash and height, the block time, and
 epoch-bound confirmations in one response, which is the shape a
 `getrawtransaction verbose` consumer needs. The bytes are filled from the same
 `TransactionBlobArtifact` the canonical reader resolves; they are not a separate
-RPC. The field rides on the existing `wallet.read.transaction_by_id_v1`
+RPC. The field rides on the existing `wallet.read.transaction_by_id_v2`
 capability rather than a new one, because the bytes are not unconditionally
 present: ingest writes transaction blobs only when `raw_blob_policy` is
 `transactions` or `all`. When the policy is `none`, the field is empty and the
@@ -322,7 +329,7 @@ contents first, then subscribes `MempoolEvents` with
 `after_cursor = events_resume_cursor` for live delivery; the composition is
 at-least-once, matching lightwalletd-go semantics. Deployments without that
 surface omit
-`wallet.events.mempool_v1` and `wallet.snapshot.mempool_v1` from
+`wallet.events.mempool_v2` and `wallet.snapshot.mempool_v2` from
 `ServerCapabilities` and return a typed unavailable response from the compat
 methods.
 
@@ -437,7 +444,7 @@ chain fence; resuming after a reorg fails with `FAILED_PRECONDITION`. The
 carries a non-empty resume cursor.
 
 The compatibility adapter implements `GetTaddressTxids` and
-`GetTaddressTransactions` through `LightwalletdServingQuery`. That path reads
+`GetTaddressTransactions` through `WalletServingQuery`. That path reads
 the transparent history already present in the admitted wallet projection,
 alongside the canonical half of the same `WalletServingReadPair`; it does not
 depend on the optional materialized-view store. Its ascending page cursor binds
@@ -545,7 +552,7 @@ Regtest can prove forwarding, typed rejection mapping, and the no-storage-mutati
 
 ## Compatibility
 
-`zinder-compat-lightwalletd` serves the vendored `CompactTxStreamer` proto from `zinder_proto::compat::lightwalletd` by translating `LightwalletdQueryApi`. The full responsibility list, allowed request shapes, error mapping, and test surface are owned by [Protocol boundary §Lightwalletd Compatibility](protocol-boundary.md#lightwalletd-compatibility); native `WalletQueryApi` remains the primary API and new functionality lands there first.
+`zinder-compat-lightwalletd` serves the vendored `CompactTxStreamer` proto from `zinder_proto::compat::lightwalletd` by translating `WalletQueryApi`. The full responsibility list, allowed request shapes, error mapping, and test surface are owned by [Protocol boundary §Lightwalletd Compatibility](protocol-boundary.md#lightwalletd-compatibility); native `WalletQueryApi` remains the primary API and new functionality lands there first.
 
 v1 wallet APIs target self-hosted, single-operator deployments backed by a configured upstream node. The v1 binaries do not implement TLS termination, authentication, rate limiting, or quota accounting; an operator who needs any of those terminates them at a load balancer or reverse proxy in front of Zinder. Public-internet hosting requirements are out of v1 scope.
 

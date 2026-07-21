@@ -14,6 +14,7 @@
 mod privacy_shape;
 mod transparent_delta_kind;
 mod utxo_set_commitment;
+mod wallet;
 
 pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};
 pub use transparent_delta_kind::{
@@ -21,6 +22,13 @@ pub use transparent_delta_kind::{
     UnknownTransparentDeltaKindByte, decode_transparent_delta_kind,
 };
 pub use utxo_set_commitment::{
-    TransparentUtxoSetCommitmentDecodeError, decode_transparent_utxo_set_commitment,
-    encode_transparent_utxo_set_commitment,
+    TransparentUtxoSetCommitmentDecodeError, TransparentUtxoSetCommitmentEncodeError,
+    decode_transparent_utxo_set_commitment, encode_transparent_utxo_set_commitment,
+};
+pub use wallet::{
+    WalletWireDecodeError, chain_epoch_from_message, chain_epoch_message,
+    compact_block_from_message, compact_block_message, compact_transaction_data_from_message,
+    compact_transaction_data_message, decode_compact_block, encode_compact_block,
+    mempool_entry_from_message, mempool_entry_message, outpoint_message,
+    transparent_mempool_output_from_message, transparent_mempool_spend_from_message,
 };

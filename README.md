@@ -2,13 +2,13 @@
 
 Zinder is a self-hosted Zcash chain-data service. It indexes the chain once from a [Zebra](https://github.com/ZcashFoundation/zebra) full node, then exposes one durable, consistent, versioned view that multiple wallets and products can share. Every read pins to one chain epoch, so a sync batch never combines data from competing tips, while shielded scanning and keys remain in the wallet.
 
-The release runtime serves wallets that speak [lightwalletd](https://github.com/zcash/lightwalletd) through the `CompactTxStreamer` compatibility service. Zinder's native `WalletQuery` traits and typed Rust client are library contracts for custom adapters and embedded compositions; the release workflow does not publish a standalone native-query service. For lightwalletd clients, adopting Zinder can be an endpoint change rather than a wallet rewrite, although every named wallet and release still requires end-to-end certification before Zinder claims support.
+The release topology serves both Zinder's native `WalletQuery` protocol and [lightwalletd](https://github.com/zcash/lightwalletd)'s `CompactTxStreamer` protocol. Native clients use `zinder-query`; existing lightwalletd clients use the independent `zinder-compat-lightwalletd` adapter. Both pin reads to exact canonical and wallet-projection fences, and every named wallet and release still requires end-to-end certification before Zinder claims support.
 
 ## Wallet integration paths
 
 - **Existing lightwalletd clients** keep their `CompactTxStreamer` integration and point it at `zinder-compat-lightwalletd`. ZODL and Vizor use this protocol shape, although each current wallet release still needs end-to-end validation before Zinder claims support.
-- **Native wallet adapters** can implement the `WalletQuery` Rust contract when they need epoch-pinned full blocks, transaction status, chain events, mempool state, or typed broadcast outcomes. Deploying such an adapter is a custom composition.
-- **Rust wallet libraries and applications** can use `zinder-client`. `RemoteChainIndex` targets a separately composed native endpoint, while `LocalChainIndex` is limited to colocated stored reads.
+- **Native wallet clients** call the published `zinder-query` runtime when they need epoch-pinned full blocks, transaction status, chain events, mempool state, or typed broadcast outcomes.
+- **Rust wallet libraries and applications** can use `zinder-client`. `RemoteChainIndex` targets `zinder-query`, while `LocalChainIndex` is limited to colocated stored reads.
 - **Explorers and application backends** use epoch-consistent wallet reads plus the optional `ExplorerQuery` plane for block summaries, transaction details, mempool views, typed search, and rebuildable materialized views.
 
 Zinder is strongest when chain access should survive one wallet process, serve several independent consumers, or remain decoupled from a particular wallet implementation. An embedded indexer such as Zaino can be simpler for one tightly coupled wallet process, while direct Zebra RPC may be sufficient when a consumer only needs node-owned data. See [What Zinder is and is not](docs/architecture/indexer-wallet-boundary.md) for the detailed comparison.
@@ -17,12 +17,12 @@ The deployment target is single-operator self-hosting backed by one Zebra node. 
 
 ## Quickstart
 
-The supported wallet-serving topology uses three independent release runtimes
+The supported wallet-serving topology uses four independent release runtimes
 on one host filesystem: `zinder-ingest` owns canonical storage,
 `zinder-projector` owns the wallet projection, and
-`zinder-compat-lightwalletd` serves one immutable exact-fence pair. Query,
-explorer, and mixed single-container images are not built or published by the
-release workflow.
+`zinder-query` and `zinder-compat-lightwalletd` independently serve native and
+compatibility protocols over immutable exact-fence pairs. Explorer and mixed
+single-container images are not built or published by the release workflow.
 
 Bring up a Zebra node through the [Z3 platform stack](https://github.com/ZcashFoundation/z3),
 then start Zinder from this checkout:
@@ -43,21 +43,24 @@ value before starting a side-by-side rebuild lane.
 
 The writer becomes ready only after canonical catch-up and a complete mempool
 snapshot. The projector remains unready until it has built or resumed the
-current wallet-store format and reached the writer's authenticated event fence. The
-compatibility service becomes ready only after its canonical and wallet
+current wallet-store format and reached the writer's authenticated event fence.
+Each serving runtime becomes ready only after its own canonical and wallet
 secondaries converge to one exact fence.
 
 ```bash
 # Testnet ports use the +10000 network offset.
 curl -fsS http://127.0.0.1:19105/readyz   # ingest
 curl -fsS http://127.0.0.1:19110/readyz   # projector
+curl -fsS http://127.0.0.1:19106/readyz   # native query reader
 curl -fsS http://127.0.0.1:19107/readyz   # compatibility reader
 
+grpcurl -plaintext -d '{}' 127.0.0.1:19102 \
+  zinder.v1.wallet.WalletQuery/ServerInfo
 grpcurl -plaintext -d '{}' 127.0.0.1:19067 \
   cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
 ```
 
-The compatibility port binds to host loopback. Terminate TLS, authentication,
+Both wallet-facing ports bind to host loopback. Terminate TLS, authentication,
 rate limits, and quotas in an operator-controlled proxy before exposing it.
 Fresh mainnet construction still requires performance, capacity, coherent
 restore, and independent-client evidence. A green local Compose deployment is
@@ -101,8 +104,8 @@ how canonical indexing, projection selection, and API serving fit together.
 - **Node source boundary** (`zinder-source`). Adapters normalize upstream node observations into `NodeSource` values. Authoritative chain facts enter only through this boundary; optional upstream-health checks and source-format parsing elsewhere cannot become fallback chain readers or parallel followers. See [node source boundary](docs/architecture/node-source-boundary.md).
 - **Chain ingestion plane** (`zinder-ingest`). The only writer to canonical storage. Owns fresh construction, continuous following, reorg handling, the authenticated canonical event stream, and live mempool state. See [chain ingestion](docs/architecture/chain-ingestion.md), [chain events](docs/architecture/chain-events.md), and [ADR-0015](docs/adrs/0015-phase-driven-ingest.md).
 - **Canonical storage** (`zinder-store`). RocksDB-backed `RocksDbCanonicalStore` and `RocksDbCanonicalSecondary` roles expose domain-shaped canonical operations. RocksDB types remain private, and readers bind to one `ChainEpoch` or `CanonicalEventFence` before reading. See [storage backend](docs/architecture/storage-backend.md) and [ADR-0003](docs/adrs/0003-canonical-storage-access-boundary.md).
-- **Wallet projection plane** (`zinder-projector`, `zinder-wallet-*`). The projector is the sole wallet-store writer. It constructs and continuously follows the current wallet-store format at authenticated canonical event fences; the query crate remains a Rust library contract consumed by compatibility, not a standalone production runtime. See [wallet data plane](docs/architecture/wallet-data-plane.md).
-- **Compatibility plane** (`zinder-compat-lightwalletd`, optional `zinder-compat-cipherscan`). Protocol-edge adapters preserve consumer contracts without shaping Zinder's native APIs around a product. The lightwalletd adapter translates `CompactTxStreamer` onto `LightwalletdQueryApi` through `LightwalletdServingQuery`; the Cipherscan adapter translates REST and WebSocket contracts onto `ExplorerQuery` and `WalletQuery`. Neither owns canonical writes or parallel artifact construction. See [protocol boundary](docs/architecture/protocol-boundary.md) and the [Cipherscan adapter README](services/zinder-compat-cipherscan/README.md).
+- **Wallet projection and query plane** (`zinder-projector`, `zinder-query`, `zinder-wallet-*`). The projector is the sole wallet-store writer. It constructs and continuously follows the current wallet-store format at authenticated canonical event fences; the query runtime serves the native WalletQuery protocol from process-owned secondary generations. See [wallet data plane](docs/architecture/wallet-data-plane.md).
+- **Compatibility plane** (`zinder-compat-lightwalletd`, optional `zinder-compat-cipherscan`). Protocol-edge adapters preserve consumer contracts without shaping Zinder's native APIs around a product. The lightwalletd adapter translates `CompactTxStreamer` onto `WalletQueryApi` through `WalletServingQuery`; the Cipherscan adapter translates REST and WebSocket contracts onto `ExplorerQuery` and `WalletQuery`. Neither owns canonical writes or parallel artifact construction. See [protocol boundary](docs/architecture/protocol-boundary.md) and the [Cipherscan adapter README](services/zinder-compat-cipherscan/README.md).
 - **Explorer plane** (`zinder-explorer`, optional). Serves block summaries, transaction details, typed search, mempool dashboards, and other explorer-shaped reads through `ExplorerQuery`. It opens, reads, and serves materialized views as a secondary. `zinder-materialized-views` owns the reusable store and consumers; no release runtime writes them unless a replay host is composed separately. See [explorer plane](docs/architecture/explorer-plane.md) and [materialized-view plane](docs/architecture/materialized-view-plane.md).
 
 Two foundation crates are shared across every plane: `zinder-core` (chain vocabulary: `ChainEpoch`, `BlockArtifact`, `Network`) and `zinder-proto` (`.proto` files and generated wire modules, including the pinned vendored lightwalletd schemas). Every binary also exposes an operational HTTP surface (`/healthz`, `/readyz`, `/metrics`) with typed readiness causes; that contract is owned by `zinder-runtime`. See [service operations](docs/architecture/service-operations.md).
@@ -125,10 +128,12 @@ The release workflow builds these deployable services:
 
 - `zinder-ingest`: the only writer to canonical RocksDB. Owns construction, following, retained canonical events, the private control endpoint, live mempool state, and upstream-source configuration.
 - `zinder-projector`: the only writer to wallet RocksDB. Owns fixed-fence construction, continuous canonical-event following, settlement, and bounded reorg reconciliation.
-- `zinder-compat-lightwalletd`: translates the vendored lightwalletd `CompactTxStreamer` gRPC service through `LightwalletdQueryApi` and an exact canonical/wallet-projection serving pair.
+- `zinder-query`: serves the native `WalletQuery` gRPC protocol through `WalletQueryApi` and an exact canonical/wallet-projection serving pair.
+- `zinder-compat-lightwalletd`: translates the vendored lightwalletd `CompactTxStreamer` gRPC service through `WalletQueryApi` and an exact canonical/wallet-projection serving pair.
 
-`zinder-query` is the internal Rust library for `WalletQueryApi`,
-`LightwalletdQueryApi`, request types, exact-fence serving pairs, and adapters.
+The `zinder-query` crate also owns the internal `WalletQueryApi`,
+`WalletServingQuery`, request types, shared exact-fence serving-pair publisher,
+and native adapter.
 `zinder-explorer` and
 `zinder-compat-cipherscan` compile as optional services but are not release
 images.
@@ -185,4 +190,4 @@ Use the local observability smoke when a change needs visible runtime evidence r
 scripts/observability-smoke.sh run
 ```
 
-It starts Prometheus and Grafana, runs ingest, projector, and the lightwalletd compatibility service against the selected local node source, records that restore is blocked until coherent canonical-plus-wallet bundles exist, generates lightwalletd-compatible gRPC traffic, prints the scraped metric samples, and writes readiness reports under `.tmp/observability/reports`. See [observability/README.md](observability/README.md) for public-network commands, calibration runs, ports, tunables, and the stop command.
+It starts Prometheus and Grafana, runs ingest, projector, native query, and the lightwalletd compatibility service against the selected local node source, records that restore is blocked until coherent canonical-plus-wallet bundles exist, generates native and lightwalletd-compatible gRPC traffic, prints the scraped metric samples, and writes readiness reports under `.tmp/observability/reports`. See [observability/README.md](observability/README.md) for public-network commands, calibration runs, ports, tunables, and the stop command.

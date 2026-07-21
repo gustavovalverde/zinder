@@ -18,7 +18,7 @@ use zinder_store::{
 
 const RANGE_BLOCK_COUNTS: [u32; 3] = [128, 512, 1_024];
 const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = 100;
-const OUTPUT_DIGEST_DOMAIN: &[u8] = b"zinder-bench-compact-block-range-output-v1\0";
+const OUTPUT_DIGEST_DOMAIN: &[u8] = b"zinder-bench-compact-block-range-output-v2\0";
 
 /// CLI contract for measuring compact-block range reads from one READY store.
 #[derive(Args)]
@@ -93,7 +93,7 @@ struct CompactBlockRangeMeasurement {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct CompactBlockRangeOutputEvidence {
     block_count: u32,
-    payload_bytes: u64,
+    structured_artifact_bytes: u64,
     digest_sha256: String,
 }
 
@@ -154,7 +154,7 @@ pub(crate) fn run_rocksdb_compact_block_range(
     })?;
     let report = RocksDbCompactBlockRangeReport {
         contract_identity: "rocksdb-compact-block-range",
-        report_format_version: 1,
+        report_format_version: 2,
         software_revision: args.software_revision,
         fixture_manifest_digest_sha256: manifest.digest_sha256()?,
         canonical_store: canonical_store.to_string_lossy().into_owned(),
@@ -256,34 +256,119 @@ fn compact_block_range_output(
         )));
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(OUTPUT_DIGEST_DOMAIN);
-    let mut payload_bytes = 0_u64;
+    let mut digest = StructuredArtifactDigest::new();
     for (height, block) in range.into_iter().zip(blocks) {
-        if block.height != height {
+        if block.height() != height {
             return Err(BenchError::report_format(format!(
                 "compact-block range returned height {} where {} was expected",
-                block.height.value(),
+                block.height().value(),
                 height.value()
             )));
         }
-        let payload_len = u64::try_from(block.payload_bytes.len()).map_err(|_| {
-            BenchError::report_format("compact-block payload length exceeds u64::MAX")
-        })?;
-        payload_bytes = payload_bytes.checked_add(payload_len).ok_or_else(|| {
-            BenchError::report_format("compact-block payload byte total exceeds u64::MAX")
-        })?;
-        hasher.update(block.height.value().to_be_bytes());
-        hasher.update(block.block_hash.as_bytes());
-        hasher.update(payload_len.to_be_bytes());
-        hasher.update(&block.payload_bytes);
+        digest.update_block(block)?;
     }
 
     Ok(CompactBlockRangeOutputEvidence {
         block_count: observed_count,
-        payload_bytes,
-        digest_sha256: hex::encode(hasher.finalize()),
+        structured_artifact_bytes: digest.structured_artifact_bytes,
+        digest_sha256: hex::encode(digest.hasher.finalize()),
     })
+}
+
+struct StructuredArtifactDigest {
+    hasher: Sha256,
+    structured_artifact_bytes: u64,
+}
+
+impl StructuredArtifactDigest {
+    fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(OUTPUT_DIGEST_DOMAIN);
+        Self {
+            hasher,
+            structured_artifact_bytes: 0,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) -> Result<(), BenchError> {
+        let byte_count = u64::try_from(bytes.len()).map_err(|_| {
+            BenchError::report_format("structured compact-block field exceeds u64::MAX bytes")
+        })?;
+        self.structured_artifact_bytes = self
+            .structured_artifact_bytes
+            .checked_add(byte_count)
+            .ok_or_else(|| {
+                BenchError::report_format("structured compact-block byte total exceeds u64::MAX")
+            })?;
+        self.hasher.update(bytes);
+        Ok(())
+    }
+
+    fn update_count(&mut self, count: usize) -> Result<(), BenchError> {
+        let count = u64::try_from(count).map_err(|_| {
+            BenchError::report_format("structured compact-block count exceeds u64::MAX")
+        })?;
+        self.update(&count.to_be_bytes())
+    }
+
+    fn update_block(&mut self, block: &CompactBlockArtifact) -> Result<(), BenchError> {
+        self.update(&block.height().value().to_be_bytes())?;
+        self.update(&block.block_hash().as_bytes())?;
+        self.update(&block.previous_block_hash().as_bytes())?;
+        self.update(&block.time().to_be_bytes())?;
+        let metadata = block.chain_metadata();
+        self.update(&metadata.sapling_commitment_tree_size.to_be_bytes())?;
+        self.update(&metadata.orchard_commitment_tree_size.to_be_bytes())?;
+        self.update(&metadata.ironwood_commitment_tree_size.to_be_bytes())?;
+        self.update_count(block.transactions().len())?;
+        for transaction in block.transactions() {
+            self.update(&transaction.index.to_be_bytes())?;
+            self.update(&transaction.transaction_id.as_bytes())?;
+            match transaction.data.fee_zat {
+                Some(fee_zat) => {
+                    self.update(&[1])?;
+                    self.update(&fee_zat.to_be_bytes())?;
+                }
+                None => self.update(&[0])?,
+            }
+            self.update_count(transaction.data.sapling_spends.len())?;
+            for spend in &transaction.data.sapling_spends {
+                self.update(&spend.nullifier)?;
+            }
+            self.update_count(transaction.data.sapling_outputs.len())?;
+            for output in &transaction.data.sapling_outputs {
+                self.update(&output.commitment)?;
+                self.update(&output.ephemeral_key)?;
+                self.update(&output.ciphertext)?;
+            }
+            self.update_count(transaction.data.orchard_actions.len())?;
+            for action in &transaction.data.orchard_actions {
+                self.update(&action.nullifier)?;
+                self.update(&action.commitment)?;
+                self.update(&action.ephemeral_key)?;
+                self.update(&action.ciphertext)?;
+            }
+            self.update_count(transaction.data.ironwood_actions.len())?;
+            for action in &transaction.data.ironwood_actions {
+                self.update(&action.nullifier)?;
+                self.update(&action.commitment)?;
+                self.update(&action.ephemeral_key)?;
+                self.update(&action.ciphertext)?;
+            }
+            self.update_count(transaction.data.transparent_inputs.len())?;
+            for input in &transaction.data.transparent_inputs {
+                self.update(&input.previous_transaction_id.as_bytes())?;
+                self.update(&input.previous_output_index.to_be_bytes())?;
+            }
+            self.update_count(transaction.data.transparent_outputs.len())?;
+            for output in &transaction.data.transparent_outputs {
+                self.update(&output.value_zat.to_be_bytes())?;
+                self.update_count(output.script_pub_key.len())?;
+                self.update(&output.script_pub_key)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn elapsed_seconds(elapsed: Duration) -> f64 {
@@ -308,40 +393,113 @@ impl From<CanonicalStoreReadyEvidence> for ReadyFenceSummary {
 
 #[cfg(test)]
 mod tests {
-    use zinder_core::{BlockHash, CompactBlockArtifact};
+    use zinder_core::{
+        BlockHash, BlockId, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
+        CompactSaplingSpend, CompactShieldedAction, CompactTransaction, CompactTransactionData,
+        CompactTransparentInput, CompactTransparentOutput, TransactionId,
+    };
 
     use super::{BlockHeight, BlockHeightRange, compact_block_range_output};
 
+    fn empty_block(height: u32, hash_byte: u8, parent_byte: u8, time: u32) -> CompactBlockArtifact {
+        CompactBlockArtifact::empty(
+            BlockId::new(
+                BlockHeight::new(height),
+                BlockHash::from_bytes([hash_byte; 32]),
+            ),
+            BlockHash::from_bytes([parent_byte; 32]),
+            time,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        )
+    }
+
     #[test]
-    fn output_digest_binds_order_height_hash_and_payload() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let first =
-            CompactBlockArtifact::new(BlockHeight::new(10), BlockHash::from_bytes([1; 32]), [2, 3]);
-        let second = CompactBlockArtifact::new(
-            BlockHeight::new(11),
-            BlockHash::from_bytes([4; 32]),
-            [5, 6, 7],
-        );
+    fn output_digest_binds_order_identity_time_and_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = empty_block(10, 1, 0, 100);
+        let second = empty_block(11, 4, 1, 101);
         let range = BlockHeightRange::inclusive(BlockHeight::new(10), BlockHeight::new(11));
 
         let evidence = compact_block_range_output(&[first.clone(), second.clone()], range, 2)?;
-        let repeated = compact_block_range_output(&[first, second.clone()], range, 2)?;
+        let repeated = compact_block_range_output(&[first, second], range, 2)?;
         let changed = compact_block_range_output(
-            &[
-                CompactBlockArtifact::new(
-                    BlockHeight::new(10),
-                    BlockHash::from_bytes([1; 32]),
-                    [2, 3],
-                ),
-                CompactBlockArtifact::new(BlockHeight::new(11), second.block_hash, [5, 6, 8]),
-            ],
+            &[empty_block(10, 1, 0, 100), empty_block(11, 4, 1, 102)],
             range,
             2,
         )?;
 
         assert_eq!(evidence, repeated);
         assert_ne!(evidence, changed);
-        assert_eq!(evidence.payload_bytes, 5);
+        assert_eq!(evidence.structured_artifact_bytes, 184);
         Ok(())
+    }
+
+    #[test]
+    fn output_digest_binds_every_transaction_field() -> Result<(), Box<dyn std::error::Error>> {
+        let block = structured_block(0x51)?;
+        let changed = structured_block(0x52)?;
+        let range = BlockHeightRange::inclusive(BlockHeight::new(10), BlockHeight::new(10));
+
+        let evidence = compact_block_range_output(&[block], range, 1)?;
+        let changed = compact_block_range_output(&[changed], range, 1)?;
+
+        assert_ne!(evidence.digest_sha256, changed.digest_sha256);
+        assert_eq!(
+            evidence.structured_artifact_bytes,
+            changed.structured_artifact_bytes
+        );
+        Ok(())
+    }
+
+    fn structured_block(
+        script_byte: u8,
+    ) -> Result<CompactBlockArtifact, Box<dyn std::error::Error>> {
+        Ok(CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(10), BlockHash::from_bytes([1; 32])),
+            BlockHash::from_bytes([0; 32]),
+            100,
+            vec![CompactTransaction {
+                index: 0,
+                transaction_id: TransactionId::from_bytes([2; 32]),
+                data: CompactTransactionData {
+                    fee_zat: Some(1_000),
+                    sapling_spends: vec![CompactSaplingSpend { nullifier: [3; 32] }],
+                    sapling_outputs: vec![CompactSaplingOutput {
+                        commitment: [4; 32],
+                        ephemeral_key: [5; 32],
+                        ciphertext: [6; 52],
+                    }],
+                    orchard_actions: vec![CompactShieldedAction {
+                        nullifier: [7; 32],
+                        commitment: [8; 32],
+                        ephemeral_key: [9; 32],
+                        ciphertext: [10; 52],
+                    }],
+                    ironwood_actions: vec![CompactShieldedAction {
+                        nullifier: [11; 32],
+                        commitment: [12; 32],
+                        ephemeral_key: [13; 32],
+                        ciphertext: [14; 52],
+                    }],
+                    transparent_inputs: vec![CompactTransparentInput {
+                        previous_transaction_id: TransactionId::from_bytes([15; 32]),
+                        previous_output_index: 1,
+                    }],
+                    transparent_outputs: vec![CompactTransparentOutput {
+                        value_zat: 500,
+                        script_pub_key: vec![script_byte],
+                    }],
+                },
+            }],
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 1,
+                orchard_commitment_tree_size: 2,
+                ironwood_commitment_tree_size: 3,
+            },
+        )?)
     }
 }

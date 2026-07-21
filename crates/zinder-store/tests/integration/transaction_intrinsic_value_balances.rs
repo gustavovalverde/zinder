@@ -21,7 +21,8 @@ use super::{synthetic_block_header, synthetic_transaction_rows};
 fn signed_intrinsic_balances_round_trip_and_unknown_transaction_is_absent() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let (epoch, block, compact) = epoch_artifacts(1, 1, 1, 0, 1, 1, 14);
+    let (epoch, block, compact) =
+        epoch_artifacts(1, 1, 1, 0, 1, 1, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     let transaction_id = TransactionId::from_bytes([7; 32]);
     let (index, location, facts, _) = synthetic_transaction_rows(
         transaction_id,
@@ -69,14 +70,16 @@ fn signed_intrinsic_balances_round_trip_and_unknown_transaction_is_absent() -> e
 fn reorged_intrinsic_balances_are_hidden_from_the_replacement_epoch() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 14);
+    let (epoch_1, block_1, compact_1) =
+        epoch_artifacts(1, 1, 1, 0, 1, 1, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_1,
         vec![block_1],
         vec![compact_1],
     ))?;
 
-    let (epoch_2, block_2, compact_2) = epoch_artifacts(2, 2, 2, 1, 1, 1, 14);
+    let (epoch_2, block_2, compact_2) =
+        epoch_artifacts(2, 2, 2, 1, 1, 1, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     let transaction_id = TransactionId::from_bytes([9; 32]);
     let (index, location, facts, _) = synthetic_transaction_rows(
         transaction_id,
@@ -97,7 +100,8 @@ fn reorged_intrinsic_balances_are_hidden_from_the_replacement_epoch() -> eyre::R
             .with_transaction_intrinsic_value_balances(vec![balances]),
     ))?;
 
-    let (epoch_3, replacement_block, replacement_compact) = epoch_artifacts(3, 2, 92, 1, 1, 1, 14);
+    let (epoch_3, replacement_block, replacement_compact) =
+        epoch_artifacts(3, 2, 92, 1, 1, 1, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     store.commit_chain_epoch(
         super::synthetic_chain_epoch_artifacts(
             epoch_3,
@@ -143,7 +147,8 @@ fn existing_intrinsic_balance_enrichment_is_settled_idempotent_and_event_neutral
 -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 13);
+    let (epoch_1, block_1, compact_1) =
+        epoch_artifacts(1, 1, 1, 0, 1, 1, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     let transaction_id = TransactionId::from_bytes([10; 32]);
     let (index, location, facts, _) = synthetic_transaction_rows(
         transaction_id,
@@ -194,7 +199,8 @@ fn existing_intrinsic_balance_enrichment_is_settled_idempotent_and_event_neutral
         Err(StoreError::InvalidChainEpochArtifacts { .. })
     ));
 
-    let (epoch_2, block_2, compact_2) = epoch_artifacts(2, 2, 2, 1, 2, 2, 14);
+    let (epoch_2, block_2, compact_2) =
+        epoch_artifacts(2, 2, 2, 1, 2, 2, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_2,
         vec![block_2],
@@ -214,13 +220,15 @@ fn existing_intrinsic_balance_enrichment_is_settled_idempotent_and_event_neutral
 fn enrichment_rejects_transactions_above_the_settled_tip() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
-    let (epoch_1, block_1, compact_1) = epoch_artifacts(1, 1, 1, 0, 1, 1, 14);
+    let (epoch_1, block_1, compact_1) =
+        epoch_artifacts(1, 1, 1, 0, 1, 1, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     store.commit_chain_epoch(super::synthetic_chain_epoch_artifacts(
         epoch_1,
         vec![block_1],
         vec![compact_1],
     ))?;
-    let (epoch_2, block_2, compact_2) = epoch_artifacts(2, 2, 2, 1, 1, 1, 14);
+    let (epoch_2, block_2, compact_2) =
+        epoch_artifacts(2, 2, 2, 1, 1, 1, CURRENT_ARTIFACT_SCHEMA_VERSION.value());
     let transaction_id = TransactionId::from_bytes([11; 32]);
     let (index, location, facts, _) = synthetic_transaction_rows(
         transaction_id,
@@ -265,6 +273,8 @@ fn epoch_artifacts(
     let height = BlockHeight::new(tip_height);
     let block_hash = BlockHash::from_bytes([hash_seed; 32]);
     let parent_hash = BlockHash::from_bytes([parent_hash_seed; 32]);
+    let block = synthetic_block_header(height, block_hash, parent_hash, b"intrinsic-balance-block");
+    let compact = super::empty_compact_block_for_header(&block, ChainTipMetadata::empty());
     (
         ChainEpoch {
             id: ChainEpochId::new(epoch_id),
@@ -277,12 +287,12 @@ fn epoch_artifacts(
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_600_000 + epoch_id),
         },
-        synthetic_block_header(height, block_hash, parent_hash, b"intrinsic-balance-block"),
-        CompactBlockArtifact::new(height, block_hash, b"intrinsic-balance-compact".to_vec()),
+        block,
+        compact,
     )
 }
 
 #[test]
-fn artifact_schema_version_is_nineteen() {
-    assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 19);
+fn artifact_schema_version_is_twenty() {
+    assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 20);
 }

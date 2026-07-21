@@ -2,9 +2,9 @@
 
 This runbook covers the supported single-host wallet-serving topology. The
 canonical writer constructs and publishes canonical RocksDB, the projector
-builds wallet RocksDB from an authenticated canonical fence, and the
-lightwalletd adapter begins serving only after both secondary readers form a
-wallet-serving pair.
+builds wallet RocksDB from an authenticated canonical fence, and the native
+query plus lightwalletd compatibility runtimes begin serving only after their
+process-local secondary readers form a wallet-serving pair.
 
 There is no in-place migration from an incompatible store identity or schema.
 Use empty target paths or a certified coherent restore bundle.
@@ -15,7 +15,7 @@ Use empty target paths or a certified coherent restore bundle.
 - Enough local storage for canonical data, wallet state, staging, compaction,
   checkpoints, and growth reserve.
 - Stable canonical and wallet primary paths on one host filesystem.
-- Unique secondary metadata roots for projector and compatibility.
+- Unique secondary metadata roots for projector, native query, and compatibility.
 - Stable projector build-owner identity and private control bearer tokens.
 - Resource limits that leave headroom outside RocksDB caches and memtables.
 
@@ -31,12 +31,14 @@ docker compose \
   up -d --build
 ```
 
-The dependency order is ingest, projector, then compatibility, but container
-start does not imply traffic readiness. Follow all three operational endpoints:
+The dependency order is ingest, projector, then both serving runtimes, but
+container start does not imply traffic readiness. Follow all four operational
+endpoints:
 
 ```bash
 curl -sS http://127.0.0.1:19105/readyz  # ingest
 curl -sS http://127.0.0.1:19110/readyz  # projector
+curl -sS http://127.0.0.1:19106/readyz  # native query
 curl -sS http://127.0.0.1:19107/readyz  # compatibility
 ```
 
@@ -81,20 +83,28 @@ Wallet publication requires the complete build digest and source position to
 match the admitted canonical fence. The projector then catches up and takes
 continuous following ownership before releasing construction leases.
 
+For checkpointed canonical history, construction begins at the exact
+authenticated first retained block rather than assuming height one. Every
+transparent spend in the retained range must still resolve to an output in
+that range; an unresolved pre-checkpoint prevout fails the build closed because
+no transparent prefix state is carried by the checkpoint.
+
 Restarting projector is safe. Lease generation, build state, source identity,
 and ready evidence are persisted. A second projector using the same wallet path
 must fail lease or writer admission rather than run concurrently.
 
 ## Wallet-serving admission
 
-Compatibility maintains generation-specific canonical and wallet secondaries.
-It catches both up, validates source identity and event position, and publishes
-one immutable `WalletServingReadPair`. Only then does `/readyz` report ready and
-the gRPC readiness interceptor admit traffic.
+Native query and compatibility each maintain generation-specific canonical and
+wallet secondaries. Each runtime catches both up, validates source identity and
+event position, and publishes one immutable `WalletServingReadPair`. Only then
+does its `/readyz` report ready and its gRPC readiness interceptor admit traffic.
 
 Probe a data-bearing method after readiness:
 
 ```bash
+grpcurl -plaintext -d '{}' 127.0.0.1:19102 \
+  zinder.v1.wallet.WalletQuery/ServerInfo
 grpcurl -plaintext -d '{}' 127.0.0.1:19067 \
   cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
 ```
@@ -109,6 +119,7 @@ fence, and wallet digest.
 | --- | --- | --- |
 | ingest | `starting` or `syncing` | Canonical lag is within threshold and mempool snapshot is complete |
 | projector | `starting` or `syncing` | Wallet store is published and following the admitted canonical source |
+| native query | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair is published |
 | compatibility | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair is published |
 
 `node_unavailable` and `upstream_not_ready` are recoverable source conditions.

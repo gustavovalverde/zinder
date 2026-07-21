@@ -6,9 +6,9 @@
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
-    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionId,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
+    ChainTipMetadata, CompactBlockArtifact, Network, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionId,
     TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
     TreeStateArtifact, UnixTimestampMillis,
 };
@@ -735,7 +735,7 @@ fn tree_state_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
 
     let old_hash = block_hash(2);
     let old_tree_state =
-        TreeStateArtifact::new(BlockHeight::new(2), old_hash, b"old-tree-state".to_vec());
+        TreeStateArtifact::new(BlockHeight::new(2), old_hash, 0, b"old-tree-state".to_vec());
     let (initial_epoch, _initial_block, _initial_compact_block) =
         synthetic_epoch(1, 2, 1, old_hash, block_hash(1));
     store.commit_chain_epoch(
@@ -785,6 +785,13 @@ fn synthetic_epoch(
     parent_hash: BlockHash,
 ) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
     let block_height = BlockHeight::new(height);
+    let block = super::synthetic_block_header(
+        block_height,
+        hash,
+        parent_hash,
+        format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
+    );
+    let compact = super::empty_compact_block_for_header(&block, ChainTipMetadata::empty());
 
     (
         ChainEpoch {
@@ -794,21 +801,12 @@ fn synthetic_epoch(
             visible_tip_hash: hash,
             settled_tip_height: BlockHeight::new(settled_tip_height),
             settled_tip_hash: block_hash(settled_tip_height),
-            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_100_000 + u64::from(height)),
         },
-        super::synthetic_block_header(
-            block_height,
-            hash,
-            parent_hash,
-            format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
-        ),
-        CompactBlockArtifact::new(
-            block_height,
-            hash,
-            format!("compact-block-{chain_epoch_id}-{height}").into_bytes(),
-        ),
+        block,
+        compact,
     )
 }
 
@@ -825,17 +823,17 @@ fn artifacts_from_height_one_to_tip(chain_epoch: ChainEpoch) -> ChainEpochArtifa
         };
         let parent_hash = self::block_hash(height.saturating_sub(1));
 
-        blocks.push(super::synthetic_block_header(
+        let block = super::synthetic_block_header(
             block_height,
             block_hash,
             parent_hash,
             format!("raw-block-{}-{height}", chain_epoch.id.value()).as_bytes(),
+        );
+        compact_blocks.push(super::empty_compact_block_for_header(
+            &block,
+            ChainTipMetadata::empty(),
         ));
-        compact_blocks.push(CompactBlockArtifact::new(
-            block_height,
-            block_hash,
-            format!("compact-block-{}-{height}", chain_epoch.id.value()).into_bytes(),
-        ));
+        blocks.push(block);
     }
 
     super::synthetic_chain_epoch_artifacts(chain_epoch, blocks, compact_blocks)

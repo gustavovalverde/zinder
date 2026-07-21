@@ -21,6 +21,7 @@ mod reader;
 mod rocksdb;
 mod secondary;
 mod subtree_load;
+mod wallet_events;
 
 use std::{io, num::NonZeroU32, path::PathBuf};
 
@@ -70,7 +71,7 @@ pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
 /// binds a complete construction manifest into every READY control record.
 /// Earlier stores are refused and rebuilt; there is no compatibility decoder
 /// or migration path.
-pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 5;
+pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 6;
 /// Global block-height cadence for typed commitment-tree checkpoints.
 ///
 /// A checkpoint at least every 100 blocks keeps wallet rewind anchors within the

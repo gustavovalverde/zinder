@@ -14,7 +14,7 @@ use super::{
     CanonicalEventFence, CanonicalStoreError, CanonicalStoreReadyEvidence, RocksDbCanonicalStore,
     mempool_lifecycle::{MEMPOOL_EVENT_RETENTION_FLOOR_KEY, MEMPOOL_EVENT_SEQUENCE_KEY},
     publication::{canonical_event_created_at, column_family, decode_chain_event},
-    rocksdb::{CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY, STORE_CONTROL_KEY},
+    rocksdb::{CHAIN_EVENT_COLUMN_FAMILY, STORE_CONTROL_KEY},
 };
 
 const CURSOR_VERSION: u8 = 1;
@@ -476,21 +476,15 @@ impl RocksDbCanonicalStore {
         });
         let mut batch = WriteBatch::default();
         let event_family = column_family(&self.bounded_open.db, CHAIN_EVENT_COLUMN_FAMILY)?;
-        let epoch_family = column_family(&self.bounded_open.db, CHAIN_EPOCH_COLUMN_FAMILY)?;
         for event_sequence in oldest_retained_sequence..retained_floor {
             if event_sequence != 1 {
                 batch.delete_cf(&event_family, event_sequence.to_be_bytes());
             }
         }
-        // Keep the immediate predecessor epoch as the retained-floor transition
-        // witness; baseline epoch 1 remains the immutable admission root.
-        // Keep epoch 1 as the immutable baseline and the epoch immediately
-        // preceding the retention floor: decoding the first retained event
-        // still needs that predecessor. Start from 2 rather than from the
-        // previous floor so repeated pruning advances this cleanup too.
-        for epoch_sequence in 2..retained_floor.saturating_sub(1) {
-            batch.delete_cf(&epoch_family, epoch_sequence.to_be_bytes());
-        }
+        // Epoch records are permanent cursor witnesses. A pruned event cursor
+        // can still require the exact historical epoch whose branch is being
+        // reverted; projecting the current epoch onto that range would lie
+        // about its tip and settlement boundary.
         if retained_floor != oldest_retained_sequence {
             batch.put(RETENTION_FLOOR_KEY, retained_floor.to_be_bytes());
         }
@@ -643,7 +637,7 @@ pub(super) fn canonical_event_retention_floor_from_db(
     Ok(floor)
 }
 
-fn read_retained_event_from_db(
+pub(super) fn read_retained_event_from_db(
     db: &rust_rocksdb::DB,
     event_sequence: u64,
 ) -> Result<CanonicalRetainedEvent, CanonicalStoreError> {

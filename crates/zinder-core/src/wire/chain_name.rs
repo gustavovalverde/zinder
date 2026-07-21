@@ -91,7 +91,7 @@ mod tests {
     ];
 
     #[test]
-    fn bip70_chain_name_matches_vendored_proto_doc() {
+    fn bip70_chain_name_matches_protocol_names() {
         assert_eq!(encode_bip70_chain_name(Network::ZcashMainnet), "main");
         assert_eq!(encode_bip70_chain_name(Network::ZcashTestnet), "test");
         assert_eq!(encode_bip70_chain_name(Network::ZcashRegtest), "test");

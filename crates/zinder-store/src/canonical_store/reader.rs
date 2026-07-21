@@ -193,7 +193,7 @@ fn read_compact_block_at(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
 ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError> {
-    let Some(payload_bytes) = read_optional(
+    let Some(encoded_compact_block) = read_optional(
         store,
         COMPACT_BLOCK_COLUMN_FAMILY,
         &encode_block_position(height),
@@ -202,13 +202,19 @@ fn read_compact_block_at(
     else {
         return Ok(None);
     };
-    let header = read_block_header_at(store, height)?
-        .ok_or_else(|| CanonicalStoreError::publication("compact block header is absent"))?;
-    Ok(Some(CompactBlockArtifact::new(
-        height,
-        header.block_hash,
-        payload_bytes,
-    )))
+    let compact_block =
+        crate::decode_compact_block_artifact(&encoded_compact_block).map_err(|_| {
+            CanonicalStoreError::publication(format!(
+                "compact block at height {} is invalid",
+                height.value()
+            ))
+        })?;
+    if compact_block.height() != height {
+        return Err(CanonicalStoreError::publication(
+            "compact block row has the wrong height",
+        ));
+    }
+    Ok(Some(compact_block))
 }
 
 fn read_compact_blocks_in_range(
@@ -257,7 +263,7 @@ fn append_compact_block_batch(
     for ((height, compact_row), header_row) in
         heights.iter().copied().zip(compact_rows).zip(header_rows)
     {
-        let payload_bytes = compact_row
+        let encoded_compact_block = compact_row
             .map_err(|source| CanonicalStoreError::RocksDbOperation {
                 operation: "compact block read",
                 source,
@@ -275,11 +281,19 @@ fn append_compact_block_batch(
             })?
             .ok_or_else(|| CanonicalStoreError::publication("compact block header is absent"))?;
         let header = decode_block_header(height, &encoded_header)?;
-        blocks.push(CompactBlockArtifact::new(
-            height,
-            header.block_hash,
-            payload_bytes.to_vec(),
-        ));
+        let compact_block =
+            crate::decode_compact_block_artifact(&encoded_compact_block).map_err(|_| {
+                CanonicalStoreError::publication(format!(
+                    "compact block at height {} is invalid",
+                    height.value()
+                ))
+            })?;
+        if compact_block.height() != height || compact_block.block_hash() != header.block_hash {
+            return Err(CanonicalStoreError::publication(
+                "compact block row does not match its canonical header",
+            ));
+        }
+        blocks.push(compact_block);
     }
     Ok(())
 }

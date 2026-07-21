@@ -490,6 +490,7 @@ async fn populate_bulk_catchup_tree_state_checkpoint<Source>(
         batch.push_tree_state_checkpoint(TreeStateArtifact::new(
             tree_state.block_id.height,
             tree_state.block_id.hash,
+            tree_state.block_time_seconds,
             tree_state.payload_bytes,
         ));
     }

@@ -1,7 +1,7 @@
 //! lightwalletd-compatible wallet sync adapter.
 //!
 //! This crate owns compatibility translation for the vendored lightwalletd
-//! `CompactTxStreamer` protocol. It consumes [`zinder_query::LightwalletdQueryApi`]
+//! `CompactTxStreamer` protocol. It consumes [`zinder_query::WalletQueryApi`]
 //! and does not open storage, call upstream nodes, or build artifacts.
 
 mod grpc;

@@ -2,17 +2,15 @@
 
 use std::collections::HashSet;
 
-use prost::Message;
 use rust_rocksdb::{DB, WriteBatch, WriteOptions};
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestBuilder, ChainEpochId, CommitmentTreeAccumulator,
-    CommitmentTreeCheckpoint, NetworkUpgradeActivations,
+    CommitmentTreeCheckpoint, CompactBlockArtifact, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootArtifact,
     SubtreeRootHash, UnixTimestampMillis,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
-use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 
 use super::{
     CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalEventFence, CanonicalStoreError,
@@ -474,7 +472,7 @@ fn validate_replacement_blocks(
         append_compact_commitments(
             &mut accumulator,
             header.height,
-            &replacement.block.compact_block.payload_bytes,
+            &replacement.block.compact_block,
         )?;
         let checkpoint = replacement
             .block
@@ -542,7 +540,7 @@ fn checkpoint_at(
         let compact = store.compact_block_at(current)?.ok_or_else(|| {
             CanonicalStoreError::live_commit("replacement parent compact block is absent")
         })?;
-        append_compact_commitments(&mut accumulator, current, &compact.payload_bytes)?;
+        append_compact_commitments(&mut accumulator, current, &compact)?;
         height = current.next();
     }
     let header = store.block_header_at(target.height)?.ok_or_else(|| {
@@ -568,34 +566,31 @@ fn checkpoint_at(
 fn append_compact_commitments(
     accumulator: &mut CommitmentTreeAccumulator,
     height: BlockHeight,
-    payload: &[u8],
+    compact: &CompactBlockArtifact,
 ) -> Result<(), CanonicalStoreError> {
-    let compact = LightwalletdCompactBlock::decode(payload).map_err(|_| {
-        CanonicalStoreError::live_commit("replacement compact block is invalid protobuf")
-    })?;
     let mut sapling = Vec::new();
     let mut orchard = Vec::new();
     let mut ironwood = Vec::new();
-    for transaction in compact.vtx {
-        for output in transaction.outputs {
+    for transaction in compact.transactions() {
+        for output in &transaction.data.sapling_outputs {
             sapling.push(commitment_bytes(
                 height,
                 ShieldedProtocol::Sapling,
-                &output.cmu,
+                &output.commitment,
             )?);
         }
-        for action in transaction.actions {
+        for action in &transaction.data.orchard_actions {
             orchard.push(commitment_bytes(
                 height,
                 ShieldedProtocol::Orchard,
-                &action.cmx,
+                &action.commitment,
             )?);
         }
-        for action in transaction.ironwood_actions {
+        for action in &transaction.data.ironwood_actions {
             ironwood.push(commitment_bytes(
                 height,
                 ShieldedProtocol::Ironwood,
-                &action.cmx,
+                &action.commitment,
             )?);
         }
     }

@@ -85,7 +85,7 @@ async fn cli_constructs_bounded_canonical_store_from_config() -> Result<()> {
     assert_eq!(store.network(), env.network());
     assert_eq!(store.workload(), CanonicalStoreWorkload::Wallet);
     assert_eq!(store.event_fence().visible_tip().height, target_height);
-    assert_eq!(compact_block.height, target_height);
+    assert_eq!(compact_block.height(), target_height);
     Ok(())
 }
 

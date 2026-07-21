@@ -790,7 +790,7 @@ impl CanonicalBuildBlockReceiver {
     ) -> Result<CanonicalBuildBlock, CanonicalConstructionError> {
         let height = prepared.facts.block_header.height;
         let block_hash = prepared.facts.block_header.block_hash;
-        let block_time_seconds = prepared.partial_compact_block.time;
+        let block_time_seconds = prepared.partial_compact_block.time();
         let commitments = compact_block_commitments(&prepared)?;
         self.commitment_tree_accumulator
             .append_block_commitments(
@@ -858,26 +858,26 @@ pub(crate) fn compact_block_commitments(
 ) -> Result<CompactBlockCommitments, CanonicalConstructionError> {
     let height = prepared.facts.block_header.height;
     let mut commitments = CompactBlockCommitments::default();
-    for transaction in &prepared.partial_compact_block.vtx {
-        for output in &transaction.outputs {
+    for transaction in prepared.partial_compact_block.transactions() {
+        for output in &transaction.data.sapling_outputs {
             commitments.sapling.push(compact_commitment_bytes(
                 height,
                 ShieldedProtocol::Sapling,
-                &output.cmu,
+                &output.commitment,
             )?);
         }
-        for action in &transaction.actions {
+        for action in &transaction.data.orchard_actions {
             commitments.orchard.push(compact_commitment_bytes(
                 height,
                 ShieldedProtocol::Orchard,
-                &action.cmx,
+                &action.commitment,
             )?);
         }
-        for action in &transaction.ironwood_actions {
+        for action in &transaction.data.ironwood_actions {
             commitments.ironwood.push(compact_commitment_bytes(
                 height,
                 ShieldedProtocol::Ironwood,
-                &action.cmx,
+                &action.commitment,
             )?);
         }
     }

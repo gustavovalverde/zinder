@@ -246,14 +246,14 @@ fn commit_address_output_then_spend(
         vec![compact_one],
         &[output],
         Vec::new(),
-    ))?;
+    )?)?;
     store.commit_chain_epoch(chain_epoch_artifacts_with_transparent_facts(
         epoch_two,
         vec![block_two],
         vec![compact_two],
         &[],
         vec![spend],
-    ))?;
+    )?)?;
 
     Ok(())
 }
@@ -273,10 +273,7 @@ fn commit_unspent_outputs(
         utxos.push(TransparentUnspentOutput::new(
             address_script_hash,
             SCRIPT_PUB_KEY.to_vec(),
-            TransparentOutPoint::new(
-                TransactionId::from_bytes(transaction_id_bytes),
-                output_index,
-            ),
+            TransparentOutPoint::new(TransactionId::from_bytes(transaction_id_bytes), 0),
             1_000_000_u64 + u64::from(output_index),
             block.height,
             block.block_hash,
@@ -293,7 +290,7 @@ fn commit_unspent_outputs(
         vec![compact_block],
         &prevouts,
         Vec::new(),
-    );
+    )?;
     store.commit_chain_epoch(artifacts)?;
 
     Ok(utxos)

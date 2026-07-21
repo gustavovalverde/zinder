@@ -16,6 +16,8 @@ mod canonical_block_replay;
 mod canonical_history;
 mod chain_epoch;
 mod chain_value_pools;
+#[cfg(feature = "commitment-tree-codec")]
+mod commitment_tree_codec;
 mod displaced_block;
 pub mod explorer_reasons;
 pub mod explorer_search;
@@ -30,6 +32,7 @@ mod transparent_output;
 mod transparent_utxo_set_summary;
 mod tree_state;
 mod utxo_set_commitment;
+mod wallet_scan;
 pub mod wire;
 
 pub use utxo_set_commitment::{
@@ -39,6 +42,7 @@ pub use utxo_set_commitment::{
 
 pub use block_artifact::{
     BlockBlobArtifact, BlockHeaderArtifact, BlockTransactionIndexArtifact, CompactBlockArtifact,
+    CompactBlockArtifactError, CompactBlockArtifactParts, CompactChainMetadata, CompactTransaction,
 };
 pub use block_header::BlockHeader;
 pub use block_id::{BlockId, BlockSelector};
@@ -63,13 +67,20 @@ pub use chain_epoch::{
 pub use chain_value_pools::{
     BlockValuePoolBalances, ChainValuePool, ChainValuePools, ChainValuePoolsAtTip, ValuePoolBalance,
 };
+#[cfg(feature = "commitment-tree-codec")]
+pub use commitment_tree_codec::{
+    CommitmentTreeAccumulator, CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint,
+    CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
+    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
+};
 pub use displaced_block::{
     DisplacedBlock, DisplacedBlockArchiveCoverage, DisplacedBlockCoinbaseOutput,
     DisplacedRootArchiveCoverage, DisplacedRootCandidate,
 };
 pub use mempool::{
-    MempoolEntry, MempoolEvictionReason, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend,
+    MempoolEntry, MempoolEntryBuildError, MempoolEntryParts, MempoolEvictionReason,
+    MempoolObservation, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
+    TransparentMempoolSpend,
 };
 pub use network_upgrade_activations::{
     ConsensusBranchId, NetworkUpgradeActivation, NetworkUpgradeActivations,
@@ -103,9 +114,8 @@ pub use transparent_output::{
     TransparentUnspentOutputsByOutpointResponse,
 };
 pub use transparent_utxo_set_summary::TransparentUtxoSetSummary;
-pub use tree_state::{
-    BlockFinalNoteCommitmentRoots, CommitmentTreeAccumulator, CommitmentTreeAccumulatorError,
-    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
-    CommitmentTreeFrontiers, FinalNoteCommitmentRoot,
-    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, TreeStateArtifact,
+pub use tree_state::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot, TreeStateArtifact};
+pub use wallet_scan::{
+    CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransactionData,
+    CompactTransparentInput, CompactTransparentOutput,
 };

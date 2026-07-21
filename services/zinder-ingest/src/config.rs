@@ -103,8 +103,8 @@ pub(crate) struct IngestCommandConfig {
 pub(crate) enum IngestCoverage {
     /// Use explicitly supplied modifier heights as-is.
     Explicit,
-    /// Derive the historical floor needed by lightwalletd-compatible
-    /// wallets. The ingest loop looks up the checkpoint against the
+    /// Derive the historical floor needed by native wallet serving. The
+    /// ingest loop looks up the checkpoint against the
     /// upstream node before entering the first phase.
     WalletServing,
 }

@@ -1,4 +1,3 @@
-use prost::Message;
 use rust_rocksdb::{DB, WriteBatch, WriteOptions};
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
@@ -7,7 +6,6 @@ use zinder_core::{
     NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootArtifact,
     UnixTimestampMillis,
 };
-use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 
 use super::{
     CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalSequenceCheckpoint,
@@ -340,31 +338,29 @@ fn validate_live_checkpoint_transition(
     let checkpoint = block.tree_state_checkpoint.as_ref().ok_or_else(|| {
         CanonicalStoreError::live_commit("live append has no transition-tip tree checkpoint")
     })?;
-    let compact = LightwalletdCompactBlock::decode(block.compact_block.payload_bytes.as_slice())
-        .map_err(|_| CanonicalStoreError::live_commit("live compact block is invalid protobuf"))?;
     let mut sapling = Vec::new();
     let mut orchard = Vec::new();
     let mut ironwood = Vec::new();
-    for transaction in compact.vtx {
-        for output in transaction.outputs {
+    for transaction in block.compact_block.transactions() {
+        for output in &transaction.data.sapling_outputs {
             sapling.push(compact_commitment_bytes(
                 block.facts.block_header.height,
                 ShieldedProtocol::Sapling,
-                &output.cmu,
+                &output.commitment,
             )?);
         }
-        for action in transaction.actions {
+        for action in &transaction.data.orchard_actions {
             orchard.push(compact_commitment_bytes(
                 block.facts.block_header.height,
                 ShieldedProtocol::Orchard,
-                &action.cmx,
+                &action.commitment,
             )?);
         }
-        for action in transaction.ironwood_actions {
+        for action in &transaction.data.ironwood_actions {
             ironwood.push(compact_commitment_bytes(
                 block.facts.block_header.height,
                 ShieldedProtocol::Ironwood,
-                &action.cmx,
+                &action.commitment,
             )?);
         }
     }
@@ -667,7 +663,7 @@ impl PreparedLiveBlockRows {
             PreparedLiveRow::new(
                 COMPACT_BLOCK_COLUMN_FAMILY,
                 height_key.clone(),
-                compact_block.payload_bytes,
+                crate::encode_compact_block_artifact(&compact_block),
             ),
         ];
         let block_hash_record = encode_block_hash_location(facts.block_header.block_hash, height);

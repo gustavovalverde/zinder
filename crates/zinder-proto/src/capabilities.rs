@@ -21,24 +21,25 @@ use crate::v1::wallet::WalletServerInfo;
 
 /// Capability advertised for `WalletQuery.VisibleTipBlock`.
 pub const WALLET_READ_VISIBLE_TIP_BLOCK_V1: &str = "wallet.read.visible_tip_block_v1";
+/// Capability advertised for `WalletQuery.SettledTipBlock`.
+pub const WALLET_READ_SETTLED_TIP_BLOCK_V1: &str = "wallet.read.settled_tip_block_v1";
 /// Capability advertised for `WalletQuery.BlockIdBySelector`.
 pub const WALLET_READ_BLOCK_ID_BY_SELECTOR_V1: &str = "wallet.read.block_id_by_selector_v1";
 /// Capability advertised for `WalletQuery.BlockHeaderBySelector`.
 pub const WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1: &str = "wallet.read.block_header_by_selector_v1";
 /// Capability advertised for `WalletQuery.CompactBlock`.
-pub const WALLET_READ_COMPACT_BLOCK_AT_V1: &str = "wallet.read.compact_block_at_v1";
+pub const WALLET_READ_COMPACT_BLOCK_AT_V2: &str = "wallet.read.compact_block_at_v2";
 /// Capability advertised for `WalletQuery.CompactBlocksInRange`.
-pub const WALLET_READ_COMPACT_BLOCK_RANGE_V1: &str = "wallet.read.compact_block_range_v1";
-/// Field capability gating `ironwoodActions`/`ironwoodCommitmentTreeSize` on
-/// the vendored lightwalletd `CompactTx`/`ChainMetadata` carried in
-/// `CompactBlock.payload_bytes`.
+pub const WALLET_READ_COMPACT_BLOCK_RANGE_V2: &str = "wallet.read.compact_block_range_v2";
+/// Field capability gating native `ironwood_actions` and
+/// `ironwood_commitment_tree_size` structured compact-block fields.
 ///
 /// Present on every deployment running this Ironwood-aware binary: absence of
 /// `ironwoodActions` on a block then means the block genuinely has no
 /// Ironwood actions. A server that does not advertise this capability
 /// predates Ironwood wallet-plane support, so a missing field is not
 /// authoritative and must not be read as "no Ironwood activity".
-pub const WALLET_READ_COMPACT_BLOCK_IRONWOOD_V1: &str = "wallet.read.compact_block_ironwood_v1";
+pub const WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2: &str = "wallet.read.compact_block_ironwood_v2";
 /// Capability advertised for `WalletQuery.FullBlock`.
 ///
 /// The serialized block bytes are present only when the writer deployment
@@ -54,10 +55,10 @@ pub const WALLET_READ_FULL_BLOCK_AT_V1: &str = "wallet.read.full_block_at_v1";
 /// when the writer deployment sets `raw_blob_policy = "all"`.
 pub const WALLET_READ_FULL_BLOCK_RANGE_V1: &str = "wallet.read.full_block_range_v1";
 /// Capability advertised for `WalletQuery.TreeStateAtHeight`.
-pub const WALLET_READ_TREE_STATE_AT_HEIGHT_V1: &str = "wallet.read.tree_state_at_height_v1";
+pub const WALLET_READ_TREE_STATE_AT_HEIGHT_V2: &str = "wallet.read.tree_state_at_height_v2";
 /// Capability advertised for `WalletQuery.LatestTreeStateCheckpoint`.
-pub const WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1: &str =
-    "wallet.read.latest_tree_state_checkpoint_v1";
+pub const WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2: &str =
+    "wallet.read.latest_tree_state_checkpoint_v2";
 /// Capability advertised for `WalletQuery.SubtreeRoots`.
 pub const WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1: &str = "wallet.read.subtree_roots_in_range_v1";
 /// Field capability gating the Ironwood protocol on `WalletQuery.SubtreeRoots`
@@ -72,7 +73,7 @@ pub const WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1: &str = "wallet.read.subtree_roo
 /// Covers the typed transaction-status response. The RPC always works; the
 /// optional `raw_transaction_bytes` field on the mined arm is gated
 /// separately by [`WALLET_READ_TRANSACTION_BYTES_V1`].
-pub const WALLET_READ_TRANSACTION_BY_ID_V1: &str = "wallet.read.transaction_by_id_v1";
+pub const WALLET_READ_TRANSACTION_BY_ID_V2: &str = "wallet.read.transaction_by_id_v2";
 /// Field capability gating `raw_transaction_bytes` on the mined arm of
 /// `WalletQuery.Transaction`.
 ///
@@ -81,7 +82,7 @@ pub const WALLET_READ_TRANSACTION_BY_ID_V1: &str = "wallet.read.transaction_by_i
 /// `None`; clients branch on presence rather than empty-vs-populated bytes.
 pub const WALLET_READ_TRANSACTION_BYTES_V1: &str = "wallet.read.transaction_bytes_v1";
 /// Capability advertised for `WalletQuery.ServerInfo`.
-pub const WALLET_READ_SERVER_INFO_V1: &str = "wallet.read.server_info_v1";
+pub const WALLET_READ_SERVER_INFO_V2: &str = "wallet.read.server_info_v2";
 /// Capability advertised for `WalletQuery.NetworkUpgradeActivations`.
 pub const WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1: &str =
     "wallet.read.network_upgrade_activations_v1";
@@ -129,9 +130,9 @@ pub const WALLET_BROADCAST_TRANSACTION_V1: &str = "wallet.broadcast.transaction_
 /// Capability advertised for `WalletQuery.ChainEvents`.
 pub const WALLET_EVENTS_CHAIN_V1: &str = "wallet.events.chain_v1";
 /// Capability advertised for `WalletQuery.MempoolSnapshot`.
-pub const WALLET_SNAPSHOT_MEMPOOL_V1: &str = "wallet.snapshot.mempool_v1";
+pub const WALLET_SNAPSHOT_MEMPOOL_V2: &str = "wallet.snapshot.mempool_v2";
 /// Capability advertised for `WalletQuery.MempoolEvents`.
-pub const WALLET_EVENTS_MEMPOOL_V1: &str = "wallet.events.mempool_v1";
+pub const WALLET_EVENTS_MEMPOOL_V2: &str = "wallet.events.mempool_v2";
 /// Capability advertised for `WalletQuery.TransparentMempoolOutputsByAddress`.
 pub const WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1: &str =
     "wallet.mempool.transparent_outputs_by_address_v1";
@@ -162,8 +163,8 @@ pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 /// plus ordered transparent inputs that combine their spent outpoint with
 /// independently resolved canonical prevout values and scripts. The always-on
 /// wallet capability for raw transaction lookup remains
-/// [`WALLET_READ_TRANSACTION_BY_ID_V1`].
-pub const EXPLORER_TRANSACTION_DETAIL_V3: &str = "explorer.transaction.detail_v3";
+/// [`WALLET_READ_TRANSACTION_BY_ID_V2`].
+pub const EXPLORER_TRANSACTION_DETAIL_V4: &str = "explorer.transaction.detail_v4";
 /// Capability advertised for `ExplorerQuery.BlockSummariesInRange`.
 ///
 /// Signals that the explorer plane is materializing the `BlockSummary`
@@ -481,11 +482,11 @@ pub const INGEST_CONTROL_WRITER_STATUS_V1: &str = "ingest.control.writer_status_
 /// Capability advertised for `IngestControl.VisibleChainEvents`.
 pub const INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1: &str = "ingest.control.visible_chain_events_v1";
 /// Capability advertised for `IngestControl.MempoolSnapshot`.
-pub const INGEST_CONTROL_MEMPOOL_SNAPSHOT_V1: &str = "ingest.control.mempool_snapshot_v1";
+pub const INGEST_CONTROL_MEMPOOL_SNAPSHOT_V2: &str = "ingest.control.mempool_snapshot_v2";
 /// Capability advertised for `IngestControl.MempoolTransaction`.
-pub const INGEST_CONTROL_MEMPOOL_TRANSACTION_V1: &str = "ingest.control.mempool_transaction_v1";
+pub const INGEST_CONTROL_MEMPOOL_TRANSACTION_V2: &str = "ingest.control.mempool_transaction_v2";
 /// Capability advertised for `IngestControl.MempoolEvents`.
-pub const INGEST_CONTROL_MEMPOOL_EVENTS_V1: &str = "ingest.control.mempool_events_v1";
+pub const INGEST_CONTROL_MEMPOOL_EVENTS_V2: &str = "ingest.control.mempool_events_v2";
 /// Capability advertised for `IngestControl.TransparentMempoolOutputsByAddress`.
 pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1: &str =
     "ingest.control.transparent_mempool_outputs_by_address_v1";
@@ -801,6 +802,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
+        WALLET_READ_SETTLED_TIP_BLOCK_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.SettledTipBlock"),
+        AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
         WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.BlockIdBySelector"),
@@ -813,19 +820,19 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        WALLET_READ_COMPACT_BLOCK_AT_V1,
+        WALLET_READ_COMPACT_BLOCK_AT_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.CompactBlock"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        WALLET_READ_COMPACT_BLOCK_RANGE_V1,
+        WALLET_READ_COMPACT_BLOCK_RANGE_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.CompactBlocksInRange"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        WALLET_READ_COMPACT_BLOCK_IRONWOOD_V1,
+        WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
         CapabilitySurface::Wallet,
         None,
         AdvertisePolicy::AlwaysOn,
@@ -843,13 +850,13 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresBlockBlobs,
     ),
     CapabilitySpec::new(
-        WALLET_READ_TREE_STATE_AT_HEIGHT_V1,
+        WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TreeStateAtHeight"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V1,
+        WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.LatestTreeStateCheckpoint"),
         AdvertisePolicy::AlwaysOn,
@@ -867,7 +874,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        WALLET_READ_TRANSACTION_BY_ID_V1,
+        WALLET_READ_TRANSACTION_BY_ID_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.Transaction"),
         AdvertisePolicy::AlwaysOn,
@@ -879,7 +886,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresTransactionBlobs,
     ),
     CapabilitySpec::new(
-        WALLET_READ_SERVER_INFO_V1,
+        WALLET_READ_SERVER_INFO_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.ServerInfo"),
         AdvertisePolicy::AlwaysOn,
@@ -927,13 +934,13 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresChainEvents,
     ),
     CapabilitySpec::new(
-        WALLET_SNAPSHOT_MEMPOOL_V1,
+        WALLET_SNAPSHOT_MEMPOOL_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.MempoolSnapshot"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        WALLET_EVENTS_MEMPOOL_V1,
+        WALLET_EVENTS_MEMPOOL_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.MempoolEvents"),
         AdvertisePolicy::AlwaysOn,
@@ -993,7 +1000,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        EXPLORER_TRANSACTION_DETAIL_V3,
+        EXPLORER_TRANSACTION_DETAIL_V4,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransactionDetail"),
         AdvertisePolicy::RequiresWalletQueryAndCanonicalStore,
@@ -1275,19 +1282,19 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        INGEST_CONTROL_MEMPOOL_SNAPSHOT_V1,
+        INGEST_CONTROL_MEMPOOL_SNAPSHOT_V2,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.MempoolSnapshot"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        INGEST_CONTROL_MEMPOOL_TRANSACTION_V1,
+        INGEST_CONTROL_MEMPOOL_TRANSACTION_V2,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.MempoolTransaction"),
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        INGEST_CONTROL_MEMPOOL_EVENTS_V1,
+        INGEST_CONTROL_MEMPOOL_EVENTS_V2,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.MempoolEvents"),
         AdvertisePolicy::AlwaysOn,
@@ -1365,9 +1372,9 @@ pub enum Capability {
     Broadcast,
     /// Cursor-resumable chain-event stream (`wallet.events.chain_v1`).
     ChainEvents,
-    /// Bounded mempool snapshot (`wallet.snapshot.mempool_v1`).
+    /// Bounded mempool snapshot (`wallet.snapshot.mempool_v2`).
     MempoolSnapshot,
-    /// Replayable mempool-event stream (`wallet.events.mempool_v1`).
+    /// Replayable mempool-event stream (`wallet.events.mempool_v2`).
     MempoolEvents,
     /// Chain value-pool totals at the upstream tip
     /// (`wallet.read.chain_value_pools_at_tip_v1`).
@@ -1383,8 +1390,8 @@ impl Capability {
         match self {
             Self::Broadcast => WALLET_BROADCAST_TRANSACTION_V1,
             Self::ChainEvents => WALLET_EVENTS_CHAIN_V1,
-            Self::MempoolSnapshot => WALLET_SNAPSHOT_MEMPOOL_V1,
-            Self::MempoolEvents => WALLET_EVENTS_MEMPOOL_V1,
+            Self::MempoolSnapshot => WALLET_SNAPSHOT_MEMPOOL_V2,
+            Self::MempoolEvents => WALLET_EVENTS_MEMPOOL_V2,
             Self::ChainValuePools => WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
             Self::TransparentAddressBalance => WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
         }

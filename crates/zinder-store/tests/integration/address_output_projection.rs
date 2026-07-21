@@ -1119,11 +1119,7 @@ fn replacement_artifacts(
         block_hash(replaced_height.saturating_sub(1)),
         format!("replacement-block-{replaced_height}").as_bytes(),
     );
-    let compact_block = CompactBlockArtifact::new(
-        height,
-        replacement_hash,
-        format!("replacement-compact-{replaced_height}").into_bytes(),
-    );
+    let compact_block = super::empty_compact_block_for_header(&block, ChainTipMetadata::empty());
     let mut chain_epoch = chain_epoch(epoch_id, replaced_height);
     chain_epoch.visible_tip_hash = replacement_hash;
     super::synthetic_chain_epoch_artifacts(chain_epoch, vec![block], vec![compact_block])
@@ -1167,11 +1163,7 @@ fn synthetic_block(height: u32) -> BlockHeaderArtifact {
 }
 
 fn synthetic_compact_block(height: u32) -> CompactBlockArtifact {
-    CompactBlockArtifact::new(
-        BlockHeight::new(height),
-        block_hash(height),
-        format!("projection-compact-{height}").into_bytes(),
-    )
+    super::empty_compact_block_for_header(&synthetic_block(height), ChainTipMetadata::empty())
 }
 
 fn block_hash(seed: u32) -> BlockHash {

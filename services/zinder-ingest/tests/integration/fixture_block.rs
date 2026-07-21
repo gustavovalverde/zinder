@@ -5,10 +5,9 @@
 
 use std::error::Error;
 
-use prost::Message;
 use serde_json::Value;
 use zebra_chain::{
-    block::{Block as ZebraBlock, Header as ZebraBlockHeader},
+    block::Block as ZebraBlock,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
 };
 use zinder_core::{
@@ -22,7 +21,6 @@ use zinder_ingest::{
     PositionedCanonicalBlock, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
 };
 use zinder_materialized_views::project_block_summary_record;
-use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_source::{SourceBlock, decode_rpc_block_hash};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention,
@@ -113,51 +111,36 @@ fn fixture_block_builds_canonical_facts() -> Result<(), Box<dyn Error>> {
         source_block.raw_block_bytes
     );
 
-    let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
-    assert_eq!(compact_block.height, 1);
-    assert_eq!(compact_block.hash, source_block.hash.as_bytes().to_vec());
+    assert_eq!(compact_block_artifact.height(), BlockHeight::new(1));
+    assert_eq!(compact_block_artifact.block_hash(), source_block.hash);
     assert_eq!(
-        compact_block.prev_hash,
-        source_block.parent_hash.as_bytes().to_vec()
+        compact_block_artifact.previous_block_hash(),
+        source_block.parent_hash
     );
-    assert_eq!(compact_block.time, 1_296_694_002);
-    assert!(
-        !compact_block.header.is_empty(),
-        "compact block must carry serialized header bytes for lightwalletd-compatible scanning"
-    );
-    let parsed_header: ZebraBlockHeader =
-        compact_block.header.as_slice().zcash_deserialize_into()?;
-    assert_eq!(
-        parsed_header.previous_block_hash.0,
-        source_block.parent_hash.as_bytes()
-    );
-    let round_tripped = parsed_header.zcash_serialize_to_vec()?;
-    assert_eq!(round_tripped, compact_block.header);
-    let chain_metadata = compact_block
-        .chain_metadata
-        .as_ref()
-        .ok_or("compact block missing chain metadata")?;
+    assert_eq!(compact_block_artifact.time(), 1_296_694_002);
+    let chain_metadata = compact_block_artifact.chain_metadata();
     assert_eq!(chain_metadata.sapling_commitment_tree_size, 0);
     assert_eq!(chain_metadata.orchard_commitment_tree_size, 0);
 
-    let compact_transaction = compact_block
-        .vtx
+    let compact_transaction = compact_block_artifact
+        .transactions()
         .first()
         .ok_or("compact block missing coinbase compact transaction")?;
-    assert_eq!(compact_block.vtx.len(), 1);
+    assert_eq!(compact_block_artifact.transactions().len(), 1);
     assert_eq!(compact_transaction.index, 0);
-    assert_eq!(compact_transaction.txid.len(), 32);
-    assert!(compact_transaction.vin.is_empty());
-    assert!(compact_transaction.spends.is_empty());
-    assert!(compact_transaction.outputs.is_empty());
-    assert!(compact_transaction.actions.is_empty());
+    assert_eq!(compact_transaction.transaction_id.as_bytes().len(), 32);
+    assert!(compact_transaction.data.transparent_inputs.is_empty());
+    assert!(compact_transaction.data.sapling_spends.is_empty());
+    assert!(compact_transaction.data.sapling_outputs.is_empty());
+    assert!(compact_transaction.data.orchard_actions.is_empty());
 
     let transparent_output = compact_transaction
-        .vout
+        .data
+        .transparent_outputs
         .first()
         .ok_or("compact transaction missing coinbase output")?;
-    assert_eq!(compact_transaction.vout.len(), 1);
-    assert_eq!(transparent_output.value, 625_000_000);
+    assert_eq!(compact_transaction.data.transparent_outputs.len(), 1);
+    assert_eq!(transparent_output.value_zat, 625_000_000);
     assert_eq!(
         hex::encode(&transparent_output.script_pub_key),
         "76a914b75028cd1ea0ca554fd5e7c8cc7ad70a89b8dd4f88ac"
@@ -366,8 +349,7 @@ fn ironwood_canonical_block_facts_digest_matches_known_answer() -> Result<(), Bo
 fn assert_compact_transaction_ids_match_canonical_facts(
     block: &PositionedCanonicalBlock,
 ) -> Result<(), Box<dyn Error>> {
-    let compact_block = CompactBlock::decode(block.compact_block.payload_bytes.as_slice())?;
-    for compact_transaction in compact_block.vtx {
+    for compact_transaction in block.compact_block.transactions() {
         let transaction_index = usize::try_from(compact_transaction.index)?;
         let transaction_facts = block
             .facts
@@ -375,12 +357,7 @@ fn assert_compact_transaction_ids_match_canonical_facts(
             .get(transaction_index)
             .ok_or("compact transaction index is outside canonical facts")?;
         assert_eq!(
-            compact_transaction.txid,
-            transaction_facts
-                .public_facts
-                .transaction_id
-                .as_bytes()
-                .to_vec(),
+            compact_transaction.transaction_id, transaction_facts.public_facts.transaction_id,
             "compact transaction id must match the same-position canonical fact"
         );
     }
@@ -486,30 +463,27 @@ fn testnet_sapling_block_compact_artifact_carries_sapling_outputs() -> Result<()
         Network::ZcashTestnet,
         include_str!("../fixtures/zcash-testnet-sapling-block-1842432.json"),
     )?;
-    let compact_block_artifact = build_positioned_block_for_test(&source_block)?.compact_block;
-    let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
-    let chain_metadata = compact_block
-        .chain_metadata
-        .as_ref()
-        .ok_or("compact block missing chain metadata")?;
+    let compact_block = build_positioned_block_for_test(&source_block)?.compact_block;
+    let chain_metadata = compact_block.chain_metadata();
 
-    assert_eq!(compact_block.height, 1_842_432);
+    assert_eq!(compact_block.height(), BlockHeight::new(1_842_432));
     assert_eq!(chain_metadata.sapling_commitment_tree_size, 1);
     assert_eq!(chain_metadata.orchard_commitment_tree_size, 0);
 
     let sapling_transaction = compact_block
-        .vtx
+        .transactions()
         .iter()
-        .find(|transaction| !transaction.outputs.is_empty())
+        .find(|transaction| !transaction.data.sapling_outputs.is_empty())
         .ok_or("compact block missing Sapling-bearing transaction")?;
-    assert_eq!(sapling_transaction.outputs.len(), 1);
-    assert!(sapling_transaction.actions.is_empty());
+    assert_eq!(sapling_transaction.data.sapling_outputs.len(), 1);
+    assert!(sapling_transaction.data.orchard_actions.is_empty());
 
     let sapling_output = sapling_transaction
-        .outputs
+        .data
+        .sapling_outputs
         .first()
         .ok_or("compact transaction missing Sapling output")?;
-    assert_eq!(sapling_output.cmu.len(), 32);
+    assert_eq!(sapling_output.commitment.len(), 32);
     assert_eq!(sapling_output.ephemeral_key.len(), 32);
     assert_eq!(sapling_output.ciphertext.len(), 52);
 
@@ -522,28 +496,24 @@ fn testnet_orchard_block_compact_artifact_carries_orchard_actions() -> Result<()
         Network::ZcashTestnet,
         include_str!("../fixtures/zcash-testnet-orchard-block-1842462.json"),
     )?;
-    let compact_block_artifact = build_positioned_block_for_test(&source_block)?.compact_block;
-    let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
-    let chain_metadata = compact_block
-        .chain_metadata
-        .as_ref()
-        .ok_or("compact block missing chain metadata")?;
+    let compact_block = build_positioned_block_for_test(&source_block)?.compact_block;
+    let chain_metadata = compact_block.chain_metadata();
 
-    assert_eq!(compact_block.height, 1_842_462);
+    assert_eq!(compact_block.height(), BlockHeight::new(1_842_462));
     assert_eq!(chain_metadata.sapling_commitment_tree_size, 0);
     assert_eq!(chain_metadata.orchard_commitment_tree_size, 2);
 
     let orchard_transaction = compact_block
-        .vtx
+        .transactions()
         .iter()
-        .find(|transaction| !transaction.actions.is_empty())
+        .find(|transaction| !transaction.data.orchard_actions.is_empty())
         .ok_or("compact block missing Orchard-bearing transaction")?;
-    assert_eq!(orchard_transaction.actions.len(), 2);
-    assert!(orchard_transaction.outputs.is_empty());
+    assert_eq!(orchard_transaction.data.orchard_actions.len(), 2);
+    assert!(orchard_transaction.data.sapling_outputs.is_empty());
 
-    for action in &orchard_transaction.actions {
+    for action in &orchard_transaction.data.orchard_actions {
         assert_eq!(action.nullifier.len(), 32);
-        assert_eq!(action.cmx.len(), 32);
+        assert_eq!(action.commitment.len(), 32);
         assert_eq!(action.ephemeral_key.len(), 32);
         assert_eq!(action.ciphertext.len(), 52);
     }
@@ -558,30 +528,26 @@ fn regtest_ironwood_block_compact_artifact_carries_ironwood_actions() -> Result<
         Network::ZcashRegtest,
         include_str!("../fixtures/z3-regtest-ironwood-block-603.json"),
     )?;
-    let compact_block_artifact = build_positioned_block_for_test(&source_block)?.compact_block;
-    let compact_block = CompactBlock::decode(compact_block_artifact.payload_bytes.as_slice())?;
-    let chain_metadata = compact_block
-        .chain_metadata
-        .as_ref()
-        .ok_or("compact block missing chain metadata")?;
+    let compact_block = build_positioned_block_for_test(&source_block)?.compact_block;
+    let chain_metadata = compact_block.chain_metadata();
 
-    assert_eq!(compact_block.height, 603);
+    assert_eq!(compact_block.height(), BlockHeight::new(603));
     assert_eq!(chain_metadata.orchard_commitment_tree_size, 0);
     assert_eq!(chain_metadata.ironwood_commitment_tree_size, 2);
 
     let ironwood_transaction = compact_block
-        .vtx
+        .transactions()
         .iter()
-        .find(|transaction| !transaction.ironwood_actions.is_empty())
+        .find(|transaction| !transaction.data.ironwood_actions.is_empty())
         .ok_or("compact block missing Ironwood-bearing transaction")?;
-    assert_eq!(ironwood_transaction.ironwood_actions.len(), 2);
-    assert!(ironwood_transaction.actions.is_empty());
-    assert!(ironwood_transaction.vout.is_empty());
-    assert_eq!(ironwood_transaction.vin.len(), 1);
+    assert_eq!(ironwood_transaction.data.ironwood_actions.len(), 2);
+    assert!(ironwood_transaction.data.orchard_actions.is_empty());
+    assert!(ironwood_transaction.data.transparent_outputs.is_empty());
+    assert_eq!(ironwood_transaction.data.transparent_inputs.len(), 1);
 
-    for action in &ironwood_transaction.ironwood_actions {
+    for action in &ironwood_transaction.data.ironwood_actions {
         assert_eq!(action.nullifier.len(), 32);
-        assert_eq!(action.cmx.len(), 32);
+        assert_eq!(action.commitment.len(), 32);
         assert_eq!(action.ephemeral_key.len(), 32);
         assert_eq!(action.ciphertext.len(), 52);
     }
@@ -610,21 +576,17 @@ fn regtest_block_without_orchard_actions_carries_forward_tree_size() -> Result<(
     assert_eq!(running_tree_sizes.sapling, 11);
     assert_eq!(running_tree_sizes.ironwood, 7);
 
-    let compact_block =
-        CompactBlock::decode(positioned_block.compact_block.payload_bytes.as_slice())?;
-    let chain_metadata = compact_block
-        .chain_metadata
-        .as_ref()
-        .ok_or("compact block missing chain metadata")?;
+    let compact_block = positioned_block.compact_block;
+    let chain_metadata = compact_block.chain_metadata();
     assert_eq!(chain_metadata.orchard_commitment_tree_size, 42);
     assert_eq!(chain_metadata.sapling_commitment_tree_size, 11);
     assert_eq!(chain_metadata.ironwood_commitment_tree_size, 7);
     assert!(
         compact_block
-            .vtx
+            .transactions()
             .iter()
-            .all(|transaction| transaction.actions.is_empty()
-                && transaction.ironwood_actions.is_empty()),
+            .all(|transaction| transaction.data.orchard_actions.is_empty()
+                && transaction.data.ironwood_actions.is_empty()),
         "regtest block 1 carries no Orchard or Ironwood actions"
     );
 

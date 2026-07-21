@@ -574,6 +574,7 @@ where
                 staging_path: staging.path(),
                 options: &data_options,
                 network,
+                first_retained_block: canonical_ready.first_retained_block,
                 settled_tip: canonical_ready.sequence_checkpoint.through(),
                 supported_reorg_depth: options.supported_reorg_depth,
                 max_outpoint_sort_memory_bytes: options.max_outpoint_sort_memory_bytes,

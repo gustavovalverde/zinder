@@ -47,7 +47,7 @@ listen_addr = "127.0.0.1:9108"
 [cipherscan]
 listen_addr = "127.0.0.1:9070"
 explorer_query_endpoint = "http://127.0.0.1:9068"
-wallet_query_endpoint = "http://127.0.0.1:9101"
+wallet_query_endpoint = "http://127.0.0.1:9102"
 current_price_endpoint = "https://api.coingecko.com/api/v3/simple/price?ids=zcash&vs_currencies=usd&include_24hr_change=true"
 historical_price_endpoint_template = "https://api.coingecko.com/api/v3/coins/zcash/history?localization=false&date={date}"
 # bearer_token_path = "/run/secrets/zinder-reader-token"

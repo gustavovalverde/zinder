@@ -18,6 +18,7 @@ use crate::sections::RuntimeService;
 pub const fn default_ops_listen_addr(service: RuntimeService) -> &'static str {
     match service {
         RuntimeService::Ingest => "127.0.0.1:9105",
+        RuntimeService::Query => "127.0.0.1:9106",
         RuntimeService::CompatLightwalletd => "127.0.0.1:9107",
         RuntimeService::CompatCipherscan => "127.0.0.1:9108",
         RuntimeService::Explorer => "127.0.0.1:9069",
@@ -32,6 +33,7 @@ pub const fn default_ops_listen_addr(service: RuntimeService) -> &'static str {
 #[must_use]
 pub const fn default_grpc_listen_addr(service: RuntimeService) -> Option<&'static str> {
     match service {
+        RuntimeService::Query => Some("127.0.0.1:9102"),
         RuntimeService::CompatLightwalletd => Some("127.0.0.1:9067"),
         RuntimeService::Explorer => Some("127.0.0.1:9068"),
         RuntimeService::CompatCipherscan | RuntimeService::Ingest => None,
@@ -62,6 +64,7 @@ mod tests {
     fn ops_default_ports_are_distinct() {
         let ports: HashSet<&'static str> = [
             default_ops_listen_addr(RuntimeService::Ingest),
+            default_ops_listen_addr(RuntimeService::Query),
             default_ops_listen_addr(RuntimeService::CompatLightwalletd),
             default_ops_listen_addr(RuntimeService::CompatCipherscan),
             default_ops_listen_addr(RuntimeService::Explorer),
@@ -70,9 +73,25 @@ mod tests {
         .collect();
         assert_eq!(
             ports.len(),
-            4,
+            5,
             "per-service ops ports must be distinct so a single host can run \
-             all four binaries without port conflicts",
+             all five binaries without port conflicts",
+        );
+    }
+
+    #[test]
+    fn native_wallet_query_defaults_do_not_reuse_projector_control() {
+        assert_eq!(
+            default_grpc_listen_addr(RuntimeService::Query),
+            Some("127.0.0.1:9102")
+        );
+        assert_eq!(
+            default_ops_listen_addr(RuntimeService::Query),
+            "127.0.0.1:9106"
+        );
+        assert_ne!(
+            default_grpc_listen_addr(RuntimeService::Query),
+            Some(DEFAULT_PROJECTOR_CONTROL_LISTEN_ADDR)
         );
     }
 }

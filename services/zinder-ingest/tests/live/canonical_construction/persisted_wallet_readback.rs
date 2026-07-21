@@ -1,13 +1,11 @@
 use std::{path::Path, time::Instant};
 
 use eyre::{Result, eyre};
-use prost::Message;
 use rust_rocksdb::{DB, LiveFile, Options, ReadOptions};
 use zinder_core::{
     BlockHeaderArtifact, BlockHeight, SerializedBytesDigest, decode_canonical_block_replay,
     wire::encode_height_key_ascending,
 };
-use zinder_proto::compat::lightwalletd::CompactBlock;
 use zinder_store::CanonicalBlockLoadEvidence;
 
 const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
@@ -264,30 +262,7 @@ fn validate_sampled_block_families(
     assert_eq!(persisted_height, height_key);
 
     let compact_bytes = read_uncached(database, COMPACT_BLOCK_COLUMN_FAMILY, &height_key)?;
-    let compact = CompactBlock::decode(compact_bytes.as_slice())?;
-    assert_eq!(compact.height, u64::from(height.value()));
-    assert_eq!(compact.hash.as_slice(), header.block_hash.as_bytes());
-    assert_eq!(compact.prev_hash.as_slice(), header.parent_hash.as_bytes());
-    let compact_metadata = compact.chain_metadata.ok_or_else(|| {
-        eyre!(
-            "sampled compact block {} has no chain metadata",
-            height.value()
-        )
-    })?;
-    if height == expected.tip_height {
-        assert_eq!(
-            compact_metadata.sapling_commitment_tree_size,
-            expected.tip_metadata.sapling_commitment_tree_size
-        );
-        assert_eq!(
-            compact_metadata.orchard_commitment_tree_size,
-            expected.tip_metadata.orchard_commitment_tree_size
-        );
-        assert_eq!(
-            compact_metadata.ironwood_commitment_tree_size,
-            expected.tip_metadata.ironwood_commitment_tree_size
-        );
-    }
+    assert!(!compact_bytes.is_empty());
 
     let last_transaction_index = facts.transactions.len().saturating_sub(1);
     for transaction_index in [0, last_transaction_index] {

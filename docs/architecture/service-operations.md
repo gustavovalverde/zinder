@@ -173,8 +173,8 @@ Production wallet recovery is one coherent state-bundle operation:
 3. bind both checkpoints to one canonical event fence and wallet digest;
 4. restore into fresh paths;
 5. cold-admit each checkpoint under bounded resources; and
-6. start ingest, projector, then compatibility and require normal wallet-serving admission
-   admission before traffic.
+6. start ingest, projector, native query, then compatibility and require normal
+   wallet-serving admission before traffic.
 
 An independently timed copy of the canonical and wallet directories is not a
 coherent backup. Physical checkpoint success also does not prove query serving,
@@ -183,7 +183,7 @@ continuous following, reorg recovery, or client compatibility.
 ## Deployment support
 
 The supported composition is the same-host RocksDB deployment in
-`deploy/docker-compose.yml` and `deploy/systemd/`. Release images are limited to
-ingest, projector, and lightwalletd compatibility. Explorer, Cipherscan, native
-query, PostgreSQL, and mixed single-container compositions are not release
+`deploy/docker-compose.yml` and `deploy/systemd/`. Release images are limited
+to ingest, projector, native query, and lightwalletd compatibility. Explorer,
+Cipherscan, PostgreSQL, and mixed single-container compositions are not release
 classes.

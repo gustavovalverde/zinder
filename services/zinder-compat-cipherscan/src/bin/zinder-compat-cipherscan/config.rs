@@ -16,7 +16,7 @@ use zinder_runtime::{
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9070";
 const DEFAULT_EXPLORER_QUERY_ENDPOINT: &str = "http://127.0.0.1:9068";
-const DEFAULT_WALLET_QUERY_ENDPOINT: &str = "http://127.0.0.1:9101";
+const DEFAULT_WALLET_QUERY_ENDPOINT: &str = "http://127.0.0.1:9102";
 const DEFAULT_CURRENT_PRICE_ENDPOINT: &str = "https://api.coingecko.com/api/v3/simple/price?ids=zcash&vs_currencies=usd&include_24hr_change=true";
 const DEFAULT_HISTORICAL_PRICE_ENDPOINT_TEMPLATE: &str =
     "https://api.coingecko.com/api/v3/coins/zcash/history?localization=false&date={date}";
@@ -256,4 +256,14 @@ fn resolve_cipherscan_config(
         bearer_token_path,
         bearer_token,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_WALLET_QUERY_ENDPOINT;
+
+    #[test]
+    fn wallet_query_default_uses_the_native_query_listener() {
+        assert_eq!(DEFAULT_WALLET_QUERY_ENDPOINT, "http://127.0.0.1:9102");
+    }
 }

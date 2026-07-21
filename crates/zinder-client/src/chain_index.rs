@@ -2,28 +2,42 @@
 
 use std::{num::NonZeroU32, pin::Pin, time::Duration};
 
+use crate::IndexerError;
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeader, BlockHeight, BlockHeightRange, BlockId,
-    BlockSelector, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
-    MempoolEntry, MempoolEvictionReason, RawTransactionBytes, SubtreeRootArtifact,
-    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TransparentSpendsByOutpointResponse,
-    TransparentUnspentOutput, TransparentUnspentOutputsByOutpointResponse,
-    TransparentUtxoSetCommitment, TreeStateArtifact, TxStatus,
+    BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
+    ChainEpoch, ChainEpochId, CompactBlockArtifact, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputsByOutpointResponse,
+    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetCommitment, TreeStateArtifact,
+    TxStatus,
 };
+#[cfg(feature = "remote")]
+use zinder_core::{
+    BlockHash, ChainValuePoolsAtTip, MempoolEntry, MempoolEvictionReason, RawTransactionBytes,
+    TransactionBroadcastOutcome, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
+    TransparentMempoolSpend,
+};
+#[cfg(feature = "remote")]
 use zinder_proto::v1::wallet::WalletServerInfo;
-use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1};
 
-use crate::IndexerError;
+/// Chain-event stream selected by a subscription.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "remote")]
+pub enum ChainEventStreamFamily {
+    /// Every visible chain transition, including reorgs.
+    Visible,
+    /// Non-reorg commits that are entirely at or below the settled tip.
+    Settled,
+}
 
 /// Typed stream returned by chain-index methods.
 pub type IndexStream<T> = Pin<Box<dyn Stream<Item = Result<T, IndexerError>> + Send + 'static>>;
 
 /// Chain-event stream returned by [`EndpointBackedIndex::chain_events`].
+#[cfg(feature = "remote")]
 pub type ChainEventStream = IndexStream<ChainEventEnvelope>;
 
 /// Explicit start position for a resumable event-stream subscription.
@@ -35,6 +49,7 @@ pub type ChainEventStream = IndexStream<ChainEventEnvelope>;
 /// `LiveTail` to resolve once at subscribe time to the current stream head,
 /// receiving only events applied after subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "remote")]
 pub enum EventStreamStart<Cursor> {
     /// Resume strictly after this cursor; its encoded family is
     /// authoritative.
@@ -47,24 +62,27 @@ pub enum EventStreamStart<Cursor> {
 
 /// Opaque chain-event cursor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ChainEventCursor(StreamCursorTokenV1);
+#[cfg(feature = "remote")]
+pub struct ChainEventCursor(Vec<u8>);
 
+#[cfg(feature = "remote")]
 impl ChainEventCursor {
     /// Creates a cursor from bytes previously returned by Zinder.
     #[must_use]
     pub fn from_bytes(cursor_bytes: impl Into<Vec<u8>>) -> Self {
-        Self(StreamCursorTokenV1::from_bytes(cursor_bytes))
+        Self(cursor_bytes.into())
     }
 
     /// Returns the opaque cursor bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
+        &self.0
     }
 }
 
 /// Cursor-bound chain event returned to Rust consumers.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "remote")]
 pub struct ChainEventEnvelope {
     /// Cursor for resuming strictly after this event.
     pub cursor: ChainEventCursor,
@@ -82,6 +100,7 @@ pub struct ChainEventEnvelope {
 ///
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
+#[cfg(feature = "remote")]
 pub enum ChainEvent {
     /// A non-reorg commit advanced the canonical tip or settled-tip prefix.
     ChainCommitted {
@@ -97,6 +116,7 @@ pub enum ChainEvent {
     },
 }
 
+#[cfg(feature = "remote")]
 impl ChainEvent {
     /// Returns `true` when this event is the [`Self::ChainCommitted`] variant.
     ///
@@ -110,6 +130,7 @@ impl ChainEvent {
 
 /// Durable range committed by one chain event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "remote")]
 pub struct ChainEpochCommitted {
     /// Chain epoch visible after the commit.
     pub chain_epoch: ChainEpoch,
@@ -119,6 +140,7 @@ pub struct ChainEpochCommitted {
 
 /// Durable range reverted by one chain event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "remote")]
 pub struct ChainRangeReverted {
     /// Chain epoch that contained the reverted range.
     pub chain_epoch: ChainEpoch,
@@ -128,24 +150,27 @@ pub struct ChainRangeReverted {
 
 /// Opaque mempool-event cursor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct MempoolEventCursor(StreamCursorTokenV1);
+#[cfg(feature = "remote")]
+pub struct MempoolEventCursor(Vec<u8>);
 
+#[cfg(feature = "remote")]
 impl MempoolEventCursor {
     /// Creates a cursor from bytes previously returned by Zinder.
     #[must_use]
     pub fn from_bytes(cursor_bytes: impl Into<Vec<u8>>) -> Self {
-        Self(StreamCursorTokenV1::from_bytes(cursor_bytes))
+        Self(cursor_bytes.into())
     }
 
     /// Returns the opaque cursor bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
+        &self.0
     }
 }
 
 /// Bounded snapshot request for [`EndpointBackedIndex::mempool_snapshot`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(feature = "remote")]
 pub struct MempoolSnapshotRequest {
     /// Server-enforced maximum entry count.
     pub max_entries: u32,
@@ -159,8 +184,10 @@ pub struct MempoolSnapshotRequest {
 /// head of the live index in one response and ignores supplied cursors; servers
 /// that return `next_cursor` use this value for the next page.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg(feature = "remote")]
 pub struct MempoolSnapshotCursor(Vec<u8>);
 
+#[cfg(feature = "remote")]
 impl MempoolSnapshotCursor {
     /// Creates a snapshot cursor from bytes returned by Zinder.
     #[must_use]
@@ -177,6 +204,7 @@ impl MempoolSnapshotCursor {
 
 /// Snapshot view returned by [`EndpointBackedIndex::mempool_snapshot`].
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "remote")]
 pub struct MempoolSnapshotView {
     /// Chain epoch visible at snapshot time.
     pub chain_epoch: ChainEpoch,
@@ -196,6 +224,7 @@ pub struct MempoolSnapshotView {
 
 /// Cursor-bound mempool source-event delivered to resumable consumers.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "remote")]
 pub struct MempoolEventEnvelope {
     /// Cursor for resuming strictly after this event.
     pub cursor: MempoolEventCursor,
@@ -215,6 +244,7 @@ pub struct MempoolEventEnvelope {
     clippy::large_enum_variant,
     reason = "Added carries the full hydrated MempoolEntry by design; consumers replay state from the event log without a follow-up snapshot call."
 )]
+#[cfg(feature = "remote")]
 pub enum MempoolEvent {
     /// Mempool transaction observed.
     Added {
@@ -242,6 +272,7 @@ pub enum MempoolEvent {
 }
 
 /// Mempool-event stream returned by [`EndpointBackedIndex::mempool_events`].
+#[cfg(feature = "remote")]
 pub type MempoolEventStream = IndexStream<MempoolEventEnvelope>;
 
 /// Read parameters for [`ChainIndex::transparent_address_unspent_outputs`].
@@ -263,19 +294,19 @@ pub type TransparentAddressUnspentOutputsStream = IndexStream<TransparentUnspent
 
 /// Opaque transparent-address tx-history cursor bound to one visible-chain fence.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct TransparentHistoryCursor(StreamCursorTokenV1);
+pub struct TransparentHistoryCursor(Vec<u8>);
 
 impl TransparentHistoryCursor {
     /// Creates a cursor from bytes previously returned by Zinder.
     #[must_use]
     pub fn from_bytes(cursor_bytes: impl Into<Vec<u8>>) -> Self {
-        Self(StreamCursorTokenV1::from_bytes(cursor_bytes))
+        Self(cursor_bytes.into())
     }
 
     /// Returns the opaque cursor bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
+        &self.0
     }
 }
 
@@ -361,8 +392,8 @@ impl TransparentUtxoSetSummaryView {
 /// Canonical and materialized-view reads served identically by every chain-index
 /// handle.
 ///
-/// Both [`crate::LocalChainIndex`] (a colocated `RocksDB`-secondary reader) and
-/// [`crate::RemoteChainIndex`] (a `WalletQuery` gRPC client) implement this
+/// Both the optional local `RocksDB`-secondary reader and remote `WalletQuery`
+/// gRPC client implement this
 /// trait with identical semantics. Every method here answers from the
 /// canonical chain store or the materialized view, so a handle that cannot
 /// reach a live ingest-control endpoint still honors the full contract.
@@ -370,7 +401,7 @@ impl TransparentUtxoSetSummaryView {
 /// Methods that require a live ingest-control/broadcast endpoint (broadcast,
 /// live-mempool reads, the chain-event stream, chain value-pools, the
 /// wallet-plane server descriptor) live on the separate
-/// [`EndpointBackedIndex`] trait, which only [`crate::RemoteChainIndex`]
+/// `EndpointBackedIndex` trait, which only the remote client
 /// implements. A caller that needs one of those methods adds an
 /// `EndpointBackedIndex` bound, so a handle without an endpoint fails to
 /// compile instead of failing at runtime.
@@ -745,7 +776,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// reject the coinbase sentinel and silently truncate requests above
     /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. This is the
     /// canonical half of a getspentinfo-equivalent lookup; the unmined half is
-    /// [`EndpointBackedIndex::transparent_mempool_spends_by_outpoint`].
+    /// the endpoint-backed `transparent_mempool_spends_by_outpoint` method.
     ///
     /// # Examples
     ///
@@ -773,7 +804,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// coinbase sentinel and silently truncate requests above
     /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. The read is
     /// canonical-only: a mempool-aware caller subtracts the spends returned by
-    /// [`EndpointBackedIndex::transparent_mempool_spends_by_outpoint`].
+    /// the endpoint-backed `transparent_mempool_spends_by_outpoint` method.
     ///
     /// # Examples
     ///
@@ -841,6 +872,7 @@ pub trait ChainIndex: Send + Sync + 'static {
 /// `T: ChainIndex + EndpointBackedIndex`, so a colocated local reader without
 /// an endpoint is rejected at compile time rather than at call time.
 #[async_trait]
+#[cfg(feature = "remote")]
 pub trait EndpointBackedIndex: ChainIndex {
     /// Returns the wallet-plane server descriptor advertised by the endpoint.
     ///

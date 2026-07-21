@@ -1817,20 +1817,16 @@ impl<'store> WalletTransitionPlanner<'store> {
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use prost::Message;
     use tempfile::TempDir;
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
         CanonicalBlockFacts, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
         CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
         CanonicalBlockReplayFormatVersion, ChainTipMetadata, CommitmentTreeAccumulator,
-        CommitmentTreeCheckpoint, CommitmentTreeFrontiers, ConsensusBranchId, Network,
-        NetworkUpgradeActivation, NetworkUpgradeActivations, SerializedBytesDigest,
-        TransparentUtxoSetCommitment, UnixTimestampMillis, encode_canonical_block_replay,
-        wire::encode_internal_block_hash,
-    };
-    use zinder_proto::compat::lightwalletd::{
-        ChainMetadata, CompactBlock as LightwalletdCompactBlock,
+        CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactBlockArtifact,
+        CompactChainMetadata, ConsensusBranchId, Network, NetworkUpgradeActivation,
+        NetworkUpgradeActivations, SerializedBytesDigest, TransparentUtxoSetCommitment,
+        UnixTimestampMillis, encode_canonical_block_replay,
     };
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventHistoryRequest,
@@ -2108,18 +2104,16 @@ mod tests {
             ),
             transactions: Vec::new(),
         };
-        let compact_payload = LightwalletdCompactBlock {
-            height: u64::from(height),
-            hash: encode_internal_block_hash(block_hash).to_vec(),
-            prev_hash: encode_internal_block_hash(BlockHash::from_bytes(parent_hash)).to_vec(),
-            chain_metadata: Some(ChainMetadata {
+        let compact_block = CompactBlockArtifact::empty(
+            BlockId::new(block_height, block_hash),
+            BlockHash::from_bytes(parent_hash),
+            height,
+            CompactChainMetadata {
                 sapling_commitment_tree_size: 0,
                 orchard_commitment_tree_size: 0,
                 ironwood_commitment_tree_size: 0,
-            }),
-            ..Default::default()
-        }
-        .encode_to_vec();
+            },
+        );
         let replay_envelope = encode_canonical_block_replay(
             &facts,
             CanonicalBlockReplayFormatVersion::V1,
@@ -2128,11 +2122,7 @@ mod tests {
         CanonicalBuildBlock {
             facts,
             replay_envelope,
-            compact_block: zinder_core::CompactBlockArtifact::new(
-                block_height,
-                block_hash,
-                compact_payload,
-            ),
+            compact_block,
             tip_metadata: ChainTipMetadata::new(0, 0, 0),
             tree_state_checkpoint: is_tip.then(|| {
                 CommitmentTreeCheckpoint::new(

@@ -1,10 +1,11 @@
 # Single-host wallet-serving topology.
 #
-# The three release runtimes share one host filesystem. zinder-ingest is the
-# only canonical writer, zinder-projector is the only wallet writer, and
-# zinder-compat-lightwalletd serves immutable canonical/wallet secondary pairs.
-# Projector and compat share ingest's network namespace so the authenticated
-# control plane remains loopback-only.
+# The four release runtimes share one host filesystem. zinder-ingest is the
+# only canonical writer, zinder-projector is the only wallet writer,
+# zinder-query serves the native WalletQuery protocol, and
+# zinder-compat-lightwalletd serves the compatibility protocol. All readers
+# share ingest's network namespace so the authenticated control plane remains
+# loopback-only.
 name: zinder-${Z3_NETWORK_LOWER:-mainnet}
 
 networks:
@@ -24,7 +25,7 @@ services:
       [
         "sh",
         "-c",
-        "chown -R 1000:1000 /var/lib/zinder /var/lib/zinder/checkpoints",
+        "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary && chown -R 1000:1000 /var/lib/zinder",
       ]
     volumes:
       - type: volume
@@ -70,7 +71,9 @@ services:
     ports:
       - "127.0.0.1:${ZINDER_INGEST_OPS_HOST_PORT:-9105}:9105"
       - "127.0.0.1:${ZINDER_COMPAT_HOST_PORT:-9067}:9067"
+      - "127.0.0.1:${ZINDER_QUERY_HOST_PORT:-9102}:9102"
       - "127.0.0.1:${ZINDER_PROJECTOR_OPS_HOST_PORT:-9110}:9110"
+      - "127.0.0.1:${ZINDER_QUERY_OPS_HOST_PORT:-9106}:9106"
       - "127.0.0.1:${ZINDER_COMPAT_OPS_HOST_PORT:-9107}:9107"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9105/readyz"]
@@ -113,6 +116,40 @@ services:
       start_period: 60s
       retries: 3
 
+  zinder-query:
+    image: ${ZINDER_QUERY_IMAGE:-zinder-query:latest}
+    mem_limit: ${ZINDER_QUERY_MEMORY_LIMIT:-4g}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: zinder-query
+    restart: on-failure
+    network_mode: "service:zinder-ingest"
+    depends_on:
+      zinder-ingest:
+        condition: service_healthy
+      zinder-projector:
+        condition: service_healthy
+    volumes:
+      - data:/var/lib/zinder
+      - ./config/query.toml:/etc/zinder/config.toml:ro
+      - z3-cookie:/var/run/auth:ro
+      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
+    command: ["--config", "/etc/zinder/config.toml"]
+    environment:
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
+      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
+      ZINDER_QUERY__LISTEN_ADDR: "[::]:9102"
+      ZINDER_OPS__LISTEN_ADDR: "[::]:9106"
+      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9106/readyz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
   zinder-compat-lightwalletd:
     image: ${ZINDER_COMPAT_IMAGE:-zinder-compat-lightwalletd:latest}
     mem_limit: ${ZINDER_COMPAT_MEMORY_LIMIT:-4g}
@@ -131,7 +168,7 @@ services:
       - data:/var/lib/zinder
       - ./config/compat-lightwalletd.toml:/etc/zinder/config.toml:ro
       - z3-cookie:/var/run/auth:ro
-      - ${ZINDER_INGEST_CONTROL_SECRET_DIR:?set a directory containing ingest.token only}/ingest.token:/var/run/zinder-control/ingest.token:ro
+      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}

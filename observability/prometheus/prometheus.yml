@@ -26,6 +26,16 @@ scrape_configs:
           stack: "zinder-local"
           service: "zinder-projector"
 
+  - job_name: "zinder-query"
+    scrape_interval: 5s
+    scrape_timeout: 3s
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["host.docker.internal:9193"]
+        labels:
+          stack: "zinder-local"
+          service: "zinder-query"
+
   - job_name: "zinder-compat-lightwalletd"
     scrape_interval: 5s
     scrape_timeout: 3s

@@ -9,7 +9,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use eyre::eyre;
 use parking_lot::Mutex;
-use prost::Message;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt as _, wrappers::UnboundedReceiverStream};
 use tonic::{Code, Request};
@@ -18,8 +17,10 @@ use zinder_compat_lightwalletd::{
     MempoolSurfaceError, TipChangeWatcher, TipChangeWatcherError,
 };
 use zinder_core::{
-    AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, MempoolEntry,
-    MempoolEvictionReason, Network, RawTransactionBytes, TransactionId, UnixTimestampMillis,
+    AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransactionData,
+    CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolEvictionReason,
+    MempoolObservation, Network, RawTransactionBytes, TransactionId, UnixTimestampMillis,
 };
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::WalletQuery;
@@ -108,8 +109,8 @@ async fn lightwalletd_get_mempool_tx_rejects_invalid_pool_type_before_surface_lo
 async fn lightwalletd_get_mempool_tx_filters_excluded_txid_suffixes() -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let surface = ScriptedMempoolSurface::with_entries(vec![
-        synthetic_entry(0xAA, synthetic_chain_epoch()),
-        synthetic_entry(0xBB, synthetic_chain_epoch()),
+        synthetic_entry(0xAA, synthetic_chain_epoch())?,
+        synthetic_entry(0xBB, synthetic_chain_epoch())?,
     ]);
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
@@ -140,8 +141,8 @@ async fn lightwalletd_get_mempool_tx_drops_transactions_outside_requested_pool_t
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let surface = ScriptedMempoolSurface::with_entries(vec![
-        synthetic_entry(0xC1, synthetic_chain_epoch()),
-        transparent_only_entry(0xC2, synthetic_chain_epoch()),
+        synthetic_entry(0xC1, synthetic_chain_epoch())?,
+        transparent_only_entry(0xC2, synthetic_chain_epoch())?,
     ]);
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
@@ -183,8 +184,8 @@ async fn lightwalletd_get_mempool_tx_drops_ironwood_entries_outside_requested_po
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let surface = ScriptedMempoolSurface::with_entries(vec![
-        synthetic_entry(0xD1, synthetic_chain_epoch()),
-        ironwood_only_entry(0xD2, synthetic_chain_epoch()),
+        synthetic_entry(0xD1, synthetic_chain_epoch())?,
+        ironwood_only_entry(0xD2, synthetic_chain_epoch())?,
     ]);
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
@@ -212,8 +213,8 @@ async fn lightwalletd_get_mempool_tx_drops_ironwood_entries_outside_requested_po
 async fn lightwalletd_get_mempool_tx_reads_all_snapshot_pages() -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let surface = ScriptedMempoolSurface::with_entries(vec![
-        synthetic_entry(0xA1, synthetic_chain_epoch()),
-        synthetic_entry(0xB2, synthetic_chain_epoch()),
+        synthetic_entry(0xA1, synthetic_chain_epoch())?,
+        synthetic_entry(0xB2, synthetic_chain_epoch())?,
     ])
     .with_snapshot_page_size(1);
     let adapter = LightwalletdGrpcAdapter::new(
@@ -261,14 +262,14 @@ async fn lightwalletd_get_mempool_stream_projects_added_envelopes_to_raw_transac
     let mut response_stream = response;
 
     control.push_event(MempoolEvent::Added {
-        entry: synthetic_entry(0x10, synthetic_chain_epoch()),
+        entry: synthetic_entry(0x10, synthetic_chain_epoch())?,
     })?;
     control.push_event(MempoolEvent::Invalidated {
         transaction_id: TransactionId::from_bytes([0x20; 32]),
         reason: MempoolEvictionReason::Conflict,
     })?;
     control.push_event(MempoolEvent::Added {
-        entry: synthetic_entry(0x30, synthetic_chain_epoch()),
+        entry: synthetic_entry(0x30, synthetic_chain_epoch())?,
     })?;
 
     let first_raw = response_stream
@@ -292,7 +293,7 @@ async fn lightwalletd_get_mempool_stream_starts_after_retained_tail() -> eyre::R
     let surface = ScriptedMempoolSurface::with_entries(Vec::new());
     let control = surface.event_control();
     control.append_retained_event(MempoolEvent::Added {
-        entry: synthetic_entry(0x10, synthetic_chain_epoch()),
+        entry: synthetic_entry(0x10, synthetic_chain_epoch())?,
     })?;
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
@@ -311,7 +312,7 @@ async fn lightwalletd_get_mempool_stream_starts_after_retained_tail() -> eyre::R
     let mut response_stream = response;
 
     control.push_event(MempoolEvent::Added {
-        entry: synthetic_entry(0x20, synthetic_chain_epoch()),
+        entry: synthetic_entry(0x20, synthetic_chain_epoch())?,
     })?;
 
     let raw = tokio::time::timeout(std::time::Duration::from_secs(2), response_stream.next())
@@ -330,16 +331,16 @@ async fn lightwalletd_get_mempool_stream_streams_snapshot_contents_before_live_e
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let surface = ScriptedMempoolSurface::with_entries(vec![
-        synthetic_entry(0x10, synthetic_chain_epoch()),
-        synthetic_entry(0x20, synthetic_chain_epoch()),
+        synthetic_entry(0x10, synthetic_chain_epoch())?,
+        synthetic_entry(0x20, synthetic_chain_epoch())?,
     ])
     .with_snapshot_page_size(1);
     let control = surface.event_control();
     control.append_retained_event(MempoolEvent::Added {
-        entry: synthetic_entry(0x10, synthetic_chain_epoch()),
+        entry: synthetic_entry(0x10, synthetic_chain_epoch())?,
     })?;
     control.append_retained_event(MempoolEvent::Added {
-        entry: synthetic_entry(0x20, synthetic_chain_epoch()),
+        entry: synthetic_entry(0x20, synthetic_chain_epoch())?,
     })?;
     let adapter = LightwalletdGrpcAdapter::new(
         WalletQuery::new(
@@ -370,7 +371,7 @@ async fn lightwalletd_get_mempool_stream_streams_snapshot_contents_before_live_e
     assert_eq!(second_raw.height, 0);
 
     control.push_event(MempoolEvent::Added {
-        entry: synthetic_entry(0x30, synthetic_chain_epoch()),
+        entry: synthetic_entry(0x30, synthetic_chain_epoch())?,
     })?;
     let live_raw = tokio::time::timeout(std::time::Duration::from_secs(2), response_stream.next())
         .await?
@@ -404,7 +405,7 @@ fn synthetic_chain_epoch() -> ChainEpoch {
     }
 }
 
-fn synthetic_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> MempoolEntry {
+fn synthetic_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> eyre::Result<MempoolEntry> {
     synthetic_entry_with_compact_tx(
         transaction_id_byte,
         chain_epoch,
@@ -426,7 +427,10 @@ fn synthetic_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> MempoolE
     )
 }
 
-fn ironwood_only_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> MempoolEntry {
+fn ironwood_only_entry(
+    transaction_id_byte: u8,
+    chain_epoch: ChainEpoch,
+) -> eyre::Result<MempoolEntry> {
     synthetic_entry_with_compact_tx(
         transaction_id_byte,
         chain_epoch,
@@ -449,7 +453,10 @@ fn ironwood_only_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> Memp
     )
 }
 
-fn transparent_only_entry(transaction_id_byte: u8, chain_epoch: ChainEpoch) -> MempoolEntry {
+fn transparent_only_entry(
+    transaction_id_byte: u8,
+    chain_epoch: ChainEpoch,
+) -> eyre::Result<MempoolEntry> {
     synthetic_entry_with_compact_tx(
         transaction_id_byte,
         chain_epoch,
@@ -477,19 +484,88 @@ fn synthetic_entry_with_compact_tx(
     transaction_id_byte: u8,
     chain_epoch: ChainEpoch,
     compact_tx: &lightwalletd::CompactTx,
-) -> MempoolEntry {
+) -> eyre::Result<MempoolEntry> {
     let transaction_id = TransactionId::from_bytes([transaction_id_byte; 32]);
-    let compact_bytes = compact_tx.encode_to_vec();
-    MempoolEntry {
+    let compact_transaction_data = CompactTransactionData {
+        fee_zat: Some(u64::from(compact_tx.fee)),
+        sapling_spends: compact_tx
+            .spends
+            .iter()
+            .map(|spend| {
+                Ok(CompactSaplingSpend {
+                    nullifier: fixed_bytes(&spend.nf)?,
+                })
+            })
+            .collect::<eyre::Result<Vec<_>>>()?,
+        sapling_outputs: compact_tx
+            .outputs
+            .iter()
+            .map(|output| -> eyre::Result<_> {
+                Ok(CompactSaplingOutput {
+                    commitment: fixed_bytes(&output.cmu)?,
+                    ephemeral_key: fixed_bytes(&output.ephemeral_key)?,
+                    ciphertext: fixed_bytes(&output.ciphertext)?,
+                })
+            })
+            .collect::<eyre::Result<Vec<_>>>()?,
+        orchard_actions: compact_tx
+            .actions
+            .iter()
+            .map(compact_action_data)
+            .collect::<eyre::Result<Vec<_>>>()?,
+        ironwood_actions: compact_tx
+            .ironwood_actions
+            .iter()
+            .map(compact_action_data)
+            .collect::<eyre::Result<Vec<_>>>()?,
+        transparent_inputs: compact_tx
+            .vin
+            .iter()
+            .map(|input| -> eyre::Result<_> {
+                Ok(CompactTransparentInput {
+                    previous_transaction_id: TransactionId::from_bytes(fixed_bytes(
+                        &input.prevout_txid,
+                    )?),
+                    previous_output_index: input.prevout_index,
+                })
+            })
+            .collect::<eyre::Result<Vec<_>>>()?,
+        transparent_outputs: compact_tx
+            .vout
+            .iter()
+            .map(|output| CompactTransparentOutput {
+                value_zat: output.value,
+                script_pub_key: output.script_pub_key.clone(),
+            })
+            .collect(),
+    };
+    MempoolEntry::new(
         transaction_id,
-        auth_digest: Some(AuthDigest::from_bytes([transaction_id_byte; 32])),
-        raw_transaction_bytes: RawTransactionBytes::new(vec![transaction_id_byte; 16]),
-        compact_transaction_bytes: compact_bytes,
-        first_seen_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
-        first_seen_chain_epoch: chain_epoch,
-        transparent_outputs: Vec::new(),
-        transparent_spends: Vec::new(),
-    }
+        Some(AuthDigest::from_bytes([transaction_id_byte; 32])),
+        RawTransactionBytes::new(vec![transaction_id_byte; 16]),
+        compact_transaction_data,
+        MempoolObservation {
+            first_seen_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
+            first_seen_chain_epoch: chain_epoch,
+        },
+    )
+    .map_err(|error| eyre!("invalid synthetic mempool entry: {error}"))
+}
+
+fn compact_action_data(
+    action: &lightwalletd::CompactOrchardAction,
+) -> eyre::Result<CompactShieldedAction> {
+    Ok(CompactShieldedAction {
+        nullifier: fixed_bytes(&action.nullifier)?,
+        commitment: fixed_bytes(&action.cmx)?,
+        ephemeral_key: fixed_bytes(&action.ephemeral_key)?,
+        ciphertext: fixed_bytes(&action.ciphertext)?,
+    })
+}
+
+fn fixed_bytes<const LENGTH: usize>(bytes: &[u8]) -> eyre::Result<[u8; LENGTH]> {
+    <[u8; LENGTH]>::try_from(bytes)
+        .map_err(|_| eyre!("expected {LENGTH} bytes, got {}", bytes.len()))
 }
 
 fn transaction_id_byte_to_txid_vec(byte: u8) -> Vec<u8> {
@@ -622,7 +698,7 @@ async fn lightwalletd_get_mempool_stream_closes_on_tip_change() -> eyre::Result<
     let mut response_stream = response;
 
     event_control.push_event(MempoolEvent::Added {
-        entry: synthetic_entry(0xAA, synthetic_chain_epoch()),
+        entry: synthetic_entry(0xAA, synthetic_chain_epoch())?,
     })?;
     let raw = response_stream
         .next()

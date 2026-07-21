@@ -5,7 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use prost::Message;
 use rust_rocksdb::{DB, IngestExternalFileOptions, IteratorMode, Options};
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, CanonicalBlockFacts,
@@ -15,7 +14,6 @@ use zinder_core::{
     CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactBlockArtifact, SerializedBytesDigest,
     TransactionBlobArtifact,
 };
-use zinder_proto::compat::lightwalletd::CompactBlock as LightwalletdCompactBlock;
 use zinder_rocksdb_bulk_load::{
     FixedRecordSorter, OrderedSstWriter, SstFileEvidence, SstFileSet, fixed_record_capacity,
 };
@@ -440,7 +438,8 @@ fn write_build_block(
     let header_value = encode_block_header(&facts.block_header);
     header_writer.put(&height_key, &header_value)?;
     replay_writer.put(&height_key, replay_envelope.as_bytes())?;
-    compact_writer.put(&height_key, &compact_block.payload_bytes)?;
+    let encoded_compact_block = crate::encode_compact_block_artifact(&compact_block);
+    compact_writer.put(&height_key, &encoded_compact_block)?;
 
     let block_hash_record = encode_block_hash_location(facts.block_header.block_hash, height);
     block_hash_sorter.push(block_hash_record)?;
@@ -617,15 +616,11 @@ pub(super) fn read_persisted_tip_metadata(
             CanonicalStoreError::block_load_sequence("published tip compact block is absent")
         })?;
     let compact =
-        LightwalletdCompactBlock::decode(encoded_compact_block.as_slice()).map_err(|_| {
-            CanonicalStoreError::block_load_sequence(
-                "published tip compact block is invalid protobuf",
-            )
+        crate::decode_compact_block_artifact(encoded_compact_block.as_slice()).map_err(|_| {
+            CanonicalStoreError::block_load_sequence("published tip compact block is invalid")
         })?;
-    let metadata = compact.chain_metadata.ok_or_else(|| {
-        CanonicalStoreError::block_load_sequence("published tip compact block has no metadata")
-    })?;
-    if compact.height != u64::from(tip.height.value()) || compact.hash != tip.hash.as_bytes() {
+    let metadata = compact.chain_metadata();
+    if compact.height() != tip.height || compact.block_hash() != tip.hash {
         return Err(CanonicalStoreError::block_load_sequence(
             "published tip compact block has the wrong canonical identity",
         ));
@@ -872,7 +867,9 @@ fn validate_block(
             height.value()
         )));
     }
-    if block.compact_block.height != height || block.compact_block.block_hash != header.block_hash {
+    if block.compact_block.height() != height
+        || block.compact_block.block_hash() != header.block_hash
+    {
         return Err(CanonicalStoreError::block_load_sequence(format!(
             "block {} compact artifact does not match its canonical facts",
             height.value()
@@ -885,24 +882,16 @@ fn validate_block(
     validate_block_final_note_commitment_roots(workload, block)
 }
 
-fn validate_compact_block_payload(block: &CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
+pub(super) fn validate_compact_block_payload(
+    block: &CanonicalBuildBlock,
+) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
-    let compact = LightwalletdCompactBlock::decode(block.compact_block.payload_bytes.as_slice())
-        .map_err(|_| {
-            CanonicalStoreError::block_load_sequence(format!(
-                "block {} compact payload is not valid protobuf",
-                header.height.value()
-            ))
-        })?;
-    let metadata = compact.chain_metadata.ok_or_else(|| {
-        CanonicalStoreError::block_load_sequence(format!(
-            "block {} compact payload has no chain metadata",
-            header.height.value()
-        ))
-    })?;
-    if compact.height != u64::from(header.height.value())
-        || compact.hash != header.block_hash.as_bytes()
-        || compact.prev_hash != header.parent_hash.as_bytes()
+    let compact = &block.compact_block;
+    let metadata = compact.chain_metadata();
+    if compact.height() != header.height
+        || compact.block_hash() != header.block_hash
+        || compact.previous_block_hash() != header.parent_hash
+        || u32::try_from(header.block_time).ok() != Some(compact.time())
         || metadata.sapling_commitment_tree_size != block.tip_metadata.sapling_commitment_tree_size
         || metadata.orchard_commitment_tree_size != block.tip_metadata.orchard_commitment_tree_size
         || metadata.ironwood_commitment_tree_size
@@ -912,6 +901,25 @@ fn validate_compact_block_payload(block: &CanonicalBuildBlock) -> Result<(), Can
             "block {} compact payload identity or tree positions do not match canonical facts",
             header.height.value()
         )));
+    }
+    for compact_transaction in compact.transactions() {
+        let transaction = usize::try_from(compact_transaction.index)
+            .ok()
+            .and_then(|index| block.facts.transactions.get(index))
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence(format!(
+                    "block {} compact transaction index {} is absent from canonical facts",
+                    header.height.value(),
+                    compact_transaction.index
+                ))
+            })?;
+        if transaction.public_facts.transaction_id != compact_transaction.transaction_id {
+            return Err(CanonicalStoreError::block_load_sequence(format!(
+                "block {} compact transaction {} has the wrong transaction id",
+                header.height.value(),
+                compact_transaction.index
+            )));
+        }
     }
     Ok(())
 }
@@ -1173,7 +1181,10 @@ impl BlockSequenceRow {
                 block_header: checked_row_bytes(4, BLOCK_HEADER_VALUE_LEN)?,
                 block_hash_index: checked_row_bytes(32, 4)?,
                 block_replay: checked_row_bytes(4, block.replay_envelope.as_bytes().len())?,
-                compact_block: checked_row_bytes(4, block.compact_block.payload_bytes.len())?,
+                compact_block: checked_row_bytes(
+                    4,
+                    crate::encode_compact_block_artifact(&block.compact_block).len(),
+                )?,
                 transaction_location: transaction_location_logical_bytes,
                 transaction_blob: transaction_blob_logical_bytes,
                 block_blob: block_blob_logical_bytes,

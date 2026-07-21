@@ -22,6 +22,7 @@ The Rust client crate `zinder-client` exposes the typed accessors:
 use zinder_client::{IndexerError, RetryPolicy};
 
 match indexer_error {
+    err if err.retry_policy() == RetryPolicy::RefreshChainEpoch => restart_with_fresh_epoch(&err),
     err if err.retry_policy() == RetryPolicy::OperatorActionRequired => alert_oncall(&err),
     err if err.retry_policy() == RetryPolicy::ClientError => fix_request(&err),
     err => retry_with_backoff(&err),
@@ -38,7 +39,7 @@ The authored `reason_policy` table pairs each reason with a `RetryDisposition`:
 | `Retryable` | The failure is a momentary contention signal; retry is safe without backoff. |
 | `NonRetryable` | Retrying the same request is futile until the request shape or deployment state changes (malformed request, schema mismatch, broadcast disabled, internal/data-loss conditions). |
 
-The Rust client crate `zinder-client` exposes a coarser `RetryPolicy` (`RetryWithBackoff`, `OperatorActionRequired`, `ClientError`) derived from the gRPC `Code` for ergonomic local handling; the `RetryDisposition` above is the authoritative wire-level disposition.
+The Rust client crate `zinder-client` exposes `RetryPolicy::RetryWithBackoff`, `RefreshChainEpoch`, `OperatorActionRequired`, and `ClientError`. `RefreshChainEpoch` means the same pinned request cannot succeed: acquire `current_epoch` again and restart the whole epoch-bound operation. The `RetryDisposition` above remains the authoritative wire-level disposition.
 
 ## Reason table
 

@@ -36,9 +36,11 @@ PROMETHEUS_STACK_LABEL="${ZINDER_OBSERVABILITY_PROMETHEUS_STACK_LABEL:-zinder-lo
 GRAFANA_PORT="${ZINDER_GRAFANA_PORT:-3002}"
 INGEST_OPS_ADDR="${ZINDER_OBSERVABILITY_INGEST_OPS_ADDR:-0.0.0.0:9190}"
 COMPAT_OPS_ADDR="${ZINDER_OBSERVABILITY_COMPAT_OPS_ADDR:-0.0.0.0:9192}"
+QUERY_OPS_ADDR="${ZINDER_OBSERVABILITY_QUERY_OPS_ADDR:-0.0.0.0:9193}"
 PROJECTOR_OPS_ADDR="${ZINDER_OBSERVABILITY_PROJECTOR_OPS_ADDR:-0.0.0.0:9194}"
 INGEST_CONTROL_ADDR="${ZINDER_OBSERVABILITY_INGEST_CONTROL_ADDR:-${ZINDER_OBSERVABILITY_WRITER_STATUS_ADDR:-127.0.0.1:9100}}"
 COMPAT_GRPC_ADDR="${ZINDER_OBSERVABILITY_COMPAT_GRPC_ADDR:-127.0.0.1:9067}"
+QUERY_GRPC_ADDR="${ZINDER_OBSERVABILITY_QUERY_GRPC_ADDR:-127.0.0.1:9102}"
 
 BULK_CATCHUP_BLOCKS="${ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS:-50}"
 CANONICAL_BATCH_MAX_BLOCKS="${ZINDER_OBSERVABILITY_CANONICAL_BATCH_MAX_BLOCKS:-25}"
@@ -63,6 +65,7 @@ CERTIFICATION_LAG_BLOCKS="${ZINDER_OBSERVABILITY_CERTIFICATION_LAG_BLOCKS:-$((CO
 INGEST_CONFIG="${CONFIG_DIR}/zinder-ingest.toml"
 PROJECTOR_CONFIG="${CONFIG_DIR}/zinder-projector.toml"
 COMPAT_CONFIG="${CONFIG_DIR}/zinder-compat-lightwalletd.toml"
+QUERY_CONFIG="${CONFIG_DIR}/zinder-query.toml"
 
 BULK_CATCHUP_SECONDS="null"
 RESTORE_STATUS="blocked"
@@ -222,6 +225,7 @@ service_ops_addr() {
   case "$1" in
     zinder-ingest) printf '%s' "$INGEST_OPS_ADDR" ;;
     zinder-projector) printf '%s' "$PROJECTOR_OPS_ADDR" ;;
+    zinder-query) printf '%s' "$QUERY_OPS_ADDR" ;;
     zinder-compat-lightwalletd) printf '%s' "$COMPAT_OPS_ADDR" ;;
     *) die "unknown Zinder service: $1" ;;
   esac
@@ -275,7 +279,7 @@ capture_readiness_sample() {
   sample_file="${EVIDENCE_DIR}/readiness/${sample_prefix}.json"
   sample_rows_file="$(mktemp "${WORK_DIR}/readiness-sample.XXXXXX")"
 
-  for service in zinder-ingest zinder-projector zinder-compat-lightwalletd; do
+  for service in zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd; do
     url="$(service_ready_url "$service")"
     body_file="$(mktemp "${WORK_DIR}/readiness-body.XXXXXX")"
     if ! http_status="$(curl -sS --output "$body_file" --write-out '%{http_code}' "$url" 2>/dev/null)"; then
@@ -348,9 +352,10 @@ wait_complete_readiness() {
   local timeout_seconds="${2:-900}"
   wait_service_ready zinder-ingest "$timeout_seconds"
   wait_service_ready zinder-projector "$timeout_seconds"
+  wait_service_ready zinder-query "$timeout_seconds"
   wait_service_ready zinder-compat-lightwalletd "$timeout_seconds"
   capture_readiness_sample "$label"
-  record_evidence_event "$label" passed "all three services traffic-ready"
+  record_evidence_event "$label" passed "all four services traffic-ready"
 }
 
 wait_service_readiness_cause() {
@@ -469,6 +474,8 @@ prepare_work_dir() {
       "${WORK_DIR}/zinder-store" \
       "${WORK_DIR}/wallet" \
       "${WORK_DIR}/projector-canonical-secondary" \
+      "${WORK_DIR}/query-canonical-secondary" \
+      "${WORK_DIR}/query-wallet-secondary" \
       "${WORK_DIR}/compat-canonical-secondary" \
       "${WORK_DIR}/compat-wallet-secondary" \
       "$CONFIG_DIR" \
@@ -480,10 +487,13 @@ prepare_work_dir() {
 
 write_configs() {
   local storage_path wallet_path projector_canonical_secondary_path
+  local query_canonical_secondary_path query_wallet_secondary_path
   local compat_canonical_secondary_path compat_wallet_secondary_path
   storage_path="$(toml_escape "${WORK_DIR}/zinder-store")"
   wallet_path="$(toml_escape "${WORK_DIR}/wallet")"
   projector_canonical_secondary_path="$(toml_escape "${WORK_DIR}/projector-canonical-secondary")"
+  query_canonical_secondary_path="$(toml_escape "${WORK_DIR}/query-canonical-secondary")"
+  query_wallet_secondary_path="$(toml_escape "${WORK_DIR}/query-wallet-secondary")"
   compat_canonical_secondary_path="$(toml_escape "${WORK_DIR}/compat-canonical-secondary")"
   compat_wallet_secondary_path="$(toml_escape "${WORK_DIR}/compat-wallet-secondary")"
   local node_addr node_username node_password network
@@ -577,6 +587,42 @@ password = "${node_password}"
 allow_public_bind = true
 EOF
 
+  cat >"$QUERY_CONFIG" <<EOF
+[network]
+name = "${network}"
+
+[storage]
+path = "${storage_path}"
+secondary_path = "${query_canonical_secondary_path}"
+
+[wallet]
+path = "${wallet_path}"
+secondary_path = "${query_wallet_secondary_path}"
+
+[ingest_control]
+addr = "http://${INGEST_CONTROL_ADDR}"
+
+[query]
+listen_addr = "${QUERY_GRPC_ADDR}"
+reorg_window_blocks = 100
+
+[ops]
+listen_addr = ""
+
+[node]
+json_rpc_addr = "${node_addr}"
+request_timeout_secs = 30
+max_response_bytes = 16777216
+
+[node.auth]
+method = "basic"
+username = "${node_username}"
+password = "${node_password}"
+
+[security]
+allow_public_bind = true
+EOF
+
   cat >"$COMPAT_CONFIG" <<EOF
 [network]
 name = "${network}"
@@ -619,6 +665,7 @@ service_executable() {
   case "$1" in
     zinder-ingest) printf '%s' "${ROOT_DIR}/target/debug/zinder-ingest" ;;
     zinder-projector) printf '%s' "${ROOT_DIR}/target/debug/zinder-projector" ;;
+    zinder-query) printf '%s' "${ROOT_DIR}/target/debug/zinder-query" ;;
     zinder-compat-lightwalletd) printf '%s' "${ROOT_DIR}/target/debug/zinder-compat-lightwalletd" ;;
     *) return 1 ;;
   esac
@@ -774,6 +821,12 @@ start_service() {
         --config "$PROJECTOR_CONFIG" \
         --ops-listen-addr "$PROJECTOR_OPS_ADDR"
       ;;
+    zinder-query)
+      start_process zinder-query \
+        "${ROOT_DIR}/target/debug/zinder-query" \
+        --config "$QUERY_CONFIG" \
+        --ops-listen-addr "$QUERY_OPS_ADDR"
+      ;;
     zinder-compat-lightwalletd)
       start_process zinder-compat-lightwalletd \
         "${ROOT_DIR}/target/debug/zinder-compat-lightwalletd" \
@@ -850,7 +903,7 @@ build_binaries() {
   log "building Zinder service binaries; log: ${log_file}"
   if ! (
     cd "$ROOT_DIR"
-    cargo build -p zinder-ingest -p zinder-projector -p zinder-compat-lightwalletd
+    cargo build -p zinder-ingest -p zinder-projector -p zinder-query -p zinder-compat-lightwalletd
   ) >"$log_file" 2>&1; then
     tail -n 160 "$log_file" >&2 || true
     die "service binary build failed"
@@ -905,6 +958,17 @@ lightwalletd_grpc() {
     -proto service.proto \
     -d "$request_json" \
     "$COMPAT_GRPC_ADDR" \
+    "$method"
+}
+
+native_wallet_grpc() {
+  local request_json="$1"
+  local method="$2"
+  grpcurl -plaintext \
+    -import-path "${ROOT_DIR}/crates/zinder-proto/proto" \
+    -proto zinder/v1/wallet/wallet.proto \
+    -d "$request_json" \
+    "$QUERY_GRPC_ADDR" \
     "$method"
 }
 
@@ -1083,9 +1147,11 @@ run_controlled_projector_lag() {
 
 run_restart_certification() {
   local service
-  for service in zinder-compat-lightwalletd zinder-projector zinder-ingest; do
+  for service in zinder-compat-lightwalletd zinder-query zinder-projector zinder-ingest; do
     restart_service "$service"
     canonical_control_grpc >"${EVIDENCE_DIR}/grpc/writer-status-after-restart-${service}.json"
+    native_wallet_grpc '{}' zinder.v1.wallet.WalletQuery/ServerInfo \
+      >"${EVIDENCE_DIR}/grpc/native-server-info-after-restart-${service}.json"
     lightwalletd_grpc '{}' cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo \
       >"${EVIDENCE_DIR}/grpc/lightd-info-after-restart-${service}.json"
   done
@@ -1221,6 +1287,8 @@ generate_traffic() {
 
   wait_compat_tip "$TARGET_TIP_HEIGHT" 90
 
+  run_grpc_call native-server-info \
+    native_wallet_grpc '{}' zinder.v1.wallet.WalletQuery/ServerInfo
   run_grpc_call compat-latest-block \
     lightwalletd_grpc '{}' cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock
   run_grpc_call compat-block \
@@ -1301,9 +1369,10 @@ print_query_summary() {
 }
 
 snapshot() {
-  local ingest_ops_url_addr projector_ops_url_addr compat_ops_url_addr
+  local ingest_ops_url_addr projector_ops_url_addr query_ops_url_addr compat_ops_url_addr
   ingest_ops_url_addr="$(local_url_addr "$INGEST_OPS_ADDR")"
   projector_ops_url_addr="$(local_url_addr "$PROJECTOR_OPS_ADDR")"
+  query_ops_url_addr="$(local_url_addr "$QUERY_OPS_ADDR")"
   compat_ops_url_addr="$(local_url_addr "$COMPAT_OPS_ADDR")"
 
   log "service endpoints"
@@ -1311,6 +1380,7 @@ snapshot() {
   printf '  Grafana:    http://127.0.0.1:%s (admin/admin unless overridden)\n' "$GRAFANA_PORT"
   printf '  Ingest ops: http://%s/metrics\n' "$ingest_ops_url_addr"
   printf '  Projector ops: http://%s/metrics\n' "$projector_ops_url_addr"
+  printf '  Query ops: http://%s/metrics\n' "$query_ops_url_addr"
   printf '  Compat ops: http://%s/metrics\n' "$compat_ops_url_addr"
   printf '  Logs:       %s\n' "$LOG_DIR"
 
@@ -1362,7 +1432,7 @@ wait_no_traffic_blocking_readiness() {
     if jq -en \
       --arg blocking "$blocking_services" \
       --arg targets "$targets_up" \
-      '($blocking | tonumber) == 0 and ($targets | tonumber) == 3' \
+      '($blocking | tonumber) == 0 and ($targets | tonumber) == 4' \
       >/dev/null 2>&1; then
       return 0
     fi
@@ -1375,11 +1445,13 @@ wait_no_traffic_blocking_readiness() {
 
 archive_runtime_evidence() {
   local service metrics_url commit_sha git_describe node_discovery
-  for service in zinder-ingest zinder-projector zinder-compat-lightwalletd; do
+  for service in zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd; do
     metrics_url="http://$(local_url_addr "$(service_ops_addr "$service")")/metrics"
     curl -fsS "$metrics_url" >"${EVIDENCE_DIR}/metrics/${service}.prom"
   done
   canonical_control_grpc >"${EVIDENCE_DIR}/grpc/writer-status-final.json"
+  native_wallet_grpc '{}' zinder.v1.wallet.WalletQuery/ServerInfo \
+    >"${EVIDENCE_DIR}/grpc/native-server-info-final.json"
   lightwalletd_grpc '{}' cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo \
     >"${EVIDENCE_DIR}/grpc/lightd-info-final.json"
   node_discovery="$(json_rpc rpc.discover '[]')" || die "could not archive Zebra OpenRPC discovery"
@@ -1445,6 +1517,7 @@ write_readiness_report() {
   local latest_markdown="${REPORT_DIR}/latest-readiness.md"
   local report_ingest_metrics_url
   local report_projector_metrics_url
+  local report_query_metrics_url
   local report_compat_metrics_url
   local report_targets_up
   local report_traffic_blocking_services
@@ -1477,6 +1550,7 @@ write_readiness_report() {
   REPORT_MARKDOWN_PATH="${REPORT_DIR}/${RUN_ID}.md"
   report_ingest_metrics_url="http://$(local_url_addr "$INGEST_OPS_ADDR")/metrics"
   report_projector_metrics_url="http://$(local_url_addr "$PROJECTOR_OPS_ADDR")/metrics"
+  report_query_metrics_url="http://$(local_url_addr "$QUERY_OPS_ADDR")/metrics"
   report_compat_metrics_url="http://$(local_url_addr "$COMPAT_OPS_ADDR")/metrics"
   report_targets_up="$(prometheus_max_value "sum(up{stack=\"${PROMETHEUS_STACK_LABEL}\"})")"
   report_traffic_blocking_services="$(prometheus_max_value "sum(zinder_readiness_state{cause!~\"${TRAFFIC_READY_READINESS_CAUSES}\"} == 1) or vector(0)")"
@@ -1520,6 +1594,7 @@ write_readiness_report() {
   export REPORT_GRAFANA_URL="http://127.0.0.1:${GRAFANA_PORT}"
   export REPORT_INGEST_METRICS_URL="$report_ingest_metrics_url"
   export REPORT_PROJECTOR_METRICS_URL="$report_projector_metrics_url"
+  export REPORT_QUERY_METRICS_URL="$report_query_metrics_url"
   export REPORT_COMPAT_METRICS_URL="$report_compat_metrics_url"
   export REPORT_TARGETS_UP="$report_targets_up"
   export REPORT_TRAFFIC_BLOCKING_SERVICES="$report_traffic_blocking_services"
@@ -1615,6 +1690,7 @@ report = {
         "grafana": os.environ["REPORT_GRAFANA_URL"],
         "ingest_metrics": os.environ["REPORT_INGEST_METRICS_URL"],
         "projector_metrics": os.environ["REPORT_PROJECTOR_METRICS_URL"],
+        "query_metrics": os.environ["REPORT_QUERY_METRICS_URL"],
         "compat_metrics": os.environ["REPORT_COMPAT_METRICS_URL"],
     },
 }
@@ -1829,10 +1905,11 @@ run_stack() {
   wait_http zinder-ingest "http://$(local_url_addr "$INGEST_OPS_ADDR")/healthz" 60
 
   # The projector is the sole wallet primary owner. Wait for its exact
-  # canonical/wallet publication before opening the compatibility secondaries.
+  # canonical/wallet publication before opening either reader's secondaries.
   start_service zinder-projector
   wait_http zinder-projector "http://$(local_url_addr "$PROJECTOR_OPS_ADDR")/readyz" 900
 
+  start_service zinder-query
   start_service zinder-compat-lightwalletd
   wait_complete_readiness initial-topology-ready 900
 

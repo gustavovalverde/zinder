@@ -137,8 +137,8 @@ struct Cli {
     /// node's reorg window. Disposable-store recovery only.
     #[arg(long = "allow-reorg-window-settlement", action = clap::ArgAction::SetTrue, global = true)]
     allow_reorg_window_settlement: bool,
-    /// Derive the bulk-catchup floor needed by lightwalletd-compatible
-    /// wallets from node-advertised activation heights.
+    /// Derive the bulk-catchup floor needed by native wallets from
+    /// node-advertised activation heights.
     #[arg(long = "wallet-serving", action = clap::ArgAction::SetTrue, global = true)]
     wallet_serving: bool,
     /// Private ingest-control gRPC listen address.

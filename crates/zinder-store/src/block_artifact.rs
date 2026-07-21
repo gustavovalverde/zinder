@@ -425,7 +425,7 @@ pub(crate) fn read_compact_block_artifacts(
             continue;
         };
         let compact_block = decode_compact_block_artifact(&key, &envelope_bytes)?;
-        if compact_block.height != height {
+        if compact_block.height() != height {
             return Err(StoreError::ArtifactCorrupt {
                 family: ArtifactFamily::CompactBlock,
                 key: key.into(),

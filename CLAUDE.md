@@ -7,7 +7,7 @@ Zinder is a service-oriented Zcash indexer. Architecture, vocabulary, and bounda
 ## Where to read first
 
 - [docs/README.md](docs/README.md): full doc index with lifecycle rules.
-- [docs/architecture/service-boundaries.md](docs/architecture/service-boundaries.md): who owns what across the three release services (`zinder-ingest`, `zinder-projector`, `zinder-compat-lightwalletd`) plus the `zinder-query` library and optional explorer services.
+- [docs/architecture/service-boundaries.md](docs/architecture/service-boundaries.md): who owns what across the four release runtimes (`zinder-ingest`, `zinder-projector`, `zinder-query`, `zinder-compat-lightwalletd`) plus the optional explorer runtime.
 - [docs/architecture/public-interfaces.md](docs/architecture/public-interfaces.md): the vocabulary spine (types, errors, config fields, capability strings).
 - [docs/architecture/chain-ingestion.md](docs/architecture/chain-ingestion.md): the canonical commit pipeline.
 - [docs/adrs/0003-canonical-storage-access-boundary.md](docs/adrs/0003-canonical-storage-access-boundary.md): the epoch-bound storage API, writer/reader topology, secondary catchup, and writer-status RPC.

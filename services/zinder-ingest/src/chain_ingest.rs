@@ -513,7 +513,7 @@ fn canonical_block_artifact_bytes(block: &PositionedCanonicalBlock) -> usize {
         .as_ref()
         .map_or(0, |blob| blob.raw_block_bytes.len());
     let replay_envelope_byte_count = block.replay_envelope.as_bytes().len();
-    let compact_block_bytes = block.compact_block.payload_bytes.len();
+    let compact_block_bytes = zinder_proto::wire::encode_compact_block(&block.compact_block).len();
     let transaction_blob_bytes = block.retained_raw_blobs.transaction_blobs.iter().fold(
         0usize,
         |bytes, transaction_blob| {

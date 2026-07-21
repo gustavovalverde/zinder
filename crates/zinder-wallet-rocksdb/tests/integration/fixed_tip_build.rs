@@ -6,20 +6,18 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 
-use prost::Message;
 use tempfile::TempDir;
 use zinder_core::{
     BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFacts,
     CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts, ChainTipMetadata,
-    CommitmentTreeCheckpoint, CommitmentTreeFrontiers, ConsensusBranchId, LockTime, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, PrivacyShape, SerializedBytesDigest,
-    TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
-    TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactBlockArtifact, CompactChainMetadata,
+    ConsensusBranchId, LockTime, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    PrivacyShape, SerializedBytesDigest, TransactionBlobArtifact, TransactionComponentCounts,
+    TransactionId, TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
     TransactionVersion, TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
     TransparentOutputFact, UnixTimestampMillis, encode_canonical_block_replay,
 };
-use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
     CanonicalBuildBlock, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalLiveAppend,
@@ -30,7 +28,7 @@ use zinder_store::{
 use zinder_wallet_projection::{
     WALLET_PROJECTION_STORE_IDENTITY, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
     WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildLeaseRequest,
-    WalletProjectionBuildOwner, WalletProjectionFamilyRowCounts,
+    WalletProjectionBuildOwner, WalletProjectionContractError, WalletProjectionFamilyRowCounts,
     WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{
@@ -41,6 +39,122 @@ use zinder_wallet_rocksdb::{
     build_wallet_from_canonical_with_lease_and_heartbeat,
     validate_wallet_projection_pre_promotion_fence,
 };
+
+#[test]
+fn checkpointed_canonical_history_builds_wallet_from_its_authenticated_first_retained_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let checkpoint = CommitmentTreeCheckpoint::new(
+        BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xc1; 32])),
+        1,
+        CommitmentTreeFrontiers::default(),
+    );
+    let address = TransparentAddressScriptHash::from_bytes([0xa1; 32]);
+    let transaction_two = TransactionId::from_bytes([0x22; 32]);
+    let transaction_three = TransactionId::from_bytes([0x33; 32]);
+    let block_two_output = TransparentOutPoint::new(transaction_two, 0);
+    let blocks = vec![
+        block_facts(
+            2,
+            [0xc1; 32],
+            [0xc2; 32],
+            vec![transaction_facts(
+                transaction_two,
+                true,
+                vec![TransparentInputFact::new(
+                    0,
+                    TransparentOutPoint::COINBASE_SENTINEL,
+                )],
+                vec![TransparentOutputFact::new(0, 7, [0x51], address)],
+            )],
+        ),
+        block_facts(
+            3,
+            [0xc2; 32],
+            [0xc3; 32],
+            vec![transaction_facts(
+                transaction_three,
+                false,
+                vec![TransparentInputFact::new(0, block_two_output)],
+                vec![TransparentOutputFact::new(0, 5, [0x52], address)],
+            )],
+        ),
+    ];
+    let canonical_store =
+        build_ready_checkpointed_canonical_store(&temporary, checkpoint, &blocks)?;
+    let canonical_ready = canonical_store.ready_evidence();
+    let expected_first = block_id(&blocks[0]);
+    let expected_tip = block_id(&blocks[1]);
+    assert_eq!(canonical_ready.first_retained_block, expected_first);
+    assert_eq!(canonical_ready.visible_tip, expected_tip);
+    assert_eq!(canonical_ready.visible_block_count, 2);
+
+    let outcome = build_wallet_from_canonical(
+        &canonical_store,
+        temporary.path().join("wallet-checkpointed"),
+        RocksDbWalletBuildOptions::for_local_tests(),
+    )?;
+    let wallet_ready = outcome.store.ready_evidence();
+    let expected_source_digest = CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+        canonical_ready.sequence_digest_version,
+        canonical_ready.visible_block_count,
+        canonical_ready.visible_sequence_digest,
+    );
+
+    assert_eq!(outcome.report.scanned_block_count, 2);
+    assert_eq!(wallet_ready.source_position.tip, expected_tip);
+    assert_eq!(wallet_ready.source_sequence_digest, expected_source_digest);
+    assert_eq!(wallet_ready.source_position, outcome.report.source_position);
+    assert_eq!(
+        wallet_ready.source_sequence_digest,
+        outcome.report.source_sequence_digest
+    );
+    assert_eq!(
+        wallet_ready.projection_digest,
+        outcome.report.projection_digest
+    );
+    assert_eq!(wallet_ready.row_counts, outcome.report.row_counts);
+    Ok(())
+}
+
+#[test]
+fn checkpointed_wallet_build_rejects_spends_whose_outputs_precede_the_retained_floor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let checkpoint = CommitmentTreeCheckpoint::new(
+        BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xc1; 32])),
+        1,
+        CommitmentTreeFrontiers::default(),
+    );
+    let precheckpoint_output = TransparentOutPoint::new(TransactionId::from_bytes([0x11; 32]), 0);
+    let block_two = block_facts(
+        2,
+        [0xc1; 32],
+        [0xc2; 32],
+        vec![transaction_facts(
+            TransactionId::from_bytes([0x22; 32]),
+            false,
+            vec![TransparentInputFact::new(0, precheckpoint_output)],
+            Vec::new(),
+        )],
+    );
+    let canonical_store =
+        build_ready_checkpointed_canonical_store(&temporary, checkpoint, &[block_two])?;
+
+    let result = build_wallet_from_canonical(
+        &canonical_store,
+        temporary.path().join("wallet-unresolved-prefix"),
+        RocksDbWalletBuildOptions::for_local_tests(),
+    );
+
+    assert!(matches!(
+        result,
+        Err(RocksDbWalletError::Contract(
+            WalletProjectionContractError::MissingTransparentPredecessor
+        ))
+    ));
+    Ok(())
+}
 
 #[test]
 #[allow(
@@ -1027,8 +1141,8 @@ fn ready_canonical_store_serves_wallet_artifacts() -> Result<(), Box<dyn std::er
     let compact_block = canonical_store
         .compact_block_at(tip.height)?
         .ok_or("tip compact block must be present")?;
-    assert_eq!(compact_block.height, tip.height);
-    assert_eq!(compact_block.block_hash, tip.hash);
+    assert_eq!(compact_block.height(), tip.height);
+    assert_eq!(compact_block.block_hash(), tip.hash);
 
     let transaction_id = fixture.blocks[2].transactions[0]
         .public_facts
@@ -1075,6 +1189,46 @@ fn build_ready_canonical_store(
     builder.bulk_load_blocks(build_blocks)?;
     builder.load_subtree_roots(std::iter::empty())?;
     let tip_checkpoint = CommitmentTreeCheckpoint::new(tip, 3, CommitmentTreeFrontiers::default());
+    builder.confirm_source_tip_checkpoint(&tip_checkpoint)?;
+    let validated = builder.prepare_cold_certified_publication()?;
+    let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+        tip,
+        UnixTimestampMillis::new(1_750_000_000_000),
+    ))?;
+    Ok(validated.publish_baseline(publication)?)
+}
+
+fn build_ready_checkpointed_canonical_store(
+    temporary: &TempDir,
+    checkpoint: CommitmentTreeCheckpoint,
+    blocks: &[CanonicalBlockFacts],
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let tip = blocks
+        .last()
+        .map(block_id)
+        .ok_or("test blocks must not be empty")?;
+    let build_plan = CanonicalStoreBuildPlan::checkpointed(
+        &inactive_upgrade_activations()?,
+        checkpoint,
+        tip,
+        CanonicalReorgPolicy::new(100)?,
+    )?;
+    let mut builder = RocksDbCanonicalBuilder::create_fresh(
+        temporary.path().join("canonical-checkpointed"),
+        CanonicalStoreWorkload::Wallet,
+        build_plan,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let last_index = blocks.len().saturating_sub(1);
+    let build_blocks = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, facts)| canonical_build_block(facts.clone(), index == last_index))
+        .map(Ok::<_, std::io::Error>);
+    builder.bulk_load_blocks(build_blocks)?;
+    builder.load_subtree_roots(std::iter::empty())?;
+    let tip_checkpoint =
+        CommitmentTreeCheckpoint::new(tip, tip.height.value(), CommitmentTreeFrontiers::default());
     builder.confirm_source_tip_checkpoint(&tip_checkpoint)?;
     let validated = builder.prepare_cold_certified_publication()?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -1508,18 +1662,16 @@ fn canonical_build_block(facts: CanonicalBlockFacts, is_tip: bool) -> CanonicalB
     let height = facts.block_header.height;
     let block_hash = facts.block_header.block_hash;
     let parent_hash = facts.block_header.parent_hash;
-    let compact_payload = LightwalletdCompactBlock {
-        height: u64::from(height.value()),
-        hash: block_hash.as_bytes().to_vec(),
-        prev_hash: parent_hash.as_bytes().to_vec(),
-        chain_metadata: Some(ChainMetadata {
+    let compact_block = CompactBlockArtifact::empty(
+        BlockId::new(height, block_hash),
+        parent_hash,
+        u32::try_from(facts.block_header.block_time).unwrap_or(u32::MAX),
+        CompactChainMetadata {
             sapling_commitment_tree_size: 0,
             orchard_commitment_tree_size: 0,
             ironwood_commitment_tree_size: 0,
-        }),
-        ..Default::default()
-    }
-    .encode_to_vec();
+        },
+    );
     let transaction_blobs = facts
         .transactions
         .iter()
@@ -1551,7 +1703,7 @@ fn canonical_build_block(facts: CanonicalBlockFacts, is_tip: bool) -> CanonicalB
     CanonicalBuildBlock {
         facts,
         replay_envelope,
-        compact_block: zinder_core::CompactBlockArtifact::new(height, block_hash, compact_payload),
+        compact_block,
         tip_metadata: ChainTipMetadata::new(0, 0, 0),
         tree_state_checkpoint,
         block_final_note_commitment_roots: None,

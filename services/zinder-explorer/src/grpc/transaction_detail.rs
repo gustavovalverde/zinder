@@ -20,7 +20,7 @@ use zinder_core::{
         encode_rpc_auth_digest_hex, encode_rpc_transaction_id_hex, encode_rpc_wtxid_hex,
     },
 };
-use zinder_proto::capabilities::EXPLORER_TRANSACTION_DETAIL_V3;
+use zinder_proto::capabilities::EXPLORER_TRANSACTION_DETAIL_V4;
 use zinder_proto::wire::encode_privacy_shape;
 
 use zinder_materialized_views::{MaterializedViewStore, TransactionFeesConsumer};
@@ -106,7 +106,7 @@ pub(crate) async fn query_transaction_detail(
         upstream_observation_cache,
         build_explorer_freshness(
             materialized_view_store,
-            EXPLORER_TRANSACTION_DETAIL_V3,
+            EXPLORER_TRANSACTION_DETAIL_V4,
             Some(chain_epoch.clone()),
             0,
         )?,
@@ -249,7 +249,7 @@ fn resolve_facts_and_location(
         wire_location::Location::InMempool(mempool) => {
             let activations = NetworkUpgradeActivations::empty(network);
             let fact_set = zinder_source::parse_transaction_public_fact_set(
-                &mempool.payload_bytes,
+                &mempool.raw_transaction_bytes,
                 None,
                 &activations,
             )
@@ -616,9 +616,10 @@ mod tests {
             None,
             Network::ZcashRegtest,
             transaction_id,
-            wire_location::Location::InMempool(wallet::MempoolTransaction {
-                payload_bytes,
-                first_seen_unix_seconds: 1_700_000_000,
+            wire_location::Location::InMempool(wallet::MempoolEntry {
+                raw_transaction_bytes: payload_bytes,
+                first_seen_unix_millis: 1_700_000_000_000,
+                ..Default::default()
             }),
         )?;
         let fact_set = resolved

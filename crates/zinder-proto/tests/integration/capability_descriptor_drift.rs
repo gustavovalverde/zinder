@@ -27,10 +27,7 @@ use zinder_proto::capabilities::{
 
 /// Fully qualified methods the descriptor serves but no capability of their
 /// own gates.
-///
-/// - `SettledTipBlock` is the settled-tip companion of `VisibleTipBlock`; it shares
-///   the always-on read contract and never carries a capability.
-const UNCAPABILITIED_METHODS: &[&str] = &["zinder.v1.wallet.WalletQuery.SettledTipBlock"];
+const UNCAPABILITIED_METHODS: &[&str] = &[];
 
 /// RPCs whose additive protocol revision is intentionally advertised beside
 /// its predecessor on the same method.

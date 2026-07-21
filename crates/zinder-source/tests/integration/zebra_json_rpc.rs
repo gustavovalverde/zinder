@@ -446,6 +446,7 @@ async fn tree_state_promotes_all_final_note_commitment_roots_without_reversing_b
         "network": "regtest",
         "height": 1,
         "hash": TREE_STATE_BLOCK_HASH_HEX,
+        "time": 1_774_668_700,
         "sapling": {"commitments": {
             "finalRoot": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
             "finalState": "aabb"
@@ -487,8 +488,11 @@ async fn tree_state_promotes_all_final_note_commitment_roots_without_reversing_b
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&tree_state.payload_bytes)?,
-        tree_state_response,
+        json!({
+            "sapling": {"commitments": {"finalState": "aabb"}}
+        }),
     );
+    assert_eq!(tree_state.block_time_seconds, 1_774_668_700);
 
     Ok(())
 }
@@ -499,6 +503,7 @@ async fn tree_state_maps_unavailable_final_note_commitment_roots_to_none() -> ey
         "network": "regtest",
         "height": 1,
         "hash": TREE_STATE_BLOCK_HASH_HEX,
+        "time": 1_774_668_700,
         "sapling": {"commitments": {}},
         "orchard": {"commitments": {"finalRoot": null}}
     }))
@@ -507,6 +512,11 @@ async fn tree_state_maps_unavailable_final_note_commitment_roots_to_none() -> ey
     assert_eq!(tree_state.final_note_commitment_roots.sapling, None);
     assert_eq!(tree_state.final_note_commitment_roots.orchard, None);
     assert_eq!(tree_state.final_note_commitment_roots.ironwood, None);
+    assert_eq!(tree_state.block_time_seconds, 1_774_668_700);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&tree_state.payload_bytes)?,
+        json!({}),
+    );
 
     Ok(())
 }

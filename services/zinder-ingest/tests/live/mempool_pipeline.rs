@@ -4,7 +4,6 @@
 )]
 
 use eyre::{Result, eyre};
-use prost::Message;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::{ZcashDeserializeInto, ZcashSerialize as _};
 use zinder_core::{
@@ -12,7 +11,6 @@ use zinder_core::{
     RawTransactionBytes, TransactionId, UnixTimestampMillis,
 };
 use zinder_ingest::build_mempool_entry;
-use zinder_proto::compat::lightwalletd::CompactTx;
 use zinder_source::{
     MempoolSourceEntry, NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
@@ -22,8 +20,8 @@ use zinder_testkit::live::{LiveTestEnv, init, require_live};
 /// Validates canonical hydration from a real Zebra-emitted transaction.
 ///
 /// The decoded `MempoolEntry` must have raw bytes that round-trip,
-/// compact-tx bytes that parse as `lightwalletd::CompactTx`, and transparent
-/// overlays that match the parsed transaction. The parsed identifiers must
+/// structured wallet scan data and transparent overlays that match the parsed
+/// transaction. The parsed identifiers must
 /// agree with `zebra-chain`'s view.
 ///
 /// This exercises the parsing pipeline used for an observed `Added` event
@@ -52,37 +50,35 @@ async fn build_mempool_entry_decodes_real_zebra_coinbase_into_canonical_form() -
     let chain_epoch = synthetic_chain_epoch_at(env.network(), tip_height);
     let mempool_entry = build_mempool_entry(source_entry, chain_epoch)?;
 
-    assert_eq!(mempool_entry.transaction_id, coinbase.transaction_id);
-    assert_eq!(mempool_entry.auth_digest, coinbase.auth_digest);
-    assert_eq!(mempool_entry.first_seen_unix_millis, observed_at);
-    assert_eq!(mempool_entry.first_seen_chain_epoch, chain_epoch);
+    assert_eq!(mempool_entry.transaction_id(), coinbase.transaction_id);
+    assert_eq!(mempool_entry.auth_digest(), coinbase.auth_digest);
+    assert_eq!(mempool_entry.first_seen_unix_millis(), observed_at);
+    assert_eq!(mempool_entry.first_seen_chain_epoch(), chain_epoch);
     assert_eq!(
-        mempool_entry.raw_transaction_bytes.as_slice(),
+        mempool_entry.raw_transaction_bytes().as_slice(),
         coinbase.raw_bytes.as_slice()
     );
     assert!(
-        mempool_entry.transparent_spends.is_empty(),
+        mempool_entry.transparent_spends().is_empty(),
         "coinbase contributes no transparent spends; got {} spends",
-        mempool_entry.transparent_spends.len()
+        mempool_entry.transparent_spends().len()
     );
     assert!(
-        !mempool_entry.transparent_outputs.is_empty(),
+        !mempool_entry.transparent_outputs().is_empty(),
         "coinbase has at least one transparent output to the miner address"
     );
-    for transparent_output in &mempool_entry.transparent_outputs {
+    for transparent_output in mempool_entry.transparent_outputs() {
         assert_eq!(
             transparent_output.outpoint.transaction_id, coinbase.transaction_id,
             "transparent overlay outpoint must reference the coinbase txid"
         );
     }
 
-    let compact_tx = CompactTx::decode(mempool_entry.compact_transaction_bytes.as_slice())
-        .map_err(|error| eyre!("compact-tx decode failed: {error}"))?;
-    assert_eq!(compact_tx.index, 0, "mempool compact-tx must use index 0");
+    let scan_data = mempool_entry.compact_transaction_data();
+    assert!(scan_data.transparent_inputs.is_empty());
     assert_eq!(
-        compact_tx.txid.as_slice(),
-        coinbase.transaction_id.as_bytes(),
-        "compact-tx txid must match the coinbase transaction id"
+        scan_data.transparent_outputs.len(),
+        mempool_entry.transparent_outputs().len()
     );
     Ok(())
 }

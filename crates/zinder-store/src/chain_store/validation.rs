@@ -6,19 +6,22 @@ use std::{
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
     BlockHeightRange, BlockId, BlockTransactionIndexArtifact, BlockValuePoolBalances,
-    CanonicalBlockFacts, CanonicalTransactionFacts, ChainEpoch, CompactBlockArtifact,
-    SerializedBytesDigest, SubtreeRootArtifact, TransactionBlobArtifact, TransactionFactsArtifact,
-    TransactionId, TransactionIntrinsicValueBalancesArtifact, TransactionLocation,
-    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
+    CanonicalBlockFacts, CanonicalHistoryBounds, CanonicalTransactionFacts, ChainEpoch,
+    ChainEpochId, CompactBlockArtifact, CompactChainMetadata, SerializedBytesDigest,
+    SubtreeRootArtifact, TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
     decode_canonical_block_replay,
 };
 
 use crate::{
-    ChainEpochArtifacts, RawBlobRetention, ReorgWindowChange, StoreError,
-    block_artifact::read_block_header_artifact, kv::RocksChainStore,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, RawBlobRetention, ReorgWindowChange,
+    StoreError,
+    block_artifact::{read_block_header_artifact, read_compact_block_artifact},
+    kv::RocksChainStore,
 };
 
-use super::ChainStoreOptions;
+use super::{ChainStoreOptions, read_canonical_history_bounds, read_chain_epoch};
 
 pub(super) fn validate_chain_store_options(options: ChainStoreOptions) -> Result<(), StoreError> {
     if options.reorg_window_blocks == 0 {
@@ -56,6 +59,11 @@ pub(super) fn validate_chain_epoch_artifacts(
             reason: "chain epoch id must be greater than zero",
         });
     }
+    if artifacts.chain_epoch.artifact_schema_version != CURRENT_ARTIFACT_SCHEMA_VERSION {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "chain epoch artifact schema version must equal the current store contract",
+        });
+    }
 
     validate_artifact_presence(artifacts)?;
 
@@ -77,7 +85,7 @@ pub(super) fn validate_chain_epoch_artifacts(
     validate_block_header_artifacts(&artifacts.block_headers, tip_height)?;
     let validated_block_replay_order =
         validate_block_replay_envelopes(artifacts, &block_hash_by_height)?;
-    validate_compact_block_artifacts(&artifacts.compact_blocks, tip_height, &block_hash_by_height)?;
+    validate_compact_block_artifacts(artifacts, tip_height, &block_hash_by_height)?;
     validate_transaction_facts_artifacts(
         &artifacts.transaction_facts,
         tip_height,
@@ -87,7 +95,7 @@ pub(super) fn validate_chain_epoch_artifacts(
         &artifacts.transaction_intrinsic_value_balances,
         &artifacts.transaction_facts,
     )?;
-    validate_tree_state_artifacts(&artifacts.tree_states, tip_height, &block_hash_by_height)?;
+    validate_tree_state_artifacts(&artifacts.tree_states, tip_height, &artifacts.block_headers)?;
     validate_final_note_commitment_roots(
         &artifacts.final_note_commitment_roots,
         tip_height,
@@ -277,7 +285,84 @@ pub(super) fn validate_visible_chain_commit(
         current_chain_epoch,
         changed_block_range,
     )?;
+    validate_first_changed_compact_metadata(
+        inner,
+        artifacts,
+        current_chain_epoch,
+        changed_block_range,
+    )?;
     validate_settled_tip_hash_against_visible_chain(inner, artifacts, current_chain_epoch)
+}
+
+fn validate_first_changed_compact_metadata(
+    inner: &RocksChainStore,
+    artifacts: &ChainEpochArtifacts,
+    current_chain_epoch: Option<ChainEpoch>,
+    changed_block_range: Option<BlockHeightRange>,
+) -> Result<(), StoreError> {
+    let Some(changed_block_range) = changed_block_range else {
+        return Ok(());
+    };
+    let previous_metadata = match current_chain_epoch {
+        Some(epoch) if epoch.visible_tip_height.next() == Some(changed_block_range.start) => {
+            Some(compact_metadata_from_epoch(epoch))
+        }
+        None if changed_block_range.start.value() <= 1 => Some(CompactChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        }),
+        Some(_) if changed_block_range.start.value() == 0 => Some(CompactChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        }),
+        Some(epoch) => {
+            let predecessor_height = BlockHeight::new(changed_block_range.start.value() - 1);
+            match read_compact_block_artifact(inner, epoch, predecessor_height) {
+                Ok(Some(predecessor)) => Some(predecessor.chain_metadata()),
+                Ok(None) | Err(StoreError::ArtifactMissing { .. }) => {
+                    let baseline_epoch = read_chain_epoch(inner, ChainEpochId::new(1))?;
+                    let checkpoint = BlockId::new(
+                        baseline_epoch.visible_tip_height,
+                        baseline_epoch.visible_tip_hash,
+                    );
+                    let is_admitted_artifactless_checkpoint = read_canonical_history_bounds(inner)?
+                        .and_then(CanonicalHistoryBounds::preceding_checkpoint)
+                        == Some(checkpoint);
+                    if baseline_epoch.visible_tip_height != predecessor_height
+                        || !is_admitted_artifactless_checkpoint
+                    {
+                        return Err(StoreError::InvalidChainEpochArtifacts {
+                            reason: "replacement compact metadata predecessor is unavailable",
+                        });
+                    }
+                    Some(compact_metadata_from_epoch(baseline_epoch))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        None => None,
+    };
+    let Some(previous_metadata) = previous_metadata else {
+        return Ok(());
+    };
+    let first = artifacts
+        .compact_blocks
+        .iter()
+        .find(|block| block.height() == changed_block_range.start)
+        .ok_or(StoreError::InvalidChainEpochArtifacts {
+            reason: "changed block range is missing its first compact block",
+        })?;
+    validate_compact_metadata_delta(previous_metadata, first)
+}
+
+const fn compact_metadata_from_epoch(epoch: ChainEpoch) -> CompactChainMetadata {
+    CompactChainMetadata {
+        sapling_commitment_tree_size: epoch.tip_metadata.sapling_commitment_tree_size,
+        orchard_commitment_tree_size: epoch.tip_metadata.orchard_commitment_tree_size,
+        ironwood_commitment_tree_size: epoch.tip_metadata.ironwood_commitment_tree_size,
+    }
 }
 
 pub(super) fn block_height_range(
@@ -632,7 +717,7 @@ fn validate_required_block_coverage(
     let compact_block_heights: HashSet<BlockHeight> = artifacts
         .compact_blocks
         .iter()
-        .map(|compact_block| compact_block.height)
+        .map(CompactBlockArtifact::height)
         .collect();
 
     for height in required_range {
@@ -659,11 +744,12 @@ fn block_hash_by_height(
 ) -> Result<HashMap<BlockHeight, BlockHash>, StoreError> {
     let mut block_hash_by_height = HashMap::new();
     for block in block_headers {
-        if let Some(existing_hash) = block_hash_by_height.insert(block.height, block.block_hash)
-            && existing_hash != block.block_hash
+        if block_hash_by_height
+            .insert(block.height, block.block_hash)
+            .is_some()
         {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "block artifacts cannot contain conflicting hashes at the same height",
+                reason: "block artifacts cannot repeat a height",
             });
         }
     }
@@ -676,12 +762,9 @@ fn block_header_by_height(
 ) -> Result<HashMap<BlockHeight, &BlockHeaderArtifact>, StoreError> {
     let mut block_header_by_height = HashMap::new();
     for block in block_headers {
-        if let Some(existing_block) = block_header_by_height.insert(block.height, block)
-            && (existing_block.block_hash != block.block_hash
-                || existing_block.parent_hash != block.parent_hash)
-        {
+        if block_header_by_height.insert(block.height, block).is_some() {
             return Err(StoreError::InvalidChainEpochArtifacts {
-                reason: "block artifacts cannot contain conflicting metadata at the same height",
+                reason: "block artifacts cannot repeat a height",
             });
         }
     }
@@ -1196,25 +1279,307 @@ fn validate_replay_artifact_membership(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Compact block validation keeps the cross-artifact parity checks in one ordered fail-closed pass."
+)]
 fn validate_compact_block_artifacts(
-    compact_blocks: &[CompactBlockArtifact],
+    artifacts: &ChainEpochArtifacts,
     tip_height: BlockHeight,
     block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
 ) -> Result<(), StoreError> {
-    for compact_block in compact_blocks {
-        if compact_block.height > tip_height {
+    let mut compact_heights = HashSet::new();
+    for compact_block in &artifacts.compact_blocks {
+        if !compact_heights.insert(compact_block.height()) {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "compact block artifacts cannot repeat a height",
+            });
+        }
+        if compact_block.height() > tip_height {
             return Err(StoreError::InvalidChainEpochArtifacts {
                 reason: "compact block artifact height cannot exceed tip height",
             });
         }
 
-        if block_hash_by_height.get(&compact_block.height) != Some(&compact_block.block_hash) {
+        if block_hash_by_height.get(&compact_block.height()) != Some(&compact_block.block_hash()) {
             return Err(StoreError::InvalidChainEpochArtifacts {
                 reason: "compact block artifact must match a block artifact at the same height",
             });
         }
+
+        let header = artifacts
+            .block_headers
+            .iter()
+            .find(|header| header.height == compact_block.height())
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "compact block artifact is missing its canonical block header",
+            })?;
+        let header_time = u32::try_from(header.block_time).map_err(|_| {
+            StoreError::InvalidChainEpochArtifacts {
+                reason: "canonical block time cannot be represented by the compact contract",
+            }
+        })?;
+        if compact_block.previous_block_hash() != header.parent_hash
+            || compact_block.time() != header_time
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "compact block parent hash and time must match canonical block facts",
+            });
+        }
+
+        let compact_block_id = BlockId::new(compact_block.height(), compact_block.block_hash());
+        let replay_envelope = artifacts
+            .block_replay_envelopes
+            .iter()
+            .find(|replay| {
+                let replay_block_id = BlockId::new(replay.block_height(), replay.block_hash());
+                replay_block_id == compact_block_id
+            })
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "compact block artifact is missing its canonical block replay",
+            })?;
+        let replay = decode_canonical_block_replay(replay_envelope.as_bytes()).map_err(|_| {
+            StoreError::InvalidChainEpochArtifacts {
+                reason: "compact block canonical replay failed semantic validation",
+            }
+        })?;
+        let mut compact_transaction_indexes = HashSet::new();
+        for compact_transaction in compact_block.transactions() {
+            let transaction = usize::try_from(compact_transaction.index)
+                .ok()
+                .and_then(|index| replay.facts().transactions.get(index))
+                .ok_or(StoreError::InvalidChainEpochArtifacts {
+                    reason: "compact transaction index is absent from canonical block facts",
+                })?;
+            if transaction.public_facts.transaction_id != compact_transaction.transaction_id {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "compact transaction id does not match canonical block facts at its index",
+                });
+            }
+            validate_compact_transaction_data(transaction, compact_transaction)?;
+            compact_transaction_indexes.insert(compact_transaction.index);
+        }
+        validate_compact_transaction_completeness(
+            &replay.facts().transactions,
+            &compact_transaction_indexes,
+        )?;
     }
 
+    if let Some(tip_compact_block) = artifacts
+        .compact_blocks
+        .iter()
+        .find(|block| block.height() == artifacts.chain_epoch.visible_tip_height)
+    {
+        let compact_metadata = tip_compact_block.chain_metadata();
+        let epoch_metadata = artifacts.chain_epoch.tip_metadata;
+        if compact_metadata.sapling_commitment_tree_size
+            != epoch_metadata.sapling_commitment_tree_size
+            || compact_metadata.orchard_commitment_tree_size
+                != epoch_metadata.orchard_commitment_tree_size
+            || compact_metadata.ironwood_commitment_tree_size
+                != epoch_metadata.ironwood_commitment_tree_size
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "visible-tip compact metadata must match the chain epoch",
+            });
+        }
+    }
+
+    let mut ordered_compact_blocks = artifacts.compact_blocks.iter().collect::<Vec<_>>();
+    ordered_compact_blocks.sort_unstable_by_key(|block| block.height());
+    for pair in ordered_compact_blocks.windows(2) {
+        let [previous, current] = pair else {
+            continue;
+        };
+        if previous.height().next() != Some(current.height()) {
+            continue;
+        }
+        validate_compact_metadata_delta(previous.chain_metadata(), current)?;
+    }
+
+    Ok(())
+}
+
+fn validate_compact_transaction_completeness(
+    transactions: &[CanonicalTransactionFacts],
+    compact_transaction_indexes: &HashSet<u64>,
+) -> Result<(), StoreError> {
+    for (index, transaction) in transactions.iter().enumerate() {
+        let compact_index =
+            u64::try_from(index).map_err(|_| StoreError::InvalidChainEpochArtifacts {
+                reason: "canonical transaction index exceeds the compact contract",
+            })?;
+        let included = compact_transaction_indexes.contains(&compact_index);
+        if compact_transaction_is_wallet_relevant(transaction) != included {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "compact block must contain exactly its wallet-relevant canonical transactions",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn compact_transaction_is_wallet_relevant(transaction: &CanonicalTransactionFacts) -> bool {
+    let counts = transaction.public_facts.counts;
+    let has_wallet_visible_transparent_input =
+        !transaction.public_facts.is_coinbase && counts.transparent_input_count > 0;
+    has_wallet_visible_transparent_input
+        || counts.transparent_output_count > 0
+        || counts.sapling_spend_count > 0
+        || counts.sapling_output_count > 0
+        || counts.orchard_action_count > 0
+        || counts.ironwood_action_count > 0
+}
+
+fn validate_compact_transaction_data(
+    transaction: &CanonicalTransactionFacts,
+    compact_transaction: &zinder_core::CompactTransaction,
+) -> Result<(), StoreError> {
+    let counts = transaction.public_facts.counts;
+    let expected_transparent_input_count = if transaction.public_facts.is_coinbase {
+        if counts.transparent_input_count != 1 {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "coinbase public facts must count exactly one transparent input sentinel",
+            });
+        }
+        if !transaction.transparent_inputs.is_empty() {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "coinbase canonical transparent facts must omit the input sentinel",
+            });
+        }
+        0
+    } else {
+        counts.transparent_input_count
+    };
+    let scan_data = &compact_transaction.data;
+    if scan_data.sapling_spends.len() != counts.sapling_spend_count as usize
+        || scan_data.sapling_outputs.len() != counts.sapling_output_count as usize
+        || scan_data.orchard_actions.len() != counts.orchard_action_count as usize
+        || scan_data.ironwood_actions.len() != counts.ironwood_action_count as usize
+        || scan_data.transparent_inputs.len() != expected_transparent_input_count as usize
+        || scan_data.transparent_outputs.len() != counts.transparent_output_count as usize
+    {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "compact transaction component counts must match canonical transaction facts",
+        });
+    }
+
+    if transaction.transparent_inputs.len() != expected_transparent_input_count as usize
+        || transaction.transparent_outputs.len() != counts.transparent_output_count as usize
+    {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "canonical transparent facts must match their public component counts",
+        });
+    }
+
+    if !transaction.public_facts.is_coinbase {
+        for (position, (compact_input, canonical_input)) in scan_data
+            .transparent_inputs
+            .iter()
+            .zip(&transaction.transparent_inputs)
+            .enumerate()
+        {
+            let expected_index =
+                u32::try_from(position).map_err(|_| StoreError::InvalidChainEpochArtifacts {
+                    reason: "transparent input index exceeds the compact contract",
+                })?;
+            if canonical_input.input_index != expected_index
+                || canonical_input.spent_outpoint.is_coinbase_sentinel()
+                || compact_input.previous_transaction_id
+                    != canonical_input.spent_outpoint.transaction_id
+                || compact_input.previous_output_index
+                    != canonical_input.spent_outpoint.output_index
+            {
+                return Err(StoreError::InvalidChainEpochArtifacts {
+                    reason: "compact transparent inputs must match ordered canonical outpoints",
+                });
+            }
+        }
+    }
+
+    for (position, (compact_output, canonical_output)) in scan_data
+        .transparent_outputs
+        .iter()
+        .zip(&transaction.transparent_outputs)
+        .enumerate()
+    {
+        let expected_index =
+            u32::try_from(position).map_err(|_| StoreError::InvalidChainEpochArtifacts {
+                reason: "transparent output index exceeds the compact contract",
+            })?;
+        if canonical_output.output_index != expected_index
+            || compact_output.value_zat != canonical_output.value_zat
+            || compact_output.script_pub_key != canonical_output.script_pub_key
+        {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "compact transparent outputs must match ordered canonical outputs",
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_compact_metadata_delta(
+    previous_metadata: CompactChainMetadata,
+    current: &CompactBlockArtifact,
+) -> Result<(), StoreError> {
+    let current_metadata = current.chain_metadata();
+    let mut sapling_additions = 0_u32;
+    let mut orchard_additions = 0_u32;
+    let mut ironwood_additions = 0_u32;
+    for transaction in current.transactions() {
+        sapling_additions = sapling_additions
+            .checked_add(
+                u32::try_from(transaction.data.sapling_outputs.len()).map_err(|_| {
+                    StoreError::InvalidChainEpochArtifacts {
+                        reason: "compact block Sapling output count exceeds u32",
+                    }
+                })?,
+            )
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "compact block Sapling output count exceeds u32",
+            })?;
+        orchard_additions = orchard_additions
+            .checked_add(
+                u32::try_from(transaction.data.orchard_actions.len()).map_err(|_| {
+                    StoreError::InvalidChainEpochArtifacts {
+                        reason: "compact block Orchard action count exceeds u32",
+                    }
+                })?,
+            )
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "compact block Orchard action count exceeds u32",
+            })?;
+        ironwood_additions = ironwood_additions
+            .checked_add(
+                u32::try_from(transaction.data.ironwood_actions.len()).map_err(|_| {
+                    StoreError::InvalidChainEpochArtifacts {
+                        reason: "compact block Ironwood action count exceeds u32",
+                    }
+                })?,
+            )
+            .ok_or(StoreError::InvalidChainEpochArtifacts {
+                reason: "compact block Ironwood action count exceeds u32",
+            })?;
+    }
+    let expected_sapling = previous_metadata
+        .sapling_commitment_tree_size
+        .checked_add(sapling_additions);
+    let expected_orchard = previous_metadata
+        .orchard_commitment_tree_size
+        .checked_add(orchard_additions);
+    let expected_ironwood = previous_metadata
+        .ironwood_commitment_tree_size
+        .checked_add(ironwood_additions);
+    if expected_sapling != Some(current_metadata.sapling_commitment_tree_size)
+        || expected_orchard != Some(current_metadata.orchard_commitment_tree_size)
+        || expected_ironwood != Some(current_metadata.ironwood_commitment_tree_size)
+    {
+        return Err(StoreError::InvalidChainEpochArtifacts {
+            reason: "compact commitment-tree delta must equal the block's shielded additions",
+        });
+    }
     Ok(())
 }
 
@@ -1272,7 +1637,7 @@ fn validate_transaction_intrinsic_value_balances(
 fn validate_tree_state_artifacts(
     tree_states: &[TreeStateArtifact],
     tip_height: BlockHeight,
-    block_hash_by_height: &HashMap<BlockHeight, BlockHash>,
+    block_headers: &[BlockHeaderArtifact],
 ) -> Result<(), StoreError> {
     for tree_state in tree_states {
         if tree_state.height > tip_height {
@@ -1281,9 +1646,22 @@ fn validate_tree_state_artifacts(
             });
         }
 
-        if block_hash_by_height.get(&tree_state.height) != Some(&tree_state.block_hash) {
+        let Some(block_header) = block_headers
+            .iter()
+            .find(|block_header| block_header.height == tree_state.height)
+        else {
             return Err(StoreError::InvalidChainEpochArtifacts {
                 reason: "tree-state artifact must match a block artifact at the same height",
+            });
+        };
+        if block_header.block_hash != tree_state.block_hash {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "tree-state artifact must match a block artifact at the same height",
+            });
+        }
+        if block_header.block_time != i64::from(tree_state.block_time_seconds) {
+            return Err(StoreError::InvalidChainEpochArtifacts {
+                reason: "tree-state artifact block time must match its block artifact",
             });
         }
     }
@@ -1512,4 +1890,158 @@ fn validate_committed_boundary_hash_if_present(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compact_transaction_is_wallet_relevant, validate_compact_transaction_completeness,
+        validate_compact_transaction_data,
+    };
+    use std::collections::HashSet;
+    use zinder_core::{
+        CanonicalTransactionFacts, CompactTransaction, CompactTransactionData,
+        CompactTransparentInput, CompactTransparentOutput, LockTime, PrivacyShape,
+        SerializedBytesDigest, TransactionComponentCounts, TransactionId,
+        TransactionIntrinsicValueBalances, TransactionPublicFacts, TransactionVersion,
+        TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
+        TransparentOutputFact, UnsupportedSection,
+    };
+
+    #[test]
+    fn wallet_relevant_canonical_transaction_cannot_be_omitted() {
+        let mut transaction = canonical_transaction();
+        transaction.public_facts.counts.sapling_spend_count = 1;
+
+        assert!(compact_transaction_is_wallet_relevant(&transaction));
+        assert!(
+            validate_compact_transaction_completeness(&[transaction], &HashSet::new()).is_err()
+        );
+    }
+
+    #[test]
+    fn compact_component_counts_must_match_canonical_counts() {
+        let mut transaction = canonical_transaction();
+        transaction.public_facts.counts.sapling_output_count = 1;
+        let compact = compact_transaction(CompactTransactionData::default());
+
+        assert!(validate_compact_transaction_data(&transaction, &compact).is_err());
+    }
+
+    #[test]
+    fn compact_transparent_fields_must_match_canonical_facts() {
+        let mut transaction = canonical_transaction();
+        transaction.public_facts.counts.transparent_input_count = 1;
+        transaction.public_facts.counts.transparent_output_count = 1;
+        let spent_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([2; 32]), 3);
+        transaction.transparent_inputs = vec![TransparentInputFact::new(0, spent_outpoint)];
+        transaction.transparent_outputs = vec![TransparentOutputFact::new(
+            0,
+            50,
+            [0x51],
+            TransparentAddressScriptHash::of_script_pub_key(&[0x51]),
+        )];
+
+        let mismatched_input = compact_transaction(CompactTransactionData {
+            transparent_inputs: vec![CompactTransparentInput {
+                previous_transaction_id: spent_outpoint.transaction_id,
+                previous_output_index: 4,
+            }],
+            transparent_outputs: vec![CompactTransparentOutput {
+                value_zat: 50,
+                script_pub_key: vec![0x51],
+            }],
+            ..CompactTransactionData::default()
+        });
+        assert!(validate_compact_transaction_data(&transaction, &mismatched_input).is_err());
+
+        let mismatched_output = compact_transaction(CompactTransactionData {
+            transparent_inputs: vec![CompactTransparentInput {
+                previous_transaction_id: spent_outpoint.transaction_id,
+                previous_output_index: spent_outpoint.output_index,
+            }],
+            transparent_outputs: vec![CompactTransparentOutput {
+                value_zat: 51,
+                script_pub_key: vec![0x51],
+            }],
+            ..CompactTransactionData::default()
+        });
+        assert!(validate_compact_transaction_data(&transaction, &mismatched_output).is_err());
+    }
+
+    #[test]
+    fn coinbase_sentinel_is_counted_publicly_and_omitted_from_canonical_and_compact_inputs() {
+        let mut transaction = canonical_transaction();
+        transaction.public_facts.is_coinbase = true;
+        transaction.public_facts.counts.transparent_input_count = 1;
+        transaction.public_facts.counts.transparent_output_count = 1;
+        transaction.transparent_outputs = vec![TransparentOutputFact::new(
+            0,
+            50,
+            [0x51],
+            TransparentAddressScriptHash::of_script_pub_key(&[0x51]),
+        )];
+        let compact = compact_transaction(CompactTransactionData {
+            transparent_outputs: vec![CompactTransparentOutput {
+                value_zat: 50,
+                script_pub_key: vec![0x51],
+            }],
+            ..CompactTransactionData::default()
+        });
+
+        assert!(compact_transaction_is_wallet_relevant(&transaction));
+        assert!(validate_compact_transaction_data(&transaction, &compact).is_ok());
+    }
+
+    #[test]
+    fn coinbase_rejects_missing_public_sentinel_count_or_materialized_sentinel_fact() {
+        let mut transaction = canonical_transaction();
+        transaction.public_facts.is_coinbase = true;
+        let compact = compact_transaction(CompactTransactionData::default());
+        assert!(validate_compact_transaction_data(&transaction, &compact).is_err());
+
+        transaction.public_facts.counts.transparent_input_count = 1;
+        transaction.transparent_inputs = vec![TransparentInputFact::new(
+            0,
+            TransparentOutPoint::COINBASE_SENTINEL,
+        )];
+        assert!(validate_compact_transaction_data(&transaction, &compact).is_err());
+    }
+
+    fn compact_transaction(data: CompactTransactionData) -> CompactTransaction {
+        CompactTransaction {
+            index: 0,
+            transaction_id: TransactionId::from_bytes([1; 32]),
+            data,
+        }
+    }
+
+    fn canonical_transaction() -> CanonicalTransactionFacts {
+        CanonicalTransactionFacts {
+            public_facts: TransactionPublicFacts {
+                transaction_id: TransactionId::from_bytes([1; 32]),
+                auth_digest: None,
+                wtxid: None,
+                version: TransactionVersion::Unsupported {
+                    effective_version: 0,
+                    version_group_id: None,
+                },
+                consensus_branch_id: None,
+                lock_time: LockTime::Unlocked,
+                expiry_height: None,
+                size_bytes: 0,
+                counts: TransactionComponentCounts::EMPTY,
+                orchard_value_balance_zat: None,
+                orchard_anchor: None,
+                ironwood_value_balance_zat: None,
+                privacy_shape: PrivacyShape::Unclassified,
+                is_coinbase: false,
+                unsupported_sections: vec![UnsupportedSection::FutureVersionHeader],
+            },
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[]),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: Vec::new(),
+        }
+    }
 }

@@ -32,7 +32,7 @@ use zinder_materialized_views::{
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
     EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_TRANSACTIONS_V2, EXPLORER_CHAIN_REORG_HISTORY_V1,
-    EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V3,
+    EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V4,
     EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
 };
 use zinder_proto::v1::explorer::{
@@ -149,7 +149,7 @@ async fn explorer_query_failed_precondition_without_wallet_query_endpoint() -> R
         !common
             .capabilities
             .iter()
-            .any(|advertised| { advertised == EXPLORER_TRANSACTION_DETAIL_V3 }),
+            .any(|advertised| { advertised == EXPLORER_TRANSACTION_DETAIL_V4 }),
         "transaction_detail capability must not advertise without a wallet_query_endpoint",
     );
     let detail_outcome = client
@@ -273,6 +273,7 @@ async fn explorer_query_serves_block_production_series_with_explicit_coverage() 
     );
     let mut coinbase_facts = synthetic_transaction_public_facts(coinbase_transaction_id, 64);
     coinbase_facts.is_coinbase = true;
+    coinbase_facts.counts.transparent_input_count = 1;
     coinbase_facts.counts.transparent_output_count = 1;
     let mut coinbase_rows =
         FixtureTransactionRows::from_public_facts(coinbase_location, coinbase_facts);
@@ -569,6 +570,7 @@ fn many_output_spend_chain_fixture() -> Result<(ChainFixture, Vec<String>)> {
         .collect::<Result<Vec<_>>>()?;
     let mut creating_facts = synthetic_transaction_public_facts(creating_transaction_id, 120);
     creating_facts.is_coinbase = true;
+    creating_facts.counts.transparent_input_count = 1;
     creating_facts.counts.transparent_output_count = u32::try_from(output_count)?;
     let creating_transaction = FixtureTransactionRows::from_public_facts(
         TransactionLocation::new(creating_transaction_id, block.height, block.hash, 0),
@@ -584,9 +586,11 @@ fn many_output_spend_chain_fixture() -> Result<(ChainFixture, Vec<String>)> {
         creating_transaction_id,
         u32::try_from(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST)?,
     );
+    let mut spending_facts = synthetic_transaction_public_facts(spending_transaction_id, 80);
+    spending_facts.counts.transparent_input_count = 1;
     let spending_transaction = FixtureTransactionRows::from_public_facts(
         TransactionLocation::new(spending_transaction_id, block.height, block.hash, 1),
-        synthetic_transaction_public_facts(spending_transaction_id, 80),
+        spending_facts,
     );
     let spending_transaction = FixtureTransactionRows {
         facts: spending_transaction.facts.with_transparent_facts(
@@ -805,6 +809,8 @@ fn coinbase_transaction_row(
     let second_script_pub_key = vec![0x52];
     let mut public_facts = synthetic_transaction_public_facts(transaction_id, 120);
     public_facts.is_coinbase = true;
+    public_facts.counts.transparent_input_count = 1;
+    public_facts.counts.transparent_output_count = 2;
     let transaction = FixtureTransactionRows::from_public_facts(
         TransactionLocation::new(transaction_id, block_height, block_hash, 0),
         public_facts,
@@ -836,9 +842,11 @@ fn transparent_spend_transaction_row(
     spent_transaction_id: TransactionId,
     transaction_id: TransactionId,
 ) -> FixtureTransactionRows {
+    let mut public_facts = synthetic_transaction_public_facts(transaction_id, 80);
+    public_facts.counts.transparent_input_count = 2;
     let transaction = FixtureTransactionRows::from_public_facts(
         TransactionLocation::new(transaction_id, block_height, block_hash, 1),
-        synthetic_transaction_public_facts(transaction_id, 80),
+        public_facts,
     );
     FixtureTransactionRows {
         facts: transaction.facts.with_transparent_facts(
@@ -855,6 +863,30 @@ fn transparent_spend_transaction_row(
     }
 }
 
+fn historical_parent_transaction_row(
+    block_height: BlockHeight,
+    block_hash: BlockHash,
+) -> FixtureTransactionRows {
+    let transaction_id = TransactionId::from_bytes([0xA1; 32]);
+    let location = TransactionLocation::new(transaction_id, block_height, block_hash, 2);
+    let mut public_facts = synthetic_transaction_public_facts(transaction_id, 64);
+    public_facts.counts.transparent_output_count = 5;
+    let transaction = FixtureTransactionRows::from_public_facts(location, public_facts);
+    FixtureTransactionRows {
+        facts: transaction.facts.with_transparent_facts(
+            Vec::new(),
+            vec![
+                transparent_output_fact(0, 1, vec![0x50]),
+                transparent_output_fact(1, 2, vec![0x51]),
+                transparent_output_fact(2, 3, vec![0x52]),
+                transparent_output_fact(3, 4, vec![0x54]),
+                transparent_output_fact(4, 60_000, vec![0x53]),
+            ],
+        ),
+        ..transaction
+    }
+}
+
 fn canonical_store_without_transaction_facts(
     chain_fixture: &ChainFixture,
     missing_transaction_id: TransactionId,
@@ -865,7 +897,6 @@ fn canonical_store_without_transaction_facts(
     let block = chain_fixture
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre!("fixture block missing"))?;
-    let parent_transaction_id = TransactionId::from_bytes([0xA1; 32]);
     let mut retained_transaction_rows =
         block_transaction_fixture_rows(block.height, block.hash, block_transaction_ids())
             .into_iter()
@@ -873,20 +904,15 @@ fn canonical_store_without_transaction_facts(
                 transaction_rows.location.transaction_id != missing_transaction_id
             })
             .collect::<Vec<_>>();
-    retained_transaction_rows.push(FixtureTransactionRows {
-        facts: zinder_core::TransactionFactsArtifact::new(
-            TransactionLocation::new(parent_transaction_id, block.height, block.hash, 2),
-            synthetic_transaction_public_facts(parent_transaction_id, 64),
+    retained_transaction_rows.push(historical_parent_transaction_row(block.height, block.hash));
+    artifacts.compact_blocks = retained_transaction_rows
+        .iter()
+        .cloned()
+        .fold(
+            ChainFixture::new(chain_fixture.network()).extend_blocks(1),
+            ChainFixture::with_transaction_rows,
         )
-        .with_transparent_facts(
-            Vec::new(),
-            vec![transparent_output_fact(4, 60_000, vec![0x53])],
-        ),
-        ..FixtureTransactionRows::from_public_facts(
-            TransactionLocation::new(parent_transaction_id, block.height, block.hash, 2),
-            synthetic_transaction_public_facts(parent_transaction_id, 64),
-        )
-    });
+        .compact_block_artifacts();
     artifacts.block_replay_envelopes = vec![encode_fixture_block_replay(
         &block.block_header_artifact(),
         &retained_transaction_rows,

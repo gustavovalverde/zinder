@@ -412,15 +412,15 @@ impl LiveMempoolOwner {
         let staged_entries = staged_generation.index.snapshot(u32::MAX);
         let current_transaction_ids = current_entries
             .iter()
-            .map(|entry| entry.transaction_id)
+            .map(|entry| entry.transaction_id())
             .collect::<HashSet<_>>();
         let staged_transaction_ids = staged_entries
             .iter()
-            .map(|entry| entry.transaction_id)
+            .map(|entry| entry.transaction_id())
             .collect::<HashSet<_>>();
 
         for entry in current_entries {
-            let transaction_id = entry.transaction_id;
+            let transaction_id = entry.transaction_id();
             if staged_transaction_ids.contains(&transaction_id) {
                 continue;
             }
@@ -441,7 +441,7 @@ impl LiveMempoolOwner {
                 .await?;
         }
         for entry in staged_entries {
-            if current_transaction_ids.contains(&entry.transaction_id) {
+            if current_transaction_ids.contains(&entry.transaction_id()) {
                 continue;
             }
             let _outcome = self
@@ -450,7 +450,7 @@ impl LiveMempoolOwner {
                     MempoolEvent::Added {
                         entry: entry.as_ref().clone(),
                     },
-                    entry.first_seen_unix_millis,
+                    entry.first_seen_unix_millis(),
                 )
                 .await?;
         }
@@ -853,6 +853,12 @@ fn hydration_failure_reason(error: &MempoolEntryBuildError) -> MempoolHydrationF
         MempoolEntryBuildError::TransactionParseFailed { .. } => {
             MempoolHydrationFailureReason::TransactionParseFailed
         }
+        MempoolEntryBuildError::TransactionIdMismatch { .. } => {
+            MempoolHydrationFailureReason::TransactionIdMismatch
+        }
+        MempoolEntryBuildError::AuthDigestMismatch { .. } => {
+            MempoolHydrationFailureReason::AuthDigestMismatch
+        }
         MempoolEntryBuildError::CompactTransactionBuildFailed { .. } => {
             MempoolHydrationFailureReason::CompactTransactionBuildFailed
         }
@@ -898,7 +904,10 @@ mod tests {
 
     use tokio_util::sync::CancellationToken;
     use tonic::Code;
-    use zinder_core::{RawTransactionBytes, TransactionId, UnixTimestampMillis};
+    use zebra_chain::{
+        serialization::ZcashDeserializeInto as _, transaction::Transaction as ZebraTransaction,
+    };
+    use zinder_core::{AuthDigest, RawTransactionBytes, TransactionId, UnixTimestampMillis};
     use zinder_source::MempoolSourceEntry;
     use zinder_store::MempoolEvent;
     use zinder_testkit::{MockMempoolSource, MockMempoolSourceControl};
@@ -976,7 +985,7 @@ mod tests {
         );
         assert!(!ready_gate.is_hydrated());
 
-        source_control.push_added(source_entry(0xA1))?;
+        source_control.push_added(source_entry(0xA1)?)?;
         wait_for_staged_entries(owner, 1).await?;
         assert_eq!(owner.index.entry_count(), 0);
         assert_eq!(
@@ -995,7 +1004,7 @@ mod tests {
             "partial source snapshots must not reach durable history"
         );
 
-        source_control.push_added(source_entry(0xA2))?;
+        source_control.push_added(source_entry(0xA2)?)?;
         wait_for_staged_entries(owner, 2).await?;
         assert_eq!(
             owner.require_serving().err().map(|status| status.code()),
@@ -1081,7 +1090,9 @@ mod tests {
         wait_for_serving(owner, false).await?;
         wait_for_hydration(ready_gate, false).await?;
         wait_for_source_open(source_control, 3).await?;
-        source_control.push_added(source_entry(0xB1))?;
+        let abandoned_entry = source_entry(0xB1)?;
+        let abandoned_transaction_id = abandoned_entry.transaction_id;
+        source_control.push_added(abandoned_entry)?;
         wait_for_staged_entries(owner, 1).await?;
         let before_abandoned_generation = canonical
             .mempool_event_page(
@@ -1104,9 +1115,11 @@ mod tests {
             )
             .await?;
         assert_eq!(after_abandoned_generation.len(), 4);
-        assert!(after_abandoned_generation.iter().all(|envelope| {
-            envelope.transaction_id() != TransactionId::from_bytes([0xB1; 32])
-        }));
+        assert!(
+            after_abandoned_generation
+                .iter()
+                .all(|envelope| envelope.transaction_id() != abandoned_transaction_id)
+        );
         Ok(())
     }
 
@@ -1134,7 +1147,7 @@ mod tests {
             first_cancel.clone(),
         ));
         wait_for_source_open(&first_source_control, 1).await?;
-        first_source_control.push_added(source_entry(0xC1))?;
+        first_source_control.push_added(source_entry(0xC1)?)?;
         wait_for_staged_entries(&first_owner, 1).await?;
         first_source_control.complete_initial_snapshot()?;
         wait_for_serving(&first_owner, true).await?;
@@ -1196,22 +1209,27 @@ mod tests {
         Ok(())
     }
 
-    fn source_entry(transaction_id_byte: u8) -> MempoolSourceEntry {
-        MempoolSourceEntry {
-            transaction_id: TransactionId::from_bytes([transaction_id_byte; 32]),
-            auth_digest: None,
-            raw_transaction_bytes: RawTransactionBytes::new(synthetic_v4_tx_bytes()),
+    fn source_entry(transaction_tag: u8) -> Result<MempoolSourceEntry, Box<dyn Error>> {
+        let raw_transaction_bytes = synthetic_v4_tx_bytes(transaction_tag);
+        let transaction: ZebraTransaction =
+            raw_transaction_bytes.as_slice().zcash_deserialize_into()?;
+        Ok(MempoolSourceEntry {
+            transaction_id: TransactionId::from_bytes(transaction.hash().0),
+            auth_digest: transaction
+                .auth_digest()
+                .map(|digest| AuthDigest::from_bytes(digest.0)),
+            raw_transaction_bytes: RawTransactionBytes::new(raw_transaction_bytes),
             observed_at_unix_millis: UnixTimestampMillis::new(1_750_000_000_000),
-        }
+        })
     }
 
-    fn synthetic_v4_tx_bytes() -> Vec<u8> {
+    fn synthetic_v4_tx_bytes(transaction_tag: u8) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0x8000_0004_u32.to_le_bytes());
         bytes.extend_from_slice(&0x892F_2085_u32.to_le_bytes());
         bytes.push(0);
         bytes.push(0);
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&u32::from(transaction_tag).to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         bytes.extend_from_slice(&0_i64.to_le_bytes());
         bytes.push(0);

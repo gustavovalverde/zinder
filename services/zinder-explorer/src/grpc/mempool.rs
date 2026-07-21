@@ -523,7 +523,7 @@ mod tests {
             transaction_id: encode_rpc_transaction_id_hex(transaction_id),
             auth_digest: String::new(),
             raw_transaction_bytes,
-            compact_transaction_bytes: Vec::new(),
+            compact_transaction_data: Some(wallet::CompactTransactionData::default()),
             first_seen_unix_millis: 1_700_000_000_000,
             first_seen_chain_epoch: None,
             transparent_outputs: vec![
@@ -613,7 +613,7 @@ mod tests {
             transaction_id: encode_rpc_transaction_id_hex(facts.transaction_id),
             auth_digest: String::new(),
             raw_transaction_bytes,
-            compact_transaction_bytes: Vec::new(),
+            compact_transaction_data: Some(wallet::CompactTransactionData::default()),
             first_seen_unix_millis,
             first_seen_chain_epoch: None,
             transparent_outputs: Vec::new(),

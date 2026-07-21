@@ -1872,7 +1872,7 @@ service ExplorerQuery {
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
 
   // Returns a typed read model for one transaction. Capability:
-  // `explorer.transaction.detail_v3`.
+  // `explorer.transaction.detail_v4`.
   rpc TransactionDetail(TransactionDetailRequest)
       returns (TransactionDetailResponse);
 

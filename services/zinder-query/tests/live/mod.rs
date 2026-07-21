@@ -1,0 +1,1 @@
+mod standalone_native_contract;

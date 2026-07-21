@@ -2,7 +2,6 @@
 
 use std::{fmt, io::Cursor, time::Instant};
 
-use prost::Message;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zebra_chain::{
@@ -12,18 +11,15 @@ use zebra_chain::{
     transparent::Input as ZebraTransparentInput,
 };
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockTransactionIndexArtifact,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockId, BlockTransactionIndexArtifact,
     CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
     CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts, ChainTipMetadata,
-    CompactBlockArtifact, NetworkUpgradeActivations, SerializedBytesDigest, ShieldedProtocol,
+    CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput, CompactSaplingSpend,
+    CompactShieldedAction, CompactTransaction, CompactTransactionData, CompactTransparentInput,
+    CompactTransparentOutput, NetworkUpgradeActivations, SerializedBytesDigest, ShieldedProtocol,
     TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
     TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutPoint,
-    TransparentOutputArtifact, encode_canonical_block_replay,
-    wire::{encode_internal_block_hash, encode_internal_transaction_id, encode_rpc_block_hash_hex},
-};
-use zinder_proto::compat::lightwalletd::{
-    ChainMetadata, CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
-    CompactTx, CompactTxIn, TxOut as CompactTxOut,
+    TransparentOutputArtifact, encode_canonical_block_replay, wire::encode_rpc_block_hash_hex,
 };
 use zinder_source::{SourceBlock, transaction_public_fact_set_from_parsed};
 use zinder_store::RawBlobRetention;
@@ -125,7 +121,7 @@ pub enum CanonicalBlockConstructionError {
         field: &'static str,
     },
 
-    /// Compact note ciphertext is shorter than the lightwalletd prefix.
+    /// Compact note ciphertext is shorter than the native wallet-scan prefix.
     #[error("compact note ciphertext is shorter than {COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN} bytes")]
     CompactCiphertextTooShort,
 
@@ -149,6 +145,14 @@ pub enum CanonicalBlockConstructionError {
         parsed_transaction_count: usize,
         /// Canonical fact rows prepared from that same block.
         canonical_fact_count: usize,
+    },
+
+    /// Structured compact-block invariants failed during construction.
+    #[error("compact block construction failed: {source}")]
+    CompactBlockInvalid {
+        /// Underlying compact-block invariant error.
+        #[from]
+        source: zinder_core::CompactBlockArtifactError,
     },
 
     /// Parsing typed transaction facts failed.
@@ -252,10 +256,10 @@ impl CommitmentTreeSizes {
         })
     }
 
-    /// Lowers to the lightwalletd `ChainMetadata` wire shape.
+    /// Lowers to native compact-block chain metadata.
     #[must_use]
-    pub const fn chain_metadata(self) -> ChainMetadata {
-        ChainMetadata {
+    pub const fn chain_metadata(self) -> CompactChainMetadata {
+        CompactChainMetadata {
             sapling_commitment_tree_size: self.sapling,
             orchard_commitment_tree_size: self.orchard,
             ironwood_commitment_tree_size: self.ironwood,
@@ -285,9 +289,9 @@ pub struct PreparedCanonicalBlock {
     pub replay_envelope: CanonicalBlockReplayEnvelope,
     /// Retained raw blobs kept outside semantic fact identity.
     pub retained_raw_blobs: RetainedRawBlobs,
-    /// Lightwalletd compact block with `chain_metadata = None`; the
-    /// serial folder stamps the final tree-size position before encoding.
-    pub partial_compact_block: CompactBlock,
+    /// Structured compact block whose zero metadata is replaced by the
+    /// serial folder's final tree-size position.
+    pub partial_compact_block: CompactBlockArtifact,
     /// Commitment-tree-size delta this block contributes.
     pub tree_size_additions: CommitmentTreeSizes,
 }
@@ -313,7 +317,7 @@ pub struct PositionedCanonicalBlock {
     pub replay_envelope: CanonicalBlockReplayEnvelope,
     /// Retained raw blobs kept outside the replay envelope.
     pub retained_raw_blobs: RetainedRawBlobs,
-    /// Lightwalletd compact block with final chain metadata stamped.
+    /// Native compact block with final chain metadata stamped.
     pub compact_block: CompactBlockArtifact,
     /// Running commitment-tree position after this block.
     pub tip_metadata: ChainTipMetadata,
@@ -324,7 +328,7 @@ pub struct PositionedCanonicalBlock {
 /// Preparation is parallel-safe because the returned value does not depend on
 /// the block's position in the running chain state.
 ///
-/// The output's `partial_compact_block.chain_metadata` is left `None`;
+/// The output's compact block carries zero placeholder tree sizes;
 /// [`position_canonical_block`] stamps the final commitment-tree position
 /// before encoding the proto and validating against any source-supplied
 /// observation.
@@ -355,22 +359,13 @@ pub fn prepare_canonical_block(
         measure_canonical_construction_stage("compact_artifacts", || {
             compact_transactions(&parsed_block, &prepared_transactions.facts)
         })?;
-    let (block_header_bytes, block_header) =
-        measure_canonical_construction_stage("block_header_artifact", || {
-            let block_header_bytes =
-                parsed_block
-                    .header
-                    .zcash_serialize_to_vec()
-                    .map_err(|source| {
-                        CanonicalBlockConstructionError::BlockHeaderSerializationFailed { source }
-                    })?;
-            let block_header = block_header_artifact_from_parsed_block(
-                &parsed_block,
-                source_block.height,
-                usize_to_u64_saturating(source_block.raw_block_bytes.len()),
-            );
-            Ok((block_header_bytes, block_header))
-        })?;
+    let block_header = measure_canonical_construction_stage("block_header_artifact", || {
+        Ok(block_header_artifact_from_parsed_block(
+            &parsed_block,
+            source_block.height,
+            usize_to_u64_saturating(source_block.raw_block_bytes.len()),
+        ))
+    })?;
     let block_blob = measure_canonical_construction_stage("block_blob", || {
         Ok(if raw_blob_policy.writes_block_blobs() {
             Some(BlockBlobArtifact::new(
@@ -384,15 +379,17 @@ pub fn prepare_canonical_block(
             None
         })
     })?;
-    let partial_compact_block = CompactBlock {
-        height: u64::from(source_block.height.value()),
-        hash: encode_internal_block_hash(source_block.hash).to_vec(),
-        prev_hash: encode_internal_block_hash(source_block.parent_hash).to_vec(),
-        time: source_block.block_time_seconds,
-        header: block_header_bytes,
-        vtx: compact_transactions,
-        chain_metadata: None,
-    };
+    let partial_compact_block = CompactBlockArtifact::new(
+        BlockId::new(source_block.height, source_block.hash),
+        source_block.parent_hash,
+        source_block.block_time_seconds,
+        compact_transactions,
+        CompactChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
+    )?;
 
     let facts = CanonicalBlockFacts {
         block_header,
@@ -457,18 +454,20 @@ pub fn position_canonical_block(
         facts,
         replay_envelope,
         retained_raw_blobs,
-        mut partial_compact_block,
+        partial_compact_block,
         tree_size_additions,
     } = prepared;
 
     let final_tree_sizes = running_tree_sizes.checked_add(tree_size_additions)?;
 
-    partial_compact_block.chain_metadata = Some(final_tree_sizes.chain_metadata());
+    let parts = partial_compact_block.into_parts();
     let compact_block = CompactBlockArtifact::new(
-        facts.block_header.height,
-        facts.block_header.block_hash,
-        partial_compact_block.encode_to_vec(),
-    );
+        parts.block_id,
+        parts.previous_block_hash,
+        parts.time,
+        parts.transactions,
+        final_tree_sizes.chain_metadata(),
+    )?;
     *running_tree_sizes = final_tree_sizes;
 
     Ok(PositionedCanonicalBlock {
@@ -831,7 +830,7 @@ fn validate_parsed_block_identity(
 fn compact_transactions(
     parsed_block: &ZebraBlock,
     canonical_transactions: &[CanonicalTransactionFacts],
-) -> Result<(Vec<CompactTx>, CommitmentTreeSizes), CanonicalBlockConstructionError> {
+) -> Result<(Vec<CompactTransaction>, CommitmentTreeSizes), CanonicalBlockConstructionError> {
     if parsed_block.transactions.len() != canonical_transactions.len() {
         return Err(
             CanonicalBlockConstructionError::TransactionFactCountMismatch {
@@ -859,10 +858,16 @@ fn compact_transactions(
             transaction.as_ref(),
         )?;
         tree_size_additions = tree_size_additions.checked_add(CommitmentTreeSizes {
-            sapling: count_to_u32(compact_transaction.outputs.len(), "Sapling output count")?,
-            orchard: count_to_u32(compact_transaction.actions.len(), "Orchard action count")?,
+            sapling: count_to_u32(
+                compact_transaction.data.sapling_outputs.len(),
+                "Sapling output count",
+            )?,
+            orchard: count_to_u32(
+                compact_transaction.data.orchard_actions.len(),
+                "Orchard action count",
+            )?,
             ironwood: count_to_u32(
-                compact_transaction.ironwood_actions.len(),
+                compact_transaction.data.ironwood_actions.len(),
                 "Ironwood action count",
             )?,
         })?;
@@ -875,37 +880,30 @@ fn compact_transactions(
     Ok((compact_transactions, tree_size_additions))
 }
 
-/// Builds a lightwalletd-compatible compact transaction from a parsed
-/// Zebra transaction.
-///
-/// `index` is the position of the transaction within its containing block;
-/// mempool callers that hydrate a single unmined transaction supply `0`.
-pub(crate) fn compact_transaction(
-    index: u64,
+/// Builds Zinder-native wallet scan data from a parsed Zebra transaction.
+pub(crate) fn compact_transaction_data(
     transaction: &ZebraTransaction,
-) -> Result<CompactTx, CanonicalBlockConstructionError> {
-    compact_transaction_with_transaction_id(
-        index,
-        TransactionId::from_bytes(transaction.hash().0),
-        transaction,
-    )
+) -> Result<CompactTransactionData, CanonicalBlockConstructionError> {
+    Ok(CompactTransactionData {
+        fee_zat: None,
+        sapling_spends: compact_sapling_spends(transaction),
+        sapling_outputs: compact_sapling_outputs(transaction)?,
+        orchard_actions: compact_orchard_actions(transaction)?,
+        ironwood_actions: compact_ironwood_actions(transaction)?,
+        transparent_inputs: compact_transparent_inputs(transaction),
+        transparent_outputs: compact_transparent_outputs(transaction),
+    })
 }
 
 fn compact_transaction_with_transaction_id(
     index: u64,
     transaction_id: TransactionId,
     transaction: &ZebraTransaction,
-) -> Result<CompactTx, CanonicalBlockConstructionError> {
-    Ok(CompactTx {
+) -> Result<CompactTransaction, CanonicalBlockConstructionError> {
+    Ok(CompactTransaction {
         index,
-        txid: encode_internal_transaction_id(transaction_id).to_vec(),
-        fee: 0,
-        spends: compact_sapling_spends(transaction),
-        outputs: compact_sapling_outputs(transaction)?,
-        actions: compact_orchard_actions(transaction)?,
-        ironwood_actions: compact_ironwood_actions(transaction)?,
-        vin: compact_transparent_inputs(transaction),
-        vout: compact_transparent_outputs(transaction),
+        transaction_id,
+        data: compact_transaction_data(transaction)?,
     })
 }
 
@@ -913,7 +911,7 @@ fn compact_sapling_spends(transaction: &ZebraTransaction) -> Vec<CompactSaplingS
     transaction
         .sapling_spends_per_anchor()
         .map(|spend| CompactSaplingSpend {
-            nf: <[u8; 32]>::from(spend.nullifier).to_vec(),
+            nullifier: spend.nullifier.into(),
         })
         .collect()
 }
@@ -926,8 +924,8 @@ fn compact_sapling_outputs(
         .map(|output| {
             let enc_ciphertext: [u8; 580] = output.enc_ciphertext.into();
             Ok(CompactSaplingOutput {
-                cmu: output.cm_u.to_bytes().to_vec(),
-                ephemeral_key: <[u8; 32]>::from(output.ephemeral_key).to_vec(),
+                commitment: output.cm_u.to_bytes(),
+                ephemeral_key: output.ephemeral_key.into(),
                 ciphertext: compact_note_ciphertext_prefix(&enc_ciphertext)?,
             })
         })
@@ -936,15 +934,15 @@ fn compact_sapling_outputs(
 
 fn compact_orchard_actions(
     transaction: &ZebraTransaction,
-) -> Result<Vec<CompactOrchardAction>, CanonicalBlockConstructionError> {
+) -> Result<Vec<CompactShieldedAction>, CanonicalBlockConstructionError> {
     transaction
         .orchard_actions()
         .map(|action| {
             let enc_ciphertext: [u8; 580] = action.enc_ciphertext.into();
-            Ok(CompactOrchardAction {
-                nullifier: <[u8; 32]>::from(action.nullifier).to_vec(),
-                cmx: <[u8; 32]>::from(action.cm_x).to_vec(),
-                ephemeral_key: <[u8; 32]>::from(action.ephemeral_key).to_vec(),
+            Ok(CompactShieldedAction {
+                nullifier: action.nullifier.into(),
+                commitment: action.cm_x.into(),
+                ephemeral_key: action.ephemeral_key.into(),
                 ciphertext: compact_note_ciphertext_prefix(&enc_ciphertext)?,
             })
         })
@@ -953,15 +951,15 @@ fn compact_orchard_actions(
 
 fn compact_ironwood_actions(
     transaction: &ZebraTransaction,
-) -> Result<Vec<CompactOrchardAction>, CanonicalBlockConstructionError> {
+) -> Result<Vec<CompactShieldedAction>, CanonicalBlockConstructionError> {
     transaction
         .ironwood_actions()
         .map(|action| {
             let enc_ciphertext: [u8; 580] = action.enc_ciphertext.into();
-            Ok(CompactOrchardAction {
-                nullifier: <[u8; 32]>::from(action.nullifier).to_vec(),
-                cmx: <[u8; 32]>::from(action.cm_x).to_vec(),
-                ephemeral_key: <[u8; 32]>::from(action.ephemeral_key).to_vec(),
+            Ok(CompactShieldedAction {
+                nullifier: action.nullifier.into(),
+                commitment: action.cm_x.into(),
+                ephemeral_key: action.ephemeral_key.into(),
                 ciphertext: compact_note_ciphertext_prefix(&enc_ciphertext)?,
             })
         })
@@ -970,45 +968,45 @@ fn compact_ironwood_actions(
 
 fn compact_note_ciphertext_prefix(
     ciphertext: &[u8],
-) -> Result<Vec<u8>, CanonicalBlockConstructionError> {
+) -> Result<[u8; COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN], CanonicalBlockConstructionError> {
     ciphertext
         .get(..COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN)
-        .map(<[u8]>::to_vec)
+        .and_then(|prefix| prefix.try_into().ok())
         .ok_or(CanonicalBlockConstructionError::CompactCiphertextTooShort)
 }
 
-fn compact_transparent_inputs(transaction: &ZebraTransaction) -> Vec<CompactTxIn> {
+fn compact_transparent_inputs(transaction: &ZebraTransaction) -> Vec<CompactTransparentInput> {
     transaction
         .inputs()
         .iter()
         .filter_map(|input| match input {
-            ZebraTransparentInput::PrevOut { outpoint, .. } => Some(CompactTxIn {
-                prevout_txid: outpoint.hash.0.to_vec(),
-                prevout_index: outpoint.index,
+            ZebraTransparentInput::PrevOut { outpoint, .. } => Some(CompactTransparentInput {
+                previous_transaction_id: TransactionId::from_bytes(outpoint.hash.0),
+                previous_output_index: outpoint.index,
             }),
             ZebraTransparentInput::Coinbase { .. } => None,
         })
         .collect()
 }
 
-fn compact_transparent_outputs(transaction: &ZebraTransaction) -> Vec<CompactTxOut> {
+fn compact_transparent_outputs(transaction: &ZebraTransaction) -> Vec<CompactTransparentOutput> {
     transaction
         .outputs()
         .iter()
-        .map(|output| CompactTxOut {
-            value: u64::from(output.value()),
+        .map(|output| CompactTransparentOutput {
+            value_zat: u64::from(output.value()),
             script_pub_key: output.lock_script.as_raw_bytes().to_vec(),
         })
         .collect()
 }
 
-fn compact_transaction_has_payload(transaction: &CompactTx) -> bool {
-    !transaction.spends.is_empty()
-        || !transaction.outputs.is_empty()
-        || !transaction.actions.is_empty()
-        || !transaction.ironwood_actions.is_empty()
-        || !transaction.vin.is_empty()
-        || !transaction.vout.is_empty()
+fn compact_transaction_has_payload(transaction: &CompactTransaction) -> bool {
+    !transaction.data.sapling_spends.is_empty()
+        || !transaction.data.sapling_outputs.is_empty()
+        || !transaction.data.orchard_actions.is_empty()
+        || !transaction.data.ironwood_actions.is_empty()
+        || !transaction.data.transparent_inputs.is_empty()
+        || !transaction.data.transparent_outputs.is_empty()
 }
 
 fn count_to_u32(count: usize, field: &'static str) -> Result<u32, CanonicalBlockConstructionError> {
@@ -1024,7 +1022,10 @@ mod tests {
     use std::error::Error;
 
     use serde_json::Value;
-    use zinder_core::{BlockHeight, ChainEpoch, ChainEpochId, Network, UnixTimestampMillis};
+    use zinder_core::{
+        BlockHeight, ChainEpoch, ChainEpochId, CompactShieldedAction, CompactTransactionData,
+        Network, TransactionId, UnixTimestampMillis,
+    };
     use zinder_source::SourceBlock;
     use zinder_store::{
         CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention,
@@ -1033,9 +1034,9 @@ mod tests {
 
     use super::{
         COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, CanonicalBlockConstructionError, CommitmentTreeSizes,
-        CompactOrchardAction, CompactTx, RawBlobPolicy, ShieldedProtocol,
-        compact_note_ciphertext_prefix, compact_transaction_has_payload,
-        expand_canonical_store_block_artifacts, position_canonical_block, prepare_canonical_block,
+        CompactTransaction, RawBlobPolicy, ShieldedProtocol, compact_note_ciphertext_prefix,
+        compact_transaction_has_payload, expand_canonical_store_block_artifacts,
+        position_canonical_block, prepare_canonical_block,
     };
 
     #[test]
@@ -1265,32 +1266,29 @@ mod tests {
     }
 
     #[test]
-    fn compact_note_ciphertext_prefix_returns_first_lightwalletd_prefix_bytes()
+    fn compact_note_ciphertext_prefix_returns_first_wallet_scan_prefix_bytes()
     -> Result<(), Box<dyn Error>> {
         let ciphertext = [1u8; 580];
         let prefix = compact_note_ciphertext_prefix(&ciphertext)?;
 
-        assert_eq!(prefix, vec![1u8; COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN]);
+        assert_eq!(prefix, [1u8; COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN]);
         Ok(())
     }
 
     #[test]
     fn has_payload_keeps_an_ironwood_only_transaction() {
-        let ironwood_only_transaction = CompactTx {
+        let ironwood_only_transaction = CompactTransaction {
             index: 0,
-            txid: vec![0u8; 32],
-            fee: 0,
-            spends: Vec::new(),
-            outputs: Vec::new(),
-            actions: Vec::new(),
-            ironwood_actions: vec![CompactOrchardAction {
-                nullifier: vec![0u8; 32],
-                cmx: vec![0u8; 32],
-                ephemeral_key: vec![0u8; 32],
-                ciphertext: vec![0u8; 52],
-            }],
-            vin: Vec::new(),
-            vout: Vec::new(),
+            transaction_id: TransactionId::from_bytes([0; 32]),
+            data: CompactTransactionData {
+                ironwood_actions: vec![CompactShieldedAction {
+                    nullifier: [0; 32],
+                    commitment: [0; 32],
+                    ephemeral_key: [0; 32],
+                    ciphertext: [0; 52],
+                }],
+                ..CompactTransactionData::default()
+            },
         };
 
         assert!(

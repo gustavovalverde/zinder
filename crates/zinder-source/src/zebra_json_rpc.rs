@@ -15,7 +15,7 @@ use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use zinder_core::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockId, BlockValuePoolBalances,
     BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
@@ -1012,10 +1012,10 @@ impl NodeSource for ZebraJsonRpcSource {
             .await?;
         let final_note_commitment_roots =
             parse_zebra_final_note_commitment_roots(&tree_state, block_id)?;
-        let payload_bytes = serde_json::to_vec(&tree_state)
-            .map_err(|source| SourceError::SourcePayloadEncodingFailed { source })?;
+        let (block_time_seconds, payload_bytes) = normalize_zebra_tree_state_payload(&tree_state)?;
         Ok(SourceTreeState::with_final_note_commitment_roots(
             final_note_commitment_roots,
+            block_time_seconds,
             payload_bytes,
         ))
     }
@@ -1750,6 +1750,38 @@ fn parse_zebra_final_note_commitment_roots(
     ))
 }
 
+fn normalize_zebra_tree_state_payload(tree_state: &Value) -> Result<(u32, Vec<u8>), SourceError> {
+    let block_time_seconds = tree_state
+        .get("time")
+        .and_then(Value::as_u64)
+        .and_then(|time| u32::try_from(time).ok())
+        .ok_or(SourceError::SourceProtocolMismatch {
+            reason: "tree-state response is missing a valid block time",
+        })?;
+    let mut payload = Map::new();
+    for pool_name in ["sapling", "orchard", "ironwood"] {
+        let Some(final_state) = tree_state
+            .get(pool_name)
+            .and_then(|pool| pool.get("commitments"))
+            .and_then(|commitments| commitments.get("finalState"))
+        else {
+            continue;
+        };
+        let final_state = final_state
+            .as_str()
+            .ok_or(SourceError::SourceProtocolMismatch {
+                reason: "tree-state finalState must be a string",
+            })?;
+        payload.insert(
+            pool_name.to_owned(),
+            serde_json::json!({"commitments": {"finalState": final_state}}),
+        );
+    }
+    serde_json::to_vec(&Value::Object(payload))
+        .map(|payload_bytes| (block_time_seconds, payload_bytes))
+        .map_err(|source| SourceError::SourcePayloadEncodingFailed { source })
+}
+
 fn parse_zebra_final_note_commitment_root(
     tree_state: &Value,
     protocol: ShieldedProtocol,
@@ -2251,6 +2283,39 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn tree_state_payload_normalization_keeps_only_pool_frontiers() -> Result<(), SourceError> {
+        let source_payload = serde_json::json!({
+            "network": "regtest",
+            "height": 42,
+            "hash": "11".repeat(32),
+            "time": 1_774_668_700,
+            "sapling": {"commitments": {"finalRoot": "22".repeat(32), "finalState": "aa"}},
+            "orchard": {"commitments": {"finalState": "bb"}},
+            "ironwood": {"commitments": {"finalState": "cc"}},
+        });
+
+        let (block_time_seconds, payload_bytes) =
+            normalize_zebra_tree_state_payload(&source_payload)?;
+        let payload: Value = serde_json::from_slice(&payload_bytes)
+            .map_err(|source| SourceError::SourcePayloadEncodingFailed { source })?;
+
+        assert_eq!(block_time_seconds, 1_774_668_700);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "sapling": {"commitments": {"finalState": "aa"}},
+                "orchard": {"commitments": {"finalState": "bb"}},
+                "ironwood": {"commitments": {"finalState": "cc"}},
+            })
+        );
+        assert!(payload.get("height").is_none());
+        assert!(payload.get("hash").is_none());
+        assert!(payload.get("time").is_none());
+
+        Ok(())
+    }
 
     #[test]
     fn batch_response_error_object_is_treated_as_splittable_response_size() {

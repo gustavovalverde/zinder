@@ -15,10 +15,8 @@ use zinder_runtime::{
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
 mod config;
-mod wallet_serving_pair_publisher;
-
 use config::{LightwalletdConfigError, LightwalletdConfigOverrides};
-use wallet_serving_pair_publisher::{WalletServingPairConfig, WalletServingPairPublisher};
+use zinder_query::{WalletServingPairConfig, WalletServingPairPublisher};
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
@@ -204,7 +202,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     );
     open_storage_phase.complete();
 
-    let mut wallet_query = zinder_query::LightwalletdServingQuery::from_serving_pair_slot(
+    let mut wallet_query = zinder_query::WalletServingQuery::from_serving_pair_slot(
         Arc::clone(&serving_pair_slot),
         broadcaster,
         network_upgrade_activations.clone(),

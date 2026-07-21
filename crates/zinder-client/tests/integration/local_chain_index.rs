@@ -52,7 +52,7 @@ fn open_swept_transparent_spend_stores() -> eyre::Result<SweptTransparentSpendSt
     );
     let spend = TransparentSpendFact::new(
         spent_outpoint,
-        1,
+        0,
         TransactionId::from_bytes([0x93; 32]),
         0,
         spending_block.height,
@@ -203,7 +203,7 @@ async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Re
 
     assert_eq!(current_epoch.visible_tip_height, BlockHeight::new(2));
     assert_eq!(visible_tip_block.height, BlockHeight::new(2));
-    assert_eq!(compact_block.height, BlockHeight::new(1));
+    assert_eq!(compact_block.height(), BlockHeight::new(1));
     assert_eq!(tree_state.height, BlockHeight::new(2));
     assert_eq!(subtree_roots.len(), 1);
     let TxStatus::Mined(mined) = mined_transaction else {

@@ -1,7 +1,7 @@
 //! Shared-secret bearer-token authentication for private gRPC control planes.
 //!
 //! The `IngestControl` gRPC service exposes mempool state and chain events
-//! to colocated `zinder-projector` and `zinder-compat-lightwalletd` processes.
+//! to colocated projector and native query processes.
 //! Operators that run those processes on a separate host (or any network
 //! that is not strictly localhost / VPN-only) need authentication on the
 //! control plane. This module provides the minimum viable surface:

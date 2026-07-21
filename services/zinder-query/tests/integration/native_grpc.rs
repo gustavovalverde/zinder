@@ -37,7 +37,7 @@ use zinder_testkit::{
 };
 
 use crate::common::{
-    chain_epoch_artifacts_with_transparent_facts, compact_block_with_tree_sizes,
+    chain_epoch_artifacts_with_sapling_outputs, chain_epoch_artifacts_with_transparent_facts,
     synthetic_chain_epoch,
 };
 
@@ -67,9 +67,8 @@ async fn native_grpc_service_returns_wallet_reads_from_stored_artifacts() -> eyr
             .ok_or_else(|| eyre!("missing compact block"))?
             .compact_block
             .as_ref()
-            .ok_or_else(|| eyre!("missing compact block"))?
-            .payload_bytes,
-        stored_artifacts.compact_block.payload_bytes
+            .ok_or_else(|| eyre!("missing compact block"))?,
+        &zinder_proto::wire::compact_block_message(&stored_artifacts.compact_block)
     );
     assert_eq!(
         grpc_responses.explicit_tree_state.payload_bytes,
@@ -140,15 +139,11 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
     let store = store_fixture.chain_store().clone();
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
     chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 65_536, 0);
-    let replay = encode_fixture_block_replay(&block, &[]);
-
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
+    store.commit_chain_epoch(chain_epoch_artifacts_with_sapling_outputs(
         chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
+        block,
+        65_536,
+    )?)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
@@ -348,7 +343,19 @@ async fn native_grpc_service_live_tail_delivers_only_post_subscribe_events() -> 
     .await?
     .into_inner();
 
-    let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    let (mut second_epoch, second_block, _second_compact_block) = synthetic_chain_epoch(2, 2);
+    second_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
+    let second_compact_block = zinder_core::CompactBlockArtifact::empty(
+        zinder_core::BlockId::new(second_block.height, second_block.block_hash),
+        second_block.parent_hash,
+        u32::try_from(second_block.block_time)
+            .map_err(|_| eyre!("fixture block time is not representable as u32"))?,
+        zinder_core::CompactChainMetadata {
+            sapling_commitment_tree_size: 65_536,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
+    );
     let second_replay = encode_fixture_block_replay(&second_block, &[]);
     store.commit_chain_epoch(ChainEpochArtifacts::new(
         second_epoch,
@@ -487,9 +494,15 @@ async fn native_grpc_service_resolves_unpinned_mempool_transactions() -> eyre::R
         }),
         location: Some(wallet::TransactionLocation {
             location: Some(wallet::transaction_location::Location::InMempool(
-                wallet::MempoolTransaction {
-                    payload_bytes: vec![0x01, 0x02, 0x03],
-                    first_seen_unix_seconds: 1_700_000_000,
+                wallet::MempoolEntry {
+                    transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+                    auth_digest: String::new(),
+                    raw_transaction_bytes: vec![0x01, 0x02, 0x03],
+                    compact_transaction_data: Some(wallet::CompactTransactionData::default()),
+                    first_seen_unix_millis: 1_700_000_000_000,
+                    first_seen_chain_epoch: Some(test_chain_epoch()),
+                    transparent_outputs: Vec::new(),
+                    transparent_spends: Vec::new(),
                 },
             )),
         }),
@@ -523,8 +536,8 @@ async fn native_grpc_service_resolves_unpinned_mempool_transactions() -> eyre::R
     assert!(matches!(
         response.location.and_then(|location| location.location),
         Some(wallet::transaction_location::Location::InMempool(transaction))
-            if transaction.payload_bytes == [0x01, 0x02, 0x03]
-                && transaction.first_seen_unix_seconds == 1_700_000_000
+            if transaction.raw_transaction_bytes == [0x01, 0x02, 0x03]
+                && transaction.first_seen_unix_millis == 1_700_000_000_000
     ));
 
     let Err(pinned_status) = WalletQueryService::transaction(
@@ -612,9 +625,9 @@ fn commit_confirmed_transparent_balance_fixture(
     store: &PrimaryChainStore,
 ) -> eyre::Result<ConfirmedTransparentBalanceFixture> {
     let address_script_hash = TransparentAddressScriptHash::from_bytes([0x42; 32]);
-    let confirmed_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x51; 32]), 7);
+    let confirmed_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x51; 32]), 0);
     let confirmed_value_zat = 10_000;
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(41, 1);
+    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
     let confirmed_output = TransparentOutputArtifact::new(
         confirmed_outpoint,
         confirmed_value_zat,
@@ -629,7 +642,7 @@ fn commit_confirmed_transparent_balance_fixture(
         vec![compact_block],
         &[confirmed_output],
         Vec::new(),
-    ))?;
+    )?)?;
 
     Ok(ConfirmedTransparentBalanceFixture {
         chain_epoch,
@@ -752,9 +765,18 @@ struct WalletGrpcResponses {
 fn commit_wallet_artifacts(store: &PrimaryChainStore) -> eyre::Result<StoredWalletArtifacts> {
     let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
     chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 65_536, 0);
-    let tree_state =
-        TreeStateArtifact::new(block.height, block.block_hash, b"tree-state-1".to_vec());
+    let artifacts = chain_epoch_artifacts_with_sapling_outputs(chain_epoch, block.clone(), 65_536)?;
+    let compact_block = artifacts
+        .compact_blocks
+        .first()
+        .cloned()
+        .ok_or_else(|| eyre!("missing compact block fixture"))?;
+    let tree_state = TreeStateArtifact::new(
+        block.height,
+        block.block_hash,
+        u32::try_from(block.block_time)?,
+        b"tree-state-1".to_vec(),
+    );
     let subtree_root = SubtreeRootArtifact::new(
         ShieldedProtocol::Sapling,
         SubtreeRootIndex::new(0),
@@ -762,17 +784,10 @@ fn commit_wallet_artifacts(store: &PrimaryChainStore) -> eyre::Result<StoredWall
         block.height,
         block.block_hash,
     );
-    let replay = encode_fixture_block_replay(&block, &[]);
-
     store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            chain_epoch,
-            vec![block],
-            vec![replay],
-            vec![compact_block.clone()],
-        )
-        .with_tree_states(vec![tree_state.clone()])
-        .with_subtree_roots(vec![subtree_root.clone()]),
+        artifacts
+            .with_tree_states(vec![tree_state.clone()])
+            .with_subtree_roots(vec![subtree_root.clone()]),
     )?;
 
     Ok(StoredWalletArtifacts {

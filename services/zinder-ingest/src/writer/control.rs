@@ -1430,7 +1430,6 @@ fn map_store_error(error: &CanonicalStoreError) -> Status {
 pub(crate) mod test_support {
     use std::{fs, num::NonZeroU32, str::FromStr as _, time::Duration};
 
-    use prost::Message as _;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_util::sync::CancellationToken;
@@ -1438,22 +1437,19 @@ pub(crate) mod test_support {
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
         CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
-        CanonicalTransactionFacts, ChainTipMetadata, CompactBlockArtifact, LockTime, MempoolEntry,
-        MempoolEvictionReason, Network, PrivacyShape, RawTransactionBytes, SerializedBytesDigest,
-        TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
-        TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
-        TransactionVersion, UnixTimestampMillis, UnsupportedSection, encode_canonical_block_replay,
-        wire::encode_internal_block_hash,
+        CanonicalTransactionFacts, ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata,
+        CompactTransactionData, LockTime, MempoolEntry, MempoolEvictionReason, MempoolObservation,
+        Network, PrivacyShape, RawTransactionBytes, SerializedBytesDigest, TransactionBlobArtifact,
+        TransactionComponentCounts, TransactionId, TransactionIntrinsicValueBalances,
+        TransactionLocation, TransactionPublicFacts, TransactionVersion, UnixTimestampMillis,
+        UnsupportedSection, encode_canonical_block_replay,
     };
-    use zinder_proto::{
-        compat::lightwalletd,
-        v1::ingest::{
-            AcquireCanonicalProjectionBuildLeaseRequest, CanonicalEventPageRequest,
-            CanonicalProjectionBuildLease, CanonicalWriterStatusRequest,
-            CreateCanonicalOwnerCheckpointRequest, ReadmitCanonicalOwnerCheckpointRequest,
-            ReleaseCanonicalProjectionBuildLeaseRequest, RenewCanonicalProjectionBuildLeaseRequest,
-            canonical_control_client::CanonicalControlClient,
-        },
+    use zinder_proto::v1::ingest::{
+        AcquireCanonicalProjectionBuildLeaseRequest, CanonicalEventPageRequest,
+        CanonicalProjectionBuildLease, CanonicalWriterStatusRequest,
+        CreateCanonicalOwnerCheckpointRequest, ReadmitCanonicalOwnerCheckpointRequest,
+        ReleaseCanonicalProjectionBuildLeaseRequest, RenewCanonicalProjectionBuildLeaseRequest,
+        canonical_control_client::CanonicalControlClient,
     };
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
@@ -1644,7 +1640,10 @@ pub(crate) mod test_support {
         assert_owner_checkpoint_readmission(&mut *client, temporary_path, &checkpoint).await?;
         assert_eq!(checkpoint.candidate_id, "bundle-a1");
         assert_eq!(checkpoint.store_identity, "canonical");
-        assert_eq!(checkpoint.schema_version, 5);
+        assert_eq!(
+            checkpoint.schema_version,
+            u32::from(zinder_store::CANONICAL_STORE_SCHEMA_VERSION)
+        );
         assert_eq!(checkpoint.workload, "wallet");
         assert_eq!(checkpoint.network_name, "zcash-testnet");
         assert!(!checkpoint.database_identity.is_empty());
@@ -1961,16 +1960,16 @@ pub(crate) mod test_support {
         let transaction_id = TransactionId::from_bytes([0xB1; 32]);
         let first = store.append_mempool_event(
             MempoolEvent::Added {
-                entry: MempoolEntry {
+                entry: MempoolEntry::new(
                     transaction_id,
-                    auth_digest: None,
-                    raw_transaction_bytes: RawTransactionBytes::new(vec![0xB1; 8]),
-                    compact_transaction_bytes: vec![0xB1; 4],
-                    first_seen_unix_millis: UnixTimestampMillis::new(1_000),
-                    first_seen_chain_epoch: chain_epoch,
-                    transparent_outputs: Vec::new(),
-                    transparent_spends: Vec::new(),
-                },
+                    None,
+                    RawTransactionBytes::new(vec![0xB1; 8]),
+                    CompactTransactionData::default(),
+                    MempoolObservation {
+                        first_seen_unix_millis: UnixTimestampMillis::new(1_000),
+                        first_seen_chain_epoch: chain_epoch,
+                    },
+                )?,
             },
             UnixTimestampMillis::new(1_000),
         )?;
@@ -2159,23 +2158,16 @@ pub(crate) mod test_support {
             CanonicalBlockReplayFormatVersion::V1,
             CanonicalBlockFactsDigestVersion::V1,
         );
-        let compact_payload = lightwalletd::CompactBlock {
-            height: 1,
-            hash: encode_internal_block_hash(facts.block_header.block_hash).to_vec(),
-            prev_hash: encode_internal_block_hash(facts.block_header.parent_hash).to_vec(),
-            chain_metadata: Some(lightwalletd::ChainMetadata {
-                sapling_commitment_tree_size: 0,
-                orchard_commitment_tree_size: 0,
-                ironwood_commitment_tree_size: 0,
-            }),
-            ..Default::default()
-        }
-        .encode_to_vec();
         CanonicalBuildBlock {
-            compact_block: CompactBlockArtifact::new(
-                height,
-                facts.block_header.block_hash,
-                compact_payload,
+            compact_block: CompactBlockArtifact::empty(
+                BlockId::new(height, facts.block_header.block_hash),
+                facts.block_header.parent_hash,
+                1,
+                CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
             ),
             replay_envelope,
             tip_metadata: ChainTipMetadata::new(0, 0, 0),

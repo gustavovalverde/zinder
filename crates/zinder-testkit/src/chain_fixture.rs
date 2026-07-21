@@ -12,21 +12,20 @@
 //! protocol surfaces). Tests that exercise `derive_*_artifact` should pull
 //! real Zcash bytes from `services/zinder-ingest/tests/fixtures/`.
 
-use prost::Message;
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockTransactionIndexArtifact,
-    CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
-    CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, LockTime, Network, PrivacyShape, SerializedBytesDigest,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    TransactionBlobArtifact, TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
-    TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
-    TransactionLocation, TransactionPublicFacts, TransactionVersion, TransparentInputFact,
-    TransparentOutPoint, TransparentOutputArtifact, TransparentOutputFact, TransparentSpendFact,
-    TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis, UnsupportedSection,
-    encode_canonical_block_replay, wire::encode_internal_block_hash,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockId,
+    BlockTransactionIndexArtifact, CanonicalBlockFacts, CanonicalBlockFactsDigestVersion,
+    CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts,
+    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata,
+    CompactTransaction, CompactTransactionData, CompactTransparentInput, CompactTransparentOutput,
+    LockTime, Network, PrivacyShape, SerializedBytesDigest, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootHash, SubtreeRootIndex, TransactionBlobArtifact, TransactionComponentCounts,
+    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalances,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransactionPublicFacts,
+    TransactionVersion, TransparentInputFact, TransparentOutPoint, TransparentOutputArtifact,
+    TransparentOutputFact, TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact,
+    UnixTimestampMillis, UnsupportedSection, encode_canonical_block_replay,
 };
-use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_source::{SourceBlock, SourceBlockHeader};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, RawBlobRetention, ReorgWindowChange,
@@ -57,9 +56,6 @@ pub struct FixtureBlock {
     pub raw_block_bytes: Vec<u8>,
     /// Tree-state checkpoint JSON payload bytes for this block.
     pub tree_state_checkpoint_payload_bytes: Vec<u8>,
-    /// Optional override for the compact-block payload; used by tests that
-    /// need a fully-populated lightwalletd `CompactBlock` shape.
-    pub compact_block_payload_override: Option<Vec<u8>>,
 }
 
 impl FixtureBlock {
@@ -93,34 +89,20 @@ impl FixtureBlock {
 
     /// Returns the compact-block artifact for this fixture block.
     ///
-    /// The compact block is encoded as a lightwalletd `CompactBlock` with the
-    /// fixture's hash, parent hash, time, and an empty transaction list, or
-    /// uses [`Self::compact_block_payload_override`] when present.
+    /// The compact block carries native structured scan data with an empty
+    /// transaction list and zero commitment-tree sizes.
     #[must_use]
     pub fn compact_block_artifact(&self) -> CompactBlockArtifact {
-        let payload_bytes = self
-            .compact_block_payload_override
-            .as_ref()
-            .map_or_else(|| self.default_compact_block_payload(), Clone::clone);
-
-        CompactBlockArtifact::new(self.height, self.hash, payload_bytes)
-    }
-
-    fn default_compact_block_payload(&self) -> Vec<u8> {
-        LightwalletdCompactBlock {
-            height: u64::from(self.height.value()),
-            hash: encode_internal_block_hash(self.hash).to_vec(),
-            prev_hash: encode_internal_block_hash(self.parent_hash).to_vec(),
-            time: self.block_time_seconds,
-            header: Vec::new(),
-            vtx: Vec::new(),
-            chain_metadata: Some(ChainMetadata {
+        CompactBlockArtifact::empty(
+            BlockId::new(self.height, self.hash),
+            self.parent_hash,
+            self.block_time_seconds,
+            CompactChainMetadata {
                 sapling_commitment_tree_size: 0,
                 orchard_commitment_tree_size: 0,
                 ironwood_commitment_tree_size: 0,
-            }),
-        }
-        .encode_to_vec()
+            },
+        )
     }
 
     /// Returns the node-shaped [`SourceBlock`] for this fixture block.
@@ -144,6 +126,7 @@ impl FixtureBlock {
         TreeStateArtifact::new(
             self.height,
             self.hash,
+            self.block_time_seconds,
             self.tree_state_checkpoint_payload_bytes.clone(),
         )
     }
@@ -475,6 +458,7 @@ pub struct ChainFixture {
     raw_blob_retention: RawBlobRetention,
     branch_salt: u32,
     blocks: Vec<FixtureBlock>,
+    compact_block_overrides: Vec<CompactBlockArtifact>,
     tip_metadata_override: Option<ChainTipMetadata>,
     sapling_subtree_roots: Vec<SubtreeRootArtifact>,
     transaction_rows: Vec<FixtureTransactionRows>,
@@ -491,6 +475,7 @@ impl ChainFixture {
             raw_blob_retention: RawBlobRetention::None,
             branch_salt: 0,
             blocks: Vec::new(),
+            compact_block_overrides: Vec::new(),
             tip_metadata_override: None,
             sapling_subtree_roots: Vec::new(),
             transaction_rows: Vec::new(),
@@ -526,7 +511,6 @@ impl ChainFixture {
                 block_time_seconds,
                 raw_block_bytes,
                 tree_state_checkpoint_payload_bytes: FIXTURE_TREE_STATE_PAYLOAD.to_vec(),
-                compact_block_payload_override: None,
             });
         }
 
@@ -578,6 +562,12 @@ impl ChainFixture {
             raw_blob_retention: self.raw_blob_retention,
             branch_salt: self.branch_salt.wrapping_add(1).max(1),
             blocks: prefix_blocks,
+            compact_block_overrides: self
+                .compact_block_overrides
+                .iter()
+                .filter(|block| block.height() < divergence_height)
+                .cloned()
+                .collect(),
             tip_metadata_override: None,
             sapling_subtree_roots: Vec::new(),
             transaction_rows: Vec::new(),
@@ -615,6 +605,15 @@ impl ChainFixture {
         self
     }
 
+    /// Overrides the structured compact artifact at its matching fixture height.
+    #[must_use]
+    pub fn with_compact_block_artifact(mut self, compact_block: CompactBlockArtifact) -> Self {
+        self.compact_block_overrides
+            .retain(|existing| existing.height() != compact_block.height());
+        self.compact_block_overrides.push(compact_block);
+        self
+    }
+
     /// Replaces the tree-state checkpoint payload bytes attached to the block at `height`.
     ///
     /// Returns the fixture unchanged if no block exists at `height`.
@@ -628,28 +627,6 @@ impl ChainFixture {
         for block in &mut self.blocks {
             if block.height == height {
                 block.tree_state_checkpoint_payload_bytes = payload_bytes;
-                break;
-            }
-        }
-        self
-    }
-
-    /// Replaces the compact-block payload bytes for the block at `height`.
-    ///
-    /// Useful when a test needs a fully-populated [`CompactBlockArtifact`]
-    /// shape that the default builder does not produce.
-    ///
-    /// Returns the fixture unchanged if no block exists at `height`.
-    #[must_use]
-    pub fn with_compact_block_payload_at(
-        mut self,
-        height: BlockHeight,
-        compact_block_payload_bytes: impl Into<Vec<u8>>,
-    ) -> Self {
-        let payload_bytes = compact_block_payload_bytes.into();
-        for block in &mut self.blocks {
-            if block.height == height {
-                block.compact_block_payload_override = Some(payload_bytes);
                 break;
             }
         }
@@ -823,9 +800,68 @@ impl ChainFixture {
     /// Returns every block as a [`CompactBlockArtifact`] in ascending height order.
     #[must_use]
     pub fn compact_block_artifacts(&self) -> Vec<CompactBlockArtifact> {
+        let canonical_transaction_rows = self.canonical_transaction_rows();
         self.blocks
             .iter()
-            .map(FixtureBlock::compact_block_artifact)
+            .map(|block| {
+                self.compact_block_overrides
+                    .iter()
+                    .find(|compact| compact.height() == block.height)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let transactions = canonical_transaction_rows
+                            .iter()
+                            .filter(|rows| rows.location.block_height == block.height)
+                            .filter_map(|rows| {
+                                let transparent_inputs = rows
+                                    .facts
+                                    .transparent_inputs
+                                    .iter()
+                                    .filter(|input| !input.spent_outpoint.is_coinbase_sentinel())
+                                    .map(|input| CompactTransparentInput {
+                                        previous_transaction_id: input
+                                            .spent_outpoint
+                                            .transaction_id,
+                                        previous_output_index: input.spent_outpoint.output_index,
+                                    })
+                                    .collect::<Vec<_>>();
+                                let transparent_outputs = rows
+                                    .facts
+                                    .transparent_outputs
+                                    .iter()
+                                    .map(|output| CompactTransparentOutput {
+                                        value_zat: output.value_zat,
+                                        script_pub_key: output.script_pub_key.clone(),
+                                    })
+                                    .collect::<Vec<_>>();
+                                if transparent_inputs.is_empty() && transparent_outputs.is_empty() {
+                                    return None;
+                                }
+                                Some(CompactTransaction {
+                                    index: u64::from(rows.location.tx_index_in_block),
+                                    transaction_id: rows.location.transaction_id,
+                                    data: CompactTransactionData {
+                                        transparent_inputs,
+                                        transparent_outputs,
+                                        ..CompactTransactionData::default()
+                                    },
+                                })
+                            })
+                            .collect();
+                        CompactBlockArtifact::new(
+                            BlockId::new(block.height, block.hash),
+                            block.parent_hash,
+                            block.block_time_seconds,
+                            transactions,
+                            CompactChainMetadata {
+                                sapling_commitment_tree_size: 0,
+                                orchard_commitment_tree_size: 0,
+                                ironwood_commitment_tree_size: 0,
+                            },
+                        )
+                        .unwrap_or_else(|_| std::process::abort())
+                    })
+            })
             .collect()
     }
 

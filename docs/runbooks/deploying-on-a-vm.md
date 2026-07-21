@@ -1,11 +1,11 @@
 # Deploying the wallet service on one VM
 
 This runbook operates the supported `rocksdb-single-host` wallet-serving
-topology. Three independent processes share one host filesystem:
+topology. Four independent processes share one host filesystem:
 `zinder-ingest` owns canonical storage, `zinder-projector` owns the wallet
-projection, and `zinder-compat-lightwalletd` serves immutable canonical and
-wallet secondary pairs. Query, explorer, and mixed single-container images are
-not release paths.
+projection, and `zinder-query` plus `zinder-compat-lightwalletd` independently
+serve immutable canonical and wallet secondary pairs. Explorer and mixed
+single-container images are not release paths.
 
 A successful deployment is a canary until the release's mainnet construction,
 wallet-build, coherent-restore, capacity, replacement, and independent-client
@@ -24,7 +24,7 @@ gates have current evidence. See
 - An HTTP/2-capable reverse proxy for TLS, authentication, rate limits, and
   quotas.
 
-Do not place the three storage owners on hosts with independent filesystems.
+Do not place the two storage owners on hosts with independent filesystems.
 RocksDB secondary replication in this lifecycle is a same-filesystem boundary,
 not a network replication protocol.
 
@@ -43,29 +43,26 @@ Use `.env.testnet` or `.env.regtest` for another network. Each file contains
 a stable, non-secret `ZINDER_PROJECTOR_BUILD_OWNER_HEX`; assign a different
 32-character hexadecimal value to every side-by-side projector lane.
 
-Create the two root-owned file-backed control-secret directories before
-validating Compose. The ordinary ingest token is mounted into all three
-runtimes; the checkpoint token is mounted only into ingest and projector.
+Create the root-owned file-backed control-secret directory before validating
+Compose. The ordinary ingest token is mounted into all four runtimes; the
+checkpoint token is mounted only into ingest and projector.
 The group must be the container service group (the release images use GID
 1000), while the files remain owned by root and are not stored in the shared
 RocksDB volume.
 
 ```bash
 sudo install -d -o root -g 1000 -m 0750 /etc/zinder/control-secrets
-sudo install -d -o root -g 1000 -m 0750 /etc/zinder/ingest-control-secrets
 openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
 openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
-sudo cp /etc/zinder/control-secrets/ingest.token /etc/zinder/ingest-control-secrets/ingest.token
-sudo chown root:1000 /etc/zinder/control-secrets/*.token /etc/zinder/ingest-control-secrets/ingest.token
-sudo chmod 0440 /etc/zinder/control-secrets/*.token /etc/zinder/ingest-control-secrets/ingest.token
+sudo chown root:1000 /etc/zinder/control-secrets/*.token
+sudo chmod 0440 /etc/zinder/control-secrets/*.token
 ```
 
 The checked-in network env templates already set
-`ZINDER_CONTROL_SECRETS_DIR=/etc/zinder/control-secrets` and
-`ZINDER_INGEST_CONTROL_SECRET_DIR=/etc/zinder/ingest-control-secrets`. If the
-host uses different paths, update the copied `/etc/zinder/env` values before
-resolving Compose. Do not place `checkpoint.token` in the
-compatibility-readable directory.
+`ZINDER_CONTROL_SECRETS_DIR=/etc/zinder/control-secrets`. If the host uses a
+different path, update the copied `/etc/zinder/env` value before resolving
+Compose. Query and compatibility mount only `ingest.token`; they cannot read
+`checkpoint.token` even though the files share one host directory.
 
 Validate the resolved topology before starting it:
 
@@ -75,32 +72,32 @@ docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml config -q
 ```
 
-Build and start the three release runtimes:
+Build and start the four release runtimes:
 
 ```bash
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml up -d --build
 ```
 
-The Compose topology gives projector and compatibility containers the ingest
-container's network namespace. This keeps `CanonicalControl` and
+The Compose topology gives projector, query, and compatibility containers the
+ingest container's network namespace. This keeps `CanonicalControl` and
 `IngestControl` on `127.0.0.1:9100` without weakening the non-loopback
-bearer-token rule. The compatibility gRPC port is published on host loopback
+bearer-token rule. Both wallet-facing gRPC ports are published on host loopback
 only.
 
 Create two file-backed control secrets outside the shared data volume: the
-ordinary `ingest.token`, mounted where compatibility can read it, and the
-separate `checkpoint.token`, mounted only into ingest and projector. Set
-`ZINDER_INGEST_CONTROL_SECRET_DIR` to a directory containing only
-`ingest.token`, and `ZINDER_CONTROL_SECRETS_DIR` to the ingest/projector
-directory containing both files. `checkpoint.token` authorizes both the
-loopback `ProjectorControl` capture request and the method-level canonical
-checkpoint capability; compatibility must never mount or read it.
+ordinary `ingest.token`, mounted into all four runtimes, and the separate
+`checkpoint.token`, mounted only into ingest and projector. Set
+`ZINDER_CONTROL_SECRETS_DIR` to the directory containing both files. Compose
+mounts individual files, so query and compatibility receive only
+`ingest.token`. `checkpoint.token` authorizes both the loopback
+`ProjectorControl` capture request and the method-level canonical checkpoint
+capability; reader runtimes must never mount or read it.
 
 The root-owned `state-init` service initializes the shared data volume and the
 separate checkpoint-staging volume for UID/GID 1000 before ingest starts.
-Checkpoint staging is mounted only into ingest and projector, never into
-compatibility. Canonical checkpoint requests accept only an opaque candidate
+Checkpoint staging is mounted only into ingest and projector, never into query
+or compatibility. Canonical checkpoint requests accept only an opaque candidate
 identifier beneath that root; the projector prepares the candidate directory,
 ingest creates the fixed `canonical.rocksdb` child through its owner queue, and
 cold admission runs off the writer queue. The current capture foundation can add
@@ -115,15 +112,18 @@ manifests satisfy the restore production gate.
 
 ## Verify the ownership chain
 
-Use the host ports from the selected env file. Mainnet uses 9105, 9110, 9107,
-and 9067; testnet adds 10000; regtest adds 20000.
+Use the host ports from the selected env file. Mainnet uses 9105, 9110, 9102,
+9106, 9107, and 9067; testnet adds 10000; regtest adds 20000.
 
 ```bash
 curl -fsS http://127.0.0.1:9105/healthz
 curl -fsS http://127.0.0.1:9105/readyz
 curl -fsS http://127.0.0.1:9110/readyz
+curl -fsS http://127.0.0.1:9106/readyz
 curl -fsS http://127.0.0.1:9107/readyz
 
+grpcurl -plaintext -d '{}' 127.0.0.1:9102 \
+  zinder.v1.wallet.WalletQuery/ServerInfo
 grpcurl -plaintext -d '{}' 127.0.0.1:9067 \
   cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
 ```
@@ -134,7 +134,10 @@ Interpret the probes in order:
    boundary and the current mempool generation has completed hydration.
 2. Projector is ready only when its admitted wallet store has reached an
    authenticated canonical event fence.
-3. Compatibility is ready only when its inactive canonical and wallet
+3. Native query is ready only when its inactive canonical and wallet
+   secondaries converge to one exact network, epoch, event sequence, visible
+   tip, settled tip, and digest before publication.
+4. Compatibility is ready only when its inactive canonical and wallet
    secondaries converge to one exact network, epoch, event sequence, visible
    tip, settled tip, and digest before publication.
 

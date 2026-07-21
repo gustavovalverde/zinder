@@ -11,7 +11,7 @@ Storage encodings belong to [Storage backend](storage-backend.md).
 
 | Surface | Rust module | Service owner | Release status |
 | --- | --- | --- | --- |
-| Native wallet API | `zinder_proto::v1::wallet` | `WalletQueryGrpcAdapter` in `zinder-query` | Library contract; no standalone query runtime |
+| Native wallet API | `zinder_proto::v1::wallet` | `WalletQueryGrpcAdapter` in `zinder-query` | Published native query runtime |
 | Native explorer API | `zinder_proto::v1::explorer` | `zinder-explorer` | Optional workspace runtime; no published release image |
 | Private control APIs | `zinder_proto::v1::ingest` | `zinder-ingest` and `zinder-projector` | Internal deployed services |
 | Shared operations messages | `zinder_proto::v1::ops` | Runtime and service adapters | Embedded in native/control surfaces |
@@ -44,8 +44,9 @@ from native APIs.
 
 `WalletQuery` is the native wallet and application read contract. The
 `zinder-query` crate implements it over `WalletQueryApi` and exact-fence
-canonical/wallet-projection readers. The release topology embeds that library in
-the lightwalletd adapter rather than running a standalone query listener.
+canonical/wallet-projection readers. The release topology publishes a
+standalone native query listener and a separate lightwalletd compatibility
+listener; both use the shared exact-fence serving-pair implementation.
 
 Wallet responses carry the chain identity needed to prevent mixed-epoch reads.
 Streaming and pagination requests use bounded ranges and authenticated cursors.
@@ -79,8 +80,10 @@ The vendored `CompactTxStreamer` schema is an external contract. Its source pin
 and provenance live in
 `crates/zinder-proto/proto/compat/lightwalletd/UPSTREAM.md`. The compatibility
 adapter translates native query results, byte order, errors, and capability
-claims into that contract. It does not mutate canonical storage or fetch missing
-artifacts from an upstream node.
+claims into that contract. It does not mutate canonical storage or use the
+upstream node as a fallback for indexed history or canonical reads. Sparse
+tree-state fill and transaction broadcast are allowed only where
+`WalletQueryApi` explicitly delegates those operations upstream.
 
 Compatibility claims are bounded by executable certification. The stable method
 matrix lives in [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md).

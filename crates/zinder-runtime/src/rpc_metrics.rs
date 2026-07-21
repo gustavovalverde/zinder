@@ -1,7 +1,7 @@
 //! Shared per-RPC duration and outcome metric helpers.
 //!
 //! Every Zinder service that serves gRPC (`zinder-query`, `zinder-explorer`,
-//! `zinder-ingest`, `zinder-compat-lightwalletd`) emits the same metric shape
+//! `zinder-ingest`, `zinder-query`) emits the same metric shape
 //! per request: a duration histogram and a total counter, each labelled with
 //! `operation`, `status` (`ok|error`), and `error_class`. The two metric
 //! names share a service-specific prefix (`zinder_explorer_request_*`,

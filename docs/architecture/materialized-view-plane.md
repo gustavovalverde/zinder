@@ -17,7 +17,7 @@ Those crates do not depend on `zinder-materialized-views`.
 ## Deployment status
 
 The materialized-view and explorer services compile in the workspace but are
-not part of the three-runtime release composition. The checked release topology
+not part of the four-runtime release composition. The checked release topology
 does not start `zinder-explorer` or expose its native query service. The SDK's
 public Rust surface is a current code contract; it does not imply release-image
 or deployment support.

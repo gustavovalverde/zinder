@@ -308,7 +308,7 @@ async fn local_and_remote_fence_history_across_a_same_height_reorg() -> eyre::Re
         .collect();
     replacement_artifacts
         .compact_blocks
-        .retain(|block| block.height == BlockHeight::new(2));
+        .retain(|block| block.height() == BlockHeight::new(2));
     replacement_artifacts.reorg_window_change = ReorgWindowChange::Replace {
         from_height: BlockHeight::new(2),
     };

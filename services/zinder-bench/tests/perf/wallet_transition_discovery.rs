@@ -11,7 +11,6 @@ use std::{
 };
 
 use eyre::{Result, WrapErr, ensure, eyre};
-use prost::Message;
 use rust_rocksdb::{PerfContext, PerfMetric, PerfStatsLevel, perf::set_perf_stats};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -19,15 +18,14 @@ use tempfile::TempDir;
 use zinder_core::{
     BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFacts,
     CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts,
-    ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontiers, ConsensusBranchId,
-    LockTime, Network, NetworkUpgradeActivation, NetworkUpgradeActivations, PrivacyShape,
-    SerializedBytesDigest, TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
-    TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
+    ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactChainMetadata,
+    ConsensusBranchId, LockTime, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    PrivacyShape, SerializedBytesDigest, TransactionBlobArtifact, TransactionComponentCounts,
+    TransactionId, TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
     TransactionVersion, TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
     TransparentOutputFact, UnixTimestampMillis, ValidatedCanonicalBlockReplay,
-    encode_canonical_block_replay, wire::encode_internal_block_hash,
+    encode_canonical_block_replay,
 };
-use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LightwalletdCompactBlock};
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
     CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
@@ -675,18 +673,16 @@ fn canonical_build_block(facts: CanonicalBlockFacts) -> CanonicalBuildBlock {
     let height = facts.block_header.height;
     let block_hash = facts.block_header.block_hash;
     let parent_hash = facts.block_header.parent_hash;
-    let compact_payload = LightwalletdCompactBlock {
-        height: u64::from(height.value()),
-        hash: encode_internal_block_hash(block_hash).to_vec(),
-        prev_hash: encode_internal_block_hash(parent_hash).to_vec(),
-        chain_metadata: Some(ChainMetadata {
+    let compact_block = zinder_core::CompactBlockArtifact::empty(
+        BlockId::new(height, block_hash),
+        parent_hash,
+        height.value(),
+        CompactChainMetadata {
             sapling_commitment_tree_size: 0,
             orchard_commitment_tree_size: 0,
             ironwood_commitment_tree_size: 0,
-        }),
-        ..Default::default()
-    }
-    .encode_to_vec();
+        },
+    );
     let transaction_blobs = facts
         .transactions
         .iter()
@@ -711,7 +707,7 @@ fn canonical_build_block(facts: CanonicalBlockFacts) -> CanonicalBuildBlock {
     CanonicalBuildBlock {
         facts,
         replay_envelope,
-        compact_block: zinder_core::CompactBlockArtifact::new(height, block_hash, compact_payload),
+        compact_block,
         tip_metadata: ChainTipMetadata::new(0, 0, 0),
         tree_state_checkpoint: Some(CommitmentTreeCheckpoint::new(
             BlockId::new(height, block_hash),

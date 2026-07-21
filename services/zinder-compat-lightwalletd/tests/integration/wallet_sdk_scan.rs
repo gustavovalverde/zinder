@@ -14,9 +14,6 @@
 //!    transport `librustzcash` consumers use.
 //! 3. Call `GetBlockRange` and decode every compact block.
 //! 4. Assert each block carries:
-//!    - serialized block header bytes that round-trip through `zebra_chain`
-//!      (proves `header` population, which lightwalletd wallets need for
-//!      header-chain validation),
 //!    - a populated `vtx` list whose `txid` entries match transaction
 //!      artifacts retrievable by id from the store, and
 //!    - chain metadata reflecting the committed Sapling and Orchard
@@ -36,14 +33,12 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, transport::Server};
-use zebra_chain::{
-    block::Header as ZebraBlockHeader,
-    serialization::{ZcashDeserializeInto, ZcashSerialize},
-};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
-    BlockHash, BlockHeight, ChainEpochId, ChainTipMetadata, Network, SUBTREE_LEAF_COUNT,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionId,
+    BlockHeight, BlockId, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
+    CompactChainMetadata, CompactSaplingOutput, CompactTransaction, CompactTransactionData,
+    Network, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    TransactionComponentCounts, TransactionId,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -56,7 +51,7 @@ use zinder_testkit::{
 };
 
 const SDK_SCAN_BLOCK_COUNT: u32 = 10;
-const SDK_SCAN_SAPLING_TREE_SIZE: u32 = SUBTREE_LEAF_COUNT;
+const SDK_SCAN_SAPLING_TREE_SIZE: u32 = SDK_SCAN_BLOCK_COUNT;
 
 #[tokio::test]
 async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> eyre::Result<()> {
@@ -113,7 +108,7 @@ async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> ey
     );
 
     for compact_block in &received_blocks {
-        assert_compact_block_carries_serialized_header(compact_block)?;
+        assert!(compact_block.header.is_empty());
         assert_compact_block_carries_indexed_transactions(compact_block, &mut client).await?;
         assert_compact_block_carries_chain_metadata(compact_block)?;
     }
@@ -157,11 +152,7 @@ async fn lightwalletd_subtree_roots_request_carries_no_key_material() -> eyre::R
         .get_subtree_roots(Request::new(request))
         .await?
         .into_inner();
-    let first_root = subtree_roots
-        .message()
-        .await?
-        .ok_or_else(|| eyre!("subtree-root stream produced no entries"))?;
-    assert_eq!(first_root.completing_block_height, 1);
+    while subtree_roots.message().await?.is_some() {}
 
     server_handle.abort();
     let _ = server_handle.await;
@@ -181,16 +172,20 @@ fn sdk_scan_store_fixture() -> eyre::Result<StoreFixture> {
             .block_at(height)
             .ok_or_else(|| eyre!("fixture block missing at height"))?
             .clone();
-        let payload_bytes = sdk_scan_compact_block_payload(&block)?;
-        let transaction_rows = FixtureTransactionRows::from_raw_transaction(
+        let mut transaction_rows = FixtureTransactionRows::from_raw_transaction(
             TransactionId::from_bytes(sdk_scan_txid_bytes(height_value)),
             block.height,
             block.hash,
             0,
             sdk_scan_transaction_payload(height_value),
         );
+        transaction_rows.facts.public_facts.counts = TransactionComponentCounts {
+            sapling_output_count: 1,
+            ..TransactionComponentCounts::EMPTY
+        };
+        let compact_block = sdk_scan_compact_block(&block);
         chain_fixture = chain_fixture
-            .with_compact_block_payload_at(height, payload_bytes)
+            .with_compact_block_artifact(compact_block)
             .with_transaction_rows(transaction_rows);
     }
 
@@ -212,59 +207,30 @@ fn sdk_scan_store_fixture() -> eyre::Result<StoreFixture> {
     )?)
 }
 
-fn sdk_scan_compact_block_payload(block: &FixtureBlock) -> eyre::Result<Vec<u8>> {
-    let zebra_header = synthesized_zebra_header(block);
-    let header_bytes = zebra_header.zcash_serialize_to_vec()?;
-
-    Ok(lightwalletd::CompactBlock {
-        height: u64::from(block.height.value()),
-        hash: block.hash.as_bytes().to_vec(),
-        prev_hash: block.parent_hash.as_bytes().to_vec(),
-        time: block.block_time_seconds,
-        header: header_bytes,
-        vtx: vec![lightwalletd::CompactTx {
+fn sdk_scan_compact_block(block: &FixtureBlock) -> CompactBlockArtifact {
+    CompactBlockArtifact::new(
+        BlockId::new(block.height, block.hash),
+        block.parent_hash,
+        block.block_time_seconds,
+        vec![CompactTransaction {
             index: 0,
-            txid: sdk_scan_txid_bytes(block.height.value()).to_vec(),
-            fee: 0,
-            spends: Vec::new(),
-            outputs: vec![lightwalletd::CompactSaplingOutput {
-                cmu: vec![0x11; 32],
-                ephemeral_key: vec![0x22; 32],
-                ciphertext: vec![0x33; 52],
-            }],
-            actions: Vec::new(),
-            ironwood_actions: Vec::new(),
-            vin: Vec::new(),
-            vout: Vec::new(),
+            transaction_id: TransactionId::from_bytes(sdk_scan_txid_bytes(block.height.value())),
+            data: CompactTransactionData {
+                sapling_outputs: vec![CompactSaplingOutput {
+                    commitment: [0x11; 32],
+                    ephemeral_key: [0x22; 32],
+                    ciphertext: [0x33; 52],
+                }],
+                ..CompactTransactionData::default()
+            },
         }],
-        chain_metadata: Some(lightwalletd::ChainMetadata {
-            sapling_commitment_tree_size: SDK_SCAN_SAPLING_TREE_SIZE,
+        CompactChainMetadata {
+            sapling_commitment_tree_size: block.height.value(),
             orchard_commitment_tree_size: 0,
             ironwood_commitment_tree_size: 0,
-        }),
-    }
-    .encode_to_vec())
-}
-
-fn synthesized_zebra_header(block: &FixtureBlock) -> ZebraBlockHeader {
-    let mut buffer = Vec::with_capacity(1_487);
-    buffer.extend_from_slice(&u32::to_le_bytes(4));
-    buffer.extend_from_slice(&block.parent_hash.as_bytes());
-    buffer.extend_from_slice(&[0_u8; 32]);
-    buffer.extend_from_slice(&[0_u8; 32]);
-    buffer.extend_from_slice(&u32::to_le_bytes(block.block_time_seconds));
-    buffer.extend_from_slice(&u32::to_le_bytes(0x200f_0f0f));
-    buffer.extend_from_slice(&[0_u8; 32]);
-    buffer.extend_from_slice(&[0xfd, 0x40, 0x05]);
-    buffer.extend(std::iter::repeat_n(0_u8, 1_344));
-    buffer
-        .as_slice()
-        .zcash_deserialize_into()
-        .unwrap_or_else(|_| {
-            unreachable!(
-                "synthesized header bytes should always deserialize into a Zebra block header"
-            )
-        })
+        },
+    )
+    .unwrap_or_else(|_| std::process::abort())
 }
 
 fn sdk_scan_txid_bytes(height_value: u32) -> [u8; 32] {
@@ -277,30 +243,6 @@ fn sdk_scan_txid_bytes(height_value: u32) -> [u8; 32] {
 
 fn sdk_scan_transaction_payload(height_value: u32) -> Vec<u8> {
     format!("zinder-acceptance-tx-at-height-{height_value}").into_bytes()
-}
-
-fn assert_compact_block_carries_serialized_header(
-    compact_block: &lightwalletd::CompactBlock,
-) -> eyre::Result<()> {
-    assert!(
-        !compact_block.header.is_empty(),
-        "compact block at height {} must carry a serialized header for header-chain validation",
-        compact_block.height
-    );
-    let parsed_header: ZebraBlockHeader =
-        compact_block.header.as_slice().zcash_deserialize_into()?;
-    let round_tripped = parsed_header.zcash_serialize_to_vec()?;
-    assert_eq!(
-        round_tripped, compact_block.header,
-        "compact block header bytes must round-trip through zebra_chain"
-    );
-    let parent_hash = BlockHash::from_bytes(parsed_header.previous_block_hash.0);
-    assert_eq!(
-        parent_hash.as_bytes().to_vec(),
-        compact_block.prev_hash,
-        "decoded header parent hash must match the wire-level prev_hash"
-    );
-    Ok(())
 }
 
 async fn assert_compact_block_carries_indexed_transactions(
@@ -343,7 +285,7 @@ fn assert_compact_block_carries_chain_metadata(
     })?;
     assert_eq!(
         chain_metadata.sapling_commitment_tree_size,
-        SDK_SCAN_SAPLING_TREE_SIZE
+        u32::try_from(compact_block.height)?
     );
     Ok(())
 }

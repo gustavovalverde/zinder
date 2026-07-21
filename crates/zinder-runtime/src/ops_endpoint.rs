@@ -16,7 +16,7 @@ use crate::{
 /// Service identity surfaced by `/metrics` for build-time labeling.
 #[derive(Clone, Debug)]
 pub struct OpsServer {
-    /// Service name (`zinder-ingest`, `zinder-query`, `zinder-compat-lightwalletd`, ...).
+    /// Service name (`zinder-ingest`, `zinder-query`, ...).
     pub service_name: &'static str,
     /// Service version, typically `env!("CARGO_PKG_VERSION")`.
     pub service_version: &'static str,

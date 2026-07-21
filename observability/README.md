@@ -2,7 +2,7 @@
 
 This directory contains the local Prometheus and Grafana stack used to inspect
 Zinder metrics while the binaries run on the host. The compose file intentionally
-does not containerize `zinder-ingest`, `zinder-projector`, or
+does not containerize `zinder-ingest`, `zinder-projector`, `zinder-query`, or
 `zinder-compat-lightwalletd`: the smoke path should exercise the same Cargo-built
 binaries that developers use during T3 live testing.
 
@@ -15,18 +15,18 @@ against the selected local upstream node:
 2. Bulk-catches-up a fresh store from a checkpoint.
 3. Records that restore is blocked because a coherent canonical-plus-wallet
    bundle restore is not implemented.
-4. Starts `zinder-ingest`, `zinder-projector`, and
+4. Starts `zinder-ingest`, `zinder-projector`, `zinder-query`, and
    `zinder-compat-lightwalletd` with `/metrics` endpoints.
-5. Requires ingest, projector, and compatibility `/readyz` responses before
-   sending traffic.
+5. Requires all four runtimes' `/readyz` responses before sending traffic.
 6. Optionally mines explicitly requested regtest blocks so the live ingest
    writer path records a commit after startup. Node mutation is disabled by
    default.
-7. Calls the lightwalletd-compatible `CompactTxStreamer` API with `grpcurl`.
+7. Calls native `WalletQuery` and lightwalletd-compatible `CompactTxStreamer`
+   APIs with `grpcurl`.
 8. Fails if Prometheus reports a traffic-blocking readiness cause or any of the
-   3 service scrape targets is unavailable.
+   4 service scrape targets is unavailable.
 9. Archives JSON readiness samples, raw metrics, process logs, exact writer
-   fences, `GetLightdInfo`, the Zebra version, and the Git revision under
+   fences, native `ServerInfo`, `GetLightdInfo`, the Zebra version, and the Git revision under
    `.tmp/observability/reports/<run-id>-evidence`.
 
 This is a local observability smoke, not a benchmark. It proves the metrics are
@@ -70,7 +70,7 @@ scripts/observability-smoke.sh run
 The opt-in path pauses the projector while Zebra advances beyond the configured
 compatibility lag threshold, requires the typed `replica_lagging` readiness
 cause, resumes the projector, and waits for wallet-serving admission recovery. It then
-restarts compatibility, projector, and ingest one at a time, requiring the
+restarts compatibility, query, projector, and ingest one at a time, requiring the
 complete readiness chain after each restart, before invalidating 1 regtest
 block and mining a 2-block replacement branch. The pass condition requires both
 the node and compatibility `GetBlock` to expose a different hash at the

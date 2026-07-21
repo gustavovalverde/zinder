@@ -24,12 +24,13 @@ use zinder_store::{
 };
 
 use crate::{
-    BlockId, ChainIndex, IndexStream, IndexerError, RemoteChainIndex, RemoteOpenOptions,
-    TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
-    TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
-    TransparentAddressUnspentOutputsStream, TransparentUnspentOutputChunk,
-    TransparentUtxoSetSummaryView,
+    BlockId, ChainIndex, IndexStream, IndexerError, TransparentAddressTransactionChunk,
+    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream,
+    TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
+    TransparentUnspentOutputChunk, TransparentUtxoSetSummaryView,
 };
+#[cfg(feature = "remote")]
+use crate::{RemoteChainIndex, RemoteOpenOptions};
 
 /// Default maximum time spent on initial secondary catchup during local open.
 pub const DEFAULT_INITIAL_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -49,7 +50,8 @@ pub struct LocalOpenOptions {
     /// Bounded `RocksDB` resource budget applied when opening the materialized-view
     /// secondary store.
     pub materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget,
-    /// Optional service endpoint used for subscriptions and command RPCs.
+    /// Optional service endpoint used for live mempool fallback reads.
+    #[cfg(feature = "remote")]
     pub subscription_endpoint: Option<String>,
     /// Periodic secondary catchup interval.
     pub catchup_interval: Duration,
@@ -72,6 +74,7 @@ pub struct LocalOpenOptions {
 pub struct LocalChainIndex {
     store: SecondaryChainStore,
     materialized_view_store: Option<MaterializedViewStore>,
+    #[cfg(feature = "remote")]
     remote_index: Option<RemoteChainIndex>,
     catchup_interval: Duration,
     catchup_cancel: CancellationToken,
@@ -124,6 +127,7 @@ impl LocalChainIndex {
         )
         .await?;
 
+        #[cfg(feature = "remote")]
         let remote_index = match options.subscription_endpoint {
             Some(endpoint) => Some(RemoteChainIndex::connect(RemoteOpenOptions {
                 endpoint,
@@ -141,6 +145,7 @@ impl LocalChainIndex {
         Ok(Self {
             store,
             materialized_view_store,
+            #[cfg(feature = "remote")]
             remote_index,
             catchup_interval: options.catchup_interval,
             catchup_cancel,
@@ -342,7 +347,7 @@ impl ChainIndex for LocalChainIndex {
                     let compact_block = maybe_block.ok_or(IndexerError::NotFound {
                         resource: "compact block",
                     })?;
-                    if compact_block.height != height {
+                    if compact_block.height() != height {
                         return Err(IndexerError::malformed(
                             "compact_block.height",
                             "height does not match requested range",
@@ -512,10 +517,12 @@ impl ChainIndex for LocalChainIndex {
         // observe the writer's in-process mempool state, so consult the live
         // mempool only when an ingest-control endpoint is wired; otherwise the
         // answer is NotFound.
-        match &self.remote_index {
-            Some(remote) => remote.transaction_by_id(transaction_id, None).await,
-            None => Ok(TxStatus::NotFound),
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote_index {
+            return remote.transaction_by_id(transaction_id, None).await;
         }
+
+        Ok(TxStatus::NotFound)
     }
 
     async fn transparent_address_unspent_outputs(

@@ -339,7 +339,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | Capability | Owner method | Always-on? |
 | ---------- | ------------ | ---------- |
 | `explorer.server_info_v1` | `ExplorerQuery.ServerInfo` | Yes |
-| `explorer.transaction.detail_v3` | `ExplorerQuery.TransactionDetail` | When the wallet endpoint and canonical store are configured |
+| `explorer.transaction.detail_v4` | `ExplorerQuery.TransactionDetail` | When the wallet endpoint and canonical store are configured |
 | `explorer.block.summary_v1` | `ExplorerQuery.BlockSummariesInRange` + `BlockDetail` summary part | When the block-summary consumer is built and caught up |
 | `explorer.block.production_series_v2` | `ExplorerQuery.BlockProductionSeries` | When the block-summary consumer and canonical secondary store are available |
 | `explorer.block.production_time_range_v1` | `ExplorerQuery.BlockProductionInTimeRange` | When the time index has contiguous height-domain coverage through its materialized-view tip |
@@ -403,7 +403,7 @@ secondary_path = "/var/lib/zinder/explorer-secondary"
 [explorer]
 listen_addr = "127.0.0.1:9068"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
-wallet_query_endpoint = "https://zinder.example:9101"   # optional native WalletQuery gRPC adapter
+wallet_query_endpoint = "https://zinder.example:9102"   # optional native WalletQuery gRPC adapter
 
 [explorer.freshness]
 max_lag_blocks = 16              # response carries UNAVAILABLE_STALE beyond this

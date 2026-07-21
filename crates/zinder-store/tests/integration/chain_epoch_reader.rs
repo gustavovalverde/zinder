@@ -13,14 +13,14 @@ use std::{
 use eyre::eyre;
 use tempfile::{TempDir, tempdir};
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
-    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, Network, TransactionId,
-    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
-    TransparentSpendFact, TransparentUnspentOutput, UnixTimestampMillis,
+    BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
+    ChainEpochId, ChainTipMetadata, CompactBlockArtifact, CompactSaplingOutput, CompactTransaction,
+    CompactTransactionData, Network, TransactionId, TransactionIntrinsicValueBalances,
+    TransactionIntrinsicValueBalancesArtifact, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput, UnixTimestampMillis,
 };
 use zinder_store::{
-    BlockHashLookup, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainStoreOptions, PrimaryChainStore,
-    ReorgWindowChange,
+    BlockHashLookup, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange, StoreError,
 };
 
 const CRASH_CHILD_ENV: &str = "ZINDER_STORE_CRASH_CHILD";
@@ -111,21 +111,18 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
         visible_tip_hash: replacement_hash,
         settled_tip_height: settled_tip_epoch.visible_tip_height,
         settled_tip_hash: settled_tip_epoch.visible_tip_hash,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
-    let replacement_compact_block = CompactBlockArtifact::new(
-        replacement_height,
-        replacement_hash,
-        b"replacement-compact-block-2".to_vec(),
-    );
     let replacement_block = super::synthetic_block_header(
         replacement_height,
         replacement_hash,
         settled_tip_block.block_hash,
         b"replacement-block-2",
     );
+    let replacement_compact_block =
+        super::empty_compact_block_for_header(&replacement_block, ChainTipMetadata::empty());
 
     super::commit_synthetic_chain_epoch(
         &store,
@@ -149,6 +146,120 @@ fn chain_epoch_reader_stays_pinned_after_replacement_deletes_visibility() -> eyr
         Some(replacement_compact_block)
     );
 
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete predecessor, shielded addition, and replacement sequence defines one metadata-validation scenario"
+)]
+fn replacement_first_compact_block_must_extend_the_canonical_predecessor_metadata()
+-> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let (settled_tip_epoch, settled_tip_block, settled_tip_compact_block) = synthetic_epoch(1, 1);
+    let (mut initial_epoch, initial_block, initial_compact_block) = synthetic_epoch(1, 2);
+    initial_epoch.settled_tip_height = settled_tip_epoch.visible_tip_height;
+    initial_epoch.settled_tip_hash = settled_tip_epoch.visible_tip_hash;
+    let old_tip_metadata = ChainTipMetadata::new(1, 0, 0);
+    initial_epoch.tip_metadata = old_tip_metadata;
+    let transaction_id = TransactionId::from_bytes([41; 32]);
+    let (transaction_index, transaction_location, mut transaction_facts, _transaction_blob) =
+        super::synthetic_transaction_rows(
+            transaction_id,
+            initial_block.height,
+            initial_block.block_hash,
+            0,
+            b"shielded-transaction",
+        );
+    transaction_facts.public_facts.counts.sapling_output_count = 1;
+    let initial_compact_block = CompactBlockArtifact::new(
+        BlockId::new(
+            initial_compact_block.height(),
+            initial_compact_block.block_hash(),
+        ),
+        initial_compact_block.previous_block_hash(),
+        initial_compact_block.time(),
+        vec![CompactTransaction {
+            index: 0,
+            transaction_id,
+            data: CompactTransactionData {
+                sapling_outputs: vec![CompactSaplingOutput {
+                    commitment: [1; 32],
+                    ephemeral_key: [2; 32],
+                    ciphertext: [3; 52],
+                }],
+                ..CompactTransactionData::default()
+            },
+        }],
+        zinder_core::CompactChainMetadata {
+            sapling_commitment_tree_size: 1,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
+    )?;
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(
+            initial_epoch,
+            vec![settled_tip_block.clone(), initial_block],
+            vec![settled_tip_compact_block, initial_compact_block],
+        )
+        .with_block_transaction_index(vec![transaction_index])
+        .with_transaction_locations(vec![transaction_location])
+        .with_transaction_facts(vec![transaction_facts])
+        .with_transaction_intrinsic_value_balances(vec![
+            TransactionIntrinsicValueBalancesArtifact::new(
+                transaction_location,
+                TransactionIntrinsicValueBalances::default(),
+            ),
+        ]),
+    )?;
+
+    let replacement_height = BlockHeight::new(2);
+    let replacement_hash = BlockHash::from_bytes([42; 32]);
+    let replacement_metadata = old_tip_metadata;
+    let replacement_epoch = ChainEpoch {
+        id: ChainEpochId::new(2),
+        network: Network::ZcashRegtest,
+        visible_tip_height: replacement_height,
+        visible_tip_hash: replacement_hash,
+        settled_tip_height: settled_tip_epoch.visible_tip_height,
+        settled_tip_hash: settled_tip_epoch.visible_tip_hash,
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
+        tip_metadata: replacement_metadata,
+        created_at: UnixTimestampMillis::new(1_774_668_000_020),
+    };
+    let replacement_block = super::synthetic_block_header(
+        replacement_height,
+        replacement_hash,
+        settled_tip_block.block_hash,
+        b"replacement-block-2",
+    );
+    let replacement_compact_block =
+        super::empty_compact_block_for_header(&replacement_block, replacement_metadata);
+    let error = store
+        .commit_chain_epoch(
+            super::synthetic_chain_epoch_artifacts(
+                replacement_epoch,
+                vec![replacement_block],
+                vec![replacement_compact_block],
+            )
+            .with_reorg_window_change(ReorgWindowChange::Replace {
+                from_height: replacement_height,
+            }),
+        )
+        .err()
+        .ok_or_else(|| eyre!("replacement with a false predecessor delta was accepted"))?;
+
+    assert!(matches!(
+        error,
+        StoreError::InvalidChainEpochArtifacts {
+            reason: "compact commitment-tree delta must equal the block's shielded additions",
+        }
+    ));
+    assert_eq!(store.current_chain_epoch()?, Some(initial_epoch));
     Ok(())
 }
 
@@ -183,7 +294,7 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         visible_tip_hash: replacement_hash,
         settled_tip_height: settled_tip_epoch.visible_tip_height,
         settled_tip_hash: settled_tip_epoch.visible_tip_hash,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -193,11 +304,8 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         settled_tip_block.block_hash,
         b"replacement-block-2",
     );
-    let replacement_compact_block = CompactBlockArtifact::new(
-        replacement_height,
-        replacement_hash,
-        b"replacement-compact-block-2".to_vec(),
-    );
+    let replacement_compact_block =
+        super::empty_compact_block_for_header(&replacement_block, ChainTipMetadata::empty());
     super::commit_synthetic_chain_epoch(
         &store,
         super::synthetic_chain_epoch_artifacts(
@@ -217,7 +325,7 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         visible_tip_hash: reintroduced_hash,
         settled_tip_height: settled_tip_epoch.visible_tip_height,
         settled_tip_hash: settled_tip_epoch.visible_tip_hash,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
     };
@@ -227,11 +335,8 @@ fn block_hash_lookup_for_historical_epoch_survives_hash_reintroduction() -> eyre
         settled_tip_block.block_hash,
         b"reintroduced-block-2",
     );
-    let reintroduced_compact_block = CompactBlockArtifact::new(
-        replacement_height,
-        reintroduced_hash,
-        b"reintroduced-compact-block-2".to_vec(),
-    );
+    let reintroduced_compact_block =
+        super::empty_compact_block_for_header(&reintroduced_block, ChainTipMetadata::empty());
     super::commit_synthetic_chain_epoch(
         &store,
         super::synthetic_chain_epoch_artifacts(
@@ -277,7 +382,7 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
         visible_tip_hash: replacement_hash,
         settled_tip_height: settled_tip_epoch.visible_tip_height,
         settled_tip_hash: settled_tip_epoch.visible_tip_hash,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -287,11 +392,8 @@ fn address_output_index_return_visible_remined_outpoint_after_reorg() -> eyre::R
         settled_tip_block.block_hash,
         b"replacement-block-2",
     );
-    let replacement_compact_block = CompactBlockArtifact::new(
-        replacement_height,
-        replacement_hash,
-        b"replacement-compact-block-2".to_vec(),
-    );
+    let replacement_compact_block =
+        super::empty_compact_block_for_header(&replacement_block, ChainTipMetadata::empty());
 
     let address_script_hash = TransparentAddressScriptHash::from_bytes([17; 32]);
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([23; 32]), 0);
@@ -557,7 +659,7 @@ fn transparent_spend_facts_by_outpoint_remove_reorged_spend() -> eyre::Result<()
         visible_tip_hash: replacement_hash,
         settled_tip_height: epoch_1.visible_tip_height,
         settled_tip_hash: epoch_1.visible_tip_hash,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_030),
     };
@@ -567,11 +669,8 @@ fn transparent_spend_facts_by_outpoint_remove_reorged_spend() -> eyre::Result<()
         block_1.block_hash,
         b"replacement-spend-block",
     );
-    let replacement_compact_block = CompactBlockArtifact::new(
-        replacement_height,
-        replacement_hash,
-        b"replacement".to_vec(),
-    );
+    let replacement_compact_block =
+        super::empty_compact_block_for_header(&replacement_block, ChainTipMetadata::empty());
     let spent_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([41; 32]), 0);
     let output = TransparentUnspentOutput::new(
         TransparentAddressScriptHash::from_bytes([42; 32]),
@@ -668,7 +767,7 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
         visible_tip_hash: replacement_hash,
         settled_tip_height: settled_tip_epoch.visible_tip_height,
         settled_tip_hash: settled_tip_epoch.visible_tip_hash,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -678,11 +777,8 @@ fn reorged_only_outpoint_fixture() -> eyre::Result<ReorgedOnlyOutpointFixture> {
         settled_tip_block.block_hash,
         b"replacement-block-2",
     );
-    let replacement_compact_block = CompactBlockArtifact::new(
-        replacement_height,
-        replacement_hash,
-        b"replacement-compact-block-2".to_vec(),
-    );
+    let replacement_compact_block =
+        super::empty_compact_block_for_header(&replacement_block, ChainTipMetadata::empty());
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([25; 32]), 0);
     let stale_utxo = TransparentUnspentOutput::new(
         TransparentAddressScriptHash::from_bytes([19; 32]),
@@ -759,7 +855,7 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
         visible_tip_hash: replacement_hash,
         settled_tip_height: settled_tip_epoch.visible_tip_height,
         settled_tip_hash: settled_tip_epoch.visible_tip_hash,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -769,11 +865,8 @@ fn reorged_outpoint_fixture() -> eyre::Result<ReorgedOutpointFixture> {
         settled_tip_block.block_hash,
         b"replacement-block-2",
     );
-    let replacement_compact_block = CompactBlockArtifact::new(
-        replacement_height,
-        replacement_hash,
-        b"replacement-compact-block-2".to_vec(),
-    );
+    let replacement_compact_block =
+        super::empty_compact_block_for_header(&replacement_block, ChainTipMetadata::empty());
     let rows = reorged_outpoint_rows(settled_tip_epoch, &initial_block, replacement_height);
 
     super::commit_synthetic_chain_epoch(
@@ -967,7 +1060,7 @@ fn checkpoint_commit_establishes_artifact_lower_bound() -> eyre::Result<()> {
         visible_tip_hash: block_hash(1),
         settled_tip_height: BlockHeight::new(1),
         settled_tip_hash: block_hash(1),
-        artifact_schema_version: ArtifactSchemaVersion::new(13),
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1),
     };
@@ -1079,6 +1172,13 @@ fn synthetic_epoch(
     let source_hash = block_hash(height);
     let parent_hash = block_hash(height.saturating_sub(1));
     let block_height = BlockHeight::new(height);
+    let block = super::synthetic_block_header(
+        block_height,
+        source_hash,
+        parent_hash,
+        format!("raw-block-{height}").as_bytes(),
+    );
+    let compact = super::empty_compact_block_for_header(&block, ChainTipMetadata::empty());
 
     (
         ChainEpoch {
@@ -1088,21 +1188,12 @@ fn synthetic_epoch(
             visible_tip_hash: source_hash,
             settled_tip_height: block_height,
             settled_tip_hash: source_hash,
-            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+            artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_000_000 + u64::from(height)),
         },
-        super::synthetic_block_header(
-            block_height,
-            source_hash,
-            parent_hash,
-            format!("raw-block-{height}").as_bytes(),
-        ),
-        CompactBlockArtifact::new(
-            block_height,
-            source_hash,
-            format!("compact-block-{height}").into_bytes(),
-        ),
+        block,
+        compact,
     )
 }
 
@@ -1179,7 +1270,7 @@ fn commit_reorg_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
         visible_tip_hash: replacement_hash,
         settled_tip_height: first_epoch.visible_tip_height,
         settled_tip_hash: first_epoch.visible_tip_hash,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
         tip_metadata: ChainTipMetadata::empty(),
         created_at: UnixTimestampMillis::new(1_774_668_000_020),
     };
@@ -1189,11 +1280,8 @@ fn commit_reorg_crash_fixture(store: &PrimaryChainStore) -> eyre::Result<()> {
         first_block.block_hash,
         b"replacement-block-2",
     );
-    let replacement_compact_block = CompactBlockArtifact::new(
-        replacement_height,
-        replacement_hash,
-        b"replacement-compact-block-2".to_vec(),
-    );
+    let replacement_compact_block =
+        super::empty_compact_block_for_header(&replacement_block, ChainTipMetadata::empty());
 
     super::commit_synthetic_chain_epoch(
         store,

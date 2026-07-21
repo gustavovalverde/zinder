@@ -8,7 +8,11 @@ use zinder_core::{
     CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
     TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
 };
-use zinder_store::{CanonicalEventFence, CanonicalStoreError, RocksDbCanonicalSecondary};
+use zinder_store::{
+    CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
+    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
+    RocksDbCanonicalSecondary,
+};
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
     WalletProjectionReadyEvidence, WalletProjectionSourcePosition,
@@ -81,6 +85,19 @@ pub trait CanonicalReader: Send + Sync + 'static {
         &self,
         range: SubtreeRootRange,
     ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError>;
+
+    /// Projects retained canonical transitions into authenticated wallet events.
+    fn wallet_chain_event_history(
+        &self,
+        request: ChainEventHistoryRequest<'_>,
+    ) -> Result<Vec<ChainEventEnvelope>, CanonicalStoreError>;
+
+    /// Resolves an authenticated wallet chain-event subscription start.
+    fn resolve_wallet_chain_event_stream_start(
+        &self,
+        start: &EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, CanonicalStoreError>;
 }
 
 /// Read-only wallet projection state held at one immutable READY source identity.
@@ -242,6 +259,21 @@ macro_rules! impl_canonical_read {
                 range: SubtreeRootRange,
             ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
                 self.subtree_roots(range)
+            }
+
+            fn wallet_chain_event_history(
+                &self,
+                request: ChainEventHistoryRequest<'_>,
+            ) -> Result<Vec<ChainEventEnvelope>, CanonicalStoreError> {
+                self.wallet_chain_event_history(request)
+            }
+
+            fn resolve_wallet_chain_event_stream_start(
+                &self,
+                start: &EventStreamStartPosition,
+                requested_family: ChainEventStreamFamily,
+            ) -> Result<ChainEventStreamResume, CanonicalStoreError> {
+                self.resolve_wallet_chain_event_stream_start(start, requested_family)
             }
         }
     };

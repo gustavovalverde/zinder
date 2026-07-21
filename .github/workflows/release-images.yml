@@ -1,8 +1,8 @@
 name: release-images
 
 # Build and push the wallet-serving service images to ghcr.io
-# when a release tag lands. The native query library, optional explorer runtime,
-# and mixed single-container bundle are intentionally not release artifacts. Use
+# when a release tag lands. The optional explorer runtime and mixed
+# single-container bundle are intentionally not release artifacts. Use
 # workflow_dispatch to dry-run.
 #
 # Tag convention:
@@ -89,6 +89,7 @@ jobs:
           images=(
             "zinder-ingest:zinder-ingest"
             "zinder-projector:zinder-projector"
+            "zinder-query:zinder-query"
             "zinder-compat-lightwalletd:zinder-compat-lightwalletd"
           )
 
@@ -135,6 +136,7 @@ jobs:
         image:
           - zinder-ingest
           - zinder-projector
+          - zinder-query
           - zinder-compat-lightwalletd
     steps:
       - name: Resolve image and tags

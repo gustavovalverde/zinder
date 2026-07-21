@@ -802,6 +802,73 @@ fn read_event_context_optional(
     Ok(Some(decode_event_context(&encoded, event_sequence)?))
 }
 
+/// Resolves the block hash at `height` on the branch visible immediately after
+/// `event_sequence` by consulting permanent displacement history.
+///
+/// The earliest later replacement covering the height displaced exactly the
+/// block that was visible at the requested event. Later replacements may
+/// displace that replacement again, so choosing the newest archive row would
+/// reconstruct the wrong historical branch.
+pub(super) fn first_displaced_block_hash_after_event(
+    db: &rust_rocksdb::DB,
+    event_sequence: u64,
+    height: BlockHeight,
+) -> Result<Option<BlockHash>, CanonicalStoreError> {
+    let Some(first_later_sequence) = event_sequence.checked_add(1) else {
+        return Ok(None);
+    };
+    let family = db
+        .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
+        .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
+    let mut options = ReadOptions::default();
+    options.fill_cache(false);
+    let mut contexts = db.raw_iterator_cf_opt(&family, options);
+    contexts.seek(encode_event_context_key(first_later_sequence));
+    while contexts.valid() {
+        let Some((key, encoded)) = contexts.item() else {
+            break;
+        };
+        if key.first() != Some(&EVENT_CONTEXT_KEY_TAG) {
+            break;
+        }
+        if key.len() != EVENT_CONTEXT_KEY_LENGTH {
+            return Err(CanonicalStoreError::displaced_archive(
+                "archive event context key is not exact version-1 bytes",
+            ));
+        }
+        let context_sequence = u64::from_be_bytes(read_array(key, 1)?);
+        let context = decode_event_context(encoded, context_sequence)?;
+        if context.reverted_range.start <= height && height <= context.reverted_range.end {
+            let mut first_position = [0; ORDER_KEY_LENGTH];
+            first_position[0] = ORDER_KEY_TAG;
+            first_position[1..9].copy_from_slice(&context_sequence.to_be_bytes());
+            first_position[9..13].copy_from_slice(&height.value().to_be_bytes());
+            let mut rows = db.raw_iterator_cf_opt(&family, ReadOptions::default());
+            rows.seek(first_position);
+            let Some(key) = rows.key() else {
+                return Err(CanonicalStoreError::displaced_archive(
+                    "archive context has no row at a covered historical height",
+                ));
+            };
+            let position = decode_order_key(key)?;
+            if position.event_sequence != context_sequence || position.height != height {
+                return Err(CanonicalStoreError::displaced_archive(
+                    "archive context does not resolve its covered historical height",
+                ));
+            }
+            return Ok(Some(position.block_hash));
+        }
+        contexts.next();
+    }
+    contexts
+        .status()
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "historical displacement context iteration",
+            source,
+        })?;
+    Ok(None)
+}
+
 fn event_has_order_row(
     store: &RocksDbCanonicalStore,
     event_sequence: u64,

@@ -147,10 +147,15 @@ impl RocksDbCanonicalStore {
 
         let event_family = column_family(&self.bounded_open.db, MEMPOOL_EVENT_COLUMN_FAMILY)?;
         let mut batch = WriteBatch::default();
+        let encoded_envelope = encode_mempool_event_envelope(&envelope).map_err(|error| {
+            CanonicalStoreError::MempoolEventLogInvalid {
+                reason: error.to_string(),
+            }
+        })?;
         batch.put_cf(
             &event_family,
             event_sequence.to_be_bytes(),
-            encode_mempool_event_envelope(&envelope),
+            encoded_envelope,
         );
         batch.put(MEMPOOL_EVENT_SEQUENCE_KEY, event_sequence.to_be_bytes());
         if current_event_sequence == 0 {
@@ -433,7 +438,7 @@ fn earliest_active_mempool_add_sequence(
         let envelope = read_mempool_event(store, event_sequence)?;
         match envelope.event {
             MempoolEvent::Added { entry } => {
-                active_add_sequences.insert(entry.transaction_id, event_sequence);
+                active_add_sequences.insert(entry.transaction_id(), event_sequence);
             }
             MempoolEvent::Invalidated { transaction_id, .. }
             | MempoolEvent::Mined { transaction_id, .. } => {

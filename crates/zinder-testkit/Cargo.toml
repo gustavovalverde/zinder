@@ -18,7 +18,6 @@ eyre.workspace = true
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard.workspace = true
 parking_lot.workspace = true
-prost.workspace = true
 rand = "0.8"
 serde_json.workspace = true
 secp256k1 = { version = "0.29.1", default-features = false, features = ["alloc"] }
@@ -35,7 +34,6 @@ zcash_protocol = { version = "0.10.0", default-features = false, features = ["lo
 zcash_transparent = { version = "0.9.0", default-features = false, features = ["transparent-inputs", "std"] }
 zinder-core.workspace = true
 zinder-materialized-views.workspace = true
-zinder-proto.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
 zinder-wallet-rocksdb.workspace = true

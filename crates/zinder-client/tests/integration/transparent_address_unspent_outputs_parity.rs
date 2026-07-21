@@ -131,10 +131,7 @@ async fn setup_chain_indexes(utxo_count: u32) -> eyre::Result<ChainIndexFixtures
         chain_fixture = chain_fixture.with_address_output_index(TransparentUnspentOutput::new(
             address_script_hash,
             SCRIPT_PUB_KEY.to_vec(),
-            TransparentOutPoint::new(
-                TransactionId::from_bytes(transaction_id_bytes),
-                output_index,
-            ),
+            TransparentOutPoint::new(TransactionId::from_bytes(transaction_id_bytes), 0),
             1_000_000_u64 + u64::from(output_index),
             block_height,
             block_hash,

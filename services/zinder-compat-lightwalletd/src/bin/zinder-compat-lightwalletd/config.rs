@@ -78,7 +78,7 @@ pub(crate) enum LightwalletdConfigError {
     WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
 
     #[error(transparent)]
-    WalletServingPair(#[from] crate::wallet_serving_pair_publisher::WalletServingPairError),
+    WalletServingPair(#[from] zinder_query::WalletServingPairError),
 
     #[error(transparent)]
     Query(#[from] zinder_query::QueryError),

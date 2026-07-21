@@ -8,9 +8,9 @@ use std::num::NonZeroU32;
 use eyre::eyre;
 use tempfile::tempdir;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, Network, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
+    BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CompactBlockArtifact, Network, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash,
+    SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
 };
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 
@@ -52,6 +52,13 @@ fn synthetic_epoch(
     let parent_hash = block_hash(height.saturating_sub(1));
     let block_height = BlockHeight::new(height);
 
+    let block = super::synthetic_block_header(
+        block_height,
+        source_hash,
+        parent_hash,
+        format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
+    );
+    let compact = super::empty_compact_block_for_header(&block, ChainTipMetadata::empty());
     (
         ChainEpoch {
             id: ChainEpochId::new(chain_epoch_id),
@@ -60,21 +67,12 @@ fn synthetic_epoch(
             visible_tip_hash: source_hash,
             settled_tip_height: block_height,
             settled_tip_hash: source_hash,
-            artifact_schema_version: ArtifactSchemaVersion::new(13),
+            artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
             tip_metadata: ChainTipMetadata::empty(),
             created_at: UnixTimestampMillis::new(1_774_668_600_000 + u64::from(height)),
         },
-        super::synthetic_block_header(
-            block_height,
-            source_hash,
-            parent_hash,
-            format!("raw-block-{chain_epoch_id}-{height}").as_bytes(),
-        ),
-        CompactBlockArtifact::new(
-            block_height,
-            source_hash,
-            format!("compact-block-{chain_epoch_id}-{height}").into_bytes(),
-        ),
+        block,
+        compact,
     )
 }
 
