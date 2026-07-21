@@ -443,10 +443,9 @@ pub trait ChainIndex: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError>;
 
-    /// Resolves the block at the chain epoch's settled tip (the height a
-    /// wallet may safely use as its scan ceiling: both a compact block and
-    /// a coherent tree-state checkpoint are guaranteed available within the
-    /// wallet's rewind cap of that height).
+    /// Resolves the block at the chain epoch's settled finality watermark.
+    /// Wallets still scan through the pinned epoch's visible tip so their
+    /// commitment-tree state matches the chain tip passed to the wallet database.
     ///
     /// # Examples
     ///

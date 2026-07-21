@@ -85,6 +85,85 @@ async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn compact_block_range_serves_visible_blocks_above_settled_tip() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
+    let (mut second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    second_epoch.settled_tip_height = first_epoch.visible_tip_height;
+    second_epoch.settled_tip_hash = first_epoch.visible_tip_hash;
+
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        first_epoch,
+        vec![first_block.clone()],
+        vec![encode_fixture_block_replay(&first_block, &[])],
+        vec![first_compact_block],
+    ))?;
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        second_epoch,
+        vec![second_block.clone()],
+        vec![encode_fixture_block_replay(&second_block, &[])],
+        vec![second_compact_block.clone()],
+    ))?;
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let response = wallet_query
+        .compact_blocks_in_range(
+            BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(2)),
+            Some(second_epoch.id),
+        )
+        .await?;
+
+    assert_eq!(response.chain_epoch, second_epoch);
+    assert_eq!(response.compact_blocks, vec![second_compact_block]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tree_state_at_serves_visible_height_above_settled_tip_under_epoch_pin() -> eyre::Result<()>
+{
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
+    let (mut second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    second_epoch.settled_tip_height = first_epoch.visible_tip_height;
+    second_epoch.settled_tip_hash = first_epoch.visible_tip_hash;
+
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        first_epoch,
+        vec![first_block.clone()],
+        vec![encode_fixture_block_replay(&first_block, &[])],
+        vec![first_compact_block],
+    ))?;
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        second_epoch,
+        vec![second_block.clone()],
+        vec![encode_fixture_block_replay(&second_block, &[])],
+        vec![second_compact_block],
+    ))?;
+
+    let block_id = BlockId::new(second_block.height, second_block.block_hash);
+    let payload = br#"{"orchard":{"commitments":{"finalState":"aa"}}}"#.to_vec();
+    let upstream = FixedTreeStateUpstream(SourceTreeState::new(
+        block_id,
+        u32::try_from(second_block.block_time)?,
+        payload.clone(),
+    ));
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
+        .with_tree_state_upstream(Arc::new(upstream));
+
+    let response = wallet_query
+        .tree_state_at(second_block.height, Some(second_epoch.id))
+        .await?;
+
+    assert_eq!(response.chain_epoch, second_epoch);
+    assert_eq!(response.height, second_block.height);
+    assert_eq!(response.block_hash, second_block.block_hash);
+    assert_eq!(response.payload_bytes, payload);
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(
     clippy::too_many_lines,
     reason = "the test keeps the complete native compact-block wire shape in one assertion scope"

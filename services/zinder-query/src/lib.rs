@@ -83,9 +83,9 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<VisibleTipBlock, QueryError>;
 
-    /// Reads the block at the chain epoch's settled tip (the wallet's scan
-    /// ceiling). Mirrors `visible_tip_block` but resolves to
-    /// `chain_epoch.settled_tip_height` rather than `chain_epoch.tip_height`.
+    /// Reads the block at the chain epoch's settled finality watermark.
+    /// Mirrors `visible_tip_block` but resolves to
+    /// `chain_epoch.settled_tip_height` rather than `chain_epoch.visible_tip_height`.
     async fn settled_tip_block(
         &self,
         at_epoch_id: Option<ChainEpochId>,
@@ -1971,8 +1971,7 @@ pub struct VisibleTipBlock {
 }
 
 /// Settled-tip block metadata bound to one chain epoch. The block sits at
-/// `chain_epoch.settled_tip_height` and is the highest height the wallet can
-/// safely use as its scan ceiling.
+/// `chain_epoch.settled_tip_height` and marks the reorg-window finality boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SettledTipBlock {
     /// Chain epoch used to answer the query.

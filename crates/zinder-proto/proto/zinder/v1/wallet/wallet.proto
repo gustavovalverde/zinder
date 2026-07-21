@@ -35,10 +35,9 @@ message ChainEpoch {
   // Best visible block in this chain epoch.
   BlockTip visible_tip = 5;
 
-  // Highest block in this chain epoch for which both compact-block and
-  // commitment-tree artifacts are coherent past the reorg window. The wallet
-  // uses this as its scan ceiling; see ADR-0005 in the zally repo. Carries the
-  // exact reorg-window semantics the prior `settled_tip_*` fields did.
+  // Reorg-window settlement watermark for this chain epoch. Wallets scan
+  // through visible_tip under the epoch pin and use this lower height for
+  // settlement-sensitive policy.
   BlockTip settled_tip = 6;
 
   // Sapling note commitment tree size at the visible tip. Wallets use this to
@@ -160,8 +159,7 @@ message VisibleTipBlockRequest {
 }
 
 // Settled-tip block metadata response bound to one chain epoch. Returns the
-// block at the chain epoch's settled_tip, which the wallet uses as its scan
-// ceiling.
+// block at the chain epoch's settlement watermark.
 message SettledTipBlockResponse {
   // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
   ChainView chain_view = 1;
@@ -1647,9 +1645,7 @@ service WalletQuery {
   // Return the visible-tip block identity.
   rpc VisibleTipBlock(VisibleTipBlockRequest) returns (VisibleTipBlockResponse);
 
-  // Return the block at the settled tip height: the highest height at which
-  // both compact blocks and a coherent tree-state checkpoint are
-  // guaranteed available. The wallet uses this as its scan ceiling.
+  // Return the block at the settled reorg-window settlement watermark.
   rpc SettledTipBlock(SettledTipBlockRequest) returns (SettledTipBlockResponse);
 
   // Resolve a typed block selector against the canonical best chain.

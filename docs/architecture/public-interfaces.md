@@ -71,7 +71,7 @@ fields report independently queryable state.
 | Field | Meaning |
 | --- | --- |
 | `visible_tip` | Best block visible in the admitted chain epoch |
-| `settled_tip` | Reorg-window ceiling and wallet scan ceiling |
+| `settled_tip` | Reorg-window finality watermark for settlement-sensitive policy |
 | `indexed_tip` | Highest block covered by the required materialized view |
 | `upstream_tip` | Latest source-node observation |
 | `materialized_views` | Materialized-view status and lag |
