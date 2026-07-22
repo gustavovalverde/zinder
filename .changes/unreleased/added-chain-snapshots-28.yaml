@@ -1,0 +1,6 @@
+kind: added
+body: Add borrowed and Arc-owned chain snapshots that pin canonical wallet reads to one chain epoch and return typed refresh guidance when that epoch is unavailable.
+time: 2026-07-22T11:53:48Z
+custom:
+  Bump: minor
+  PR: "28"
