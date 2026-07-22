@@ -1,4 +1,4 @@
-//! Consumer-release certification tests for the public client contracts.
+//! Consumer-shaped contract tests for the public client surface.
 //!
 //! Each per-consumer module asserts the typed shape that consumer's contract
 //! depends on. Parity here means "Zinder serves the consumer-expected shape",

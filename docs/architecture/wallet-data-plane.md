@@ -608,6 +608,14 @@ pending-transaction UX.
 
 Wallet sync APIs must read from one `ChainEpoch`. Primary in-process reads may also be backed by one RocksDB snapshot; secondary reads are snapshotless and rely on epoch-bound visibility retention per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).
 
+Rust consumers capture that boundary with `ChainSnapshot` for a borrowed
+handle or `OwnedChainSnapshot` for an `Arc`-owned, cloneable chain view. Every
+pinnable canonical method on either view sends `Some(captured_epoch.id)`,
+including transaction lookup; snapshot transaction reads therefore never fall
+back to the live mempool. The snapshot types do not wrap current-only address
+history or balance reads, local catchup cadence, or any `EndpointBackedIndex`
+operation.
+
 For example, a compact block range response should bind:
 
 - Start height.
@@ -619,6 +627,11 @@ For example, a compact block range response should bind:
 - Subtree-root range or cursor when subtree data is returned.
 
 If the chain tip changes while the request is executing, the response should still finish from the epoch it started with or restart from a new epoch. It should not mix both.
+
+The production `WalletServingQuery` publishes one current exact read pair and
+does not promise historical pair retention. After publication advances, an old
+snapshot receives `CHAIN_EPOCH_PIN_UNAVAILABLE` and captures a new snapshot;
+it must not silently read replacement-branch artifacts.
 
 ## Performance and Pagination
 

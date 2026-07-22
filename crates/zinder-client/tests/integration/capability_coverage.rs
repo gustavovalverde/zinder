@@ -14,8 +14,8 @@
 //! the wallet capability surface stays bound to the trait at build time.
 
 use zinder_client::{
-    CAPABILITIES, Capability, CapabilityDescriptor, CapabilitySurface, ChainIndex,
-    EndpointBackedIndex, INGEST_WRITER_PHASE_V1, always_on_capability_strings,
+    CAPABILITIES, Capability, CapabilityDescriptor, CapabilitySurface, ChainIndex, ChainSnapshot,
+    EndpointBackedIndex, INGEST_WRITER_PHASE_V1, OwnedChainSnapshot, always_on_capability_strings,
 };
 
 #[test]
@@ -71,6 +71,56 @@ fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::transparent_address_unspent_outputs;
     let _ = T::transparent_address_tx_ids_in_range;
     let _ = T::transparent_address_balance;
+}
+
+#[allow(
+    dead_code,
+    reason = "compile-time existence check for every epoch-pinnable ChainSnapshot read"
+)]
+fn assert_chain_snapshot_methods_compile<T: ChainIndex>() {
+    let _ = ChainSnapshot::<T>::chain_epoch;
+    let _ = ChainSnapshot::<T>::visible_tip_block;
+    let _ = ChainSnapshot::<T>::settled_tip_block;
+    let _ = ChainSnapshot::<T>::block_id_by_selector;
+    let _ = ChainSnapshot::<T>::block_header_by_selector;
+    let _ = ChainSnapshot::<T>::compact_block_at;
+    let _ = ChainSnapshot::<T>::compact_blocks_in_range;
+    let _ = ChainSnapshot::<T>::full_block_at;
+    let _ = ChainSnapshot::<T>::full_blocks_in_range;
+    let _ = ChainSnapshot::<T>::tree_state_at;
+    let _ = ChainSnapshot::<T>::latest_tree_state_checkpoint;
+    let _ = ChainSnapshot::<T>::subtree_roots_in_range;
+    let _ = ChainSnapshot::<T>::transaction_by_id;
+    let _ = ChainSnapshot::<T>::transparent_address_unspent_outputs;
+    let _ = ChainSnapshot::<T>::transparent_outputs_by_outpoint;
+    let _ = ChainSnapshot::<T>::transparent_spends_by_outpoint;
+    let _ = ChainSnapshot::<T>::transparent_unspent_outputs_by_outpoint;
+    let _ = ChainSnapshot::<T>::transparent_utxo_set_summary;
+}
+
+#[allow(
+    dead_code,
+    reason = "compile-time parity check between borrowed and owned snapshot methods"
+)]
+fn assert_owned_chain_snapshot_methods_compile<T: ChainIndex>() {
+    let _ = OwnedChainSnapshot::<T>::chain_epoch;
+    let _ = OwnedChainSnapshot::<T>::visible_tip_block;
+    let _ = OwnedChainSnapshot::<T>::settled_tip_block;
+    let _ = OwnedChainSnapshot::<T>::block_id_by_selector;
+    let _ = OwnedChainSnapshot::<T>::block_header_by_selector;
+    let _ = OwnedChainSnapshot::<T>::compact_block_at;
+    let _ = OwnedChainSnapshot::<T>::compact_blocks_in_range;
+    let _ = OwnedChainSnapshot::<T>::full_block_at;
+    let _ = OwnedChainSnapshot::<T>::full_blocks_in_range;
+    let _ = OwnedChainSnapshot::<T>::tree_state_at;
+    let _ = OwnedChainSnapshot::<T>::latest_tree_state_checkpoint;
+    let _ = OwnedChainSnapshot::<T>::subtree_roots_in_range;
+    let _ = OwnedChainSnapshot::<T>::transaction_by_id;
+    let _ = OwnedChainSnapshot::<T>::transparent_address_unspent_outputs;
+    let _ = OwnedChainSnapshot::<T>::transparent_outputs_by_outpoint;
+    let _ = OwnedChainSnapshot::<T>::transparent_spends_by_outpoint;
+    let _ = OwnedChainSnapshot::<T>::transparent_unspent_outputs_by_outpoint;
+    let _ = OwnedChainSnapshot::<T>::transparent_utxo_set_summary;
 }
 
 /// Compile-time existence check for the [`EndpointBackedIndex`] methods that

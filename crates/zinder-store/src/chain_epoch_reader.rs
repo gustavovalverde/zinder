@@ -140,6 +140,16 @@ impl<'store> ChainEpochReader<'store> {
         self.chain_epoch
     }
 
+    /// Verifies that a secondary reader still exposes this reader's pinned
+    /// epoch.
+    ///
+    /// Primary readers always pass. Secondary readers return
+    /// [`StoreError::ChainEpochConflict`] after catchup advances them to a
+    /// different epoch.
+    pub fn validate_epoch_pin(&self) -> Result<(), StoreError> {
+        self.ensure_secondary_epoch_is_pinned()
+    }
+
     /// Returns the durable canonical-history bounds for this read session.
     #[must_use]
     pub const fn canonical_history_bounds(&self) -> CanonicalHistoryBounds {

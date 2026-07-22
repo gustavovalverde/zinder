@@ -1,6 +1,6 @@
 //! Public chain-index trait and consumer-facing domain types.
 
-use std::{num::NonZeroU32, pin::Pin, time::Duration};
+use std::{num::NonZeroU32, pin::Pin, sync::Arc, time::Duration};
 
 use crate::IndexerError;
 use async_trait::async_trait;
@@ -391,6 +391,390 @@ impl TransparentUtxoSetSummaryView {
     }
 }
 
+/// Borrowed canonical-chain view pinned to one [`ChainEpoch`].
+///
+/// Capture resolves [`ChainIndex::current_epoch`] exactly once. Every read on
+/// this view forwards that captured epoch id, so a multi-call operation either
+/// remains on one canonical branch or receives
+/// [`IndexerError::ChainEpochPinUnavailable`] after the serving implementation
+/// stops retaining that epoch.
+pub struct ChainSnapshot<'a, I: ChainIndex + ?Sized> {
+    chain_index: &'a I,
+    chain_epoch: ChainEpoch,
+}
+
+impl<I: ChainIndex + ?Sized> Copy for ChainSnapshot<'_, I> {}
+
+impl<I: ChainIndex + ?Sized> Clone for ChainSnapshot<'_, I> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
+    /// Captures the chain index's current visible epoch exactly once.
+    pub async fn capture(chain_index: &'a I) -> Result<Self, IndexerError> {
+        let chain_epoch = chain_index.current_epoch().await?;
+        Ok(Self {
+            chain_index,
+            chain_epoch,
+        })
+    }
+
+    /// Returns the epoch used by every canonical read on this snapshot.
+    #[must_use]
+    pub const fn chain_epoch(&self) -> ChainEpoch {
+        self.chain_epoch
+    }
+
+    /// Returns the captured epoch's visible-tip block identity.
+    pub async fn visible_tip_block(&self) -> Result<BlockId, IndexerError> {
+        self.chain_index
+            .visible_tip_block(Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Returns the captured epoch's settled-tip block identity.
+    pub async fn settled_tip_block(&self) -> Result<BlockId, IndexerError> {
+        self.chain_index
+            .settled_tip_block(Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Resolves a block selector against the captured canonical epoch.
+    pub async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+    ) -> Result<BlockId, IndexerError> {
+        self.chain_index
+            .block_id_by_selector(selector, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Returns a typed block header from the captured canonical epoch.
+    pub async fn block_header_by_selector(
+        &self,
+        selector: BlockSelector,
+    ) -> Result<BlockHeader, IndexerError> {
+        self.chain_index
+            .block_header_by_selector(selector, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Reads one compact block from the captured canonical epoch.
+    pub async fn compact_block_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<CompactBlockArtifact, IndexerError> {
+        self.chain_index
+            .compact_block_at(height, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Streams compact blocks from the captured canonical epoch.
+    pub async fn compact_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
+        self.chain_index
+            .compact_blocks_in_range(block_range, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Reads one retained full block from the captured canonical epoch.
+    pub async fn full_block_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<BlockBlobArtifact, IndexerError> {
+        self.chain_index
+            .full_block_at(height, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Streams retained full blocks from the captured canonical epoch.
+    pub async fn full_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<IndexStream<BlockBlobArtifact>, IndexerError> {
+        self.chain_index
+            .full_blocks_in_range(block_range, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Reads the tree state at one height from the captured canonical epoch.
+    pub async fn tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<TreeStateArtifact, IndexerError> {
+        self.chain_index
+            .tree_state_at(height, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Reads the latest tree-state checkpoint from the captured canonical
+    /// epoch.
+    pub async fn latest_tree_state_checkpoint(&self) -> Result<TreeStateArtifact, IndexerError> {
+        self.chain_index
+            .latest_tree_state_checkpoint(Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Reads a bounded subtree-root range from the captured canonical epoch.
+    pub async fn subtree_roots_in_range(
+        &self,
+        subtree_root_range: SubtreeRootRange,
+    ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
+        self.chain_index
+            .subtree_roots_in_range(subtree_root_range, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Looks up a canonical transaction without consulting live mempool state.
+    pub async fn transaction_by_id(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<TxStatus, IndexerError> {
+        self.chain_index
+            .transaction_by_id(transaction_id, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Streams one address's unspent outputs from the captured canonical
+    /// epoch.
+    pub async fn transparent_address_unspent_outputs(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        start_height: BlockHeight,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
+        self.chain_index
+            .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
+                address_script_hash,
+                start_height,
+                at_epoch_id: Some(self.chain_epoch.id),
+            })
+            .await
+    }
+
+    /// Resolves canonical transparent outputs from the captured epoch.
+    pub async fn transparent_outputs_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
+        self.chain_index
+            .transparent_outputs_by_outpoint(outpoints, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Resolves canonical transparent spends from the captured epoch.
+    pub async fn transparent_spends_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentSpendsByOutpointResponse, IndexerError> {
+        self.chain_index
+            .transparent_spends_by_outpoint(outpoints, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Resolves canonical unspent transparent outputs from the captured epoch.
+    pub async fn transparent_unspent_outputs_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError> {
+        self.chain_index
+            .transparent_unspent_outputs_by_outpoint(outpoints, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Returns the transparent UTXO-set summary from the captured epoch.
+    pub async fn transparent_utxo_set_summary(
+        &self,
+    ) -> Result<TransparentUtxoSetSummaryView, IndexerError> {
+        self.chain_index
+            .transparent_utxo_set_summary(Some(self.chain_epoch.id))
+            .await
+    }
+}
+
+/// Owned canonical-chain view pinned to one [`ChainEpoch`].
+///
+/// This companion to [`ChainSnapshot`] is suitable for consumer APIs that
+/// must retain a cloneable, `'static` chain view. It owns an [`Arc`] to the
+/// index while preserving the same canonical-only epoch-pinning behavior.
+pub struct OwnedChainSnapshot<I: ChainIndex + ?Sized> {
+    chain_index: Arc<I>,
+    chain_epoch: ChainEpoch,
+}
+
+impl<I: ChainIndex + ?Sized> Clone for OwnedChainSnapshot<I> {
+    fn clone(&self) -> Self {
+        Self {
+            chain_index: Arc::clone(&self.chain_index),
+            chain_epoch: self.chain_epoch,
+        }
+    }
+}
+
+impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
+    /// Captures the shared chain index's current visible epoch exactly once.
+    pub async fn capture(chain_index: Arc<I>) -> Result<Self, IndexerError> {
+        let chain_epoch = chain_index.current_epoch().await?;
+        Ok(Self {
+            chain_index,
+            chain_epoch,
+        })
+    }
+
+    /// Returns the epoch used by every canonical read on this snapshot.
+    #[must_use]
+    pub const fn chain_epoch(&self) -> ChainEpoch {
+        self.chain_epoch
+    }
+
+    fn borrowed(&self) -> ChainSnapshot<'_, I> {
+        ChainSnapshot {
+            chain_index: self.chain_index.as_ref(),
+            chain_epoch: self.chain_epoch,
+        }
+    }
+
+    /// Returns the captured epoch's visible-tip block identity.
+    pub async fn visible_tip_block(&self) -> Result<BlockId, IndexerError> {
+        self.borrowed().visible_tip_block().await
+    }
+
+    /// Returns the captured epoch's settled-tip block identity.
+    pub async fn settled_tip_block(&self) -> Result<BlockId, IndexerError> {
+        self.borrowed().settled_tip_block().await
+    }
+
+    /// Resolves a block selector against the captured canonical epoch.
+    pub async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+    ) -> Result<BlockId, IndexerError> {
+        self.borrowed().block_id_by_selector(selector).await
+    }
+
+    /// Returns a typed block header from the captured canonical epoch.
+    pub async fn block_header_by_selector(
+        &self,
+        selector: BlockSelector,
+    ) -> Result<BlockHeader, IndexerError> {
+        self.borrowed().block_header_by_selector(selector).await
+    }
+
+    /// Reads one compact block from the captured canonical epoch.
+    pub async fn compact_block_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<CompactBlockArtifact, IndexerError> {
+        self.borrowed().compact_block_at(height).await
+    }
+
+    /// Streams compact blocks from the captured canonical epoch.
+    pub async fn compact_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
+        self.borrowed().compact_blocks_in_range(block_range).await
+    }
+
+    /// Reads one retained full block from the captured canonical epoch.
+    pub async fn full_block_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<BlockBlobArtifact, IndexerError> {
+        self.borrowed().full_block_at(height).await
+    }
+
+    /// Streams retained full blocks from the captured canonical epoch.
+    pub async fn full_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+    ) -> Result<IndexStream<BlockBlobArtifact>, IndexerError> {
+        self.borrowed().full_blocks_in_range(block_range).await
+    }
+
+    /// Reads the tree state at one height from the captured canonical epoch.
+    pub async fn tree_state_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<TreeStateArtifact, IndexerError> {
+        self.borrowed().tree_state_at(height).await
+    }
+
+    /// Reads the latest tree-state checkpoint from the captured epoch.
+    pub async fn latest_tree_state_checkpoint(&self) -> Result<TreeStateArtifact, IndexerError> {
+        self.borrowed().latest_tree_state_checkpoint().await
+    }
+
+    /// Reads a bounded subtree-root range from the captured canonical epoch.
+    pub async fn subtree_roots_in_range(
+        &self,
+        subtree_root_range: SubtreeRootRange,
+    ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
+        self.borrowed()
+            .subtree_roots_in_range(subtree_root_range)
+            .await
+    }
+
+    /// Looks up a canonical transaction without consulting live mempool state.
+    pub async fn transaction_by_id(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<TxStatus, IndexerError> {
+        self.borrowed().transaction_by_id(transaction_id).await
+    }
+
+    /// Streams one address's unspent outputs from the captured epoch.
+    pub async fn transparent_address_unspent_outputs(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        start_height: BlockHeight,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
+        self.borrowed()
+            .transparent_address_unspent_outputs(address_script_hash, start_height)
+            .await
+    }
+
+    /// Resolves canonical transparent outputs from the captured epoch.
+    pub async fn transparent_outputs_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
+        self.borrowed()
+            .transparent_outputs_by_outpoint(outpoints)
+            .await
+    }
+
+    /// Resolves canonical transparent spends from the captured epoch.
+    pub async fn transparent_spends_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentSpendsByOutpointResponse, IndexerError> {
+        self.borrowed()
+            .transparent_spends_by_outpoint(outpoints)
+            .await
+    }
+
+    /// Resolves canonical unspent transparent outputs from the captured epoch.
+    pub async fn transparent_unspent_outputs_by_outpoint(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError> {
+        self.borrowed()
+            .transparent_unspent_outputs_by_outpoint(outpoints)
+            .await
+    }
+
+    /// Returns the transparent UTXO-set summary from the captured epoch.
+    pub async fn transparent_utxo_set_summary(
+        &self,
+    ) -> Result<TransparentUtxoSetSummaryView, IndexerError> {
+        self.borrowed().transparent_utxo_set_summary().await
+    }
+}
+
 /// Canonical and materialized-view reads served identically by every chain-index
 /// handle.
 ///
@@ -429,6 +813,24 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// # let _ = epoch; Ok(()) }
     /// ```
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError>;
+
+    /// Captures a borrowed canonical-chain view pinned to the current epoch.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let snapshot = client.snapshot().await?;
+    /// let tip = snapshot.visible_tip_block().await?;
+    /// # let _ = tip; Ok(()) }
+    /// ```
+    async fn snapshot(&self) -> Result<ChainSnapshot<'_, Self>, IndexerError>
+    where
+        Self: Sized,
+    {
+        ChainSnapshot::capture(self).await
+    }
 
     /// Returns the visible-tip block identity.
     ///

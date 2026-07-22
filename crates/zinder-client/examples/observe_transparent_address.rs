@@ -36,9 +36,9 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use zinder_client::{
-    BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex, EndpointBackedIndex,
-    EventStreamStart, IndexerError, Network, RemoteChainIndex, RemoteOpenOptions, RetryPolicy,
-    TransparentAddressScriptHash, TransparentAddressUnspentOutputsQuery,
+    BlockHeight, ChainEvent, ChainEventStreamFamily, ChainIndex, ChainSnapshot,
+    EndpointBackedIndex, EventStreamStart, IndexerError, Network, RemoteChainIndex,
+    RemoteOpenOptions, RetryPolicy, TransparentAddressScriptHash,
 };
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -128,23 +128,20 @@ async fn observe_once(endpoint: &str, network: Network, address: &str) -> Result
 
     let script_hash = transparent_address_script_hash(address)?;
 
-    snapshot_utxos(&chain_index, script_hash, address).await?;
+    let snapshot = chain_index.snapshot().await?;
+    snapshot_utxos(&snapshot, script_hash, address).await?;
     subscribe_chain_events(chain_index, address).await
 }
 
 async fn snapshot_utxos(
-    chain_index: &RemoteChainIndex,
+    snapshot: &ChainSnapshot<'_, RemoteChainIndex>,
     script_hash: TransparentAddressScriptHash,
     address: &str,
 ) -> Result<(), IndexerError> {
     let mut total_zat: u64 = 0;
     let mut utxo_count: u32 = 0;
-    let mut unspent_outputs = chain_index
-        .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
-            address_script_hash: script_hash,
-            start_height: BlockHeight::new(0),
-            at_epoch_id: None,
-        })
+    let mut unspent_outputs = snapshot
+        .transparent_address_unspent_outputs(script_hash, BlockHeight::new(0))
         .await?;
     while let Some(unspent_item) = unspent_outputs.next().await {
         let utxo = unspent_item?.output;
