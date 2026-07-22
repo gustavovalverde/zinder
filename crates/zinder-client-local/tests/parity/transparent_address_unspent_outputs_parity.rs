@@ -11,12 +11,12 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use zinder_client::{
-    BlockHeight, ChainEpochId, ChainIndex, DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex,
-    LocalOpenOptions, Network, RemoteChainIndex, RemoteOpenOptions, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressUnspentOutputsQuery,
+    BlockHeight, ChainEpochId, ChainIndex, Network, RemoteChainIndex, RemoteOpenOptions,
+    TransactionId, TransparentAddressScriptHash, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentOutPoint, TransparentUnspentOutput,
     TransparentUnspentOutputChunk,
 };
+use zinder_client_local::{DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex, LocalOpenOptions};
 use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
 

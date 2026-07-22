@@ -5703,13 +5703,33 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
- "tokio-util",
  "toml",
  "tonic",
  "tonic-prost",
  "tonic-types",
  "tracing",
  "zebra-chain",
+ "zinder-compat-lightwalletd",
+ "zinder-core",
+ "zinder-materialized-views",
+ "zinder-proto",
+ "zinder-query",
+ "zinder-store",
+ "zinder-testkit",
+]
+
+[[package]]
+name = "zinder-client-local"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "eyre",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tracing",
+ "zinder-client",
  "zinder-core",
  "zinder-materialized-views",
  "zinder-proto",

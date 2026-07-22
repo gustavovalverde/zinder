@@ -6,12 +6,8 @@ use tonic::Code;
 #[cfg(feature = "remote")]
 use tonic_types::StatusExt;
 use zinder_core::Network;
-#[cfg(feature = "local")]
-use zinder_materialized_views::MaterializedViewStoreError;
 #[cfg(feature = "remote")]
 use zinder_proto::v1::ops::ErrorReason;
-#[cfg(feature = "local")]
-use zinder_store::StoreError;
 
 /// Domain Zinder services set on every `google.rpc.ErrorInfo`.
 ///
@@ -157,87 +153,6 @@ pub enum IndexerError {
 }
 
 impl IndexerError {
-    #[cfg(feature = "local")]
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "StoreError is consumed through map_err adapters at storage boundaries"
-    )]
-    pub(crate) fn from_store_error(error: StoreError) -> Self {
-        match error {
-            StoreError::NoVisibleChainEpoch => Self::NoVisibleChainEpoch,
-            StoreError::ArtifactMissing { family, key } => Self::ArtifactUnavailable {
-                family: family.wire_label().to_owned(),
-                key: format!("{key:?}"),
-            },
-            StoreError::ChainEpochMissing { .. } => Self::NotFound {
-                resource: "artifact",
-            },
-            StoreError::ChainEventCursorInvalid { reason }
-            | StoreError::MempoolEventCursorInvalid { reason }
-            | StoreError::InvalidChainEpochArtifacts { reason }
-            | StoreError::InvalidChainStoreOptions { reason }
-            | StoreError::ArtifactCorrupt { reason, .. }
-            | StoreError::Unsupported { feature: reason } => Self::InvalidRequest {
-                reason: reason.to_owned(),
-            },
-            StoreError::ChainEventCursorExpired {
-                event_sequence: _,
-                oldest_retained_sequence: _,
-            } => Self::ChainEventCursorExpired {
-                recovery: ChainEventCursorRecovery::EarliestRetained,
-            },
-            StoreError::MempoolEventCursorExpired {
-                event_sequence,
-                oldest_retained_sequence,
-            } => Self::FailedPrecondition {
-                reason: format!(
-                    "mempool event cursor {event_sequence} is before oldest retained event {oldest_retained_sequence}"
-                ),
-            },
-            StoreError::StorageUnavailable { .. }
-            | StoreError::EntropyUnavailable { .. }
-            | StoreError::ChainEpochConflict { .. }
-            | StoreError::ChainEpochNetworkMismatch { .. }
-            | StoreError::SchemaMismatch { .. }
-            | StoreError::SchemaTooNew { .. }
-            | StoreError::PrimaryAlreadyOpen { .. }
-            | StoreError::SecondaryCatchupFailed { .. }
-            | StoreError::CheckpointUnavailable { .. }
-            | StoreError::ReorgWindowExceeded { .. }
-            | StoreError::ChainEventSequenceOverflow
-            | StoreError::ChainEpochSequenceOverflow
-            | StoreError::ArtifactPayloadTooLarge { .. }
-            | _ => Self::StorageUnavailable {
-                reason: error.to_string(),
-            },
-        }
-    }
-
-    #[cfg(feature = "local")]
-    #[allow(
-        clippy::needless_pass_by_value,
-        clippy::wildcard_enum_match_arm,
-        reason = "MaterializedViewStoreError is consumed through map_err adapters at storage boundaries; unknown future variants stay storage-unavailable for clients."
-    )]
-    pub(crate) fn from_materialized_view_store_error(error: MaterializedViewStoreError) -> Self {
-        match &error {
-            MaterializedViewStoreError::Decode { reason, .. } if reason.contains("cursor") => {
-                Self::InvalidRequest {
-                    reason: reason.clone(),
-                }
-            }
-            MaterializedViewStoreError::Decode { reason, .. } => Self::DataLoss {
-                reason: reason.clone(),
-            },
-            MaterializedViewStoreError::InvalidOptions { reason } => Self::InvalidRequest {
-                reason: (*reason).to_owned(),
-            },
-            _ => Self::StorageUnavailable {
-                reason: error.to_string(),
-            },
-        }
-    }
-
     #[cfg(feature = "remote")]
     #[allow(
         clippy::needless_pass_by_value,
@@ -357,7 +272,7 @@ impl IndexerError {
         }
     }
 
-    #[cfg(any(feature = "local", feature = "remote"))]
+    #[cfg(feature = "remote")]
     pub(crate) fn malformed(field: &'static str, reason: impl Into<String>) -> Self {
         Self::MalformedResponse {
             field,
@@ -365,7 +280,7 @@ impl IndexerError {
         }
     }
 
-    #[cfg(any(feature = "local", feature = "remote"))]
+    #[cfg(feature = "remote")]
     pub(crate) fn invalid_request(reason: impl Into<String>) -> Self {
         Self::InvalidRequest {
             reason: reason.into(),
@@ -420,21 +335,5 @@ mod tests {
             error.retry_policy(),
             RetryPolicy::RestartFromEarliestRetained
         );
-    }
-
-    #[cfg(feature = "local")]
-    #[test]
-    fn local_expired_chain_event_cursor_uses_the_same_typed_recovery() {
-        let error = IndexerError::from_store_error(StoreError::ChainEventCursorExpired {
-            event_sequence: 4,
-            oldest_retained_sequence: 9,
-        });
-
-        assert!(matches!(
-            error,
-            IndexerError::ChainEventCursorExpired {
-                recovery: ChainEventCursorRecovery::EarliestRetained,
-            }
-        ));
     }
 }

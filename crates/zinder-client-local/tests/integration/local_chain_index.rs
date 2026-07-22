@@ -9,11 +9,11 @@ use eyre::eyre;
 use tokio_stream::StreamExt as _;
 use zinder_client::{
     BlockHeight, BlockHeightRange, BlockSelector, ChainEpochId, ChainIndex, ChainSnapshot,
-    DEFAULT_INITIAL_CATCHUP_TIMEOUT, IndexerError, LocalChainIndex, LocalOpenOptions, Network,
-    OwnedChainSnapshot, RetryPolicy, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
-    TransactionId, TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
-    TxStatus,
+    IndexerError, Network, OwnedChainSnapshot, RetryPolicy, ShieldedProtocol, SubtreeRootIndex,
+    SubtreeRootRange, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentUnspentOutput, TxStatus,
 };
+use zinder_client_local::{DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex, LocalOpenOptions};
 use zinder_core::TransparentSpendFact;
 use zinder_materialized_views::{
     MaterializedViewCoverage, MaterializedViewState, MaterializedViewStore,
@@ -126,6 +126,7 @@ async fn open_local_secondary_for_canonical(
         network: Network::ZcashRegtest,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        #[cfg(feature = "remote-fallback")]
         subscription_endpoint: None,
         catchup_interval: Duration::from_millis(20),
         initial_catchup_timeout: DEFAULT_INITIAL_CATCHUP_TIMEOUT,
@@ -133,6 +134,24 @@ async fn open_local_secondary_for_canonical(
         utxo_set_commitment_enabled: false,
     })
     .await
+}
+
+#[tokio::test]
+async fn local_chain_index_returns_configured_network_upgrade_activations() -> eyre::Result<()> {
+    let expected = sample_regtest_upgrade_activations();
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let store_fixture =
+        StoreFixture::with_chain_committed(&chain_fixture, zinder_client::ChainEpochId::new(1))?;
+    let chain_index =
+        open_local_secondary_for_canonical(&store_fixture, "activation-secondary").await?;
+
+    let activations = chain_index.network_upgrade_activations().await?;
+    let erased: &dyn ChainIndex = &chain_index;
+    let erased_activations = erased.network_upgrade_activations().await?;
+
+    assert_eq!(activations, expected);
+    assert_eq!(erased_activations, expected);
+    Ok(())
 }
 
 #[tokio::test]
@@ -422,6 +441,7 @@ async fn local_chain_index_reads_typed_values_from_secondary_store() -> eyre::Re
         network: Network::ZcashRegtest,
         canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
         materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        #[cfg(feature = "remote-fallback")]
         subscription_endpoint: None,
         catchup_interval: Duration::from_millis(20),
         initial_catchup_timeout: DEFAULT_INITIAL_CATCHUP_TIMEOUT,

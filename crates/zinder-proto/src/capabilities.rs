@@ -45,14 +45,15 @@ pub const WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2: &str = "wallet.read.compact_blo
 /// The serialized block bytes are present only when the writer deployment
 /// retains block blobs (ingest `raw_blob_policy` is `all`). Reads for
 /// unretained heights return `ArtifactUnavailable` (gRPC `NOT_FOUND`). The
-/// capability advertises the RPC surface unconditionally; bytes availability
-/// is a deployment concern.
+/// server advertises this capability only when block-blob retention is
+/// enabled.
 pub const WALLET_READ_FULL_BLOCK_AT_V1: &str = "wallet.read.full_block_at_v1";
 /// Capability advertised for `WalletQuery.FullBlocksInRange`.
 ///
 /// Same block-blob retention requirement as
 /// [`WALLET_READ_FULL_BLOCK_AT_V1`]: the stream yields serialized blocks only
-/// when the writer deployment sets `raw_blob_policy = "all"`.
+/// when the writer deployment sets `raw_blob_policy = "all"`, and the server
+/// advertises this capability only for such deployments.
 pub const WALLET_READ_FULL_BLOCK_RANGE_V1: &str = "wallet.read.full_block_range_v1";
 /// Capability advertised for `WalletQuery.TreeStateAtHeight`.
 pub const WALLET_READ_TREE_STATE_AT_HEIGHT_V2: &str = "wallet.read.tree_state_at_height_v2";

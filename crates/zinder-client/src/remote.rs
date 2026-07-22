@@ -24,15 +24,16 @@ use zinder_core::{
     BlockBlobArtifact, BlockHash, BlockHeader, BlockHeight, BlockHeightRange, BlockSelector,
     ChainEpoch, ChainEpochId, ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact,
     ConsensusBranchId, MempoolEntry, MempoolEvictionReason, MinedTransaction,
-    MinedTransactionChainContext, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TransparentSpendEntry,
+    MinedTransactionChainContext, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentMempoolOutput, TransparentMempoolOutputsRequest, TransparentMempoolSpend,
+    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendEntry,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact, TxStatus,
 };
+use zinder_proto::capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1;
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::{
     WalletWireDecodeError, chain_epoch_from_message,
@@ -68,7 +69,8 @@ pub struct RemoteOpenOptions {
 /// `RemoteChainIndex` is the recommended baseline for the Zallet-with-Zinder
 /// operator recipe documented in
 /// [Service operations §Zallet with Zinder](../../../docs/architecture/service-operations.md#zallet-with-zinder).
-/// `LocalChainIndex` is the colocated optimization for advanced operators.
+/// `zinder_client_local::LocalChainIndex` is the private, in-workspace
+/// colocated optimization for advanced operators.
 ///
 /// The underlying tonic `Channel` is configured with HTTP/2 keepalive and a
 /// lazy connect: the connection is established on the first call and
@@ -205,6 +207,27 @@ impl ChainIndex for RemoteChainIndex {
             .into_inner();
 
         chain_epoch_from_chain_view_with_network(self.network, response.chain_view)
+    }
+
+    async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, IndexerError> {
+        let server_info = EndpointBackedIndex::server_info(self).await?;
+        let common = server_info
+            .common
+            .as_ref()
+            .ok_or_else(|| IndexerError::malformed("info.common", "field is missing"))?;
+        ensure_advertised_capability(
+            &common.capabilities,
+            WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+        )?;
+
+        let response = self
+            .client()
+            .network_upgrade_activations(Request::new(wallet::NetworkUpgradeActivationsRequest {}))
+            .await
+            .map_err(|status| self.map_status(status))?
+            .into_inner();
+
+        network_upgrade_activations_from_message(self.network, response)
     }
 
     async fn visible_tip_block(
@@ -1180,6 +1203,128 @@ fn ensure_supported_contract_revision(contract_revision: u32) -> Result<(), Inde
         });
     }
     Ok(())
+}
+
+fn ensure_advertised_capability(
+    advertised_capabilities: &[String],
+    required_capability: &'static str,
+) -> Result<(), IndexerError> {
+    if advertised_capabilities
+        .iter()
+        .any(|capability| capability == required_capability)
+    {
+        return Ok(());
+    }
+    Err(IndexerError::FailedPrecondition {
+        reason: format!(
+            "remote wallet service does not advertise required capability {required_capability}"
+        ),
+    })
+}
+
+fn network_upgrade_activations_from_message(
+    network: Network,
+    response: wallet::NetworkUpgradeActivationsResponse,
+) -> Result<NetworkUpgradeActivations, IndexerError> {
+    let activations = response
+        .activations
+        .into_iter()
+        .enumerate()
+        .map(|(index, activation)| {
+            if activation.name.trim().is_empty() {
+                return Err(IndexerError::malformed(
+                    "activations.name",
+                    format!("activation at index {index} has an empty name"),
+                ));
+            }
+            Ok(NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(activation.consensus_branch_id),
+                activation_height: BlockHeight::new(activation.activation_height),
+                name: activation.name,
+            })
+        })
+        .collect::<Result<Vec<_>, IndexerError>>()?;
+
+    NetworkUpgradeActivations::new(network, activations)
+        .map_err(|error| IndexerError::malformed("activations", error.to_string()))
+}
+
+#[cfg(test)]
+mod network_upgrade_activation_tests {
+    use super::*;
+
+    #[test]
+    fn exact_network_upgrade_capability_preflight_accepts_only_advertised_capability() {
+        let advertised = vec![WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1.to_owned()];
+        assert!(
+            ensure_advertised_capability(&advertised, WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1)
+                .is_ok()
+        );
+
+        let error = ensure_advertised_capability(
+            &["wallet.read.network_upgrade_activations_v2".to_owned()],
+            WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+        );
+        assert!(matches!(
+            error,
+            Err(IndexerError::FailedPrecondition { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_branch_ids_are_rejected_as_malformed_responses() -> Result<(), &'static str> {
+        let response = wallet::NetworkUpgradeActivationsResponse {
+            activations: vec![
+                wallet::NetworkUpgradeActivation {
+                    consensus_branch_id: 0x5ba8_1b19,
+                    name: "Overwinter".to_owned(),
+                    activation_height: 1,
+                },
+                wallet::NetworkUpgradeActivation {
+                    consensus_branch_id: 0x5ba8_1b19,
+                    name: "Duplicate".to_owned(),
+                    activation_height: 2,
+                },
+            ],
+        };
+
+        let error = network_upgrade_activations_from_message(Network::ZcashRegtest, response)
+            .err()
+            .ok_or("duplicate branch id must be rejected")?;
+
+        assert!(matches!(
+            error,
+            IndexerError::MalformedResponse {
+                field: "activations",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn whitespace_only_names_are_rejected_as_malformed_responses() -> Result<(), &'static str> {
+        let response = wallet::NetworkUpgradeActivationsResponse {
+            activations: vec![wallet::NetworkUpgradeActivation {
+                consensus_branch_id: 0x5ba8_1b19,
+                name: " \t".to_owned(),
+                activation_height: 1,
+            }],
+        };
+
+        let error = network_upgrade_activations_from_message(Network::ZcashRegtest, response)
+            .err()
+            .ok_or("whitespace-only name must be rejected")?;
+
+        assert!(matches!(
+            error,
+            IndexerError::MalformedResponse {
+                field: "activations.name",
+                ..
+            }
+        ));
+        Ok(())
+    }
 }
 
 fn transparent_outputs_by_outpoint_response_from_message(

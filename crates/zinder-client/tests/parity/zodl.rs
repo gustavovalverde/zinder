@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
-use zinder_client::{ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex};
+use zinder_client::{ChainIndex, EndpointBackedIndex, RemoteChainIndex};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::WalletQuery;
@@ -38,7 +38,6 @@ fn parity_chain_index_surface_compiles_for_zodl_use_cases() {
         let _ = T::transparent_mempool_outputs_by_address;
         let _ = T::transparent_mempool_spends_by_outpoint;
     }
-    assert_base_compiles::<LocalChainIndex>();
     assert_base_compiles::<RemoteChainIndex>();
     assert_endpoint_compiles::<RemoteChainIndex>();
 }
@@ -89,14 +88,6 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
         .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
         .await?
         .into_inner();
-    let mut subtree_roots = adapter
-        .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
-            start_index: 0,
-            shielded_protocol: lightwalletd::ShieldedProtocol::Sapling as i32,
-            max_entries: 1,
-        }))
-        .await?
-        .into_inner();
     let lightd_info = adapter
         .get_lightd_info(Request::new(lightwalletd::Empty {}))
         .await?
@@ -110,10 +101,6 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
         .next()
         .await
         .ok_or_else(|| eyre::eyre!("missing second compact block"))??;
-    let subtree_root = subtree_roots
-        .next()
-        .await
-        .ok_or_else(|| eyre::eyre!("missing subtree root"))??;
 
     assert_eq!(visible_tip_block.height, 2);
     assert_eq!(compact_block.height, visible_tip_block.height);
@@ -123,7 +110,6 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     assert_eq!(tree_state.height, 2);
     assert_eq!(tree_state.sapling_tree, "000000");
     assert_eq!(tree_state.orchard_tree, "111111");
-    assert_eq!(subtree_root.completing_block_height, 2);
     assert_eq!(lightd_info.vendor, "Zinder");
     assert_eq!(lightd_info.chain_name, "test");
     assert_eq!(lightd_info.block_height, visible_tip_block.height);

@@ -23,14 +23,15 @@ use zinder_store::{
     EventStreamStartPosition, RocksDbResourceBudget, SecondaryChainStore, StoreError,
 };
 
-use crate::{
-    BlockId, ChainIndex, IndexStream, IndexerError, TransparentAddressTransactionChunk,
-    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream,
-    TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
-    TransparentUnspentOutputChunk, TransparentUtxoSetSummaryView,
+use zinder_client::{
+    BlockId, ChainEventCursorRecovery, ChainIndex, IndexStream, IndexerError,
+    TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
+    TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
+    TransparentAddressUnspentOutputsStream, TransparentUnspentOutputChunk,
+    TransparentUtxoSetSummaryView,
 };
-#[cfg(feature = "remote")]
-use crate::{RemoteChainIndex, RemoteOpenOptions};
+#[cfg(feature = "remote-fallback")]
+use zinder_client::{RemoteChainIndex, RemoteOpenOptions};
 
 /// Default maximum time spent on initial secondary catchup during local open.
 pub const DEFAULT_INITIAL_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,7 +52,7 @@ pub struct LocalOpenOptions {
     /// secondary store.
     pub materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// Optional service endpoint used for live mempool fallback reads.
-    #[cfg(feature = "remote")]
+    #[cfg(feature = "remote-fallback")]
     pub subscription_endpoint: Option<String>,
     /// Periodic secondary catchup interval.
     pub catchup_interval: Duration,
@@ -74,7 +75,7 @@ pub struct LocalOpenOptions {
 pub struct LocalChainIndex {
     store: SecondaryChainStore,
     materialized_view_store: Option<MaterializedViewStore>,
-    #[cfg(feature = "remote")]
+    #[cfg(feature = "remote-fallback")]
     remote_index: Option<RemoteChainIndex>,
     catchup_interval: Duration,
     catchup_cancel: CancellationToken,
@@ -86,12 +87,12 @@ impl LocalChainIndex {
     /// Opens a local chain index and starts its secondary catchup loop.
     pub async fn open(options: LocalOpenOptions) -> Result<Self, IndexerError> {
         if options.catchup_interval.is_zero() {
-            return Err(IndexerError::invalid_request(
+            return Err(invalid_request(
                 "catchup_interval must be greater than zero",
             ));
         }
         if options.initial_catchup_timeout.is_zero() {
-            return Err(IndexerError::invalid_request(
+            return Err(invalid_request(
                 "initial_catchup_timeout must be greater than zero",
             ));
         }
@@ -109,7 +110,7 @@ impl LocalChainIndex {
                     ..ChainStoreOptions::for_network(network)
                 },
             )
-            .map_err(IndexerError::from_store_error)
+            .map_err(map_store_error)
         }))
         .await?;
         let store_for_initial_catchup = store.clone();
@@ -127,7 +128,7 @@ impl LocalChainIndex {
         )
         .await?;
 
-        #[cfg(feature = "remote")]
+        #[cfg(feature = "remote-fallback")]
         let remote_index = match options.subscription_endpoint {
             Some(endpoint) => Some(RemoteChainIndex::connect(RemoteOpenOptions {
                 endpoint,
@@ -145,7 +146,7 @@ impl LocalChainIndex {
         Ok(Self {
             store,
             materialized_view_store,
-            #[cfg(feature = "remote")]
+            #[cfg(feature = "remote-fallback")]
             remote_index,
             catchup_interval: options.catchup_interval,
             catchup_cancel,
@@ -166,16 +167,14 @@ impl LocalChainIndex {
     {
         let store = self.store.clone();
         join_blocking(tokio::task::spawn_blocking(move || {
-            store
-                .try_catch_up()
-                .map_err(IndexerError::from_store_error)?;
+            store.try_catch_up().map_err(map_store_error)?;
             let reader = match at_epoch_id {
                 Some(at_epoch_id) => store
                     .chain_epoch_reader_at(at_epoch_id)
                     .map_err(|error| map_epoch_pin_store_error(error, at_epoch_id))?,
                 None => store
                     .current_chain_epoch_reader()
-                    .map_err(IndexerError::from_store_error)?,
+                    .map_err(map_store_error)?,
             };
             if let Some(at_epoch_id) = at_epoch_id {
                 reader
@@ -208,11 +207,11 @@ fn current_visible_chain_event_cursor_for_epoch(
             &EventStreamStartPosition::LiveTail,
             ChainEventStreamFamily::Visible,
         )
-        .map_err(IndexerError::from_store_error)?
+        .map_err(map_store_error)?
         .cursor;
     let current_chain_epoch = store
         .current_chain_epoch_reader()
-        .map_err(IndexerError::from_store_error)?
+        .map_err(map_store_error)?
         .chain_epoch();
     if current_chain_epoch != expected_chain_epoch {
         return Err(IndexerError::FailedPrecondition {
@@ -224,9 +223,96 @@ fn current_visible_chain_event_cursor_for_epoch(
     Ok(fence)
 }
 
+fn invalid_request(reason: impl Into<String>) -> IndexerError {
+    IndexerError::InvalidRequest {
+        reason: reason.into(),
+    }
+}
+
+fn malformed_response(field: &'static str, reason: impl Into<String>) -> IndexerError {
+    IndexerError::MalformedResponse {
+        field,
+        reason: reason.into(),
+    }
+}
+
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "Unknown materialized-view failures retain the client storage-error mapping."
+    reason = "Unknown future storage failures stay storage-unavailable at the local adapter boundary."
+)]
+fn map_store_error(error: StoreError) -> IndexerError {
+    match error {
+        StoreError::NoVisibleChainEpoch => IndexerError::NoVisibleChainEpoch,
+        StoreError::ArtifactMissing { family, key } => IndexerError::ArtifactUnavailable {
+            family: family.wire_label().to_owned(),
+            key: format!("{key:?}"),
+        },
+        StoreError::ChainEpochMissing { .. } => IndexerError::NotFound {
+            resource: "artifact",
+        },
+        StoreError::ChainEventCursorInvalid { reason }
+        | StoreError::MempoolEventCursorInvalid { reason }
+        | StoreError::InvalidChainEpochArtifacts { reason }
+        | StoreError::InvalidChainStoreOptions { reason }
+        | StoreError::ArtifactCorrupt { reason, .. }
+        | StoreError::Unsupported { feature: reason } => IndexerError::InvalidRequest {
+            reason: reason.to_owned(),
+        },
+        StoreError::ChainEventCursorExpired {
+            event_sequence: _,
+            oldest_retained_sequence: _,
+        } => IndexerError::ChainEventCursorExpired {
+            recovery: ChainEventCursorRecovery::EarliestRetained,
+        },
+        StoreError::MempoolEventCursorExpired {
+            event_sequence,
+            oldest_retained_sequence,
+        } => IndexerError::FailedPrecondition {
+            reason: format!(
+                "mempool event cursor {event_sequence} is before oldest retained event {oldest_retained_sequence}"
+            ),
+        },
+        _ => IndexerError::StorageUnavailable {
+            reason: error.to_string(),
+        },
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::wildcard_enum_match_arm,
+    reason = "The consumed error is passed through map_err adapters; unknown future materialized-view failures stay storage-unavailable at the local adapter boundary."
+)]
+fn map_materialized_view_store_error(
+    error: zinder_materialized_views::MaterializedViewStoreError,
+) -> IndexerError {
+    match &error {
+        zinder_materialized_views::MaterializedViewStoreError::Decode { reason, .. }
+            if reason.contains("cursor") =>
+        {
+            IndexerError::InvalidRequest {
+                reason: reason.clone(),
+            }
+        }
+        zinder_materialized_views::MaterializedViewStoreError::Decode { reason, .. } => {
+            IndexerError::DataLoss {
+                reason: reason.clone(),
+            }
+        }
+        zinder_materialized_views::MaterializedViewStoreError::InvalidOptions { reason } => {
+            IndexerError::InvalidRequest {
+                reason: (*reason).to_owned(),
+            }
+        }
+        _ => IndexerError::StorageUnavailable {
+            reason: error.to_string(),
+        },
+    }
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Unknown materialized-view failures retain the local adapter storage-error mapping."
 )]
 fn map_transparent_history_page_error(
     error: zinder_materialized_views::MaterializedViewStoreError,
@@ -245,7 +331,7 @@ fn map_transparent_history_page_error(
         } => IndexerError::InvalidRequest {
             reason: reason.to_owned(),
         },
-        error => IndexerError::from_materialized_view_store_error(error),
+        error => map_materialized_view_store_error(error),
     }
 }
 
@@ -264,6 +350,10 @@ impl ChainIndex for LocalChainIndex {
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError> {
         self.read_at_epoch(None, |reader| Ok(reader.chain_epoch()))
             .await
+    }
+
+    async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, IndexerError> {
+        Ok((*self.network_upgrade_activations).clone())
     }
 
     async fn visible_tip_block(
@@ -314,7 +404,7 @@ impl ChainIndex for LocalChainIndex {
             let block_id = resolve_block_id(reader, selector)?;
             let block = reader
                 .block_header_at(block_id.height)
-                .map_err(IndexerError::from_store_error)?
+                .map_err(map_store_error)?
                 .ok_or(IndexerError::NotFound { resource: "block" })?;
             Ok(block.into_header())
         })
@@ -329,7 +419,7 @@ impl ChainIndex for LocalChainIndex {
         self.read_at_epoch(at_epoch_id, move |reader| {
             reader
                 .compact_block_at(height)
-                .map_err(IndexerError::from_store_error)?
+                .map_err(map_store_error)?
                 .ok_or(IndexerError::NotFound {
                     resource: "compact block",
                 })
@@ -343,23 +433,21 @@ impl ChainIndex for LocalChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
         if block_range.start > block_range.end {
-            return Err(IndexerError::invalid_request(
-                "start height exceeds end height",
-            ));
+            return Err(invalid_request("start height exceeds end height"));
         }
 
         let compact_blocks = self
             .read_at_epoch(at_epoch_id, move |reader| {
                 let maybe_blocks = reader
                     .compact_blocks_in_range(block_range)
-                    .map_err(IndexerError::from_store_error)?;
+                    .map_err(map_store_error)?;
                 let mut compact_blocks = Vec::with_capacity(maybe_blocks.len());
                 for (height, maybe_block) in block_range.into_iter().zip(maybe_blocks) {
                     let compact_block = maybe_block.ok_or(IndexerError::NotFound {
                         resource: "compact block",
                     })?;
                     if compact_block.height() != height {
-                        return Err(IndexerError::malformed(
+                        return Err(malformed_response(
                             "compact_block.height",
                             "height does not match requested range",
                         ));
@@ -381,7 +469,7 @@ impl ChainIndex for LocalChainIndex {
         self.read_at_epoch(at_epoch_id, move |reader| {
             reader
                 .block_blob_at(height)
-                .map_err(IndexerError::from_store_error)?
+                .map_err(map_store_error)?
                 .ok_or(IndexerError::NotFound {
                     resource: "full block",
                 })
@@ -395,23 +483,21 @@ impl ChainIndex for LocalChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<BlockBlobArtifact>, IndexerError> {
         if block_range.start > block_range.end {
-            return Err(IndexerError::invalid_request(
-                "start height exceeds end height",
-            ));
+            return Err(invalid_request("start height exceeds end height"));
         }
 
         let block_blobs = self
             .read_at_epoch(at_epoch_id, move |reader| {
                 let maybe_blobs = reader
                     .block_blobs_in_range(block_range)
-                    .map_err(IndexerError::from_store_error)?;
+                    .map_err(map_store_error)?;
                 let mut block_blobs = Vec::with_capacity(maybe_blobs.len());
                 for (height, maybe_blob) in block_range.into_iter().zip(maybe_blobs) {
                     let block_blob = maybe_blob.ok_or(IndexerError::NotFound {
                         resource: "full block",
                     })?;
                     if block_blob.height != height {
-                        return Err(IndexerError::malformed(
+                        return Err(malformed_response(
                             "full_block.height",
                             "height does not match requested range",
                         ));
@@ -433,7 +519,7 @@ impl ChainIndex for LocalChainIndex {
         self.read_at_epoch(at_epoch_id, move |reader| {
             reader
                 .tree_state_checkpoint_at_or_before(height)
-                .map_err(IndexerError::from_store_error)?
+                .map_err(map_store_error)?
                 .filter(|tree_state| tree_state.height == height)
                 .ok_or(IndexerError::NotFound {
                     resource: "tree state",
@@ -449,7 +535,7 @@ impl ChainIndex for LocalChainIndex {
         self.read_at_epoch(at_epoch_id, |reader| {
             reader
                 .latest_tree_state_checkpoint()
-                .map_err(IndexerError::from_store_error)?
+                .map_err(map_store_error)?
                 .ok_or(IndexerError::NotFound {
                     resource: "tree state",
                 })
@@ -465,7 +551,7 @@ impl ChainIndex for LocalChainIndex {
         self.read_at_epoch(at_epoch_id, move |reader| {
             let maybe_roots = reader
                 .subtree_roots(subtree_root_range)
-                .map_err(IndexerError::from_store_error)?;
+                .map_err(map_store_error)?;
             let mut subtree_roots = Vec::with_capacity(maybe_roots.len());
             for maybe_root in maybe_roots {
                 subtree_roots.push(maybe_root.ok_or(IndexerError::NotFound {
@@ -487,14 +573,14 @@ impl ChainIndex for LocalChainIndex {
             .read_at_epoch(at_epoch_id, move |reader| {
                 let Some(artifact) = reader
                     .transaction_facts_by_id(transaction_id)
-                    .map_err(IndexerError::from_store_error)?
+                    .map_err(map_store_error)?
                 else {
                     return Ok(TxStatus::NotFound);
                 };
                 let chain_epoch = reader.chain_epoch();
                 let block_time = reader
                     .block_header_at(artifact.location.block_height)
-                    .map_err(IndexerError::from_store_error)?
+                    .map_err(map_store_error)?
                     .map(|block| block.block_time)
                     .unwrap_or_default();
                 let consensus_branch_id =
@@ -507,7 +593,7 @@ impl ChainIndex for LocalChainIndex {
                 );
                 let raw_transaction_bytes = reader
                     .transaction_blob_by_id(transaction_id)
-                    .map_err(IndexerError::from_store_error)?
+                    .map_err(map_store_error)?
                     .map(|blob| blob.raw_transaction_bytes);
                 Ok(TxStatus::Mined(MinedTransaction::new(
                     artifact.location,
@@ -528,7 +614,7 @@ impl ChainIndex for LocalChainIndex {
         // observe the writer's in-process mempool state, so consult the live
         // mempool only when an ingest-control endpoint is wired; otherwise the
         // answer is NotFound.
-        #[cfg(feature = "remote")]
+        #[cfg(feature = "remote-fallback")]
         if let Some(remote) = &self.remote_index {
             return remote.transaction_by_id(transaction_id, None).await;
         }
@@ -548,7 +634,7 @@ impl ChainIndex for LocalChainIndex {
                         query.start_height,
                         NonZeroU32::MAX,
                     )
-                    .map_err(IndexerError::from_store_error)?;
+                    .map_err(map_store_error)?;
                 Ok((reader.chain_epoch(), outputs))
             })
             .await?;
@@ -578,20 +664,20 @@ impl ChainIndex for LocalChainIndex {
         let page = join_blocking(tokio::task::spawn_blocking(move || {
             store
                 .try_catch_up()
-                .map_err(IndexerError::from_store_error)?;
+                .map_err(map_store_error)?;
             let chain_epoch = store
                 .current_chain_epoch_reader()
-                .map_err(IndexerError::from_store_error)?
+                .map_err(map_store_error)?
                 .chain_epoch();
             let canonical_fence =
                 current_visible_chain_event_cursor_for_epoch(&store, chain_epoch)?;
             materialized_view_store
                 .try_catch_up()
-                .map_err(IndexerError::from_materialized_view_store_error)?;
+                .map_err(map_materialized_view_store_error)?;
             let snapshot = materialized_view_store.read_snapshot();
             let materialized_fence = snapshot
                 .get_chain_event_cursor(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME)
-                .map_err(IndexerError::from_materialized_view_store_error)?;
+                .map_err(map_materialized_view_store_error)?;
             if materialized_fence.as_deref()
                 != canonical_fence
                     .as_ref()
@@ -623,8 +709,9 @@ impl ChainIndex for LocalChainIndex {
         }))
         .await?;
         let (chain_epoch, artifacts, next_cursor) = page;
-        let next_cursor = next_cursor
-            .map(|cursor| crate::TransparentHistoryCursor::from_bytes(cursor.as_bytes().to_vec()));
+        let next_cursor = next_cursor.map(|cursor| {
+            zinder_client::TransparentHistoryCursor::from_bytes(cursor.as_bytes().to_vec())
+        });
         let last_index = artifacts.len().saturating_sub(1);
         let items = artifacts
             .into_iter()
@@ -659,12 +746,10 @@ impl ChainIndex for LocalChainIndex {
         let addresses = addresses.to_vec();
         let store = self.store.clone();
         join_blocking(tokio::task::spawn_blocking(move || {
-            store
-                .try_catch_up()
-                .map_err(IndexerError::from_store_error)?;
+            store.try_catch_up().map_err(map_store_error)?;
             let chain_epoch = store
                 .current_chain_epoch_reader()
-                .map_err(IndexerError::from_store_error)?
+                .map_err(map_store_error)?
                 .chain_epoch();
             let mut confirmed_zat: u64 = 0;
             for address_script_hash in addresses {
@@ -676,7 +761,7 @@ impl ChainIndex for LocalChainIndex {
                         max_entries: NonZeroU32::MAX,
                         from_cursor: None,
                     })
-                    .map_err(IndexerError::from_store_error)?;
+                    .map_err(map_store_error)?;
                 for output in &page.outputs {
                     confirmed_zat = confirmed_zat.saturating_add(output.value_zat);
                 }
@@ -701,7 +786,7 @@ impl ChainIndex for LocalChainIndex {
             let chain_epoch = reader.chain_epoch();
             let prevouts_by_outpoint = reader
                 .transparent_outputs_by_outpoints(&outpoints)
-                .map_err(IndexerError::from_store_error)?;
+                .map_err(map_store_error)?;
             let mut entries = Vec::with_capacity(outpoints.len());
             for outpoint in outpoints {
                 let prevout = prevouts_by_outpoint
@@ -732,7 +817,7 @@ impl ChainIndex for LocalChainIndex {
             let chain_epoch = reader.chain_epoch();
             let canonical_spends = reader
                 .transparent_spend_facts_by_outpoints(&outpoints)
-                .map_err(IndexerError::from_store_error)?;
+                .map_err(map_store_error)?;
             let mut spends = Vec::with_capacity(outpoints.len());
             let mut seen_outpoints = HashSet::with_capacity(outpoints.len());
             let mut unresolved_outpoints = Vec::new();
@@ -748,13 +833,13 @@ impl ChainIndex for LocalChainIndex {
             if !unresolved_outpoints.is_empty()
                 && let Some(deleted_through_height) = reader
                     .transparent_retention_deleted_through_height()
-                    .map_err(IndexerError::from_store_error)?
+                    .map_err(map_store_error)?
             {
                 let materialized_view_store =
                     materialized_view_store.ok_or_else(transparent_spend_projection_unavailable)?;
                 materialized_view_store
                     .try_catch_up()
-                    .map_err(IndexerError::from_materialized_view_store_error)?;
+                    .map_err(map_materialized_view_store_error)?;
                 let snapshot = materialized_view_store.read_snapshot();
                 for spend in resolve_materialized_transparent_spends(
                     &snapshot,
@@ -785,7 +870,7 @@ impl ChainIndex for LocalChainIndex {
             let chain_epoch = reader.chain_epoch();
             let entries = reader
                 .transparent_unspent_outputs_by_outpoints(&outpoints)
-                .map_err(IndexerError::from_store_error)?;
+                .map_err(map_store_error)?;
             Ok(zinder_core::TransparentUnspentOutputsByOutpointResponse {
                 chain_epoch,
                 entries,
@@ -802,7 +887,7 @@ impl ChainIndex for LocalChainIndex {
         self.read_at_epoch(at_epoch_id, move |reader| {
             let summary = reader
                 .transparent_utxo_set_summary(commitment_enabled)
-                .map_err(IndexerError::from_store_error)?;
+                .map_err(map_store_error)?;
             Ok(TransparentUtxoSetSummaryView {
                 chain_epoch: summary.chain_epoch,
                 summarized_height: summary.summarized_height,
@@ -829,7 +914,7 @@ fn normalize_transparent_outpoints(
 ) -> Result<Vec<zinder_core::TransparentOutPoint>, IndexerError> {
     for (request_index, outpoint) in outpoints.iter().enumerate() {
         if outpoint.is_coinbase_sentinel() {
-            return Err(IndexerError::invalid_request(format!(
+            return Err(invalid_request(format!(
                 "outpoints[{request_index}] is the coinbase sentinel \
                  (transaction_id == [0u8; 32], output_index == 0xFFFFFFFF); \
                  filter coinbase inputs at the request boundary",
@@ -875,7 +960,7 @@ fn resolve_materialized_transparent_spends(
 ) -> Result<Vec<zinder_core::TransparentSpendEntry>, IndexerError> {
     let materialized_view_state = snapshot
         .consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)
-        .map_err(IndexerError::from_materialized_view_store_error)?
+        .map_err(map_materialized_view_store_error)?
         .ok_or_else(transparent_spend_projection_unavailable)?;
     validate_transparent_spend_materialized_view_coverage(
         reader,
@@ -886,7 +971,7 @@ fn resolve_materialized_transparent_spends(
         snapshot,
         unresolved_outpoints,
     )
-    .map_err(IndexerError::from_materialized_view_store_error)?;
+    .map_err(map_materialized_view_store_error)?;
     let settled_tip_height = reader.chain_epoch().settled_tip_height;
     let mut resolved_spends = Vec::with_capacity(projected_spends.len());
     for outpoint in unresolved_outpoints {
@@ -947,7 +1032,7 @@ fn canonical_block_hash_matches(
 ) -> Result<bool, IndexerError> {
     Ok(reader
         .block_header_at(height)
-        .map_err(IndexerError::from_store_error)?
+        .map_err(map_store_error)?
         .is_some_and(|header| header.block_hash == expected_hash))
 }
 
@@ -968,7 +1053,7 @@ fn map_epoch_pin_store_error(error: StoreError, _at_epoch_id: ChainEpochId) -> I
         StoreError::ChainEpochMissing { .. } | StoreError::ChainEpochConflict { .. } => {
             IndexerError::ChainEpochPinUnavailable
         }
-        error => IndexerError::from_store_error(error),
+        error => map_store_error(error),
     }
 }
 
@@ -1003,7 +1088,7 @@ async fn open_materialized_view_secondary_with_timeout(
         ) {
             Ok(materialized_view_store) => Ok(Some(materialized_view_store)),
             Err(zinder_materialized_views::MaterializedViewStoreError::Open { .. }) => Ok(None),
-            Err(error) => Err(IndexerError::from_materialized_view_store_error(error)),
+            Err(error) => Err(map_materialized_view_store_error(error)),
         }
     }))
     .await?;
@@ -1023,10 +1108,7 @@ async fn try_catch_up_store_with_timeout(
     role: &'static str,
 ) -> Result<(), IndexerError> {
     let handle = tokio::task::spawn_blocking(move || {
-        store
-            .try_catch_up()
-            .map(|_| ())
-            .map_err(IndexerError::from_store_error)
+        store.try_catch_up().map(|_| ()).map_err(map_store_error)
     });
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(catchup_outcome)) => catchup_outcome,
@@ -1053,7 +1135,7 @@ async fn try_catch_up_materialized_view_store_with_timeout(
     let handle = tokio::task::spawn_blocking(move || {
         materialized_view_store
             .try_catch_up()
-            .map_err(IndexerError::from_materialized_view_store_error)
+            .map_err(map_materialized_view_store_error)
     });
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(catchup_outcome)) => catchup_outcome,
@@ -1089,15 +1171,12 @@ fn resolve_block_id(
             }
             let block = reader
                 .block_header_at(height)
-                .map_err(IndexerError::from_store_error)?
+                .map_err(map_store_error)?
                 .ok_or(IndexerError::NotFound { resource: "block" })?;
             Ok(BlockId::new(height, block.block_hash))
         }
         BlockSelector::Hash(hash) => {
-            match reader
-                .block_hash_lookup(hash)
-                .map_err(IndexerError::from_store_error)?
-            {
+            match reader.block_hash_lookup(hash).map_err(map_store_error)? {
                 BlockHashLookup::Resolved(block_id) => Ok(block_id),
                 BlockHashLookup::NotInBestChain | BlockHashLookup::NotIndexed => {
                     Err(IndexerError::NotFound { resource: "block" })
@@ -1107,5 +1186,25 @@ fn resolve_block_id(
         _ => Err(IndexerError::InvalidRequest {
             reason: "unsupported block selector variant".to_owned(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_chain_event_cursor_maps_to_typed_replay_recovery() {
+        let error = map_store_error(StoreError::ChainEventCursorExpired {
+            event_sequence: 4,
+            oldest_retained_sequence: 9,
+        });
+
+        assert!(matches!(
+            error,
+            IndexerError::ChainEventCursorExpired {
+                recovery: ChainEventCursorRecovery::EarliestRetained,
+            }
+        ));
     }
 }

@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use tokio_stream::StreamExt as _;
 
 use zinder_client::{
-    BlockHeight, ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex, TransactionId,
+    BlockHeight, ChainIndex, EndpointBackedIndex, RemoteChainIndex, TransactionId,
     TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentAddressTxIndexArtifact,
     TransparentAddressUnspentOutputsQuery, TransparentOutPoint, TransparentUnspentOutput,
 };
@@ -20,7 +20,7 @@ use zinder_testkit::{
     open_test_materialized_view_store_for_canonical, seed_transparent_address_transaction_history,
 };
 
-use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixture};
+use super::{committed_store_fixture, open_remote_chain_index, parity_chain_fixture};
 
 #[test]
 fn parity_chain_index_surface_compiles_for_block_explorers() {
@@ -45,7 +45,6 @@ fn parity_chain_index_surface_compiles_for_block_explorers() {
         // live-mempool prevout fallback for chained-mempool input decode
         let _ = T::transparent_mempool_outputs_by_outpoint;
     }
-    assert_base_compiles::<LocalChainIndex>();
     assert_base_compiles::<RemoteChainIndex>();
     assert_endpoint_compiles::<RemoteChainIndex>();
 }
@@ -100,7 +99,8 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
         TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
         chain_fence.as_bytes(),
     )?;
-    let chain_index = open_local_chain_index(&store_fixture).await?;
+    let chain_index =
+        open_remote_chain_index(&store_fixture, false, Some(materialized_view_store)).await?;
 
     let mut utxo_stream = chain_index
         .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
@@ -177,7 +177,7 @@ async fn serves_explorer_transparent_outputs_by_outpoint_in_input_order() -> eyr
         block_hash,
     ));
     let store_fixture = committed_store_fixture(&chain_fixture)?;
-    let chain_index = open_local_chain_index(&store_fixture).await?;
+    let chain_index = open_remote_chain_index(&store_fixture, false, None).await?;
 
     let unknown_transaction_id = TransactionId::from_bytes([0xDD; 32]);
     let outpoints = [
@@ -212,7 +212,7 @@ async fn rejects_coinbase_sentinel_in_explorer_transparent_outputs_by_outpoint()
 {
     let chain_fixture = parity_chain_fixture(1);
     let store_fixture = committed_store_fixture(&chain_fixture)?;
-    let chain_index = open_local_chain_index(&store_fixture).await?;
+    let chain_index = open_remote_chain_index(&store_fixture, false, None).await?;
 
     let outpoints = [TransparentOutPoint::COINBASE_SENTINEL];
     let canonical_error = match chain_index

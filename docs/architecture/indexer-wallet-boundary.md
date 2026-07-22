@@ -24,7 +24,7 @@ Zinder exposes the same indexed chain through 2 contracts. The native contract i
 
 `WalletQuery` and the Rust `zinder-client` expose typed errors, capability discovery, epoch-pinned reads, resumable chain events, transaction broadcast outcomes, mempool views, and transparent-address artifacts. An integration that deploys the native adapter should prefer this contract when it needs explicit consistency or Zinder-specific features.
 
-The Rust client divides the contract by topology. `RemoteChainIndex` uses gRPC across a process or host boundary, while `LocalChainIndex` uses a colocated RocksDB secondary without a tonic round trip. Both implement `ChainIndex` for canonical and wallet-projection reads. Operations that require a live ingest-control endpoint, including broadcast and live subscriptions, use the `EndpointBackedIndex` extension and are available through `RemoteChainIndex`.
+The Rust integration divides the contract by topology. The public SDK's default `RemoteChainIndex` uses gRPC across a process or host boundary, while the private `zinder_client_local::LocalChainIndex` workspace adapter uses colocated RocksDB secondaries. Both implement `ChainIndex` for immutable network metadata plus canonical and wallet-projection reads. Operations that require a live endpoint, including broadcast and live subscriptions, use the `EndpointBackedIndex` extension and are available through `RemoteChainIndex`.
 
 ### Lightwalletd compatibility contract
 

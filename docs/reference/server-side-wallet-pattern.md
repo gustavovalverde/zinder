@@ -25,7 +25,8 @@ needs transaction broadcast. These methods map to `RemoteChainIndex` and
 `EndpointBackedIndex`, while Zally remains responsible for its SQLite wallet
 state, sync driver, transaction lifecycle, key sealing, and recovery policy.
 
-That method set requires the remote shape, not `LocalChainIndex`, because a
+That method set requires the remote shape, not the private
+`zinder_client_local::LocalChainIndex`, because a
 canonical-storage secondary cannot provide chain events or broadcast. The
 remaining sections apply when implementing the equivalent integration directly
 with librustzcash.
@@ -95,10 +96,10 @@ The structure is "snapshot once, subscribe forever, re-derive on hint" (see [Cha
 
 `zinder-client` splits the chain-index contract in two so the compiler tells you which calls a handle can serve:
 
-- `ChainIndex` carries canonical and wallet-projection reads. Both `RemoteChainIndex` (a `WalletQuery` gRPC client) and `LocalChainIndex` (a colocated RocksDB-secondary reader) implement it identically: compact blocks, tree state, subtree roots, transparent-address unspent outputs and tx-history, canonical prevout resolution, and the confirmed transparent-address balance.
+- `ChainIndex` carries immutable network metadata plus canonical and wallet-projection reads. The public `RemoteChainIndex` (a `WalletQuery` gRPC client) and the private in-workspace `zinder_client_local::LocalChainIndex` implement the same typed read contract.
 - `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
 
-A function that broadcasts or subscribes to chain events bounds its handle `T: ChainIndex + EndpointBackedIndex`; a function that only reads canonical state bounds it `T: ChainIndex`. A `LocalChainIndex` passed where `EndpointBackedIndex` is required fails to compile, so the missing-endpoint case is a build error rather than a runtime error.
+A function that broadcasts or subscribes to chain events bounds its handle `T: ChainIndex + EndpointBackedIndex`; a function that only reads canonical state bounds it `T: ChainIndex`. The private local adapter passed where `EndpointBackedIndex` is required fails to compile, so the missing-endpoint case is a build error rather than a runtime error.
 
 ## Direct integration skeleton
 
@@ -142,7 +143,7 @@ async fn run_server_wallet(endpoint: String) -> Result<(), IndexerError> {
 
     // 2. Snapshot: drain the complete unspent set for every watched address.
     //    `transparent_address_unspent_outputs` is a base `ChainIndex` read, so
-    //    a colocated `LocalChainIndex` could serve it too.
+    //    the private colocated adapter could serve it too.
     for address_script_hash in wallet.watched_script_hashes() {
         let mut unspent_outputs = zinder
             .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {

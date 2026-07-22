@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
-    ChainEpoch, ChainEpochId, CompactBlockArtifact, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
+    ChainEpoch, ChainEpochId, CompactBlockArtifact, NetworkUpgradeActivations, SubtreeRootArtifact,
+    SubtreeRootRange, TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
     TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputsByOutpointResponse,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetCommitment, TreeStateArtifact,
@@ -813,6 +813,23 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// # let _ = epoch; Ok(()) }
     /// ```
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError>;
+
+    /// Returns the immutable network-upgrade activation table advertised by
+    /// this index.
+    ///
+    /// This metadata describes the configured network rather than a specific
+    /// chain epoch, so callers discover it directly from the index instead of
+    /// through a snapshot.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let activations = client.network_upgrade_activations().await?;
+    /// # let _ = activations; Ok(()) }
+    /// ```
+    async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, IndexerError>;
 
     /// Captures a borrowed canonical-chain view pinned to the current epoch.
     ///

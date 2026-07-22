@@ -8,7 +8,7 @@ The release topology serves both Zinder's native `WalletQuery` protocol and [lig
 
 - **Existing lightwalletd clients** keep their `CompactTxStreamer` integration and point it at `zinder-compat-lightwalletd`. ZODL and Vizor use this protocol shape, although each current wallet release still needs end-to-end validation before Zinder claims support.
 - **Native wallet clients** call the published `zinder-query` runtime when they need epoch-pinned full blocks, transaction status, chain events, mempool state, or typed broadcast outcomes.
-- **Rust wallet libraries and applications** can use `zinder-client`. `RemoteChainIndex` targets `zinder-query`, while `LocalChainIndex` is limited to colocated stored reads.
+- **Rust wallet libraries and applications** use the remote-first `zinder-client` SDK. Its default `RemoteChainIndex` connects to `zinder-query` without linking Zinder's RocksDB storage stack. The private `zinder-client-local` workspace crate remains available to Zinder deployments that deliberately colocate a secondary reader with storage.
 - **Explorers and application backends** use epoch-consistent wallet reads plus the optional `ExplorerQuery` plane for block summaries, transaction details, mempool views, typed search, and rebuildable materialized views.
 
 Zinder is strongest when chain access should survive one wallet process, serve several independent consumers, or remain decoupled from a particular wallet implementation. An embedded indexer such as Zaino can be simpler for one tightly coupled wallet process, while direct Zebra RPC may be sufficient when a consumer only needs node-owned data. See [What Zinder is and is not](docs/architecture/indexer-wallet-boundary.md) for the detailed comparison.
