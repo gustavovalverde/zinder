@@ -319,6 +319,22 @@ expect_rejected \
   "a publishing workflow with a manual-dispatch path" \
   --release-workflow "$manual_release_workflow"
 
+single_binary_build_workflow="$temporary_directory/single-binary-build-release.yml"
+sed 's/for build_number in 1 2/for build_number in 1/' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$single_binary_build_workflow"
+expect_rejected \
+  "a release workflow without an independent binary reproduction build" \
+  --release-workflow "$single_binary_build_workflow"
+
+late_binary_assets_workflow="$temporary_directory/late-binary-assets-release.yml"
+sed '/^[[:space:]]*- collect-binary-assets$/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$late_binary_assets_workflow"
+expect_rejected \
+  "a release workflow authenticating before binary assets succeed" \
+  --release-workflow "$late_binary_assets_workflow"
+
 early_latest_workflow="$temporary_directory/early-latest-release.yml"
 # The literal workflow expression is the unsafe fixture insertion target.
 # shellcheck disable=SC2016

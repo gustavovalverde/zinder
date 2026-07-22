@@ -23,12 +23,43 @@ gates have current evidence. See
   checkpoint, compaction/restore workspace, and chain-growth reserve.
 - An HTTP/2-capable reverse proxy for TLS, authentication, rate limits, and
   quotas.
+- For native binary installation, a GNU/Linux system with glibc 2.34 or newer,
+  dynamic `libstdc++.so.6` providing `GLIBCXX_3.4.30`, and either an
+  x86-64-v3 CPU or an AArch64 Armv8-A CPU. Debian 12 Bookworm is the certified
+  runtime baseline; the downloadable bundles are not musl artifacts.
 
 Do not place the two storage owners on hosts with independent filesystems.
 RocksDB secondary replication in this lifecycle is a same-filesystem boundary,
 not a network replication protocol.
 
 ## Install
+
+### Download native binaries
+
+Choose the archive that matches the host CPU. Preserve prerelease suffixes in
+both the tag and filename:
+
+```bash
+release=vX.Y.Z
+platform=x86_64-v3-unknown-linux-gnu
+gh release download "$release" \
+  --repo gustavovalverde/zinder \
+  --pattern "zinder-${release#v}-${platform}.tar.gz" \
+  --pattern SHA256SUMS
+sha256sum --check SHA256SUMS
+tar -xzf "zinder-${release#v}-${platform}.tar.gz"
+sudo install -m 0755 \
+  "zinder-${release#v}-${platform}"/bin/zinder-* \
+  /usr/local/bin/
+```
+
+Use `aarch64-unknown-linux-gnu` on AArch64. Inspect `BUILD-INFO.json` and the
+internal `SHA256SUMS` before installation. The four executables still require
+separate service configuration, storage paths, control secrets, process
+supervision, and the ownership order documented below; downloading the bundle
+does not create a mixed single-process deployment.
+
+### Deploy with Compose
 
 Clone and pin the intended release:
 
@@ -265,3 +296,4 @@ every gate above.
 - [Initial sync](initial-sync.md)
 - [Testing](testing.md)
 - [ADR-0035](../adrs/0035-canonical-storage-topologies.md)
+- [ADR-0036](../adrs/0036-gnu-linux-binary-release-bundles.md)

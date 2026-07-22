@@ -16,10 +16,12 @@
 # git, and target artifacts in BuildKit cache mounts. Rebuilding one service
 # warms the shared cache for every other service image.
 
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION=1.95.0
 ARG DEBIAN_RELEASE=bookworm
+ARG RUST_IMAGE_DIGEST=sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+ARG DEBIAN_IMAGE_DIGEST=sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
-FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS zinder-build-base
+FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE}@${RUST_IMAGE_DIGEST} AS zinder-build-base
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -31,6 +33,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CARGO_TARGET_DIR=/workspace/target
+ENV CARGO_INCREMENTAL=0
 WORKDIR /workspace
 
 # Keep rustup's toolchain/component hydration in a source-independent layer.
@@ -45,30 +48,44 @@ ARG RUST_VERSION
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG ZINDER_BUILD_GIT_COMMIT="unknown"
+ARG SOURCE_DATE_EPOCH=0
+ARG RELEASE_CACHE_SCOPE=shared
 
 # x86-64-v3 also reaches the vendored RocksDB C++ (hardware CRC32c, AVX2);
 # scoping to the target triple keeps build scripts and non-x86 images on the
 # baseline ISA. Runtime hosts are verified at startup before storage opens.
-ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq --remap-path-prefix=/workspace=/usr/src/zinder --remap-path-prefix=/usr/local/cargo=/cargo"
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--remap-path-prefix=/workspace=/usr/src/zinder --remap-path-prefix=/usr/local/cargo=/cargo"
+ENV CARGO_PROFILE_RELEASE_STRIP=symbols
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 ENV ZINDER_BUILD_GIT_COMMIT=${ZINDER_BUILD_GIT_COMMIT}
 
 COPY . .
 
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/workspace/target,sharing=locked \
-    cargo build --locked --release \
+    --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT}-${RELEASE_CACHE_SCOPE},target=/workspace/target,sharing=locked \
+    rust_target="$(case "$TARGETARCH" in amd64) printf '%s' x86_64-unknown-linux-gnu ;; arm64) printf '%s' aarch64-unknown-linux-gnu ;; *) exit 1 ;; esac)" \
+    && rustup target add "$rust_target" \
+    && cargo build --locked --release --target "$rust_target" \
         --bin zinder-ingest \
         --bin zinder-projector \
         --bin zinder-query \
         --bin zinder-compat-lightwalletd \
         --bin zinder-bench \
     && mkdir -p /zinder-binaries \
-    && cp /workspace/target/release/zinder-ingest /zinder-binaries/zinder-ingest \
-    && cp /workspace/target/release/zinder-projector /zinder-binaries/zinder-projector \
-    && cp /workspace/target/release/zinder-query /zinder-binaries/zinder-query \
-    && cp /workspace/target/release/zinder-compat-lightwalletd /zinder-binaries/zinder-compat-lightwalletd \
-    && cp /workspace/target/release/zinder-bench /zinder-binaries/zinder-bench
+    && cp "/workspace/target/${rust_target}/release/zinder-ingest" /zinder-binaries/zinder-ingest \
+    && cp "/workspace/target/${rust_target}/release/zinder-projector" /zinder-binaries/zinder-projector \
+    && cp "/workspace/target/${rust_target}/release/zinder-query" /zinder-binaries/zinder-query \
+    && cp "/workspace/target/${rust_target}/release/zinder-compat-lightwalletd" /zinder-binaries/zinder-compat-lightwalletd \
+    && cp "/workspace/target/${rust_target}/release/zinder-bench" /zinder-binaries/zinder-bench
+
+FROM scratch AS release-binaries
+
+COPY --from=zinder-binaries /zinder-binaries/zinder-ingest /bin/zinder-ingest
+COPY --from=zinder-binaries /zinder-binaries/zinder-projector /bin/zinder-projector
+COPY --from=zinder-binaries /zinder-binaries/zinder-query /bin/zinder-query
+COPY --from=zinder-binaries /zinder-binaries/zinder-compat-lightwalletd /bin/zinder-compat-lightwalletd
 
 FROM zinder-build-base AS zinder-ingest-live-test-binary
 
@@ -89,10 +106,10 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
     && test -n "$test_binary" \
     && cp "$test_binary" /zinder-live-tests/zinder-ingest-acceptance
 
-FROM debian:${DEBIAN_RELEASE}-slim AS zinder-runtime-base
+FROM debian:${DEBIAN_RELEASE}-slim@${DEBIAN_IMAGE_DIGEST} AS zinder-runtime-base
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 1000 zinder \

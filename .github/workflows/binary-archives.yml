@@ -1,0 +1,106 @@
+name: binary-archives
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/binary-archives.yml"
+      - ".github/workflows/release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "LICENSE"
+      - "README.md"
+      - "crates/**"
+      - "deploy/Dockerfile"
+      - "deploy/release-images.json"
+      - "rust-toolchain.toml"
+      - "scripts/build-release-binary-archive.sh"
+      - "scripts/check-release-binary-archive.sh"
+      - "scripts/test-release-binary-archive.sh"
+      - "services/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binary-archives-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  archive:
+    name: binary archive (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: x86_64-v3-unknown-linux-gnu
+            docker: linux/amd64
+            rust: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - name: aarch64-unknown-linux-gnu
+            docker: linux/arm64
+            rust: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and verify binary archive
+        env:
+          RUST_TARGET: ${{ matrix.platform.rust }}
+          TARGET_PLATFORM: ${{ matrix.platform.docker }}
+        run: |
+          set -euo pipefail
+
+          version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "zinder-core") | .version')"
+          release_tag="v${version}"
+          commit="$(git rev-parse HEAD)"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          docker buildx build \
+            --platform "$TARGET_PLATFORM" \
+            --target release-binaries \
+            --build-arg "RELEASE_CACHE_SCOPE=pr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUST_TARGET}" \
+            --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
+            --build-arg "ZINDER_BUILD_GIT_COMMIT=${commit}" \
+            --output "type=local,dest=${RUNNER_TEMP}/binary-export" \
+            --file deploy/Dockerfile \
+            .
+          scripts/build-release-binary-archive.sh \
+            --binaries "${RUNNER_TEMP}/binary-export/bin" \
+            --output dist \
+            --version "$version" \
+            --tag "$release_tag" \
+            --commit "$commit" \
+            --target "$RUST_TARGET" \
+            --source-date-epoch "$source_date_epoch"
+          archive_path="$(find dist -maxdepth 1 -type f -name '*.tar.gz')"
+          scripts/check-release-binary-archive.sh "$archive_path" \
+            --version "$version" \
+            --tag "$release_tag" \
+            --commit "$commit" \
+            --target "$RUST_TARGET" \
+            --source-date-epoch "$source_date_epoch"
+          docker run --rm \
+            --platform "$TARGET_PLATFORM" \
+            --volume "${RUNNER_TEMP}/binary-export/bin:/opt/zinder/bin:ro" \
+            debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 \
+            sh -ec '
+              apt-get update >/dev/null
+              apt-get install -y --no-install-recommends ca-certificates libstdc++6 >/dev/null
+              for binary in /opt/zinder/bin/*; do
+                "$binary" --version
+                "$binary" --help >/dev/null
+              done
+            '
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binary-${{ matrix.platform.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 3

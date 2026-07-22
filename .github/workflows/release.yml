@@ -105,6 +105,148 @@ jobs:
         id: images
         run: printf 'release_images=%s\n' "$(jq -c '.' "$RELEASE_IMAGES_FILE")" >> "$GITHUB_OUTPUT"
 
+  binary-archives:
+    name: build binary archive (${{ matrix.platform.name }})
+    needs: validate
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: x86_64-v3-unknown-linux-gnu
+            docker: linux/amd64
+            rust: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - name: aarch64-unknown-linux-gnu
+            docker: linux/arm64
+            rust: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build, verify, and reproduce archive
+        env:
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RUST_TARGET: ${{ matrix.platform.rust }}
+          TARGET_PLATFORM: ${{ matrix.platform.docker }}
+        run: |
+          set -euo pipefail
+
+          source_date_epoch="$(git show -s --format=%ct "$RELEASE_COMMIT")"
+          for build_number in 1 2; do
+            export_root="${RUNNER_TEMP}/binary-export-${build_number}"
+            archive_root="${RUNNER_TEMP}/binary-archive-${build_number}"
+            docker buildx build \
+              --no-cache \
+              --platform "$TARGET_PLATFORM" \
+              --target release-binaries \
+              --build-arg "RELEASE_CACHE_SCOPE=release-${RELEASE_COMMIT}-${RUST_TARGET}-${build_number}" \
+              --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
+              --build-arg "ZINDER_BUILD_GIT_COMMIT=${RELEASE_COMMIT}" \
+              --output "type=local,dest=${export_root}" \
+              --file deploy/Dockerfile \
+              .
+            scripts/build-release-binary-archive.sh \
+              --binaries "${export_root}/bin" \
+              --output "$archive_root" \
+              --version "$RELEASE_VERSION" \
+              --tag "$RELEASE_TAG" \
+              --commit "$RELEASE_COMMIT" \
+              --target "$RUST_TARGET" \
+              --source-date-epoch "$source_date_epoch"
+            archive_path="$(find "$archive_root" -maxdepth 1 -type f -name '*.tar.gz')"
+            scripts/check-release-binary-archive.sh "$archive_path" \
+              --version "$RELEASE_VERSION" \
+              --tag "$RELEASE_TAG" \
+              --commit "$RELEASE_COMMIT" \
+              --target "$RUST_TARGET" \
+              --source-date-epoch "$source_date_epoch"
+          done
+
+          docker run --rm \
+            --platform "$TARGET_PLATFORM" \
+            --volume "${RUNNER_TEMP}/binary-export-1/bin:/opt/zinder/bin:ro" \
+            debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 \
+            sh -ec '
+              apt-get update >/dev/null
+              apt-get install -y --no-install-recommends ca-certificates libstdc++6 >/dev/null
+              for binary in /opt/zinder/bin/*; do
+                "$binary" --version
+                "$binary" --help >/dev/null
+              done
+            '
+
+          find "${RUNNER_TEMP}/binary-export-1/bin" -maxdepth 1 -type f -printf '%f\n' \
+            | sort \
+            | while IFS= read -r binary_name; do
+                first="$(sha256sum "${RUNNER_TEMP}/binary-export-1/bin/${binary_name}" | awk '{print $1}')"
+                second="$(sha256sum "${RUNNER_TEMP}/binary-export-2/bin/${binary_name}" | awk '{print $1}')"
+                [[ "$first" == "$second" ]]
+              done
+          first_archive="$(find "${RUNNER_TEMP}/binary-archive-1" -maxdepth 1 -type f -name '*.tar.gz')"
+          second_archive="$(find "${RUNNER_TEMP}/binary-archive-2" -maxdepth 1 -type f -name '*.tar.gz')"
+          [[ "$(sha256sum "$first_archive" | awk '{print $1}')" == \
+             "$(sha256sum "$second_archive" | awk '{print $1}')" ]]
+
+          mkdir -p dist/binary-archive
+          cp "$first_archive" dist/binary-archive/
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-binary-${{ matrix.platform.name }}
+          path: dist/binary-archive/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  collect-binary-assets:
+    name: collect binary release assets
+    needs:
+      - validate
+      - binary-archives
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binary archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist/binaries
+          pattern: release-binary-*
+          merge-multiple: true
+
+      - name: Verify binary asset catalog
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          expected="$({
+            printf '%s\n' \
+              "zinder-${RELEASE_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+              "zinder-${RELEASE_VERSION}-x86_64-v3-unknown-linux-gnu.tar.gz"
+          })"
+          actual="$(find dist/binaries -maxdepth 1 -type f -printf '%f\n' | sort)"
+          [[ "$actual" == "$expected" ]]
+          (
+            cd dist/binaries
+            sha256sum *.tar.gz | sort -k2 > SHA256SUMS
+          )
+
+      - name: Upload binary release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-binary-assets
+          path: dist/binaries
+          if-no-files-found: error
+          retention-days: 7
+
   api-docs:
     name: build API release artifacts
     needs: validate
@@ -232,6 +374,7 @@ jobs:
     needs:
       - validate
       - api-docs
+      - collect-binary-assets
       - sdk-packages
     environment: release
     permissions:
@@ -418,6 +561,7 @@ jobs:
     needs:
       - validate
       - api-docs
+      - collect-binary-assets
       - merge
     permissions:
       contents: write
@@ -434,6 +578,12 @@ jobs:
         with:
           name: release-notes
           path: release-notes
+
+      - name: Download binary release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-binary-assets
+          path: dist
 
       - name: Create or update draft release
         env:

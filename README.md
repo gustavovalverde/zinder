@@ -24,6 +24,13 @@ on one host filesystem: `zinder-ingest` owns canonical storage,
 compatibility protocols over immutable exact-fence pairs. Explorer and mixed
 single-container images are not built or published by the release workflow.
 
+Tagged releases also provide checksum-bound GNU/Linux bundles containing these
+same four executables for `x86_64-v3` and AArch64 hosts. The x86 archive
+requires an x86-64-v3 CPU; both archives require glibc 2.34 or newer and
+dynamic `libstdc++.so.6` with `GLIBCXX_3.4.30`, with Debian 12 Bookworm as the
+certified runtime baseline. See the [VM deployment runbook](docs/runbooks/deploying-on-a-vm.md)
+for native installation and runtime ownership requirements.
+
 Bring up a Zebra node through the [Z3 platform stack](https://github.com/ZcashFoundation/z3),
 then start Zinder from this checkout:
 

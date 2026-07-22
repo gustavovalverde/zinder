@@ -639,6 +639,80 @@ EOF
     exit 1
   fi
 
+  dockerfile="$repository_root/deploy/Dockerfile"
+  binary_export_stage="$(
+    awk '
+      $0 == "FROM scratch AS release-binaries" { in_stage = 1; next }
+      in_stage && /^FROM / { exit }
+      in_stage { print }
+    ' "$dockerfile"
+  )"
+  exported_binary_catalog="$(
+    sed -n 's#^COPY --from=zinder-binaries .* /bin/\([^ ]*\)$#\1#p' \
+      <<< "$binary_export_stage" | sort
+  )"
+  if [[ "$exported_binary_catalog" != "$configured_release_images" ]] \
+    || grep -Eq 'zinder-(bench|explorer|compat-cipherscan|proto-codegen)' <<< "$binary_export_stage" \
+    || ! grep -Fq 'ARG RUST_VERSION=1.95.0' "$dockerfile" \
+    || ! grep -Eq '^ARG RUST_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$dockerfile" \
+    || ! grep -Eq '^ARG DEBIAN_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$dockerfile" \
+    || ! grep -Fq 'ENV CARGO_INCREMENTAL=0' "$dockerfile" \
+    || ! grep -Fq 'ARG RELEASE_CACHE_SCOPE=shared' "$dockerfile" \
+    || ! grep -Fq '${RELEASE_CACHE_SCOPE}' "$dockerfile" \
+    || ! grep -Fq -- '--remap-path-prefix=/workspace=/usr/src/zinder' "$dockerfile" \
+    || ! grep -Fq -- '--remap-path-prefix=/usr/local/cargo=/cargo' "$dockerfile" \
+    || ! grep -Fq 'ENV CARGO_PROFILE_RELEASE_STRIP=symbols' "$dockerfile" \
+    || ! grep -Fq 'libstdc++6' "$dockerfile"; then
+    cat >&2 <<'EOF'
+release admission rejected: the Docker release-binaries target must export
+exactly the four runtime catalog binaries with the pinned reproducible GNU
+build inputs and runtime libstdc++ dependency.
+EOF
+    exit 1
+  fi
+
+  binary_archive_job="$(
+    awk '
+      $0 == "  binary-archives:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  collected_binary_job="$(
+    awk '
+      $0 == "  collect-binary-assets:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  prepare_release_job="$(
+    awk '
+      $0 == "  prepare-release:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  if [[ -z "$binary_archive_job" || -z "$collected_binary_job" ]] \
+    || ! grep -Fq 'needs: validate' <<< "$binary_archive_job" \
+    || ! grep -Fq 'for build_number in 1 2' <<< "$binary_archive_job" \
+    || ! grep -Fq -- '--no-cache' <<< "$binary_archive_job" \
+    || ! grep -Fq -- '--target release-binaries' <<< "$binary_archive_job" \
+    || ! grep -Fq 'scripts/check-release-binary-archive.sh' <<< "$binary_archive_job" \
+    || ! grep -Fq 'x86_64-v3-unknown-linux-gnu' <<< "$binary_archive_job" \
+    || ! grep -Fq 'aarch64-unknown-linux-gnu' <<< "$binary_archive_job" \
+    || ! grep -Eq '^[[:space:]]+- binary-archives$' <<< "$collected_binary_job" \
+    || ! grep -Fq 'SHA256SUMS' <<< "$collected_binary_job" \
+    || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$crate_publication_job" \
+    || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$prepare_release_job" \
+    || ! grep -Fq 'name: release-binary-assets' <<< "$prepare_release_job"; then
+    cat >&2 <<'EOF'
+release admission rejected: release binaries must build twice for both GNU
+platforms, collect exactly before crates.io authentication, and be downloaded
+into the draft GitHub Release assets.
+EOF
+    exit 1
+  fi
+
   exit 0
 fi
 
