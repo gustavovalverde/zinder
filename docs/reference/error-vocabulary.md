@@ -14,7 +14,7 @@ Every Zinder gRPC failure ships:
 - A `google.rpc.ErrorInfo` detail with `domain = "zinder.dev"` and `reason = <ErrorReason name>` (the string-form name of the enum value, e.g. `"BROADCAST_DISABLED"`).
 - For some reasons, an additional structured detail (`BadRequest.field_violations`, `PreconditionFailure.violations`, `ResourceInfo`).
 
-Clients consult `ErrorInfo.reason` for the typed category and the auxiliary detail for the failure shape. Match on the domain first to avoid mistaking a non-Zinder service's `ErrorInfo` for a Zinder one.
+Clients consult `ErrorInfo.reason` for the typed category and the auxiliary detail for the failure shape. Match on the domain first to avoid mistaking a non-Zinder service's `ErrorInfo` for a Zinder one. The Rust SDK converts recognized strings to its client-owned `ErrorReason` variants and preserves unrecognized Zinder reasons as `ErrorReason::Unknown(String)`, so a newer server does not erase diagnostic identity at an older client.
 
 The Rust client crate `zinder-client` exposes the typed accessors:
 

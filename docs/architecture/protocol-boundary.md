@@ -4,6 +4,13 @@
 protobufs, generated Rust modules, and wire-level byte conventions. Domain and
 storage crates use their own types and convert at service adapters.
 
+Generated Rust modules and descriptor sets are checked in under
+`crates/zinder-proto/generated/`. Normal builds and downstream package builds
+therefore require neither `protoc` nor a build script. The private repository
+codegen tool is the only place that depends on `prost-build` and
+`tonic-prost-build`; the protocol workflow runs it with the pinned Buf and
+protoc versions and rejects generated-file drift.
+
 Upstream node protocols belong to [Node source boundary](node-source-boundary.md).
 Storage encodings belong to [Storage backend](storage-backend.md).
 
@@ -113,5 +120,7 @@ domain value.
 - Compatibility schemas change only with an explicit upstream-pin update.
 - Proto tests cover golden decoding, byte order, enum mappings, pagination, and
   epoch identity.
+- `scripts/regenerate-zinder-proto.sh --check` proves that checked-in Rust and
+  descriptors match the source schemas with the pinned code generators.
 - `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps`
   keeps generated and adapter documentation references valid.

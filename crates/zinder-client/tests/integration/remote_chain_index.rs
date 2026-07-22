@@ -28,7 +28,6 @@ use zinder_client::{
     NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, RemoteChainIndex,
     RemoteOpenOptions, RetryPolicy, TransactionBroadcastOutcome, TransactionId,
 };
-use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_proto::v1::wallet;
 use zinder_query::{
     ServerInfoSettings, WalletCapabilityProfile, WalletQuery, WalletQueryGrpcAdapter,
@@ -90,14 +89,8 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
         .await?
         .ok_or_else(|| eyre!("chain-events stream closed before first event"))??;
 
-    let server_common = server_info
-        .common
-        .as_ref()
-        .ok_or_else(|| eyre!("server_info missing common ops.ServerInfo"))?;
-    assert_eq!(
-        server_common.network,
-        encode_zinder_native_chain_name(Network::ZcashRegtest)
-    );
+    assert_eq!(server_info.network, Network::ZcashRegtest);
+    assert_eq!(server_info.service_name, "zinder-query");
     assert!(server_info.supports(Capability::Broadcast));
     assert_eq!(current_epoch.visible_tip_height, BlockHeight::new(2));
     assert_eq!(compact_block.height(), BlockHeight::new(1));

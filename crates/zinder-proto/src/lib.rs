@@ -27,13 +27,15 @@ pub const CONTRACT_REVISION: u32 = 4;
 ///
 /// Wire it into `tonic_reflection::server::Builder::configure().register_encoded_file_descriptor_set(...)`
 /// to expose `grpc.reflection.v1.ServerReflection` on the native query server.
-pub const ZINDER_V1_FILE_DESCRIPTOR_SET: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/zinder_v1_descriptor.bin"));
+pub const ZINDER_V1_FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/generated/zinder_v1_descriptor.bin"
+));
 
 /// Encoded descriptor set for the vendored lightwalletd compatibility schemas.
 pub const LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/lightwalletd_compat_descriptor.bin"
+    env!("CARGO_MANIFEST_DIR"),
+    "/generated/lightwalletd_compat_descriptor.bin"
 ));
 
 /// Native Zinder protocol modules.
@@ -54,7 +56,10 @@ pub mod v1 {
             reason = "Generated protobuf code mirrors owned schemas."
         )]
 
-        include!(concat!(env!("OUT_DIR"), "/zinder.v1.ingest.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/generated/zinder.v1.ingest.rs"
+        ));
     }
 
     /// Operations-plane protocol messages (readiness, error vocabulary,
@@ -75,7 +80,10 @@ pub mod v1 {
             reason = "Generated protobuf code mirrors owned schemas."
         )]
 
-        include!(concat!(env!("OUT_DIR"), "/zinder.v1.ops.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/generated/zinder.v1.ops.rs"
+        ));
     }
 
     /// Explorer-shaped read protocol messages served by zinder-explorer.
@@ -93,7 +101,10 @@ pub mod v1 {
             reason = "Generated protobuf code mirrors owned schemas."
         )]
 
-        include!(concat!(env!("OUT_DIR"), "/zinder.v1.explorer.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/generated/zinder.v1.explorer.rs"
+        ));
     }
 
     /// Native wallet and wallet-like application protocol messages.
@@ -112,7 +123,10 @@ pub mod v1 {
             reason = "Generated protobuf code mirrors owned schemas."
         )]
 
-        include!(concat!(env!("OUT_DIR"), "/zinder.v1.wallet.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/generated/zinder.v1.wallet.rs"
+        ));
     }
 }
 
@@ -135,9 +149,15 @@ pub mod compat {
         )]
 
         /// Upstream `lightwallet-protocol` commit served by this compatibility pin.
-        pub const LIGHTWALLETD_PROTOCOL_COMMIT: &str = env!("LIGHTWALLETD_PROTOCOL_COMMIT");
+        pub const LIGHTWALLETD_PROTOCOL_COMMIT: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/generated/lightwalletd_protocol_commit.txt"
+        ));
 
-        include!(concat!(env!("OUT_DIR"), "/cash.z.wallet.sdk.rpc.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/generated/cash.z.wallet.sdk.rpc.rs"
+        ));
     }
 }
 
@@ -163,8 +183,14 @@ pub mod external {
         )]
 
         /// Upstream Zebra commit served by this vendored proto pin.
-        pub const ZEBRA_INDEXER_PROTOCOL_COMMIT: &str = env!("ZEBRA_INDEXER_PROTOCOL_COMMIT");
+        pub const ZEBRA_INDEXER_PROTOCOL_COMMIT: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/generated/zebra_indexer_protocol_commit.txt"
+        ));
 
-        include!(concat!(env!("OUT_DIR"), "/zebra.indexer.rpc.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/generated/zebra.indexer.rpc.rs"
+        ));
     }
 }

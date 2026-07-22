@@ -115,15 +115,11 @@ async fn observe_once(endpoint: &str, network: Network, address: &str) -> Result
     })?;
 
     let wallet_info = chain_index.server_info().await?;
-    let common = wallet_info
-        .common
-        .as_ref()
-        .ok_or_else(|| IndexerError::InvalidRequest {
-            reason: "server_info response missing common ops.ServerInfo".to_owned(),
-        })?;
     println!(
-        "connected: network={} service_version={} schema_version={}",
-        common.network, common.service_version, wallet_info.schema_version
+        "connected: network={:?} service_version={} schema_version={}",
+        wallet_info.network,
+        wallet_info.service_version,
+        wallet_info.schema_version.value()
     );
 
     let script_hash = transparent_address_script_hash(address)?;

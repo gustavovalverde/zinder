@@ -1,0 +1,70 @@
+//! Client-owned wallet endpoint metadata.
+
+use std::time::Duration;
+
+use zinder_core::{ArtifactSchemaVersion, Network};
+
+use crate::{Capability, CapabilityDescriptor};
+
+/// Upstream node metadata captured by the query endpoint.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct NodeServerInfo {
+    /// Node-reported semantic version, when available.
+    pub version: Option<String>,
+    /// Exact upstream-node capability strings.
+    pub capabilities: Vec<String>,
+}
+
+/// Wallet endpoint identity, capability, retention, and schema metadata.
+///
+/// This is a client-owned representation. Generated protobuf messages remain
+/// private to the remote transport conversion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ServerInfo {
+    /// Network served by the endpoint.
+    pub network: Network,
+    /// Stable service identifier, such as `zinder-query`.
+    pub service_name: String,
+    /// Service semantic version.
+    pub service_version: String,
+    /// Wallet capabilities, including unknown additive values.
+    pub capabilities: Vec<Capability>,
+    /// Monotonic native contract revision.
+    pub contract_revision: u32,
+    /// Closed materialized-view preset, when a view store is attached.
+    pub materialized_view_preset: Option<String>,
+    /// Stable materialized-view identities selected by the preset.
+    pub materialized_view_identities: Vec<String>,
+    /// Full source commit embedded by the release build.
+    pub build_git_commit: String,
+    /// Canonical artifact schema version.
+    pub schema_version: ArtifactSchemaVersion,
+    /// Configured canonical reorg window depth in blocks.
+    pub reorg_window_blocks: u32,
+    /// Chain-event retention duration; `None` means unbounded retention.
+    pub chain_event_retention: Option<Duration>,
+    /// Retention duration for mined mempool entries; `None` means not retained.
+    pub mempool_mined_retention: Option<Duration>,
+    /// Retention duration for invalidated mempool entries; `None` means not retained.
+    pub mempool_invalidated_retention: Option<Duration>,
+    /// Upstream node metadata, when the endpoint has a source snapshot.
+    pub node: Option<NodeServerInfo>,
+}
+
+impl CapabilityDescriptor for ServerInfo {
+    fn has(&self, capability: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|advertised| advertised.as_str() == capability)
+    }
+}
+
+pub(crate) const fn optional_duration(seconds: u64) -> Option<Duration> {
+    if seconds == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(seconds))
+    }
+}

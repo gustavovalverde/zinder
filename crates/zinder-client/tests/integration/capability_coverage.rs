@@ -16,9 +16,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use zinder_client::{
-    CAPABILITIES, Capability, CapabilityDescriptor, CapabilitySurface, ChainIndex, ChainSnapshot,
-    EndpointBackedIndex, INGEST_WRITER_PHASE_V1, OwnedChainSnapshot, RemoteChainIndex,
-    always_on_capability_strings,
+    Capability, CapabilityDescriptor, ChainIndex, ChainSnapshot, EndpointBackedIndex,
+    OwnedChainSnapshot, RemoteChainIndex,
 };
 use zinder_proto::capabilities::*;
 
@@ -167,6 +166,9 @@ fn typed_capability_variants_match_table_strings() {
         Capability::ChainValuePools,
         Capability::NetworkUpgradeActivations,
         Capability::TransparentAddressBalance,
+        Capability::FullBlock,
+        Capability::FullBlockRange,
+        Capability::NetworkUpgradeActivations,
     ] {
         assert!(
             advertised.contains(capability.as_str()),
@@ -190,7 +192,7 @@ fn capability_descriptor_supports_reads_typed_variant() {
     }
 
     let descriptor = StubDescriptor {
-        advertised: vec![Capability::Broadcast.as_str()],
+        advertised: vec![WALLET_BROADCAST_TRANSACTION_V1],
     };
     assert!(descriptor.supports(Capability::Broadcast));
     assert!(!descriptor.supports(Capability::ChainValuePools));

@@ -3,13 +3,18 @@ name = "zinder-core"
 version.workspace = true
 description = "Core Zinder chain epoch and artifact domain values"
 edition.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["zcash", "indexer", "zinder"]
 categories = ["database"]
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
-publish.workspace = true
+rust-version = "1.88"
+publish = ["crates-io"]
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/README.md",
+]
 
 [features]
 default = ["commitment-tree-codec"]

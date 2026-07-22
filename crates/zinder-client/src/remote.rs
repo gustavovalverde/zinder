@@ -21,20 +21,20 @@ use zinder_core::wire::{
     encode_zinder_native_chain_name,
 };
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeader, BlockHeight, BlockHeightRange, BlockSelector,
-    ChainEpoch, ChainEpochId, ChainValuePool, ChainValuePoolsAtTip, CompactBlockArtifact,
-    ConsensusBranchId, MempoolEntry, MempoolEvictionReason, MinedTransaction,
-    MinedTransactionChainContext, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
-    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentMempoolOutput, TransparentMempoolOutputsRequest, TransparentMempoolSpend,
-    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendEntry,
+    ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeader, BlockHeight,
+    BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId, ChainValuePool,
+    ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId, MempoolEntry,
+    MempoolEvictionReason, MinedTransaction, MinedTransactionChainContext, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
+    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
+    TransparentOutputsByOutpointResponse, TransparentSpendEntry,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact, TxStatus,
 };
-use zinder_proto::capabilities::{Capability, CapabilityDescriptor};
-use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
+use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::{
     WalletWireDecodeError, chain_epoch_from_message,
     compact_block_from_message as compact_block_from_wire_message,
@@ -44,12 +44,14 @@ use zinder_proto::wire::{
 };
 
 use crate::error::ZINDER_ERROR_DOMAIN;
+use crate::server_info::optional_duration;
 use crate::{
-    BlockId, ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope,
-    ChainEventStream, ChainEventStreamFamily, ChainIndex, ChainRangeReverted, EndpointBackedIndex,
-    EventStreamStart, IndexStream, IndexerError, MempoolEvent, MempoolEventCursor,
-    MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor, MempoolSnapshotRequest,
-    MempoolSnapshotView, TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
+    BlockId, Capability, CapabilityDescriptor, ChainEpochCommitted, ChainEvent, ChainEventCursor,
+    ChainEventEnvelope, ChainEventStream, ChainEventStreamFamily, ChainIndex, ChainRangeReverted,
+    EndpointBackedIndex, EventStreamStart, IndexStream, IndexerError, MempoolEvent,
+    MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
+    MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo, ServerInfo,
+    TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
     TransparentUnspentOutputChunk, TransparentUtxoSetSummaryView,
@@ -112,7 +114,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// OS-level TCP keepalive idle interval. Belt-and-braces alongside the
 /// application-level HTTP/2 PING: detects connections dropped silently by
 /// intermediaries that don't surface the failure to userspace.
-const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
+#[allow(
+    clippy::duration_suboptimal_units,
+    reason = "Duration::from_mins postdates the public SDK's Rust 1.88 MSRV"
+)]
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
 /// Oldest native wallet contract revision this client can safely consume.
 pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 4;
@@ -211,11 +217,7 @@ impl ChainIndex for RemoteChainIndex {
 
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, IndexerError> {
         let server_info = EndpointBackedIndex::server_info(self).await?;
-        let common = server_info
-            .common
-            .as_ref()
-            .ok_or_else(|| IndexerError::malformed("info.common", "field is missing"))?;
-        ensure_advertised_capability(common, Capability::NetworkUpgradeActivations)?;
+        ensure_advertised_capability(&server_info, Capability::NetworkUpgradeActivations)?;
 
         let response = self
             .client()
@@ -994,7 +996,7 @@ fn subtree_roots_from_response(
 
 #[async_trait]
 impl EndpointBackedIndex for RemoteChainIndex {
-    async fn server_info(&self) -> Result<WalletServerInfo, IndexerError> {
+    async fn server_info(&self) -> Result<ServerInfo, IndexerError> {
         let response = self
             .client()
             .server_info(Request::new(wallet::ServerInfoRequest {}))
@@ -1004,13 +1006,7 @@ impl EndpointBackedIndex for RemoteChainIndex {
         let wallet_info = response
             .info
             .ok_or_else(|| IndexerError::malformed("info", "field is missing"))?;
-        let common = wallet_info
-            .common
-            .as_ref()
-            .ok_or_else(|| IndexerError::malformed("info.common", "field is missing"))?;
-        ensure_network_name(self.network, &common.network)?;
-        ensure_supported_contract_revision(common.contract_revision)?;
-        Ok(wallet_info)
+        server_info_from_message(self.network, wallet_info)
     }
 
     async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError> {
@@ -1206,14 +1202,58 @@ fn ensure_advertised_capability(
     descriptor: &impl CapabilityDescriptor,
     required_capability: Capability,
 ) -> Result<(), IndexerError> {
+    let required_name = required_capability.as_str().to_owned();
     if descriptor.supports(required_capability) {
         return Ok(());
     }
-    let required_capability = required_capability.as_str();
     Err(IndexerError::FailedPrecondition {
         reason: format!(
-            "remote wallet service does not advertise required capability {required_capability}"
+            "remote wallet service does not advertise required capability {required_name}"
         ),
+    })
+}
+
+fn server_info_from_message(
+    expected_network: Network,
+    wallet_info: wallet::WalletServerInfo,
+) -> Result<ServerInfo, IndexerError> {
+    let common = wallet_info
+        .common
+        .ok_or_else(|| IndexerError::malformed("info.common", "field is missing"))?;
+    ensure_network_name(expected_network, &common.network)?;
+    ensure_supported_contract_revision(common.contract_revision)?;
+    let schema_version = u16::try_from(wallet_info.schema_version).map_err(|_| {
+        IndexerError::malformed(
+            "info.schema_version",
+            "artifact schema version exceeds u16::MAX",
+        )
+    })?;
+
+    Ok(ServerInfo {
+        network: expected_network,
+        service_name: common.service_name,
+        service_version: common.service_version,
+        capabilities: common
+            .capabilities
+            .into_iter()
+            .map(Capability::from_wire_name)
+            .collect(),
+        contract_revision: common.contract_revision,
+        materialized_view_preset: (!common.materialized_view_preset.is_empty())
+            .then_some(common.materialized_view_preset),
+        materialized_view_identities: common.materialized_view_identities,
+        build_git_commit: common.build_git_commit,
+        schema_version: ArtifactSchemaVersion::new(schema_version),
+        reorg_window_blocks: wallet_info.reorg_window_blocks,
+        chain_event_retention: optional_duration(wallet_info.chain_event_retention_seconds),
+        mempool_mined_retention: optional_duration(wallet_info.mempool_mined_retention_seconds),
+        mempool_invalidated_retention: optional_duration(
+            wallet_info.mempool_invalidated_retention_seconds,
+        ),
+        node: wallet_info.node.map(|node| NodeServerInfo {
+            version: node.version,
+            capabilities: node.capabilities,
+        }),
     })
 }
 
@@ -1247,25 +1287,30 @@ fn network_upgrade_activations_from_message(
 #[cfg(test)]
 mod network_upgrade_activation_tests {
     use super::*;
-    use zinder_proto::v1::ops::ServerInfo;
 
     #[test]
     fn exact_network_upgrade_capability_preflight_accepts_only_advertised_capability() {
-        let advertised = ServerInfo {
-            capabilities: vec![Capability::NetworkUpgradeActivations.as_str().to_owned()],
-            ..ServerInfo::default()
-        };
+        struct StubDescriptor(Vec<String>);
+        impl CapabilityDescriptor for StubDescriptor {
+            fn has(&self, capability: &str) -> bool {
+                self.0.iter().any(|advertised| advertised == capability)
+            }
+        }
+
+        let advertised = StubDescriptor(vec![
+            Capability::NetworkUpgradeActivations.as_str().to_owned(),
+        ]);
         assert!(
             ensure_advertised_capability(&advertised, Capability::NetworkUpgradeActivations)
                 .is_ok()
         );
 
-        let unadvertised = ServerInfo {
-            capabilities: vec!["wallet.read.network_upgrade_activations_v2".to_owned()],
-            ..ServerInfo::default()
-        };
-        let error =
-            ensure_advertised_capability(&unadvertised, Capability::NetworkUpgradeActivations);
+        let error = ensure_advertised_capability(
+            &StubDescriptor(vec![
+                "wallet.read.network_upgrade_activations_v2".to_owned(),
+            ]),
+            Capability::NetworkUpgradeActivations,
+        );
         assert!(matches!(
             error,
             Err(IndexerError::FailedPrecondition { .. })
@@ -1325,6 +1370,78 @@ mod network_upgrade_activation_tests {
             }
         ));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod server_info_conversion_tests {
+    use zinder_proto::v1::ops;
+
+    use super::*;
+
+    #[test]
+    fn maximum_domain_schema_version_is_accepted() -> Result<(), IndexerError> {
+        let server_info = server_info_from_message(
+            Network::ZcashRegtest,
+            wallet_server_info(u32::from(u16::MAX)),
+        )?;
+
+        assert_eq!(server_info.schema_version.value(), u16::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_version_above_domain_range_is_rejected() {
+        let error = server_info_from_message(
+            Network::ZcashRegtest,
+            wallet_server_info(u32::from(u16::MAX) + 1),
+        );
+
+        assert!(matches!(
+            error,
+            Err(IndexerError::MalformedResponse {
+                field: "info.schema_version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unknown_capabilities_survive_server_info_conversion() -> Result<(), IndexerError> {
+        let mut message = wallet_server_info(1);
+        let common = message
+            .common
+            .as_mut()
+            .ok_or_else(|| IndexerError::malformed("info.common", "test field is missing"))?;
+        common.capabilities = vec![
+            Capability::FullBlock.as_str().to_owned(),
+            "wallet.read.future_v7".to_owned(),
+        ];
+
+        let server_info = server_info_from_message(Network::ZcashRegtest, message)?;
+
+        assert!(server_info.supports(Capability::FullBlock));
+        assert!(server_info.has("wallet.read.future_v7"));
+        assert!(
+            server_info
+                .capabilities
+                .contains(&Capability::Unknown("wallet.read.future_v7".to_owned()))
+        );
+        Ok(())
+    }
+
+    fn wallet_server_info(schema_version: u32) -> wallet::WalletServerInfo {
+        wallet::WalletServerInfo {
+            common: Some(ops::ServerInfo {
+                network: "zcash-regtest".to_owned(),
+                service_name: "zinder-query".to_owned(),
+                service_version: "0.5.0".to_owned(),
+                contract_revision: MIN_SUPPORTED_CONTRACT_REVISION,
+                ..ops::ServerInfo::default()
+            }),
+            schema_version,
+            ..wallet::WalletServerInfo::default()
+        }
     }
 }
 

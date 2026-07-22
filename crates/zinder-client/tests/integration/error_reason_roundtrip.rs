@@ -8,6 +8,7 @@ use tonic::Status;
 use tonic_types::StatusExt;
 use zinder_client::{ErrorReason, IndexerError, RetryPolicy};
 use zinder_core::BlockHeight;
+use zinder_proto::v1::ops::ErrorReason as WireErrorReason;
 use zinder_query::{QueryError, status_from_query_error};
 
 const ZINDER_DOMAIN: &str = "zinder.dev";
@@ -26,7 +27,7 @@ fn query_error_status_carries_error_info() {
 }
 
 #[test]
-fn artifact_unavailable_status_preserves_resource_info_on_client() {
+fn generic_remote_status_preserves_exact_reason_on_client() {
     let status = status_from_query_error(&QueryError::CompactBlockRangeTooLarge {
         requested: 4_096,
         maximum: 1_000,
@@ -38,11 +39,14 @@ fn artifact_unavailable_status_preserves_resource_info_on_client() {
     };
     assert_eq!(error_info.reason, "COMPACT_BLOCK_RANGE_TOO_LARGE");
 
-    // Round-trip the status through the client mapper and confirm we get a
-    // request-validation error back, with reason() pointing nowhere (the
-    // public reason() does not surface InvalidRequest-mapped reasons today).
+    // Round-trip the status through the public-vocabulary compatibility
+    // mapper and confirm the exact reason survives a shared gRPC code.
     let client_error: IndexerError = into_client_error(&status);
-    assert!(matches!(client_error, IndexerError::InvalidRequest { .. }));
+    assert!(matches!(client_error, IndexerError::RemoteFailure { .. }));
+    assert_eq!(
+        client_error.reason(),
+        Some(ErrorReason::CompactBlockRangeTooLarge)
+    );
     assert_eq!(client_error.retry_policy(), RetryPolicy::ClientError);
 }
 
@@ -82,55 +86,60 @@ fn every_error_reason_round_trips_through_proto_str_name() {
     // inverses for every variant. If a future variant gets a name that
     // disagrees, this test fails immediately.
     let reasons = [
-        ErrorReason::Unspecified,
-        ErrorReason::InvalidBlockRange,
-        ErrorReason::CompactBlockRangeTooLarge,
-        ErrorReason::ChainEventCursorInvalid,
-        ErrorReason::AddressOutputCursorInvalid,
-        ErrorReason::TransparentHistoryCursorInvalid,
-        ErrorReason::InvalidAddress,
-        ErrorReason::UnsupportedShieldedProtocol,
-        ErrorReason::InvalidChainStoreOptions,
-        ErrorReason::ArtifactPayloadTooLarge,
-        ErrorReason::InvalidChainEpochArtifacts,
-        ErrorReason::BroadcastDisabled,
-        ErrorReason::ChainEventCursorExpired,
-        ErrorReason::MempoolEventCursorExpired,
-        ErrorReason::ChainEpochPinUnavailable,
-        ErrorReason::SchemaMismatch,
-        ErrorReason::SchemaTooNew,
-        ErrorReason::ReorgWindowExceeded,
-        ErrorReason::ChainEpochConflict,
-        ErrorReason::ChainEpochNetworkMismatch,
-        ErrorReason::ArtifactUnavailable,
-        ErrorReason::ChainEpochMissing,
-        ErrorReason::BlockNotInBestChain,
-        ErrorReason::CompactBlockPayloadMalformed,
-        ErrorReason::ArtifactCorrupt,
-        ErrorReason::UnsupportedChainEvent,
-        ErrorReason::UnsupportedBlockSelector,
-        ErrorReason::UnsupportedTransactionStatus,
-        ErrorReason::BlockingTaskFailed,
-        ErrorReason::NodeUnavailable,
-        ErrorReason::StorageUnavailable,
-        ErrorReason::EntropyUnavailable,
-        ErrorReason::MaterializedViewUnavailable,
-        ErrorReason::NodeCapabilityMissing,
-        ErrorReason::NoVisibleChainEpoch,
-        ErrorReason::ExplorerInternal,
-        ErrorReason::ExplorerMethodDisabled,
-        ErrorReason::ExplorerPreconditionUnsatisfied,
-        ErrorReason::DependencyNotConfigured,
-        ErrorReason::UpstreamUnreachable,
+        WireErrorReason::Unspecified,
+        WireErrorReason::InvalidBlockRange,
+        WireErrorReason::CompactBlockRangeTooLarge,
+        WireErrorReason::ChainEventCursorInvalid,
+        WireErrorReason::AddressOutputCursorInvalid,
+        WireErrorReason::TransparentHistoryCursorInvalid,
+        WireErrorReason::InvalidAddress,
+        WireErrorReason::UnsupportedShieldedProtocol,
+        WireErrorReason::InvalidChainStoreOptions,
+        WireErrorReason::ArtifactPayloadTooLarge,
+        WireErrorReason::InvalidChainEpochArtifacts,
+        WireErrorReason::TransparentBalanceAddressCountExceeded,
+        WireErrorReason::SnapshotPageCursorInvalid,
+        WireErrorReason::BroadcastTransactionTooLarge,
+        WireErrorReason::BroadcastDisabled,
+        WireErrorReason::ChainEventCursorExpired,
+        WireErrorReason::MempoolEventCursorExpired,
+        WireErrorReason::SnapshotPageCursorExpired,
+        WireErrorReason::ChainEpochPinUnavailable,
+        WireErrorReason::SchemaMismatch,
+        WireErrorReason::SchemaTooNew,
+        WireErrorReason::ReorgWindowExceeded,
+        WireErrorReason::ChainEpochConflict,
+        WireErrorReason::ChainEpochNetworkMismatch,
+        WireErrorReason::ArtifactUnavailable,
+        WireErrorReason::ChainEpochMissing,
+        WireErrorReason::BlockNotInBestChain,
+        WireErrorReason::CompactBlockPayloadMalformed,
+        WireErrorReason::ArtifactCorrupt,
+        WireErrorReason::UnsupportedChainEvent,
+        WireErrorReason::UnsupportedBlockSelector,
+        WireErrorReason::UnsupportedTransactionStatus,
+        WireErrorReason::BlockingTaskFailed,
+        WireErrorReason::NodeUnavailable,
+        WireErrorReason::StorageUnavailable,
+        WireErrorReason::UnsupportedWalletEncoding,
+        WireErrorReason::EntropyUnavailable,
+        WireErrorReason::MaterializedViewUnavailable,
+        WireErrorReason::NodeCapabilityMissing,
+        WireErrorReason::NoVisibleChainEpoch,
+        WireErrorReason::ExplorerInternal,
+        WireErrorReason::ExplorerMethodDisabled,
+        WireErrorReason::ExplorerPreconditionUnsatisfied,
+        WireErrorReason::DependencyNotConfigured,
+        WireErrorReason::UpstreamUnreachable,
     ];
 
     for reason in reasons {
         let name = reason.as_str_name();
-        let parsed = ErrorReason::from_str_name(name);
+        let parsed = ErrorReason::from_wire_name(name);
         assert_eq!(
-            parsed,
-            Some(reason),
-            "{name} did not round-trip through ErrorReason::from_str_name"
+            parsed.as_str(),
+            name,
+            "{name} did not round-trip through client-owned ErrorReason"
         );
     }
 }
@@ -153,7 +162,7 @@ fn indexer_error_from_status_compat(status: &Status) -> IndexerError {
     let details = status.get_error_details();
     let Some(zinder_reason) = details.error_info().and_then(|error_info| {
         if error_info.domain == ZINDER_DOMAIN {
-            ErrorReason::from_str_name(&error_info.reason)
+            Some(ErrorReason::from_wire_name(&error_info.reason))
         } else {
             None
         }
@@ -164,7 +173,7 @@ fn indexer_error_from_status_compat(status: &Status) -> IndexerError {
     };
 
     if status.code() == Code::NotFound
-        && matches!(zinder_reason, ErrorReason::ArtifactUnavailable)
+        && matches!(&zinder_reason, ErrorReason::ArtifactUnavailable)
         && let Some(resource_info) = details.resource_info()
     {
         return IndexerError::ArtifactUnavailable {
@@ -173,25 +182,27 @@ fn indexer_error_from_status_compat(status: &Status) -> IndexerError {
         };
     }
 
-    match status.code() {
-        Code::InvalidArgument => IndexerError::InvalidRequest { reason: message },
-        Code::FailedPrecondition => IndexerError::FailedPrecondition { reason: message },
-        Code::NotFound => IndexerError::NotFound {
-            resource: "artifact",
-        },
-        Code::DataLoss => IndexerError::DataLoss { reason: message },
+    let retry_policy = match status.code() {
+        Code::InvalidArgument | Code::OutOfRange => RetryPolicy::ClientError,
+        Code::FailedPrecondition
+        | Code::PermissionDenied
+        | Code::Unauthenticated
+        | Code::Unimplemented => RetryPolicy::OperatorActionRequired,
         Code::Ok
         | Code::Cancelled
         | Code::Unknown
         | Code::DeadlineExceeded
+        | Code::NotFound
         | Code::AlreadyExists
-        | Code::PermissionDenied
         | Code::ResourceExhausted
         | Code::Aborted
-        | Code::OutOfRange
-        | Code::Unimplemented
         | Code::Internal
         | Code::Unavailable
-        | Code::Unauthenticated => IndexerError::ServiceUnavailable { reason: message },
+        | Code::DataLoss => RetryPolicy::RetryWithBackoff,
+    };
+    IndexerError::RemoteFailure {
+        reason: zinder_reason,
+        message,
+        retry_policy,
     }
 }

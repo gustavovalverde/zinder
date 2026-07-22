@@ -3,13 +3,20 @@ name = "zinder-proto"
 version.workspace = true
 description = "Zinder-owned generated protocol modules"
 edition.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["zcash", "indexer", "protocol"]
 categories = ["network-programming"]
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
-publish.workspace = true
+rust-version = "1.88"
+publish = ["crates-io"]
+include = [
+    "/src/**",
+    "/generated/**",
+    "/proto/**",
+    "/Cargo.toml",
+    "/README.md",
+]
 
 [dependencies]
 prost.workspace = true
@@ -17,15 +24,11 @@ tonic.workspace = true
 tonic-prost.workspace = true
 tonic-types.workspace = true
 thiserror.workspace = true
-zinder-core = { path = "../zinder-core", default-features = false }
+zinder-core = { version = "0.5.0", path = "../zinder-core", default-features = false }
 
 [package.metadata.cargo-machete]
-# The generated modules included from OUT_DIR reference these crates directly.
+# The checked-in generated modules reference these crates directly.
 ignored = ["prost", "tonic", "tonic-prost"]
-
-[build-dependencies]
-prost-build.workspace = true
-tonic-prost-build.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true

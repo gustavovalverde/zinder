@@ -106,11 +106,14 @@ jobs:
 
           mkdir -p dist/release
           cp -R dist/openapi dist/release/openapi
+          cp -R dist/proto dist/release/proto
           cp dist/zinder.v1.descriptor.bin dist/release/zinder.v1.descriptor.bin
+          bash scripts/check-native-proto-closure.sh dist/release
           tar \
             -C dist/release \
             -czf "dist/zinder-api-docs-${RELEASE_TAG}.tar.gz" \
             openapi \
+            proto \
             zinder.v1.descriptor.bin
 
       - name: Upload API artifacts

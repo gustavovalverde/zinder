@@ -17,21 +17,14 @@ ARG RAILWAY_DOCKER_TARGET_STAGE=zinder-admission-required
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS zinder-build-base
 
-ARG PROTOC_VERSION=29.3
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         clang \
         cmake \
-        curl \
         libclang-dev \
         pkg-config \
-        unzip \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSLo /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-$(uname -m | sed 's/aarch64/aarch_64/').zip" \
-    && unzip -q /tmp/protoc.zip -d /usr/local \
-    && rm -f /tmp/protoc.zip
+    && rm -rf /var/lib/apt/lists/*
 
 ENV CARGO_TARGET_DIR=/workspace/target
 WORKDIR /workspace

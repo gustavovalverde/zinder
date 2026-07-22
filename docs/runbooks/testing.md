@@ -82,6 +82,24 @@ engineer. It does not execute the blocks; running them still requires the
 documented prerequisites. See [Runbook self-test](#runbook-self-test)
 below for the full contract.
 
+## Public SDK package gate
+
+Run after changing `zinder-core`, `zinder-proto`, `zinder-client`, their
+manifests, generated protocol artifacts, or release packaging:
+
+```bash
+scripts/verify-sdk-packages.sh
+```
+
+The gate permits exactly those three crates for crates.io, verifies their
+lockstep dependency requirements and Rust 1.88 MSRV, packages them in
+dependency order, checks default and feature-extreme builds, and builds their
+documentation with `PROTOC` unavailable. It then extracts the `.crate`
+archives and compiles a standalone consumer against the extracted packages.
+This catches workspace path leakage, missing package files, accidental test
+inclusion, generated-code dependencies, and public protobuf vocabulary that a
+normal workspace build can hide.
+
 ## PostgreSQL driver integration gate
 
 Run after changing the canonical-replay PostgreSQL path, its driver dependencies, or

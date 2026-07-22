@@ -3,6 +3,8 @@
 use std::{num::NonZeroU32, pin::Pin, sync::Arc};
 
 use crate::IndexerError;
+#[cfg(feature = "remote")]
+use crate::ServerInfo;
 use async_trait::async_trait;
 use tokio_stream::Stream;
 use zinder_core::{
@@ -20,8 +22,6 @@ use zinder_core::{
     TransactionBroadcastOutcome, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
     TransparentMempoolSpend,
 };
-#[cfg(feature = "remote")]
-use zinder_proto::v1::wallet::WalletServerInfo;
 
 /// Chain-event stream selected by a subscription.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1314,7 +1314,7 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// let descriptor = client.server_info().await?;
     /// # let _ = descriptor; Ok(()) }
     /// ```
-    async fn server_info(&self) -> Result<WalletServerInfo, IndexerError>;
+    async fn server_info(&self) -> Result<ServerInfo, IndexerError>;
 
     /// Reads chain-wide value-pool totals at the upstream node's current tip.
     ///

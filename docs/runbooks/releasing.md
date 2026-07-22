@@ -1,10 +1,14 @@
 # Releasing Zinder
 
 Zinder releases one lockstep product version across every first-party crate and
-service. A release publishes 4 multi-architecture runtime images, the native
-protocol descriptor, generated OpenAPI documents, and one GitHub Release. The
-optional explorer and Cipherscan services, benchmark executable, and internal
-Rust crates are not release artifacts.
+service. A tagged release publishes 4 multi-architecture runtime images, the
+native protocol source and descriptor, generated OpenAPI documents, and one
+GitHub Release. The same version also prepares a registry-ready Rust SDK formed
+by `zinder-core`, `zinder-proto`, and `zinder-client`. The tagged workflow does
+not publish those crates to crates.io yet; crate publication remains a separate
+release phase until registry credentials and first-publication ordering are
+admitted. The optional explorer and Cipherscan services, benchmark executable,
+and internal Rust crates are not release artifacts.
 
 `deploy/release-images.json` is the authoritative published image set. The PR
 smoke build and tagged release both consume the exact catalog value validated
@@ -13,12 +17,17 @@ by their admission job.
 ## Release identity
 
 The root `[workspace.package]` version is the product version. Every
-first-party package inherits it, and every package also inherits
-`publish = false`; Zinder does not publish crates to a registry. The release
-tag must equal `v` followed by the workspace version. Stable versions use
-`vMAJOR.MINOR.PATCH`, while prereleases may add a SemVer suffix such as
-`v0.5.0-rc.1`. Build metadata is rejected because `+` cannot be represented in
-an OCI image tag without changing the version.
+first-party package inherits it. Exactly `zinder-core`, `zinder-proto`, and
+`zinder-client` allow publication to crates.io; all other workspace packages
+remain non-publishable. Public-package dependencies carry both repository paths
+and a requirement for the same lockstep version, including its prerelease
+suffix. The public packages declare Rust 1.88 as their MSRV, while the internal
+workspace and runtime binaries use Rust 1.95.
+
+The release tag must equal `v` followed by the workspace version. Stable
+versions use `vMAJOR.MINOR.PATCH`, while prereleases may add a SemVer suffix
+such as `v0.5.0-rc.1`. Build metadata is rejected because `+` cannot be
+represented in an OCI image tag without changing the version.
 
 Every user-visible pull request records its release note as an independent
 Changie fragment under `.changes/unreleased/`. Each fragment separates its
@@ -41,6 +50,8 @@ bash scripts/test-release-tag.sh
 bash scripts/test-deployment-admission.sh
 scripts/test-changelog.sh
 scripts/validate-changelog.sh fragments
+scripts/check-sdk-package-policy.sh
+scripts/verify-sdk-packages.sh
 cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 ```
@@ -60,11 +71,15 @@ printf '%s\n' "$next_version"
 ```
 
 Set `[workspace.package].version` in `Cargo.toml` to that version without its
-`v` prefix, then prepare the changelog:
+`v` prefix. Update the version requirements on the three public dependency
+edges (`zinder-proto` to `zinder-core`, and `zinder-client` to both public
+dependencies) to the same exact product version, then prepare the changelog:
 
 ```console
 scripts/prepare-changelog-release.sh "${next_version#v}"
 cargo check --workspace --all-targets --all-features
+scripts/check-sdk-package-policy.sh
+scripts/verify-sdk-packages.sh
 git diff -- Cargo.toml Cargo.lock CHANGELOG.md .changes
 ```
 
@@ -98,7 +113,8 @@ registry write.
 
 After approval, the workflow performs these operations in order:
 
-1. Generate and validate the OpenAPI documents and descriptor set.
+1. Generate and validate the native proto source closure, OpenAPI documents,
+   and descriptor set.
 2. Build the 4 runtime images natively for Linux amd64 and arm64.
 3. Publish exact `vX.Y.Z` and `sha-<commit>` multi-architecture manifests.
 4. Create a draft GitHub Release from the exact versioned changelog section and
@@ -131,10 +147,13 @@ done
 ```
 
 The GitHub Release must contain `zinder.v1.descriptor.bin` and the versioned
-`zinder-api-docs` archive. Each image must contain amd64 and arm64 manifests,
-and its OCI revision label must equal the tag-target commit. Deployments should
-pin the verified image digests. The Compose file uses `:local` only for source
-builds and does not treat `latest` as a deployment identity.
+`zinder-api-docs` archive. The archive contains the exact native `.proto`
+source closure alongside OpenAPI and the descriptor, so non-Rust consumers can
+generate clients without a repository checkout. Each image must contain amd64
+and arm64 manifests, and its OCI revision label must equal the tag-target
+commit. Deployments should pin the verified image digests. The Compose file
+uses `:local` only for source builds and does not treat `latest` as a deployment
+identity.
 
 ## Recover a failed release
 

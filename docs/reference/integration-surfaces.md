@@ -54,6 +54,10 @@ Public deployments terminate TLS, authentication, rate limiting, and quota contr
 `zinder-client` is the canonical Rust integration crate:
 
 - `RemoteChainIndex` is enabled by default and connects to a `WalletQuery` gRPC endpoint without a RocksDB dependency.
+- `ServerInfo`, `Capability`, `CapabilityDescriptor`, and `ErrorReason` are
+  client-owned public types. Generated protobuf messages and `tonic::Status`
+  remain behind the SDK boundary, while unknown capability and error-reason
+  strings are preserved for forward compatibility.
 - `ChainSnapshot<'_, I>` captures one epoch from a borrowed `ChainIndex` and
   exposes its pinnable canonical reads without a repeated epoch parameter.
 - `OwnedChainSnapshot<I>` provides the same surface over `Arc<I>`, including
@@ -84,6 +88,14 @@ compatibility layer.
 Inside Zinder, `zinder-query` and `zinder-compat-lightwalletd` read storage
 through `WalletServingQuery` over an admitted `WalletServingReadPair`. That
 service-internal composition is not a public SDK adapter.
+
+The registry-ready Rust SDK consists of `zinder-core`, `zinder-proto`, and
+`zinder-client`, all at the lockstep product version with Rust 1.88 as their
+package MSRV. Package CI builds each feature mode, checks documentation without
+`protoc`, and compiles a standalone consumer from the extracted crate archives.
+The packages become installable from crates.io only after a release publishes
+that lockstep version; local repository consumers continue to resolve the same
+edges by path.
 
 ## Vendoring the protocol
 
