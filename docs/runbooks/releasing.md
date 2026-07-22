@@ -52,6 +52,7 @@ Run the local release-policy checks before opening the version change:
 bash scripts/test-release-tag.sh
 bash scripts/test-deployment-admission.sh
 scripts/test-release-binary-archive.sh
+scripts/test-release-sbom.sh
 scripts/test-changelog.sh
 scripts/validate-changelog.sh fragments
 scripts/check-sdk-package-policy.sh
@@ -112,39 +113,45 @@ git tag -a v0.5.0 -m "v0.5.0"
 git push origin v0.5.0
 ```
 
+The repository must have immutable releases enabled before the tag is pushed.
 The tag must be reachable from `main`. The `release` workflow validates the tag
 against Cargo metadata, requires a matching non-empty changelog section, and
-rejects pending fragments before it logs in to GitHub Container Registry
-(GHCR) or requests a crates.io identity token. Before credentials are
-available, it validates exactly the three SDK archives with the workspace Rust
-1.95 toolchain, compiles an extracted consumer without `protoc`, and uses Cargo
-Release to dry-run the complete dependency-aware publication plan. Missing
-crate versions and package tags are expected during this read-only check. The
-package and Cargo Release checks run independently, then one final gate reports
-both outcomes and includes the complete plan and observed state in the job
-summary. It also builds each GNU/Linux binary platform twice, confirms identical
-binary and archive hashes, and validates the four-binary catalog, embedded
-commit, ELF machine, dynamic library closure, GLIBC symbol ceiling, and clean
-Debian runtime probes. The workflow generates and validates the native proto
-source closure, OpenAPI documents, and descriptor set, then collects the
-x86-64-v3 and AArch64 GNU archives with their sorted external `SHA256SUMS`.
-These credential-free jobs must succeed before the `release` environment
-requests approval for the first registry write.
+rejects pending fragments and refuses an already published tag before it
+logs in to GitHub Container Registry (GHCR) or requests an OIDC token. Before
+approval, it generates and validates the native proto source closure, OpenAPI
+documents, and descriptor set. It also validates exactly the three SDK archives
+with the workspace Rust 1.95 toolchain, compiles an extracted consumer without
+`protoc`, and uses Cargo Release to dry-run the complete dependency-aware
+publication plan. Missing crate versions and package tags are expected during
+this read-only check. The package and Cargo Release checks run independently,
+then one final gate reports both outcomes and includes the complete plan and
+observed state in the job summary. These credential-free jobs must succeed
+before the protected `release` environment authorizes all trusted publication
+and attestation work.
 
 After approval, the workflow performs these operations in order:
 
-1. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
+1. Build each GNU/Linux binary platform twice, confirm identical binary and
+   archive hashes, and validate the catalog, embedded commit, ELF machine,
+   dynamic libraries, symbol ceilings, and clean Debian runtime probes.
+2. Generate one SPDX 2.3 SBOM from each auditable archive and attest both SLSA
+   provenance and the SBOM.
+3. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
    publish only missing SDK crates in Cargo's dependency order and verify their
    source provenance.
-2. Compile a fresh registry-only consumer against the exact published
+4. Compile a fresh registry-only consumer against the exact published
    `zinder-client` version after sparse-index propagation.
-3. Build the 4 runtime images natively for Linux amd64 and arm64.
-4. Publish exact `vX.Y.Z` and `sha-<commit>` multi-architecture manifests.
-5. Create a draft GitHub Release from the exact versioned changelog section and
-   attach the API artifacts, binary bundles, and `SHA256SUMS`.
-6. Publish the GitHub Release after every exact image manifest succeeds.
-7. For a stable release, verify all 4 exact manifests and promote their
-   `latest` tags in one final job.
+5. Build the 4 runtime images natively for Linux amd64 and arm64 with BuildKit
+   max-mode provenance and SBOMs.
+6. Publish exact `vX.Y.Z` and `sha-<commit>` manifests, attest each child SBOM
+   and the root provenance, sign only the root digest, and verify the exact
+   two-platform topology and producer identity.
+7. Assemble the exact 6 payload assets, create their sorted `SHA256SUMS`, and
+   keyless-sign that checksum file into `SHA256SUMS.sigstore.json`.
+8. Publish the draft GitHub Release, then verify its immutable release
+   attestation and every asset.
+9. For a stable release, promote the 4 `latest` tags only after immutable
+   release verification succeeds.
 
 Stable and prerelease tags publish the same three-crate SDK catalog.
 Prereleases never move image `latest`, and GitHub marks their Releases as
@@ -221,17 +228,27 @@ order, and pass the fresh registry-only consumer smoke test. Prepare and publish
 ## Verify publication
 
 Check out the exact release tag so the smoke test compiles against the API
-surface named by that version, then confirm the Release and each exact image
-before changing a deployment:
+surface named by that version. Use GitHub CLI 2.94 or newer and Cosign with
+Sigstore bundle support, then confirm the Release and each exact image before
+changing a deployment:
 
 ```console
 git switch --detach v0.5.0
 gh release view v0.5.0
+gh release verify v0.5.0
 
 gh release download v0.5.0 \
   --pattern 'zinder-0.5.0-*-unknown-linux-gnu.tar.gz' \
-  --pattern SHA256SUMS
+  --pattern 'zinder-0.5.0-*-unknown-linux-gnu.spdx.json' \
+  --pattern SHA256SUMS \
+  --pattern SHA256SUMS.sigstore.json
 sha256sum --check SHA256SUMS
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity \
+    'https://github.com/gustavovalverde/zinder/.github/workflows/release.yml@refs/tags/v0.5.0' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
 
 for package_name in zinder-core zinder-proto zinder-client; do
   cargo info "${package_name}@0.5.0"
@@ -251,15 +268,18 @@ done
 ```
 
 The GitHub Release must contain `zinder.v1.descriptor.bin`, the versioned
-`zinder-api-docs` archive, both versioned GNU/Linux binary archives, and the
-external `SHA256SUMS`. The API archive contains the exact native `.proto`
-source closure alongside OpenAPI and the descriptor. Each binary archive is
-rooted and contains exactly `bin/` with the four runtime executables plus
+`zinder-api-docs` archive, both versioned GNU/Linux binary archives, their 2
+SPDX 2.3 JSON SBOMs, `SHA256SUMS`, and `SHA256SUMS.sigstore.json`. The API
+archive contains the exact native `.proto` source closure alongside OpenAPI and
+the descriptor. Each binary archive is rooted and contains exactly `bin/` with
+the 4 runtime executables plus
 `BUILD-INFO.json`, `LICENSE`, `README.md`, and an internal `SHA256SUMS`. Each
-image must contain amd64 and arm64 manifests, and its OCI revision label must
-equal the tag-target commit. Deployments should pin verified image digests or
-binary archive checksums. The Compose file uses `:local` only for source builds
-and does not treat `latest` as a deployment identity.
+image must contain amd64 and arm64 runtime manifests, and its OCI revision
+label must equal the tag-target commit. Binary SBOMs describe the recoverable
+Rust dependency graph and the owning `rust-librocksdb-sys` package; they do not
+claim complete native C or C++ CPE inventory. Deployments should pin verified
+image digests or binary archive checksums. The Compose file uses `:local` only
+for source builds and does not treat `latest` as a deployment identity.
 
 ## Recover a failed release
 
@@ -285,11 +305,11 @@ and `publish` phases: the existing product tag, artifact-rich GitHub Release,
 and `latest` image promotion remain owned by the Zinder workflow.
 
 The workflow creates the public GitHub Release only after all exact image tags
-exist. A failure before publication may leave untagged platform digests or an
-editable draft Release; rerunning the failed workflow jobs is safe because the
-workflow replaces draft assets and recreates exact tags from the same validated
-commit. A published Release causes the preparation job to fail closed rather
-than modify public assets.
+and trust evidence exist. A failure before publication may leave untagged
+platform digests or an editable draft Release; rerunning the failed workflow
+jobs is safe because the workflow replaces draft assets and recreates exact
+tags from the same validated commit. A published immutable Release causes
+validation to fail closed rather than modify public assets.
 
 If only the final stable promotion fails, rerun the failed
 `promote stable image tags` job. It verifies all 4 exact manifests before moving

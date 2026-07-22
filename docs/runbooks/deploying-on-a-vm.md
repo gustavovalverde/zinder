@@ -23,6 +23,8 @@ gates have current evidence. See
   checkpoint, compaction/restore workspace, and chain-growth reserve.
 - An HTTP/2-capable reverse proxy for TLS, authentication, rate limits, and
   quotas.
+- GitHub CLI 2.94 or newer and Cosign with Sigstore bundle support when
+  installing a native release bundle.
 - For native binary installation, a GNU/Linux system with glibc 2.34 or newer,
   dynamic `libstdc++.so.6` providing `GLIBCXX_3.4.30`, and either an
   x86-64-v3 CPU or an AArch64 Armv8-A CPU. Debian 12 Bookworm is the certified
@@ -45,19 +47,31 @@ platform=x86_64-v3-unknown-linux-gnu
 gh release download "$release" \
   --repo gustavovalverde/zinder \
   --pattern "zinder-${release#v}-${platform}.tar.gz" \
-  --pattern SHA256SUMS
+  --pattern "zinder-${release#v}-${platform}.spdx.json" \
+  --pattern SHA256SUMS \
+  --pattern SHA256SUMS.sigstore.json
 sha256sum --check SHA256SUMS
+gh release verify "$release" --repo gustavovalverde/zinder
+gh release verify-asset "$release" \
+  "zinder-${release#v}-${platform}.tar.gz" \
+  --repo gustavovalverde/zinder
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity \
+    "https://github.com/gustavovalverde/zinder/.github/workflows/release.yml@refs/tags/${release}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
 tar -xzf "zinder-${release#v}-${platform}.tar.gz"
 sudo install -m 0755 \
   "zinder-${release#v}-${platform}"/bin/zinder-* \
   /usr/local/bin/
 ```
 
-Use `aarch64-unknown-linux-gnu` on AArch64. Inspect `BUILD-INFO.json` and the
-internal `SHA256SUMS` before installation. The four executables still require
-separate service configuration, storage paths, control secrets, process
-supervision, and the ownership order documented below; downloading the bundle
-does not create a mixed single-process deployment.
+Use `aarch64-unknown-linux-gnu` on AArch64. Inspect `BUILD-INFO.json`, the
+internal `SHA256SUMS`, and the accompanying SPDX SBOM before installation. The
+4 executables still require separate service configuration, storage paths,
+control secrets, process supervision, and the ownership order documented below;
+downloading the bundle does not create a mixed single-process deployment.
 
 ### Deploy with Compose
 
@@ -297,3 +311,4 @@ every gate above.
 - [Testing](testing.md)
 - [ADR-0035](../adrs/0035-canonical-storage-topologies.md)
 - [ADR-0036](../adrs/0036-gnu-linux-binary-release-bundles.md)
+- [ADR-0037](../adrs/0037-release-artifact-provenance-and-sboms.md)

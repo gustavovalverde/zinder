@@ -41,6 +41,7 @@ WORKDIR /workspace
 # `COPY . .`, every source-change rebuild can pay for component synchronization.
 COPY rust-toolchain.toml ./
 RUN rustup show active-toolchain >/dev/null
+RUN cargo install cargo-auditable --version 0.7.4 --locked
 
 FROM zinder-build-base AS zinder-binaries
 
@@ -67,7 +68,7 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
     --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT}-${RELEASE_CACHE_SCOPE},target=/workspace/target,sharing=locked \
     rust_target="$(case "$TARGETARCH" in amd64) printf '%s' x86_64-unknown-linux-gnu ;; arm64) printf '%s' aarch64-unknown-linux-gnu ;; *) exit 1 ;; esac)" \
     && rustup target add "$rust_target" \
-    && cargo build --locked --release --target "$rust_target" \
+    && cargo auditable build --locked --release --target "$rust_target" \
         --bin zinder-ingest \
         --bin zinder-projector \
         --bin zinder-query \
