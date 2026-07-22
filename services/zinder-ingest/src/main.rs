@@ -247,6 +247,10 @@ async fn run_probe(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "ingest startup and lifecycle shutdown remain together so worker drain, reorg parking, and ops shutdown order stays auditable"
+)]
 async fn run_ingest(
     config_path: Option<PathBuf>,
     overrides: IngestConfigOverrides,
@@ -284,16 +288,19 @@ async fn run_ingest(
     let recover_state_phase = StartupPhase::RecoverState.start();
     resolve_wallet_serving_modifiers(&mut command_config);
     recover_state_phase.complete();
-    let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
-    let _upstream_health_probe_handle = spawn_upstream_health_probe_for(
+    let termination = CancellationToken::new();
+    let _signal_handle = cancel_on_terminating_signal(termination.clone());
+    let worker_cancel = termination.child_token();
+    let upstream_health_probe_handle = spawn_upstream_health_probe_for(
         &command_config.runtime_config.node,
         &source,
         readiness.clone(),
-        cancel.clone(),
+        worker_cancel.clone(),
     );
-    let memory_metrics_handle =
-        spawn_runtime_memory_metrics_task(DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, cancel.clone());
+    let memory_metrics_handle = spawn_runtime_memory_metrics_task(
+        DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
+        worker_cancel.clone(),
+    );
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
 
@@ -303,7 +310,7 @@ async fn run_ingest(
         &command_config,
         &source,
         &readiness,
-        &cancel,
+        &worker_cancel,
         &mut writer_config,
     );
     log_canonical_writer_start(&command_config, &writer_config);
@@ -314,18 +321,24 @@ async fn run_ingest(
             writer_config,
         },
         &readiness,
-        &cancel,
+        &worker_cancel,
         &mut canonical_control_tasks,
     )
     .await;
-    shutdown_ingest_tasks(
-        &cancel,
-        canonical_control_tasks,
-        memory_metrics_handle,
-        ops_handle,
+    coordinate_canonical_writer_lifecycle(
+        writer_result,
+        &termination,
+        &readiness,
+        shutdown_ingest_worker_tasks(
+            &worker_cancel,
+            canonical_control_tasks,
+            memory_metrics_handle,
+            upstream_health_probe_handle,
+        ),
+        shutdown_ops_endpoint(ops_handle),
     )
-    .await;
-    writer_result.map_err(IngestConfigError::from)
+    .await
+    .map_err(IngestConfigError::from)
 }
 
 type CanonicalControlServer = JoinHandle<Result<(), tonic::transport::Error>>;
@@ -460,11 +473,56 @@ async fn run_supervised_canonical_writer(
     writer_result.map(drop)
 }
 
-async fn shutdown_ingest_tasks(
+async fn coordinate_canonical_writer_lifecycle<DrainWorkers, ShutdownOps>(
+    writer_result: Result<(), zinder_ingest::CanonicalWriterError>,
+    termination: &CancellationToken,
+    readiness: &Readiness,
+    drain_workers: DrainWorkers,
+    shutdown_ops: ShutdownOps,
+) -> Result<(), zinder_ingest::CanonicalWriterError>
+where
+    DrainWorkers: std::future::Future<Output = ()>,
+    ShutdownOps: std::future::Future<Output = ()>,
+{
+    drain_workers.await;
+    match writer_result {
+        Err(zinder_ingest::CanonicalWriterError::Follow(
+            zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(evidence),
+        )) => {
+            readiness.set(
+                ReadinessState::reorg_window_exceeded(
+                    u64::from(evidence.required_depth),
+                    u64::from(evidence.configured_window_blocks),
+                    Some(evidence.local_tip.height.value()),
+                )
+                .with_phase(zinder_runtime::IngestPhase::FollowingTip),
+            );
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "canonical_writer_reorg_window_exceeded",
+                local_tip_height = evidence.local_tip.height.value(),
+                source_tip_height = evidence.source_tip.height.value(),
+                settled_tip_height = evidence.settled_tip.height.value(),
+                required_depth = evidence.required_depth,
+                configured_window_blocks = evidence.configured_window_blocks,
+                "canonical writer parked with readiness drained for operator review"
+            );
+            termination.cancelled().await;
+            shutdown_ops.await;
+            Ok(())
+        }
+        outcome => {
+            shutdown_ops.await;
+            outcome
+        }
+    }
+}
+
+async fn shutdown_ingest_worker_tasks(
     cancel: &CancellationToken,
     mut control_tasks: CanonicalControlTasks,
     memory_metrics_handle: JoinHandle<()>,
-    ops_handle: Option<OpsEndpointHandle>,
+    upstream_health_probe_handle: Option<JoinHandle<()>>,
 ) {
     cancel.cancel();
     if !control_tasks.server_completed {
@@ -498,6 +556,19 @@ async fn shutdown_ingest_tasks(
             "runtime memory metrics task failed during shutdown"
         );
     }
+    if let Some(upstream_health_probe_handle) = upstream_health_probe_handle
+        && let Err(join_error) = upstream_health_probe_handle.await
+    {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "upstream_health_probe_join_failed",
+            error = %join_error,
+            "upstream health probe did not shut down cleanly"
+        );
+    }
+}
+
+async fn shutdown_ops_endpoint(ops_handle: Option<OpsEndpointHandle>) {
     if let Some(handle) = ops_handle {
         handle.shutdown().await;
     }
@@ -891,9 +962,152 @@ impl From<CanonicalReplayVerificationArgs> for CanonicalReplayVerificationConfig
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        NodeCapabilities, NodeCapability, ZebraJsonRpcSource, require_ingest_node_capabilities,
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
     };
+
+    use super::{
+        NodeCapabilities, NodeCapability, ZebraJsonRpcSource,
+        coordinate_canonical_writer_lifecycle, require_ingest_node_capabilities,
+    };
+
+    #[tokio::test]
+    async fn writer_reorg_window_exceeded_drains_workers_then_parks_ops_until_termination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let readiness = zinder_runtime::Readiness::default();
+        let termination = tokio_util::sync::CancellationToken::new();
+        let workers_drained = Arc::new(AtomicBool::new(false));
+        let ops_shutdown = Arc::new(AtomicBool::new(false));
+        let drain_workers = {
+            let workers_drained = Arc::clone(&workers_drained);
+            let readiness = readiness.clone();
+            async move {
+                readiness.set(zinder_runtime::ReadinessState::starting());
+                workers_drained.store(true, Ordering::SeqCst);
+            }
+        };
+        let shutdown_ops = {
+            let ops_shutdown = Arc::clone(&ops_shutdown);
+            async move {
+                ops_shutdown.store(true, Ordering::SeqCst);
+            }
+        };
+        let writer_result = Err(zinder_ingest::CanonicalWriterError::Follow(
+            zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(Box::new(
+                zinder_ingest::CanonicalReorgWindowExceeded {
+                    local_tip: zinder_core::BlockId::new(
+                        zinder_core::BlockHeight::new(4),
+                        zinder_core::BlockHash::from_bytes([4; 32]),
+                    ),
+                    source_tip: zinder_core::BlockId::new(
+                        zinder_core::BlockHeight::new(4),
+                        zinder_core::BlockHash::from_bytes([5; 32]),
+                    ),
+                    settled_tip: zinder_core::BlockId::new(
+                        zinder_core::BlockHeight::new(2),
+                        zinder_core::BlockHash::from_bytes([2; 32]),
+                    ),
+                    required_depth: 3,
+                    configured_window_blocks: 2,
+                },
+            )),
+        ));
+        let mut lifecycle = Box::pin(coordinate_canonical_writer_lifecycle(
+            writer_result,
+            &termination,
+            &readiness,
+            drain_workers,
+            shutdown_ops,
+        ));
+
+        tokio::select! {
+            outcome = &mut lifecycle => {
+                return Err(std::io::Error::other(format!(
+                    "reorg-window lifecycle returned before termination: {outcome:?}"
+                )).into());
+            }
+            () = async {
+                while !workers_drained.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+
+        assert!(matches!(
+            readiness.report().cause,
+            zinder_runtime::ReadinessCause::ReorgWindowExceeded {
+                depth: 3,
+                configured: 2,
+            }
+        ));
+        assert_eq!(readiness.report().current_height, Some(4));
+        assert_eq!(
+            readiness.report().phase,
+            Some(zinder_runtime::IngestPhase::FollowingTip)
+        );
+        assert!(!ops_shutdown.load(Ordering::SeqCst));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut lifecycle)
+                .await
+                .is_err(),
+            "reorg-window lifecycle must keep the ops endpoint alive until termination"
+        );
+
+        termination.cancel();
+        lifecycle.await?;
+        assert!(ops_shutdown.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_reorg_writer_error_drains_workers_shuts_ops_and_returns_without_termination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let readiness = zinder_runtime::Readiness::default();
+        let termination = tokio_util::sync::CancellationToken::new();
+        let workers_drained = Arc::new(AtomicBool::new(false));
+        let ops_shutdown = Arc::new(AtomicBool::new(false));
+        let drain_workers = {
+            let workers_drained = Arc::clone(&workers_drained);
+            async move {
+                workers_drained.store(true, Ordering::SeqCst);
+            }
+        };
+        let shutdown_ops = {
+            let ops_shutdown = Arc::clone(&ops_shutdown);
+            async move {
+                ops_shutdown.store(true, Ordering::SeqCst);
+            }
+        };
+        let writer_result = Err(zinder_ingest::CanonicalWriterError::ControlServer {
+            reason: "test control server stopped".to_owned(),
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            coordinate_canonical_writer_lifecycle(
+                writer_result,
+                &termination,
+                &readiness,
+                drain_workers,
+                shutdown_ops,
+            ),
+        )
+        .await?;
+        let error = outcome
+            .err()
+            .ok_or("non-reorg writer error must propagate")?;
+
+        assert!(matches!(
+            error,
+            zinder_ingest::CanonicalWriterError::ControlServer { reason }
+                if reason == "test control server stopped"
+        ));
+        assert!(workers_drained.load(Ordering::SeqCst));
+        assert!(ops_shutdown.load(Ordering::SeqCst));
+        assert!(!termination.is_cancelled());
+        Ok(())
+    }
 
     #[test]
     fn ingest_capability_validation_accepts_zebra_baseline()
