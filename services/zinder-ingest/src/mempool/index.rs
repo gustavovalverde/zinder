@@ -12,7 +12,8 @@
 //! [`MempoolIndex::apply_invalidated`], [`MempoolIndex::apply_mined`]) take
 //! a write lock.
 
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, HashMap, HashSet, btree_map::Entry};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -20,7 +21,6 @@ use thiserror::Error;
 use zinder_core::{
     MempoolEntry, TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput,
     TransparentMempoolSpend, TransparentOutPoint, TransparentOutput, TransparentOutputEntry,
-    UnixTimestampMillis,
 };
 use zinder_store::{MempoolEvent, MempoolEventPosition};
 
@@ -87,8 +87,6 @@ pub struct MempoolSnapshotPage {
     pub entries: Vec<Arc<MempoolEntry>>,
     /// Last transaction id included in this page when more entries remain.
     pub next_after_transaction_id: Option<TransactionId>,
-    /// Last time this in-memory index observed an applied mempool state change.
-    pub last_updated_at: UnixTimestampMillis,
     /// Log position of the last event applied to the index, read atomically
     /// with the page entries. `None` before any event has been applied.
     pub last_applied_event: Option<MempoolEventPosition>,
@@ -100,30 +98,16 @@ pub struct MempoolIndex {
     state: Arc<RwLock<MempoolIndexState>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct MempoolIndexState {
-    entries: HashMap<TransactionId, Arc<MempoolEntry>>,
+    entries: BTreeMap<TransactionId, Arc<MempoolEntry>>,
     outputs_by_address: HashMap<
         TransparentAddressScriptHash,
         HashMap<TransparentOutPoint, TransparentMempoolOutput>,
     >,
     output_by_outpoint: HashMap<TransparentOutPoint, TransparentMempoolOutput>,
     spend_by_outpoint: HashMap<TransparentOutPoint, TransactionId>,
-    last_updated_at: UnixTimestampMillis,
     last_applied_event: Option<MempoolEventPosition>,
-}
-
-impl Default for MempoolIndexState {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            outputs_by_address: HashMap::new(),
-            output_by_outpoint: HashMap::new(),
-            spend_by_outpoint: HashMap::new(),
-            last_updated_at: UnixTimestampMillis::now(),
-            last_applied_event: None,
-        }
-    }
 }
 
 impl MempoolIndex {
@@ -218,7 +202,6 @@ impl MempoolIndex {
             Entry::Vacant(slot) => Arc::clone(slot.insert(Arc::new(entry))),
         };
         index_secondary_overlays(&mut state, inserted_entry.as_ref());
-        state.last_updated_at = UnixTimestampMillis::now();
         drop(state);
         MempoolApplyOutcome::Applied
     }
@@ -258,7 +241,6 @@ impl MempoolIndex {
             return MempoolApplyOutcome::NoChange;
         };
         unindex_secondary_overlays(&mut state, removed_entry.as_ref());
-        state.last_updated_at = UnixTimestampMillis::now();
         drop(state);
         MempoolApplyOutcome::Applied
     }
@@ -364,9 +346,7 @@ impl MempoolIndex {
     ///
     /// Each returned [`Arc`] aliases the in-index entry so callers serialize
     /// the snapshot without re-cloning the underlying payload. The order is
-    /// implementation-defined and not stable across snapshots; callers
-    /// requiring a deterministic ordering must sort the returned entries by
-    /// their `transaction_id`.
+    /// ascending transaction-id order.
     #[must_use]
     pub fn snapshot(&self, max_entries: u32) -> Vec<Arc<MempoolEntry>> {
         self.snapshot_page(max_entries, None).entries
@@ -374,8 +354,8 @@ impl MempoolIndex {
 
     /// Returns a deterministic page of mempool entries after `after_transaction_id`.
     ///
-    /// Pagination is ordered by transaction id so callers can traverse the
-    /// current in-memory view without relying on `HashMap` iteration order.
+    /// Pagination is ordered by transaction id. Only the requested page and
+    /// one lookahead entry are cloned from the index.
     #[must_use]
     pub fn snapshot_page(
         &self,
@@ -383,25 +363,29 @@ impl MempoolIndex {
         after_transaction_id: Option<TransactionId>,
     ) -> MempoolSnapshotPage {
         let state = self.state.read();
-        let last_updated_at = state.last_updated_at;
         let last_applied_event = state.last_applied_event;
-        let mut entries = state.entries.values().cloned().collect::<Vec<_>>();
-        drop(state);
-
-        entries.sort_by_key(|entry| entry.transaction_id().as_bytes());
-        let start_index = after_transaction_id.map_or(0, |transaction_id| {
-            let after_bytes = transaction_id.as_bytes();
-            entries.partition_point(|entry| entry.transaction_id().as_bytes() <= after_bytes)
-        });
         let bound = u32_to_usize(max_entries);
-        let end_index = start_index.saturating_add(bound).min(entries.len());
-        let has_more = end_index < entries.len();
-
-        // Reuse the sorted vec for the page: trim the tail past end_index,
-        // then shift the head out via drain. Avoids the second Vec allocation
-        // an `entries[start..end].to_vec()` would force.
-        entries.truncate(end_index);
-        entries.drain(..start_index);
+        let mut entries = after_transaction_id.map_or_else(
+            || {
+                state
+                    .entries
+                    .values()
+                    .take(bound.saturating_add(1))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            },
+            |after_transaction_id| {
+                state
+                    .entries
+                    .range((Excluded(after_transaction_id), Unbounded))
+                    .take(bound.saturating_add(1))
+                    .map(|(_transaction_id, entry)| Arc::clone(entry))
+                    .collect::<Vec<_>>()
+            },
+        );
+        drop(state);
+        let has_more = entries.len() > bound;
+        entries.truncate(bound);
         let next_after_transaction_id = if has_more {
             entries.last().map(|entry| entry.transaction_id())
         } else {
@@ -411,7 +395,6 @@ impl MempoolIndex {
         MempoolSnapshotPage {
             entries,
             next_after_transaction_id,
-            last_updated_at,
             last_applied_event,
         }
     }
@@ -636,6 +619,35 @@ mod tests {
         }
         assert_eq!(index.snapshot(2).len(), 2);
         assert_eq!(index.snapshot(10).len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_pages_follow_transaction_id_order_without_repetition()
+    -> Result<(), MempoolEntryBuildError> {
+        let index = MempoolIndex::new();
+        let mut expected_transaction_ids = Vec::new();
+        for index_byte in [0x50, 0x10, 0x40, 0x20, 0x30] {
+            let entry = entry_with_outputs_and_spend(index_byte, 0xAA, 0x20)?;
+            let transaction_id = entry.transaction_id();
+            expected_transaction_ids.push(transaction_id);
+            let _ = index.apply_added(entry, applied_at(u64::from(index_byte), transaction_id));
+        }
+        expected_transaction_ids.sort_unstable();
+
+        let mut observed_transaction_ids = Vec::new();
+        let mut after_transaction_id = None;
+        loop {
+            let page = index.snapshot_page(2, after_transaction_id);
+            observed_transaction_ids
+                .extend(page.entries.iter().map(|entry| entry.transaction_id()));
+            let Some(next_after_transaction_id) = page.next_after_transaction_id else {
+                break;
+            };
+            after_transaction_id = Some(next_after_transaction_id);
+        }
+
+        assert_eq!(observed_transaction_ids, expected_transaction_ids);
         Ok(())
     }
 

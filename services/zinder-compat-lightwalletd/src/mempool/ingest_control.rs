@@ -21,8 +21,10 @@
 //! (Caddy, nginx) bound N at the proxy edge; Zinder does not enforce a
 //! process-wide cap.
 //! [`spawn_ingest_control_tip_change_publisher`] runs a separate session-per-
-//! reconnect loop for `VisibleChainEvents`, with a 500 ms backoff between attempts
-//! so a writer restart does not drive a tight reconnect loop.
+//! reconnect loop for `VisibleChainEvents`, replaying the retained window so a
+//! writer or network interruption cannot hide a tip change from an already-
+//! fenced mempool stream. A 500 ms backoff between attempts prevents a writer
+//! restart from driving a tight reconnect loop.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +34,7 @@ use tokio::sync::{OnceCell, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
+use zinder_core::{BlockHeight, BlockId, ChainEpochId};
 use zinder_proto::v1::{ingest::ingest_control_client::IngestControlClient, wallet};
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 use zinder_store::{
@@ -142,8 +145,44 @@ impl MempoolSurface for IngestControlMempoolSurface {
         } else {
             Some(response.next_cursor)
         };
+        let chain_epoch = response
+            .chain_view
+            .and_then(|chain_view| chain_view.chain_epoch)
+            .ok_or_else(|| MempoolSurfaceError::Unavailable {
+                reason: "ingest-control mempool_snapshot omitted chain_view.chain_epoch".to_owned(),
+            })?;
+        let visible_tip =
+            chain_epoch
+                .visible_tip
+                .ok_or_else(|| MempoolSurfaceError::Unavailable {
+                    reason: "ingest-control mempool_snapshot omitted chain_view visible tip"
+                        .to_owned(),
+                })?;
+        let source_tip = response
+            .source_tip
+            .ok_or_else(|| MempoolSurfaceError::Unavailable {
+                reason: "ingest-control mempool_snapshot omitted source_tip".to_owned(),
+            })?;
+        let visible_tip_hash = zinder_core::wire::decode_rpc_block_hash_hex(&visible_tip.hash)
+            .map_err(|error| MempoolSurfaceError::Unavailable {
+                reason: format!("ingest-control mempool_snapshot visible tip is invalid: {error}"),
+            })?;
+        let source_tip_hash = zinder_core::wire::decode_rpc_block_hash_hex(&source_tip.hash)
+            .map_err(|error| MempoolSurfaceError::Unavailable {
+                reason: format!("ingest-control mempool_snapshot source tip is invalid: {error}"),
+            })?;
+        if BlockId::new(BlockHeight::new(visible_tip.height), visible_tip_hash)
+            != BlockId::new(BlockHeight::new(source_tip.height), source_tip_hash)
+        {
+            return Err(MempoolSurfaceError::Unavailable {
+                reason: "ingest-control mempool_snapshot source tip differs from its chain view"
+                    .to_owned(),
+            });
+        }
+        let chain_epoch_id = ChainEpochId::new(chain_epoch.chain_epoch_id);
         let events_resume_cursor = stream_cursor_from_message_bytes(response.events_resume_cursor);
         Ok(MempoolSnapshotPage {
+            chain_epoch_id,
             events_resume_cursor,
             entries,
             next_cursor,
@@ -206,7 +245,7 @@ impl MempoolSurface for IngestControlMempoolSurface {
     }
 }
 
-/// Resolves [`TipChangeWatcher::await_tip_change`] from a
+/// Resolves [`TipChangeWatcher::await_tip_change_after`] from a
 /// [`tokio::sync::watch::Receiver`] published by a chain-events consumer.
 #[derive(Clone, Debug)]
 pub struct WatchTipChangeWatcher {
@@ -223,20 +262,26 @@ impl WatchTipChangeWatcher {
 
 #[async_trait]
 impl TipChangeWatcher for WatchTipChangeWatcher {
-    async fn await_tip_change(&self) -> Result<(), TipChangeWatcherError> {
+    async fn await_tip_change_after(
+        &self,
+        chain_epoch_id: ChainEpochId,
+    ) -> Result<(), TipChangeWatcherError> {
         let mut receiver = self.receiver.clone();
-        // Marks any unseen value as seen so the next `changed()` waits for
-        // the strictly-after-now publish.
-        receiver.mark_unchanged();
-        receiver
-            .changed()
-            .await
-            .map_err(|_| TipChangeWatcherError::SignalClosed)
+        loop {
+            if *receiver.borrow_and_update() > chain_epoch_id.value() {
+                return Ok(());
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| TipChangeWatcherError::SignalClosed)?;
+        }
     }
 }
 
-/// Spawns a task that consumes `IngestControl.VisibleChainEvents` and publishes
-/// committed event sequences to a `watch::Sender<u64>`.
+/// Spawns a task that consumes retained and live
+/// `IngestControl.VisibleChainEvents` and publishes committed event sequences
+/// to a `watch::Sender<u64>`.
 ///
 /// Returns a watcher view over the same channel. Drop the
 /// [`tokio::task::JoinHandle`] to detach, or await it for symmetric
@@ -281,7 +326,7 @@ async fn run_ingest_control_tip_change_session(
     };
     let response_outcome = client
         .visible_chain_events(Request::new(event_stream_start_message(
-            &EventStreamStartPosition::LiveTail,
+            &EventStreamStartPosition::EarliestRetained,
         )))
         .await;
     let response = match response_outcome {
@@ -300,7 +345,14 @@ async fn run_ingest_control_tip_change_session(
     while let Some(message_outcome) = tokio_stream::StreamExt::next(&mut response_stream).await {
         match message_outcome {
             Ok(envelope) => {
-                let _ = tip_sender.send(envelope.event_sequence);
+                tip_sender.send_if_modified(|latest_event_sequence| {
+                    if envelope.event_sequence > *latest_event_sequence {
+                        *latest_event_sequence = envelope.event_sequence;
+                        true
+                    } else {
+                        false
+                    }
+                });
             }
             Err(error) => {
                 tracing::debug!(

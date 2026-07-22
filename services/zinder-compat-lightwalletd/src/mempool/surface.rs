@@ -21,7 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio_stream::Stream;
-use zinder_core::MempoolEntry;
+use zinder_core::{ChainEpochId, MempoolEntry};
 use zinder_store::{MempoolEventEnvelope, StreamCursorTokenV1};
 
 /// Stream of mempool event envelopes returned by [`MempoolSurface::mempool_events`].
@@ -31,6 +31,11 @@ pub type MempoolEventEnvelopeStream =
 /// Page of mempool snapshot entries returned by [`MempoolSurface`].
 #[derive(Clone, Debug)]
 pub struct MempoolSnapshotPage {
+    /// Canonical chain epoch captured before this snapshot page was read. A
+    /// larger observed chain-event sequence invalidates tip-coherent use of
+    /// the page because epoch ids and chain-event sequences share one
+    /// monotonic identity space.
+    pub chain_epoch_id: ChainEpochId,
     /// `MempoolEvents` after-cursor anchored at the moment the snapshot walk
     /// began; identical on every page of one paged walk. `None` when the
     /// writer had applied no mempool event yet.
@@ -92,15 +97,18 @@ pub type SharedMempoolSurface = Arc<dyn MempoolSurface>;
 /// instead and never see this signal.
 #[async_trait]
 pub trait TipChangeWatcher: Send + Sync + 'static {
-    /// Resolves on the next tip change observed after this watcher was
-    /// constructed.
+    /// Resolves once a tip change newer than `chain_epoch_id` has been
+    /// observed, including one retained before this method is called.
     ///
     /// Implementations are typically wrappers over a
     /// [`tokio::sync::watch::Receiver`] tracking the writer's current
     /// chain-event sequence. Returns `Ok(())` on a successful tip change,
     /// or [`TipChangeWatcherError`] if the underlying signal source
     /// disappears (e.g. the writer shut down).
-    async fn await_tip_change(&self) -> Result<(), TipChangeWatcherError>;
+    async fn await_tip_change_after(
+        &self,
+        chain_epoch_id: ChainEpochId,
+    ) -> Result<(), TipChangeWatcherError>;
 }
 
 /// Errors surfaced while awaiting a tip change.

@@ -180,9 +180,9 @@ pub struct MempoolSnapshotRequest {
 
 /// Opaque next-page cursor for paged mempool snapshots.
 ///
-/// Cursor for paged implementations. Today's in-memory snapshot returns the
-/// head of the live index in one response and ignores supplied cursors; servers
-/// that return `next_cursor` use this value for the next page.
+/// Pass the cursor returned in one snapshot page to the next request. The
+/// cursor binds the durable event-resume anchor and the last transaction id in
+/// that page; callers must treat its bytes as opaque.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[cfg(feature = "remote")]
 pub struct MempoolSnapshotCursor(Vec<u8>);
@@ -208,13 +208,15 @@ impl MempoolSnapshotCursor {
 pub struct MempoolSnapshotView {
     /// Chain epoch visible at snapshot time.
     pub chain_epoch: ChainEpoch,
+    /// Upstream source tip under which the mempool generation was certified.
+    pub source_tip: BlockId,
     /// `MempoolEvents` after-cursor anchored at the moment the snapshot walk
     /// began; identical on every page of one paged walk. `None` when the
     /// server had applied no mempool event yet, in which case a consumer
     /// subscribes with [`EventStreamStart::EarliestRetained`]. Replaying from
     /// it yields at-least-once delivery; consumers apply events idempotently.
     pub events_resume_cursor: Option<MempoolEventCursor>,
-    /// Snapshot age in milliseconds when the response was constructed.
+    /// Milliseconds since the current source generation's snapshot was certified.
     pub snapshot_age_millis: u64,
     /// Hydrated mempool entries.
     pub entries: Vec<MempoolEntry>,

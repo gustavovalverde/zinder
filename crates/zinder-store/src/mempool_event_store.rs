@@ -10,7 +10,10 @@
 //!
 //! [`StorageTable::MempoolEvent`]: crate::kv::StorageTable::MempoolEvent
 
-use std::{num::NonZeroU32, time::Duration};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    time::Duration,
+};
 
 use zinder_core::UnixTimestampMillis;
 
@@ -104,6 +107,40 @@ impl MempoolEventRetentionConfig {
     }
 }
 
+/// Work budget for one durable mempool-event retention step.
+///
+/// The encoded-byte budget is a target: the first row is always examined so
+/// every step can make progress, even when one admitted row exceeds the
+/// configured byte budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MempoolEventRetentionStepBudget {
+    max_events: NonZeroU32,
+    max_encoded_bytes: NonZeroU64,
+}
+
+impl MempoolEventRetentionStepBudget {
+    /// Creates a non-zero per-step event and encoded-byte budget.
+    #[must_use]
+    pub const fn new(max_events: NonZeroU32, max_encoded_bytes: NonZeroU64) -> Self {
+        Self {
+            max_events,
+            max_encoded_bytes,
+        }
+    }
+
+    /// Maximum event rows examined by one step.
+    #[must_use]
+    pub const fn max_events(self) -> NonZeroU32 {
+        self.max_events
+    }
+
+    /// Target maximum encoded event bytes examined by one step.
+    #[must_use]
+    pub const fn max_encoded_bytes(self) -> NonZeroU64 {
+        self.max_encoded_bytes
+    }
+}
+
 /// Mempool-event retention state observed after a pruning or inspection pass.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MempoolEventRetentionReport {
@@ -132,5 +169,42 @@ impl MempoolEventRetentionReport {
         self.pruned_added_count
             .saturating_add(self.pruned_mined_count)
             .saturating_add(self.pruned_invalidated_count)
+    }
+}
+
+/// Reason one bounded mempool-event retention step stopped scanning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MempoolEventRetentionStepStop {
+    /// The event-count or encoded-byte budget was exhausted before the
+    /// captured head or first unexpired event was reached.
+    BudgetExhausted,
+    /// The step reached the captured durable event head.
+    ReachedHead,
+    /// The first event whose retention window has not expired stopped the
+    /// contiguous-prefix scan.
+    ReachedUnexpiredEvent,
+    /// No finite retention window is configured.
+    RetentionDisabled,
+}
+
+/// Result of one bounded durable mempool-event retention step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MempoolEventRetentionStepOutcome {
+    /// Retention floor and per-kind deletions after this step.
+    pub report: MempoolEventRetentionReport,
+    /// Number of encoded event rows examined by this step.
+    pub examined_event_count: u32,
+    /// Total encoded bytes in the event rows examined by this step.
+    pub examined_encoded_bytes: u64,
+    /// Reason the step stopped scanning.
+    pub stop: MempoolEventRetentionStepStop,
+}
+
+impl MempoolEventRetentionStepOutcome {
+    /// Returns whether another bounded step should be scheduled without the
+    /// normal retention interval delay.
+    #[must_use]
+    pub const fn has_immediate_work(self) -> bool {
+        matches!(self.stop, MempoolEventRetentionStepStop::BudgetExhausted)
     }
 }

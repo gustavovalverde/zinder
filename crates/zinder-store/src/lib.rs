@@ -99,7 +99,8 @@ pub use kv::{
 pub use mempool_event::{MempoolEvent, MempoolEventEnvelope, MempoolEventPosition};
 pub use mempool_event_store::{
     DEFAULT_MAX_MEMPOOL_EVENT_HISTORY_EVENTS, MempoolEventHistoryRequest,
-    MempoolEventRetentionConfig, MempoolEventRetentionReport,
+    MempoolEventRetentionConfig, MempoolEventRetentionReport, MempoolEventRetentionStepBudget,
+    MempoolEventRetentionStepOutcome, MempoolEventRetentionStepStop,
 };
 pub use proto_codec::{
     ChainEventEncodeError, MempoolDecodeError, block_tip_message, chain_epoch_from_message,

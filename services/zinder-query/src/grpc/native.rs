@@ -158,7 +158,7 @@ impl WalletCapabilityProfile {
             | capabilities::WALLET_READ_SERVER_INFO_V2
             | capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1
             | capabilities::WALLET_BROADCAST_TRANSACTION_V1
-            | capabilities::WALLET_SNAPSHOT_MEMPOOL_V2
+            | capabilities::WALLET_SNAPSHOT_MEMPOOL_V3
             | capabilities::WALLET_EVENTS_MEMPOOL_V2
             | capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1
             | capabilities::WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1

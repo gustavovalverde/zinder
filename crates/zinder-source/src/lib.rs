@@ -28,8 +28,10 @@ pub use json_rpc_mempool::{
     DEFAULT_MEMPOOL_POLL_INTERVAL, JsonRpcMempoolSource, JsonRpcMempoolSourceOptions,
 };
 pub use mempool_source::{
-    MempoolHydrationFailureReason, MempoolSource, MempoolSourceBackend, MempoolSourceCapabilities,
-    MempoolSourceEntry, MempoolSourceEvent, MempoolSourceEventStream,
+    DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
+    MempoolHydrationFailureReason, MempoolSource, MempoolSourceAdmissionLimits,
+    MempoolSourceBackend, MempoolSourceCapabilities, MempoolSourceEntry, MempoolSourceEvent,
+    MempoolSourceEventStream,
 };
 pub use node_auth::{CookieSource, CookieSourceError, NodeAuth};
 pub use node_capabilities::{NodeCapabilities, NodeCapabilitiesError, NodeCapability};

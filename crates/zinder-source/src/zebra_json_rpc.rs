@@ -1543,6 +1543,12 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         Some(SourceError::UnsupportedNodeAuth { .. }) => "unsupported_node_auth",
         Some(SourceError::MempoolStreamUnavailable { .. }) => "mempool_stream_unavailable",
         Some(SourceError::MempoolHydrationFailed { .. }) => "mempool_hydration_failed",
+        Some(SourceError::MempoolTransactionCountLimitExceeded { .. }) => {
+            "mempool_transaction_count_limit_exceeded"
+        }
+        Some(SourceError::MempoolRawTransactionBytesLimitExceeded { .. }) => {
+            "mempool_raw_transaction_bytes_limit_exceeded"
+        }
         Some(SourceError::ChainTipStreamUnavailable { .. }) => "chain_tip_stream_unavailable",
         Some(
             SourceError::InvalidBlockHashHex { .. }

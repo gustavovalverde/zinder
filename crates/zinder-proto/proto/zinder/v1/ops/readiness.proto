@@ -16,6 +16,9 @@ package zinder.v1.ops;
 // new scalar code; existing variants' semantics are stable within a major
 // version.
 enum ReadinessCause {
+  reserved 12 to 14;
+  reserved "READINESS_CAUSE_MEMPOOL_CURSOR_AT_RISK", "READINESS_CAUSE_MEMPOOL_SOURCE_UNAVAILABLE", "READINESS_CAUSE_MEMPOOL_HYDRATION_LAGGING";
+
   // Default scalar so unset fields do not silently match a real cause.
   READINESS_CAUSE_UNSPECIFIED = 0;
   // Service is starting up but has not yet completed initialization.
@@ -42,13 +45,6 @@ enum ReadinessCause {
   // Retained chain-event history is approaching the configured cursor-expiry
   // window.
   READINESS_CAUSE_CURSOR_AT_RISK = 11;
-  // Mempool retained-event history is approaching the configured retention
-  // window.
-  READINESS_CAUSE_MEMPOOL_CURSOR_AT_RISK = 12;
-  // Mempool source observation is unavailable.
-  READINESS_CAUSE_MEMPOOL_SOURCE_UNAVAILABLE = 13;
-  // Mempool source hydration is falling behind the source's emission rate.
-  READINESS_CAUSE_MEMPOOL_HYDRATION_LAGGING = 14;
   // Service is shutting down and no longer accepting new traffic.
   READINESS_CAUSE_SHUTTING_DOWN = 15;
   // Upstream node is reachable but reports it is itself behind the network
@@ -80,14 +76,15 @@ message ReadinessReport {
 // active oneof variant must match the cause enum value or the report is
 // malformed.
 message ReadinessCauseDetail {
+  reserved 6, 7;
+  reserved "mempool_cursor_at_risk", "mempool_hydration_lagging";
+
   oneof payload {
     SyncingDetail syncing = 1;
     NodeCapabilityMissingDetail node_capability_missing = 2;
     ReorgWindowExceededDetail reorg_window_exceeded = 3;
     ReplicaLaggingDetail replica_lagging = 4;
     CursorAtRiskDetail cursor_at_risk = 5;
-    MempoolCursorAtRiskDetail mempool_cursor_at_risk = 6;
-    MempoolHydrationLaggingDetail mempool_hydration_lagging = 7;
     NodeUnavailableDetail node_unavailable = 8;
     UpstreamNotReadyDetail upstream_not_ready = 9;
   }
@@ -125,22 +122,6 @@ message CursorAtRiskDetail {
   uint64 oldest_retained_age_hours = 1;
   // Configured retention window, rounded down to whole hours.
   uint64 retention_hours = 2;
-}
-
-// Detail for READINESS_CAUSE_MEMPOOL_CURSOR_AT_RISK.
-message MempoolCursorAtRiskDetail {
-  // Age of the oldest retained mempool event, rounded down to whole minutes.
-  uint64 oldest_retained_age_minutes = 1;
-  // Shortest configured mempool retention window, rounded down to whole minutes.
-  uint64 retention_minutes = 2;
-}
-
-// Detail for READINESS_CAUSE_MEMPOOL_HYDRATION_LAGGING.
-message MempoolHydrationLaggingDetail {
-  // Total hydration failures observed since startup. Diagnostic only;
-  // operators should compare against zinder_mempool_hydration_failures_total
-  // for a rate.
-  uint64 recent_hydration_failures = 1;
 }
 
 // Detail for READINESS_CAUSE_NODE_UNAVAILABLE.

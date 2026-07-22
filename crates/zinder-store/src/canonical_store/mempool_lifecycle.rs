@@ -13,7 +13,8 @@ use zinder_core::{Network, TransactionId, UnixTimestampMillis};
 use crate::{
     EventStreamStartPosition, MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest,
     MempoolEventPosition, MempoolEventRetentionConfig, MempoolEventRetentionReport,
-    SnapshotPageCursorAnchor, StreamCursorTokenV1,
+    MempoolEventRetentionStepBudget, MempoolEventRetentionStepOutcome,
+    MempoolEventRetentionStepStop, SnapshotPageCursorAnchor, StreamCursorTokenV1,
     format::{StoreKey, decode_mempool_event_envelope, encode_mempool_event_envelope},
 };
 
@@ -26,6 +27,22 @@ use super::{
 pub(super) const MEMPOOL_EVENT_SEQUENCE_KEY: &[u8] = b"mempool_event_sequence_v1";
 /// Durable inclusive retention floor for the canonical mempool-event log.
 pub(super) const MEMPOOL_EVENT_RETENTION_FLOOR_KEY: &[u8] = b"mempool_event_retention_floor_v1";
+
+/// Process-local progress for one resumable bounded retention scan.
+///
+/// Losing this state on restart is safe: the durable floor remains the source
+/// of truth and the next step reconstructs progress from that floor.
+#[derive(Debug)]
+pub(super) struct MempoolEventRetentionProgress {
+    expected_floor: u64,
+    captured_head: u64,
+    next_sequence: u64,
+    active_add_sequences: HashMap<TransactionId, u64>,
+    observed_at: UnixTimestampMillis,
+    retention: MempoolEventRetentionConfig,
+    prunable_through: u64,
+    terminal_stop: Option<MempoolEventRetentionStepStop>,
+}
 
 /// Validates the bounded durable mempool-log admission invariant.
 ///
@@ -124,7 +141,31 @@ impl RocksDbCanonicalStore {
         event: MempoolEvent,
         source_observed_at: UnixTimestampMillis,
     ) -> Result<MempoolEventEnvelope, CanonicalStoreError> {
-        validate_append_event(&event)?;
+        self.append_mempool_events(vec![(event, source_observed_at)])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CanonicalStoreError::MempoolEventLogInvalid {
+                reason: "single mempool event append produced no durable envelope".to_owned(),
+            })
+    }
+
+    /// Appends an ordered batch of durable mempool transitions before the
+    /// ingest owner mutates its process-local live index.
+    ///
+    /// Every event row, the final monotonic head pointer, and the first
+    /// retention floor are committed in one synced `RocksDB` write. Callers
+    /// preflight the complete transition set before invoking this method,
+    /// then apply the returned positions in order under their mutation gate.
+    pub fn append_mempool_events(
+        &self,
+        events: Vec<(MempoolEvent, UnixTimestampMillis)>,
+    ) -> Result<Vec<MempoolEventEnvelope>, CanonicalStoreError> {
+        for (event, _) in &events {
+            validate_append_event(event)?;
+        }
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
         let _lifecycle_guard = self.lifecycle_lock.lock();
         let current_event_sequence = current_mempool_event_sequence(self)?;
         if current_event_sequence == 0 {
@@ -134,38 +175,39 @@ impl RocksDbCanonicalStore {
                 self.cursor_auth_key,
             )?;
         }
-        let event_sequence = current_event_sequence
-            .checked_add(1)
-            .ok_or(CanonicalStoreError::MempoolEventSequenceOverflow)?;
-        let cursor = mempool_event_cursor(self, event_sequence, event.transaction_id())?;
-        let envelope = MempoolEventEnvelope {
-            cursor,
-            event_sequence,
-            source_observed_unix_millis: source_observed_at.value(),
-            event,
-        };
-
         let event_family = column_family(&self.bounded_open.db, MEMPOOL_EVENT_COLUMN_FAMILY)?;
         let mut batch = WriteBatch::default();
-        let encoded_envelope = encode_mempool_event_envelope(&envelope).map_err(|error| {
-            CanonicalStoreError::MempoolEventLogInvalid {
-                reason: error.to_string(),
-            }
-        })?;
-        batch.put_cf(
-            &event_family,
-            event_sequence.to_be_bytes(),
-            encoded_envelope,
-        );
+        let mut event_sequence = current_event_sequence;
+        let mut envelopes = Vec::with_capacity(events.len());
+        for (event, source_observed_at) in events {
+            event_sequence = event_sequence
+                .checked_add(1)
+                .ok_or(CanonicalStoreError::MempoolEventSequenceOverflow)?;
+            let cursor = mempool_event_cursor(self, event_sequence, event.transaction_id())?;
+            let envelope = MempoolEventEnvelope {
+                cursor,
+                event_sequence,
+                source_observed_unix_millis: source_observed_at.value(),
+                event,
+            };
+            let encoded_envelope = encode_mempool_event_envelope(&envelope).map_err(|error| {
+                CanonicalStoreError::MempoolEventLogInvalid {
+                    reason: error.to_string(),
+                }
+            })?;
+            batch.put_cf(
+                &event_family,
+                event_sequence.to_be_bytes(),
+                encoded_envelope,
+            );
+            envelopes.push(envelope);
+        }
         batch.put(MEMPOOL_EVENT_SEQUENCE_KEY, event_sequence.to_be_bytes());
         if current_event_sequence == 0 {
-            batch.put(
-                MEMPOOL_EVENT_RETENTION_FLOOR_KEY,
-                event_sequence.to_be_bytes(),
-            );
+            batch.put(MEMPOOL_EVENT_RETENTION_FLOOR_KEY, 1_u64.to_be_bytes());
         }
-        write_mempool_lifecycle_batch(self, &batch, "mempool event append")?;
-        Ok(envelope)
+        write_mempool_lifecycle_batch(self, &batch, "mempool event batch append")?;
+        Ok(envelopes)
     }
 
     /// Reads a bounded page of durable mempool events strictly after its
@@ -360,98 +402,283 @@ impl RocksDbCanonicalStore {
         mempool_event_retention_report_locked(self)
     }
 
-    /// Prunes one contiguous expired prefix from the durable mempool-event
-    /// log while always retaining the current head and every active entry's
-    /// last `Added` event as replay anchors.
-    pub fn prune_mempool_events_before(
+    /// Advances one bounded step of durable mempool-event retention.
+    ///
+    /// Process-local progress resumes the forward scan across calls. Each
+    /// step bounds decoded event bytes and deletes; inspecting a candidate
+    /// must fetch its encoded value before its size is known. The durable
+    /// floor and current head remain retained as crash-safe authorities.
+    pub fn advance_mempool_event_retention(
         &self,
         now: UnixTimestampMillis,
         retention: MempoolEventRetentionConfig,
-    ) -> Result<MempoolEventRetentionReport, CanonicalStoreError> {
+        budget: MempoolEventRetentionStepBudget,
+    ) -> Result<MempoolEventRetentionStepOutcome, CanonicalStoreError> {
         let _lifecycle_guard = self.lifecycle_lock.lock();
         let current_event_sequence = current_mempool_event_sequence(self)?;
-        if current_event_sequence == 0 || retention.is_unbounded() {
-            return mempool_event_retention_report_locked(self);
+        if current_event_sequence == 0 {
+            self.mempool_retention_progress.lock().take();
+            return Ok(MempoolEventRetentionStepOutcome {
+                report: MempoolEventRetentionReport::default(),
+                examined_event_count: 0,
+                examined_encoded_bytes: 0,
+                stop: MempoolEventRetentionStepStop::ReachedHead,
+            });
+        }
+        if retention.is_unbounded() {
+            self.mempool_retention_progress.lock().take();
+            return Ok(MempoolEventRetentionStepOutcome {
+                report: mempool_event_retention_report_locked(self)?,
+                examined_event_count: 0,
+                examined_encoded_bytes: 0,
+                stop: MempoolEventRetentionStepStop::RetentionDisabled,
+            });
         }
         let oldest_retained_sequence = mempool_event_retention_floor(self, current_event_sequence)?;
-        let earliest_active_add_sequence = earliest_active_mempool_add_sequence(
-            self,
-            oldest_retained_sequence,
-            current_event_sequence,
-        )?;
-        let mut new_floor = oldest_retained_sequence;
-        let mut pruned_added_count = 0_u64;
-        let mut pruned_mined_count = 0_u64;
-        let mut pruned_invalidated_count = 0_u64;
-        let mut batch = WriteBatch::default();
-        let event_family = column_family(&self.bounded_open.db, MEMPOOL_EVENT_COLUMN_FAMILY)?;
-        for event_sequence in oldest_retained_sequence..current_event_sequence {
-            if earliest_active_add_sequence.is_some_and(|active| event_sequence >= active) {
-                break;
-            }
-            let envelope = read_mempool_event(self, event_sequence)?;
-            let Some(window) = retention_window_for(&envelope.event, retention)? else {
-                break;
-            };
-            if !age_exceeds_window(now, envelope.source_observed_unix_millis, window) {
-                break;
-            }
-            batch.delete_cf(&event_family, event_sequence.to_be_bytes());
-            new_floor = event_sequence.saturating_add(1);
-            increment_pruned_count(
-                &envelope.event,
-                &mut pruned_added_count,
-                &mut pruned_mined_count,
-                &mut pruned_invalidated_count,
-            )?;
+        let mut progress_guard = self.mempool_retention_progress.lock();
+        let progress_is_stale = progress_guard.as_ref().is_some_and(|progress| {
+            progress.expected_floor != oldest_retained_sequence || progress.retention != retention
+        });
+        if progress_is_stale {
+            progress_guard.take();
         }
-        if new_floor != oldest_retained_sequence {
-            batch.put(MEMPOOL_EVENT_RETENTION_FLOOR_KEY, new_floor.to_be_bytes());
-            write_mempool_lifecycle_batch(self, &batch, "mempool event prune")?;
+        let progress = progress_guard.get_or_insert_with(|| MempoolEventRetentionProgress {
+            expected_floor: oldest_retained_sequence,
+            captured_head: current_event_sequence,
+            next_sequence: oldest_retained_sequence,
+            active_add_sequences: HashMap::new(),
+            observed_at: now,
+            retention,
+            prunable_through: oldest_retained_sequence.saturating_sub(1),
+            terminal_stop: None,
+        });
+
+        let mut work =
+            perform_mempool_retention_step(self, progress, budget, oldest_retained_sequence)?;
+
+        if work.new_floor != oldest_retained_sequence {
+            work.batch.put(
+                MEMPOOL_EVENT_RETENTION_FLOOR_KEY,
+                work.new_floor.to_be_bytes(),
+            );
+            write_mempool_lifecycle_batch(self, &work.batch, "mempool event prune")?;
+            progress.expected_floor = work.new_floor;
         }
+        let pending_deletes = work.new_floor <= progress.prunable_through;
+        let stop = if pending_deletes || progress.terminal_stop.is_none() {
+            MempoolEventRetentionStepStop::BudgetExhausted
+        } else {
+            progress
+                .terminal_stop
+                .unwrap_or(MempoolEventRetentionStepStop::ReachedHead)
+        };
+        if stop != MempoolEventRetentionStepStop::BudgetExhausted {
+            progress_guard.take();
+        }
+        drop(progress_guard);
         let mut report = mempool_event_retention_report_locked(self)?;
-        report.pruned_added_count = pruned_added_count;
-        report.pruned_mined_count = pruned_mined_count;
-        report.pruned_invalidated_count = pruned_invalidated_count;
-        Ok(report)
+        report.pruned_added_count = work.pruned_added_count;
+        report.pruned_mined_count = work.pruned_mined_count;
+        report.pruned_invalidated_count = work.pruned_invalidated_count;
+        Ok(MempoolEventRetentionStepOutcome {
+            report,
+            examined_event_count: work.examined_event_count,
+            examined_encoded_bytes: work.examined_encoded_bytes,
+            stop,
+        })
     }
 }
 
-/// Finds the oldest retained `Added` event required to reconstruct the
-/// current process-local index after a restart.
-///
-/// The canonical store deliberately persists an event history rather than a
-/// second durable mempool index. Prefix pruning therefore cannot cross an
-/// active transaction's last add: doing so would make a later empty source
-/// snapshot unable to publish the terminal transition that removes it.
+fn perform_mempool_retention_step(
+    store: &RocksDbCanonicalStore,
+    progress: &mut MempoolEventRetentionProgress,
+    budget: MempoolEventRetentionStepBudget,
+    oldest_retained_sequence: u64,
+) -> Result<MempoolRetentionStepWork, CanonicalStoreError> {
+    let mut work = MempoolRetentionStepWork::new(oldest_retained_sequence);
+    loop {
+        let examined_event_count_before = work.examined_event_count;
+        let new_floor_before = work.new_floor;
+        let next_sequence_before = progress.next_sequence;
+        delete_prunable_mempool_events(store, progress, budget, &mut work)?;
+        scan_expired_mempool_events(store, progress, budget, &mut work)?;
+        let made_progress = work.examined_event_count != examined_event_count_before
+            || work.new_floor != new_floor_before
+            || progress.next_sequence != next_sequence_before;
+        if !made_progress {
+            return Ok(work);
+        }
+    }
+}
+
+struct MempoolRetentionStepWork {
+    batch: WriteBatch,
+    new_floor: u64,
+    examined_event_count: u32,
+    examined_encoded_bytes: u64,
+    pruned_added_count: u64,
+    pruned_mined_count: u64,
+    pruned_invalidated_count: u64,
+}
+
+impl MempoolRetentionStepWork {
+    fn new(oldest_retained_sequence: u64) -> Self {
+        Self {
+            batch: WriteBatch::default(),
+            new_floor: oldest_retained_sequence,
+            examined_event_count: 0,
+            examined_encoded_bytes: 0,
+            pruned_added_count: 0,
+            pruned_mined_count: 0,
+            pruned_invalidated_count: 0,
+        }
+    }
+
+    fn can_read_another(&self, budget: MempoolEventRetentionStepBudget) -> bool {
+        self.examined_event_count < budget.max_events().get()
+            && (self.examined_event_count == 0
+                || self.examined_encoded_bytes < budget.max_encoded_bytes().get())
+    }
+
+    fn can_examine(&self, encoded_bytes: u64, budget: MempoolEventRetentionStepBudget) -> bool {
+        self.examined_event_count < budget.max_events().get()
+            && (self.examined_event_count == 0
+                || self.examined_encoded_bytes.saturating_add(encoded_bytes)
+                    <= budget.max_encoded_bytes().get())
+    }
+
+    fn record_examined(&mut self, encoded_bytes: u64) {
+        self.examined_event_count = self.examined_event_count.saturating_add(1);
+        self.examined_encoded_bytes = self.examined_encoded_bytes.saturating_add(encoded_bytes);
+    }
+}
+
+fn delete_prunable_mempool_events(
+    store: &RocksDbCanonicalStore,
+    progress: &MempoolEventRetentionProgress,
+    budget: MempoolEventRetentionStepBudget,
+    work: &mut MempoolRetentionStepWork,
+) -> Result<(), CanonicalStoreError> {
+    let event_family = column_family(&store.bounded_open.db, MEMPOOL_EVENT_COLUMN_FAMILY)?;
+    while work.new_floor <= progress.prunable_through && work.can_read_another(budget) {
+        let event_sequence = work.new_floor;
+        let Some(encoded_event) = read_encoded_mempool_event(store, event_sequence)? else {
+            return Err(CanonicalStoreError::MempoolEventLogInvalid {
+                reason: format!("mempool event {event_sequence} is absent"),
+            });
+        };
+        let encoded_bytes = u64::try_from(encoded_event.len()).unwrap_or(u64::MAX);
+        if !work.can_examine(encoded_bytes, budget) {
+            break;
+        }
+        let envelope = decode_mempool_event(store, event_sequence, &encoded_event)?;
+        increment_pruned_count(
+            &envelope.event,
+            &mut work.pruned_added_count,
+            &mut work.pruned_mined_count,
+            &mut work.pruned_invalidated_count,
+        )?;
+        work.batch
+            .delete_cf(&event_family, event_sequence.to_be_bytes());
+        work.record_examined(encoded_bytes);
+        work.new_floor = event_sequence.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn scan_expired_mempool_events(
+    store: &RocksDbCanonicalStore,
+    progress: &mut MempoolEventRetentionProgress,
+    budget: MempoolEventRetentionStepBudget,
+    work: &mut MempoolRetentionStepWork,
+) -> Result<(), CanonicalStoreError> {
+    while work.new_floor > progress.prunable_through
+        && progress.terminal_stop.is_none()
+        && progress.next_sequence <= progress.captured_head
+        && work.can_read_another(budget)
+    {
+        let event_sequence = progress.next_sequence;
+        let Some(encoded_event) = read_encoded_mempool_event(store, event_sequence)? else {
+            return Err(CanonicalStoreError::MempoolEventLogInvalid {
+                reason: format!("mempool event {event_sequence} is absent"),
+            });
+        };
+        let encoded_bytes = u64::try_from(encoded_event.len()).unwrap_or(u64::MAX);
+        if !work.can_examine(encoded_bytes, budget) {
+            break;
+        }
+        let envelope = decode_mempool_event(store, event_sequence, &encoded_event)?;
+        work.record_examined(encoded_bytes);
+        let Some(window) = retention_window_for(&envelope.event, progress.retention)? else {
+            progress.terminal_stop = Some(MempoolEventRetentionStepStop::ReachedUnexpiredEvent);
+            break;
+        };
+        if !age_exceeds_window(
+            progress.observed_at,
+            envelope.source_observed_unix_millis,
+            window,
+        ) {
+            progress.terminal_stop = Some(MempoolEventRetentionStepStop::ReachedUnexpiredEvent);
+            break;
+        }
+        update_active_add_sequences(
+            &mut progress.active_add_sequences,
+            event_sequence,
+            &envelope.event,
+        )?;
+        if event_sequence == progress.captured_head {
+            progress.terminal_stop = Some(MempoolEventRetentionStepStop::ReachedHead);
+        } else {
+            progress.next_sequence = event_sequence.saturating_add(1);
+        }
+        progress.prunable_through = prunable_through(
+            event_sequence,
+            progress.captured_head,
+            &progress.active_add_sequences,
+        );
+    }
+    Ok(())
+}
+
 #[allow(
     unreachable_patterns,
     reason = "MempoolEvent is non-exhaustive; unrecognized variants must not silently change replay retention."
 )]
-fn earliest_active_mempool_add_sequence(
-    store: &RocksDbCanonicalStore,
-    oldest_retained_sequence: u64,
-    current_event_sequence: u64,
-) -> Result<Option<u64>, CanonicalStoreError> {
-    let mut active_add_sequences = HashMap::<TransactionId, u64>::new();
-    for event_sequence in oldest_retained_sequence..=current_event_sequence {
-        let envelope = read_mempool_event(store, event_sequence)?;
-        match envelope.event {
-            MempoolEvent::Added { entry } => {
-                active_add_sequences.insert(entry.transaction_id(), event_sequence);
-            }
-            MempoolEvent::Invalidated { transaction_id, .. }
-            | MempoolEvent::Mined { transaction_id, .. } => {
-                active_add_sequences.remove(&transaction_id);
-            }
-            _ => {
-                return Err(CanonicalStoreError::MempoolEventLogInvalid {
-                    reason: "mempool event variant is unsupported for replay retention".to_owned(),
-                });
-            }
+fn update_active_add_sequences(
+    active_add_sequences: &mut HashMap<TransactionId, u64>,
+    event_sequence: u64,
+    event: &MempoolEvent,
+) -> Result<(), CanonicalStoreError> {
+    match event {
+        MempoolEvent::Added { entry } => {
+            active_add_sequences.insert(entry.transaction_id(), event_sequence);
+        }
+        MempoolEvent::Invalidated { transaction_id, .. }
+        | MempoolEvent::Mined { transaction_id, .. } => {
+            active_add_sequences.remove(transaction_id);
+        }
+        _ => {
+            return Err(CanonicalStoreError::MempoolEventLogInvalid {
+                reason: "mempool event variant is unsupported for replay retention".to_owned(),
+            });
         }
     }
-    Ok(active_add_sequences.into_values().min())
+    Ok(())
+}
+
+fn prunable_through(
+    latest_inspected_sequence: u64,
+    captured_head: u64,
+    active_add_sequences: &HashMap<TransactionId, u64>,
+) -> u64 {
+    let before_head = latest_inspected_sequence.min(captured_head.saturating_sub(1));
+    active_add_sequences
+        .values()
+        .copied()
+        .min()
+        .map_or(before_head, |earliest_active_add| {
+            before_head.min(earliest_active_add.saturating_sub(1))
+        })
 }
 
 #[allow(
@@ -571,19 +798,27 @@ fn read_mempool_event(
     store: &RocksDbCanonicalStore,
     event_sequence: u64,
 ) -> Result<MempoolEventEnvelope, CanonicalStoreError> {
+    let encoded_event = read_encoded_mempool_event(store, event_sequence)?.ok_or_else(|| {
+        CanonicalStoreError::MempoolEventLogInvalid {
+            reason: format!("mempool event {event_sequence} is absent"),
+        }
+    })?;
+    decode_mempool_event(store, event_sequence, &encoded_event)
+}
+
+fn read_encoded_mempool_event(
+    store: &RocksDbCanonicalStore,
+    event_sequence: u64,
+) -> Result<Option<Vec<u8>>, CanonicalStoreError> {
     let event_family = column_family(&store.bounded_open.db, MEMPOOL_EVENT_COLUMN_FAMILY)?;
-    let encoded_event = store
+    store
         .bounded_open
         .db
         .get_cf(&event_family, event_sequence.to_be_bytes())
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
             operation: "mempool event read",
             source,
-        })?
-        .ok_or_else(|| CanonicalStoreError::MempoolEventLogInvalid {
-            reason: format!("mempool event {event_sequence} is absent"),
-        })?;
-    decode_mempool_event(store, event_sequence, &encoded_event)
+        })
 }
 
 fn decode_mempool_event(

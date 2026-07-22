@@ -1,0 +1,6 @@
+kind: changed
+body: Require mempool snapshots to match the visible chain tip, bound ingestion and retention work, and treat ordinary tip movement as synchronization instead of a source failure.
+time: 2026-07-22T00:54:49Z
+custom:
+  Bump: minor
+  PR: "27"

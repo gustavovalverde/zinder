@@ -1074,7 +1074,8 @@ message MempoolSnapshotResponse {
   // events idempotently.
   bytes events_resume_cursor = 2;
 
-  // Snapshot age in milliseconds when the response was constructed.
+  // Milliseconds since the current source generation's snapshot was certified,
+  // including when that certified snapshot is empty.
   uint64 snapshot_age_millis = 3;
 
   // Hydrated mempool entries.
@@ -1082,6 +1083,10 @@ message MempoolSnapshotResponse {
 
   // Next-page cursor when the response was truncated.
   bytes next_cursor = 5;
+
+  // Upstream source tip under which this mempool snapshot was certified.
+  // It exactly matches `chain_view.chain_epoch.visible_tip`.
+  BlockTip source_tip = 6;
 }
 
 // Bounded request for unmined transparent outputs at one transparent address.

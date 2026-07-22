@@ -99,6 +99,19 @@ pub enum CanonicalWriterError {
         /// Redacted tonic transport failure.
         reason: String,
     },
+    /// The live mempool owner stopped while the canonical writer was still running.
+    #[error("live mempool owner failed: {reason}")]
+    MempoolOwner {
+        /// Bounded task-completion diagnostic.
+        reason: String,
+    },
+    /// Durable mempool-event retention stopped while the canonical writer was
+    /// still running.
+    #[error("mempool retention task failed: {reason}")]
+    MempoolRetention {
+        /// Bounded task-completion diagnostic.
+        reason: String,
+    },
 }
 
 /// Opens or freshly constructs the canonical store, then follows Zebra.

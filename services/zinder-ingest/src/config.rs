@@ -16,8 +16,10 @@ use zinder_ingest::{
     CanonicalConstructionSettings, CanonicalFollowSettings, CanonicalPipelineLimits,
     CanonicalRunOverrides, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
-    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, IngestError, IngestRuntimeConfig, NodeSourceKind,
-    PhaseClassificationConfig, RawBlobPolicy, container_memory_budget_bytes,
+    DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
+    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, IngestError, IngestRuntimeConfig,
+    MempoolIngestSettings, NodeSourceKind, PhaseClassificationConfig, RawBlobPolicy,
+    container_memory_budget_bytes,
 };
 use zinder_runtime::{
     ConfigError, ConfigLoader, IngestControlSection, IngestControlWriterToml, NetworkSection,
@@ -28,7 +30,10 @@ use zinder_runtime::{
     resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer,
     resolve_ops_listen_addr, resolve_retention,
 };
-use zinder_source::{NodeSection, NodeTarget};
+use zinder_source::{
+    DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
+    MempoolSourceAdmissionLimits, NodeSection, NodeTarget,
+};
 use zinder_store::RocksDbResourceBudget;
 
 use crate::cli::parse::{
@@ -211,6 +216,18 @@ pub(crate) fn load_ingest_config(
         // `--storage-path` CLI flag.
         .with_default("storage.path", "/var/lib/zinder/store")?
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
+        .with_default(
+            "ingest.mempool.max_transaction_count",
+            DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT.get(),
+        )?
+        .with_default(
+            "ingest.mempool.max_total_raw_transaction_bytes",
+            DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES.get(),
+        )?
+        .with_default(
+            "ingest.mempool.reconciliation_batch_target_raw_transaction_bytes",
+            DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
+        )?
         .with_default(
             "ingest.construction.canonical_batch_max_blocks",
             DEFAULT_CANONICAL_BATCH_MAX_BLOCKS,
@@ -422,10 +439,20 @@ struct IngestSection {
     phase_classification: IngestPhaseClassificationSection,
     /// Pipelined-fetch knobs for bulk catch-up.
     construction: IngestConstructionSection,
+    /// Live mempool admission and durable reconciliation limits.
+    mempool: IngestMempoolSection,
     /// Serial-loop knobs for tip-follow.
     follow: IngestFollowSection,
     /// One-shot `run_overrides` for the ingest loop.
     run_overrides: IngestRunOverridesSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct IngestMempoolSection {
+    max_transaction_count: Option<u32>,
+    max_total_raw_transaction_bytes: Option<u64>,
+    reconciliation_batch_target_raw_transaction_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -550,6 +577,22 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .phase_classification
         .catchup_threshold_blocks
         .unwrap_or(reorg_window_blocks);
+
+    let mempool_max_transaction_count = nonzero_u32_config(
+        config.ingest.mempool.max_transaction_count,
+        "ingest.mempool.max_transaction_count",
+    )?;
+    let mempool_max_total_raw_transaction_bytes = nonzero_u64_config(
+        config.ingest.mempool.max_total_raw_transaction_bytes,
+        "ingest.mempool.max_total_raw_transaction_bytes",
+    )?;
+    let reconciliation_batch_target_raw_transaction_bytes = nonzero_u64_config(
+        config
+            .ingest
+            .mempool
+            .reconciliation_batch_target_raw_transaction_bytes,
+        "ingest.mempool.reconciliation_batch_target_raw_transaction_bytes",
+    )?;
 
     let canonical_batch_max_blocks_raw = require_field(
         config.ingest.construction.canonical_batch_max_blocks,
@@ -747,6 +790,13 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             commit_reassembly_max_queued_artifact_bytes,
             flush_interval_epochs,
         },
+        mempool: MempoolIngestSettings {
+            source_admission_limits: MempoolSourceAdmissionLimits {
+                max_transaction_count: mempool_max_transaction_count,
+                max_total_raw_transaction_bytes: mempool_max_total_raw_transaction_bytes,
+            },
+            reconciliation_batch_target_raw_transaction_bytes,
+        },
         follow: CanonicalFollowSettings {
             poll_interval,
             lag_threshold_blocks,
@@ -914,6 +964,22 @@ impl RedactedIngestConfigToml {
                         .get(),
                     flush_interval_epochs: runtime_config.construction.flush_interval_epochs.get(),
                 },
+                mempool: IngestMempoolToml {
+                    max_transaction_count: runtime_config
+                        .mempool
+                        .source_admission_limits
+                        .max_transaction_count
+                        .get(),
+                    max_total_raw_transaction_bytes: runtime_config
+                        .mempool
+                        .source_admission_limits
+                        .max_total_raw_transaction_bytes
+                        .get(),
+                    reconciliation_batch_target_raw_transaction_bytes: runtime_config
+                        .mempool
+                        .reconciliation_batch_target_raw_transaction_bytes
+                        .get(),
+                },
                 follow: IngestFollowToml {
                     poll_interval_ms: duration_as_millis_u64(runtime_config.follow.poll_interval),
                     lag_threshold_blocks: runtime_config.follow.lag_threshold_blocks,
@@ -965,8 +1031,16 @@ struct IngestToml {
     reorg_window_blocks: u32,
     phase_classification: IngestPhaseClassificationToml,
     construction: IngestConstructionToml,
+    mempool: IngestMempoolToml,
     follow: IngestFollowToml,
     run_overrides: IngestRunOverridesToml,
+}
+
+#[derive(Serialize)]
+struct IngestMempoolToml {
+    max_transaction_count: u32,
+    max_total_raw_transaction_bytes: u64,
+    reconciliation_batch_target_raw_transaction_bytes: u64,
 }
 
 #[derive(Serialize)]

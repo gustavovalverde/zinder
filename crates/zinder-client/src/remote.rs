@@ -113,7 +113,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 /// Oldest native wallet contract revision this client can safely consume.
-pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 2;
+pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 4;
 
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.
@@ -2202,6 +2202,20 @@ fn mempool_snapshot_view_from_message(
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| IndexerError::malformed("chain_view.chain_epoch", "field is missing"))?;
     let chain_epoch = chain_epoch_from_message_with_network(expected_network, chain_epoch_message)?;
+    let source_tip_message = message
+        .source_tip
+        .ok_or_else(|| IndexerError::malformed("source_tip", "field is missing"))?;
+    let source_tip = BlockId::new(
+        BlockHeight::new(source_tip_message.height),
+        block_hash_from_rpc_hex("source_tip.hash", &source_tip_message.hash)?,
+    );
+    let visible_tip = BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+    if source_tip != visible_tip {
+        return Err(IndexerError::malformed(
+            "source_tip",
+            "does not match chain_view.chain_epoch.visible_tip",
+        ));
+    }
     let entries = message
         .entries
         .into_iter()
@@ -2219,6 +2233,7 @@ fn mempool_snapshot_view_from_message(
     };
     Ok(MempoolSnapshotView {
         chain_epoch,
+        source_tip,
         events_resume_cursor,
         snapshot_age_millis: message.snapshot_age_millis,
         entries,
@@ -2440,6 +2455,10 @@ mod tests {
             snapshot_age_millis: 0,
             entries: vec![synthetic_mempool_entry(entry_network)],
             next_cursor: Vec::new(),
+            source_tip: Some(wallet::BlockTip {
+                height: 42,
+                hash: "11".repeat(32),
+            }),
         }
     }
 
@@ -2518,13 +2537,13 @@ mod tests {
     }
 
     #[test]
-    fn contract_revision_two_is_the_minimum() {
+    fn contract_revision_four_is_the_minimum() {
         assert!(matches!(
-            ensure_supported_contract_revision(1),
+            ensure_supported_contract_revision(3),
             Err(IndexerError::FailedPrecondition { .. })
         ));
-        assert!(ensure_supported_contract_revision(2).is_ok());
-        assert!(ensure_supported_contract_revision(3).is_ok());
+        assert!(ensure_supported_contract_revision(4).is_ok());
+        assert!(ensure_supported_contract_revision(5).is_ok());
     }
 
     #[test]
@@ -2909,6 +2928,25 @@ mod tests {
                 ref actual,
             }) if actual == encode_zinder_native_chain_name(MISMATCHED_NETWORK)
         ));
+    }
+
+    #[test]
+    fn mempool_snapshot_rejects_a_missing_source_tip() {
+        let mut message = mempool_snapshot_message(EXPECTED_NETWORK, EXPECTED_NETWORK);
+        message.source_tip = None;
+
+        assert!(mempool_snapshot_view_from_message(EXPECTED_NETWORK, message).is_err());
+    }
+
+    #[test]
+    fn mempool_snapshot_rejects_a_source_tip_that_differs_from_the_chain_view() {
+        let mut message = mempool_snapshot_message(EXPECTED_NETWORK, EXPECTED_NETWORK);
+        message.source_tip = Some(wallet::BlockTip {
+            height: 42,
+            hash: "22".repeat(32),
+        });
+
+        assert!(mempool_snapshot_view_from_message(EXPECTED_NETWORK, message).is_err());
     }
 
     #[test]

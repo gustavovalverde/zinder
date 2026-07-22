@@ -121,7 +121,7 @@ impl SourceRecoveryBackoff {
         clippy::wildcard_enum_match_arm,
         reason = "SourceFailureClass is #[non_exhaustive]; new variants default to operator-action backoff until a dedicated cadence is documented."
     )]
-    fn for_class(self, class: SourceFailureClass) -> Duration {
+    pub(crate) fn for_class(self, class: SourceFailureClass) -> Duration {
         match class {
             SourceFailureClass::NodeUnreachable => self.node_unreachable,
             SourceFailureClass::UpstreamViewChanged => self.view_changed,

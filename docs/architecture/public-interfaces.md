@@ -27,6 +27,7 @@ and wire contracts that actually carry versions.
 | `MaterializedViewStore` | Independent store for materialized-view rows, cursors, coverage, and schemas |
 | `ChainEvent` | Durable canonical append or replacement transition |
 | `MempoolEvent` | Typed live-pool transition: added, invalidated, or mined |
+| `MempoolSnapshotView` | Bounded live-pool page with a mempool-resume cursor, canonical `ChainEpoch` fence, and matching certified source tip |
 
 Use `canonical` for chain truth, `wallet projection` for wallet query state,
 and `materialized view` for optional explorer aggregates. `fact` is appropriate
@@ -80,6 +81,17 @@ Do not substitute generic safety or finality labels for this field. `safe` is
 ambiguous, and `finalized` collides with Zcash consensus finality. Use
 `settled_tip` for the reorg-window boundary and a named consensus term when
 describing an actual consensus rule.
+
+`MempoolSnapshotView` keeps two independent monotonic positions. Its
+`events_resume_cursor` resumes `MempoolEvents` without a delivery gap. Its
+`chain_epoch.id` proves which canonical chain fence was captured before the
+page read. Its `source_tip` must exactly equal that epoch's `visible_tip` by
+height and hash; the server returns `UNAVAILABLE` instead of exposing an empty
+or stale answer when the certified mempool generation differs. Epoch ids and
+chain-event sequences share one identity space, so a tip-coherent consumer
+restarts when it observes a larger chain-event sequence. The mempool cursor and
+chain epoch do not substitute for each other; live mempool-event consumers
+resume from the opaque cursor.
 
 ## Canonical writer vocabulary
 
@@ -158,9 +170,9 @@ Release configuration is grouped by owner:
 
 - `[network]`, `[node]`, `[node.auth]`, `[ops]`, and `[security]` are shared
   sections;
-- `[storage]`, `[ingest]`, `[ingest.construction]`, `[ingest.follow]`,
-  `[ingest.run_overrides]`, `[retention]`, and `[ingest_control]` configure the
-  canonical writer;
+- `[storage]`, `[ingest]`, `[ingest.construction]`, `[ingest.mempool]`,
+  `[ingest.follow]`, `[ingest.run_overrides]`, `[retention]`, and
+  `[ingest_control]` configure the canonical writer;
 - `[storage]`, `[projector]`, `[ingest_control]`, and `[projector_control]`
   configure the wallet projector; and
 - `[storage]`, `[wallet]`, `[compat]`, and `[ingest_control]` configure the
@@ -173,6 +185,7 @@ ZINDER_NETWORK__NAME
 ZINDER_NODE__JSON_RPC_ADDR
 ZINDER_NODE__AUTH__METHOD
 ZINDER_INGEST__CONSTRUCTION__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS
+ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES
 ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS
 ZINDER_PROJECTOR__BUILD_OWNER_HEX
 ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS
@@ -252,6 +265,9 @@ stay synchronized with it.
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0016](../adrs/0016-source-segment-fetching.md). |
 | `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest | Optional | `storage.raw_blob_policy` | Immutable raw-blob retention contract: `none`, `transactions`, or `all`. Defaults to `none` for explicit coverage so canonical indexing does not write raw block or transaction blobs unless a deployment explicitly needs raw export. Wallet-serving coverage defaults to `transactions` and rejects `none`, because native and lightwalletd-compatible transaction and transparent-history methods require retained bytes. The first canonical commit fixes historical coverage; changing a non-empty store requires a rebuild. |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds settlement, classifier default, and replacement traversal. Must be greater than zero. Defaults to 100. |
+| `ZINDER_INGEST__MEMPOOL__MAX_TRANSACTION_COUNT` | zinder-ingest | Optional | `ingest.mempool.max_transaction_count` | Maximum number of transactions admitted into one coherent live mempool. Exceeding the bound withdraws the serving generation and retries source hydration. Must be greater than zero. Defaults to 8000. |
+| `ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES` | zinder-ingest | Optional | `ingest.mempool.max_total_raw_transaction_bytes` | Maximum cumulative raw transaction bytes admitted into one coherent live mempool. Exceeding the bound withdraws the serving generation and retries source hydration. Must be greater than zero. Defaults to 80000000. |
+| `ZINDER_INGEST__MEMPOOL__RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES` | zinder-ingest | Optional | `ingest.mempool.reconciliation_batch_target_raw_transaction_bytes` | Target raw transaction bytes for one durable mempool reconciliation write. A single protocol-valid transaction above the target is written alone so reconciliation can make progress. Must be greater than zero. Defaults to 16000000. |
 | `ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS` | zinder-projector | Optional | `projector.reorg_window_blocks` | Wallet undo suffix depth and expected canonical replacement policy. Must match the canonical writer. Defaults to 100. |
 | `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | zinder-projector | Required | `projector.build_owner_hex` | Stable 16-byte wallet-build lease owner encoded as exactly 32 hexadecimal characters. Use a distinct value for each concurrently provisioned lane. |
 | `ZINDER_PROJECTOR__LEASE_DURATION_SECONDS` | zinder-projector | Required | `projector.lease_duration_seconds` | Wallet-build and canonical-retention lease duration in seconds. Must be at least 14400 so a durable construction phase cannot outlive its lease. |
@@ -286,7 +302,8 @@ stay synchronized with it.
 | `ZINDER_RETENTION__MEMPOOL_MINED_RETENTION_MINUTES` | zinder-ingest | Optional | `retention.mempool_mined_retention_minutes` | Mined-mempool retention window in minutes, enforced by `zinder-ingest`. Defaults to 60. `0` disables retention. |
 | `ZINDER_RETENTION__MEMPOOL_INVALIDATED_RETENTION_HOURS` | zinder-ingest | Optional | `retention.mempool_invalidated_retention_hours` | Invalidated-mempool retention window in hours, enforced by `zinder-ingest`. Defaults to 24. `0` disables retention. |
 | `ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_CHECK_INTERVAL_MS` | zinder-ingest | Optional | `retention.mempool_event_retention_check_interval_ms` | Mempool-event retention sweep cadence in milliseconds. Must be greater than zero. Defaults to 30000. |
-| `ZINDER_RETENTION__MEMPOOL_CURSOR_AT_RISK_WARNING_MINUTES` | zinder-ingest | Optional | `retention.mempool_cursor_at_risk_warning_minutes` | Mempool cursor-at-risk warning lead time in minutes. Must be ≤ the shortest configured mempool retention window. Defaults to 12. |
+| `ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_MAX_EVENTS_PER_STEP` | zinder-ingest | Optional | `retention.mempool_event_retention_max_events_per_step` | Maximum event rows examined by one bounded mempool-retention step. Must be greater than zero. Defaults to 1024. |
+| `ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_MAX_ENCODED_BYTES_PER_STEP` | zinder-ingest | Optional | `retention.mempool_event_retention_max_encoded_bytes_per_step` | Target maximum encoded event bytes examined by one bounded mempool-retention step. The first row may exceed the target to guarantee progress. Must be greater than zero. Defaults to 16000000. |
 | `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0006). |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
 | `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the explorer's wallet-composed reads (transaction detail, block views, search, mempool activity). Empty/unset disables the explorer capabilities that compose canonical wallet reads. |
@@ -330,7 +347,7 @@ wallet.read.server_info_v2
 wallet.read.network_upgrade_activations_v1
 wallet.broadcast.transaction_v1
 wallet.events.chain_v1
-wallet.snapshot.mempool_v2
+wallet.snapshot.mempool_v3
 wallet.events.mempool_v2
 wallet.mempool.transparent_outputs_by_address_v1
 wallet.mempool.transparent_spends_by_outpoint_v1

@@ -130,28 +130,6 @@ pub enum ReadinessCause {
         /// Configured retention window, rounded down to whole hours.
         retention_hours: u64,
     },
-    /// Mempool retained-event history is approaching the configured retention
-    /// window. Mempool retention is shorter than chain-event retention, so
-    /// this signal is reported in minutes rather than hours.
-    MempoolCursorAtRisk {
-        /// Age of the oldest retained mempool event, rounded down to whole
-        /// minutes.
-        oldest_retained_age_minutes: u64,
-        /// Shortest configured mempool retention window, rounded down to
-        /// whole minutes.
-        retention_minutes: u64,
-    },
-    /// Mempool source observation is unavailable. The writer cannot hydrate
-    /// `Added` events without an upstream mempool stream.
-    MempoolSourceUnavailable,
-    /// Mempool source hydration is falling behind the source's emission rate.
-    MempoolHydrationLagging {
-        /// Total hydration failures observed since startup.
-        ///
-        /// Diagnostic only; operators should compare against
-        /// `zinder_mempool_hydration_failures_total` for a rate.
-        recent_hydration_failures: u64,
-    },
     /// Service is shutting down and no longer accepting new traffic.
     ShuttingDown,
     /// Upstream node is reachable but reports it is itself behind the
@@ -314,9 +292,6 @@ impl ReadinessCause {
         "replica_lagging",
         "writer_status_unavailable",
         "cursor_at_risk",
-        "mempool_cursor_at_risk",
-        "mempool_source_unavailable",
-        "mempool_hydration_lagging",
         "shutting_down",
         "upstream_not_ready",
     ];
@@ -336,9 +311,6 @@ impl ReadinessCause {
             Self::ReplicaLagging { .. } => "replica_lagging",
             Self::WriterStatusUnavailable => "writer_status_unavailable",
             Self::CursorAtRisk { .. } => "cursor_at_risk",
-            Self::MempoolCursorAtRisk { .. } => "mempool_cursor_at_risk",
-            Self::MempoolSourceUnavailable => "mempool_source_unavailable",
-            Self::MempoolHydrationLagging { .. } => "mempool_hydration_lagging",
             Self::ShuttingDown => "shutting_down",
             Self::UpstreamNotReady(_) => "upstream_not_ready",
         }
@@ -365,9 +337,6 @@ impl ReadinessCause {
             | Self::ReplicaLagging { .. }
             | Self::WriterStatusUnavailable
             | Self::CursorAtRisk { .. }
-            | Self::MempoolCursorAtRisk { .. }
-            | Self::MempoolSourceUnavailable
-            | Self::MempoolHydrationLagging { .. }
             | Self::ShuttingDown
             | Self::UpstreamNotReady(_) => None,
         }
@@ -380,24 +349,11 @@ impl ReadinessCause {
     /// fail while the service can still safely serve requests.
     #[must_use]
     pub const fn permits_traffic(&self) -> bool {
-        matches!(
-            self,
-            Self::Ready
-                | Self::CursorAtRisk { .. }
-                | Self::MempoolCursorAtRisk { .. }
-                | Self::MempoolSourceUnavailable
-                | Self::MempoolHydrationLagging { .. }
-        )
+        matches!(self, Self::Ready | Self::CursorAtRisk { .. })
     }
 
     const fn preserves_observed_target(&self) -> bool {
-        matches!(
-            self,
-            Self::CursorAtRisk { .. }
-                | Self::MempoolCursorAtRisk { .. }
-                | Self::MempoolSourceUnavailable
-                | Self::MempoolHydrationLagging { .. }
-        )
+        matches!(self, Self::CursorAtRisk { .. })
     }
 }
 
@@ -774,51 +730,6 @@ impl ReadinessState {
         }
     }
 
-    /// Returns a mempool-cursor-at-risk state for the mempool event log.
-    #[must_use]
-    pub const fn mempool_cursor_at_risk(
-        oldest_retained_age_minutes: u64,
-        retention_minutes: u64,
-        current_height: Option<u32>,
-    ) -> Self {
-        Self {
-            cause: ReadinessCause::MempoolCursorAtRisk {
-                oldest_retained_age_minutes,
-                retention_minutes,
-            },
-            current_height,
-            target_height: current_height,
-            phase: None,
-        }
-    }
-
-    /// Returns a state reporting the mempool source is unavailable.
-    #[must_use]
-    pub const fn mempool_source_unavailable(current_height: Option<u32>) -> Self {
-        Self {
-            cause: ReadinessCause::MempoolSourceUnavailable,
-            current_height,
-            target_height: current_height,
-            phase: None,
-        }
-    }
-
-    /// Returns a state reporting that mempool hydration is failing.
-    #[must_use]
-    pub const fn mempool_hydration_lagging(
-        recent_hydration_failures: u64,
-        current_height: Option<u32>,
-    ) -> Self {
-        Self {
-            cause: ReadinessCause::MempoolHydrationLagging {
-                recent_hydration_failures,
-            },
-            current_height,
-            target_height: current_height,
-            phase: None,
-        }
-    }
-
     /// Returns an upstream-not-ready state with the dual-path probe
     /// payload.
     ///
@@ -866,9 +777,6 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
             ReadinessCause::ReplicaLagging { .. } => Self::ReplicaLagging,
             ReadinessCause::WriterStatusUnavailable => Self::WriterStatusUnavailable,
             ReadinessCause::CursorAtRisk { .. } => Self::CursorAtRisk,
-            ReadinessCause::MempoolCursorAtRisk { .. } => Self::MempoolCursorAtRisk,
-            ReadinessCause::MempoolSourceUnavailable => Self::MempoolSourceUnavailable,
-            ReadinessCause::MempoolHydrationLagging { .. } => Self::MempoolHydrationLagging,
             ReadinessCause::ShuttingDown => Self::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => Self::UpstreamNotReady,
         }
@@ -924,22 +832,6 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
                     retention_hours: *retention_hours,
                 },
             ),
-            ReadinessCause::MempoolCursorAtRisk {
-                oldest_retained_age_minutes,
-                retention_minutes,
-            } => ops_proto::readiness_cause_detail::Payload::MempoolCursorAtRisk(
-                ops_proto::MempoolCursorAtRiskDetail {
-                    oldest_retained_age_minutes: *oldest_retained_age_minutes,
-                    retention_minutes: *retention_minutes,
-                },
-            ),
-            ReadinessCause::MempoolHydrationLagging {
-                recent_hydration_failures,
-            } => ops_proto::readiness_cause_detail::Payload::MempoolHydrationLagging(
-                ops_proto::MempoolHydrationLaggingDetail {
-                    recent_hydration_failures: *recent_hydration_failures,
-                },
-            ),
             ReadinessCause::NodeUnavailable(detail) => {
                 ops_proto::readiness_cause_detail::Payload::NodeUnavailable(
                     ops_proto::NodeUnavailableDetail {
@@ -960,7 +852,6 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
             | ReadinessCause::StorageUnavailable
             | ReadinessCause::SchemaMismatch
             | ReadinessCause::WriterStatusUnavailable
-            | ReadinessCause::MempoolSourceUnavailable
             | ReadinessCause::ShuttingDown => return None,
         };
         Some(ops_proto::ReadinessCauseDetail {
@@ -1168,22 +1059,9 @@ mod tests {
 
     #[test]
     fn warning_causes_remain_ready_for_traffic() {
-        let warning_states = [
-            ReadinessState::cursor_at_risk(145, 168, Some(100)),
-            ReadinessState::mempool_cursor_at_risk(49, 60, Some(100)),
-            ReadinessState::mempool_source_unavailable(Some(100)),
-            ReadinessState::mempool_hydration_lagging(3, Some(100)),
-        ];
-
-        for state in warning_states {
-            let report = Readiness::new(state).report();
-            assert!(
-                report.is_ready,
-                "warning cause {:?} must not fail traffic readiness",
-                report.cause
-            );
-            assert_eq!(report.current_height, Some(100));
-        }
+        let report = Readiness::new(ReadinessState::cursor_at_risk(145, 168, Some(100))).report();
+        assert!(report.is_ready);
+        assert_eq!(report.current_height, Some(100));
     }
 
     #[test]
@@ -1283,14 +1161,6 @@ mod tests {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,
             },
-            ReadinessCause::MempoolCursorAtRisk {
-                oldest_retained_age_minutes: 0,
-                retention_minutes: 0,
-            },
-            ReadinessCause::MempoolSourceUnavailable,
-            ReadinessCause::MempoolHydrationLagging {
-                recent_hydration_failures: 0,
-            },
             ReadinessCause::ShuttingDown,
             ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
                 upstream_committed_height: None,
@@ -1335,15 +1205,6 @@ mod tests {
                 ops_proto::ReadinessCause::WriterStatusUnavailable
             }
             ReadinessCause::CursorAtRisk { .. } => ops_proto::ReadinessCause::CursorAtRisk,
-            ReadinessCause::MempoolCursorAtRisk { .. } => {
-                ops_proto::ReadinessCause::MempoolCursorAtRisk
-            }
-            ReadinessCause::MempoolSourceUnavailable => {
-                ops_proto::ReadinessCause::MempoolSourceUnavailable
-            }
-            ReadinessCause::MempoolHydrationLagging { .. } => {
-                ops_proto::ReadinessCause::MempoolHydrationLagging
-            }
             ReadinessCause::ShuttingDown => ops_proto::ReadinessCause::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => ops_proto::ReadinessCause::UpstreamNotReady,
         }
@@ -1385,14 +1246,6 @@ mod tests {
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,
-            },
-            ReadinessCause::MempoolCursorAtRisk {
-                oldest_retained_age_minutes: 0,
-                retention_minutes: 0,
-            },
-            ReadinessCause::MempoolSourceUnavailable,
-            ReadinessCause::MempoolHydrationLagging {
-                recent_hydration_failures: 0,
             },
             ReadinessCause::ShuttingDown,
             ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {

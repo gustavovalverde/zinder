@@ -18,7 +18,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, CommitmentTreeCheckpoint};
 use zinder_runtime::{IngestPhase, Readiness};
-use zinder_source::NodeTarget;
+use zinder_source::{MempoolSourceAdmissionLimits, NodeTarget};
 
 use crate::{CanonicalPipelineLimits, NodeSourceKind, RawBlobPolicy};
 
@@ -123,10 +123,23 @@ pub struct IngestRuntimeConfig {
     pub phase_classification: PhaseClassificationConfig,
     /// Pipelined-fetch and commit knobs (`[ingest.construction]`).
     pub construction: CanonicalConstructionSettings,
+    /// Live mempool admission and durable reconciliation limits (`[ingest.mempool]`).
+    pub mempool: MempoolIngestSettings,
     /// Serial-loop knobs (`[ingest.follow]`).
     pub follow: CanonicalFollowSettings,
     /// One-shot or disposable-store `run_overrides` (`[ingest.run_overrides]`).
     pub run_overrides: CanonicalRunOverrides,
+}
+
+/// Resolved `[ingest.mempool]` resource limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MempoolIngestSettings {
+    /// Bounds the number and cumulative raw bytes of transactions admitted from
+    /// either upstream mempool source.
+    pub source_admission_limits: MempoolSourceAdmissionLimits,
+    /// Target raw transaction bytes for one durable reconciliation write; a
+    /// single protocol-valid transaction may exceed it as a singleton.
+    pub reconciliation_batch_target_raw_transaction_bytes: NonZeroU64,
 }
 
 impl IngestRuntimeConfig {

@@ -98,8 +98,8 @@ message ExplorerFreshness {
   // Cross-plane chain-state envelope the response was produced from.
   zinder.v1.wallet.ChainView chain_view = 1;
 
-  // Age of the mempool snapshot in milliseconds; zero for responses that
-  // do not touch mempool state.
+  // Milliseconds since the current mempool source generation was certified;
+  // zero for responses that do not touch mempool state.
   uint64 snapshot_age_millis = 2;
 
   // The capability string that produced this response. Lets clients branch

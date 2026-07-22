@@ -281,7 +281,10 @@ where
             Ok(lag_state) => lag_state,
             Err(error) => break Err(error),
         };
-        set_tip_follow_readiness(readiness, lag_state, mempool_ready_gate);
+        let canonical_tip = store.current_chain_epoch()?.map(|chain_epoch| {
+            BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash)
+        });
+        set_tip_follow_readiness(readiness, lag_state, canonical_tip, mempool_ready_gate);
 
         let store_tip = current_chain_height(&store);
         if reached_target_height(config.target_height, store_tip) {
@@ -385,31 +388,24 @@ fn start_chain_tip_notification_wakeup(
 fn set_tip_follow_readiness(
     readiness: &Readiness,
     lag_state: ReadinessState,
+    canonical_tip: Option<BlockId>,
     mempool_ready_gate: Option<&MempoolReadyGate>,
 ) {
     let gated_state = if matches!(lag_state.cause, ReadinessCause::Ready)
-        && mempool_ready_gate.is_some_and(|gate| !gate.is_hydrated())
+        && mempool_ready_gate
+            .is_some_and(|gate| !canonical_tip.is_some_and(|tip| gate.admits_canonical_tip(tip)))
     {
         ReadinessState::syncing(None, lag_state.current_height, lag_state.target_height)
     } else {
         lag_state
     };
 
-    // Don't override retention-driven warning states with the lag-derived
-    // Ready: the retention task owns the cursor-at-risk lifecycle and the
-    // live mempool owner owns mempool source/hydration causes. Leaving those in
-    // place keeps each subsystem the source of truth for its own causes. The
+    // Don't override the chain-retention warning with lag-derived Ready. The
     // tip-follow observation still owns current and target heights, so advance
     // those fields while the orthogonal warning remains active.
     readiness.update(|current_state| {
         let warning_owns_cause = matches!(gated_state.cause, ReadinessCause::Ready)
-            && matches!(
-                current_state.cause,
-                ReadinessCause::CursorAtRisk { .. }
-                    | ReadinessCause::MempoolCursorAtRisk { .. }
-                    | ReadinessCause::MempoolSourceUnavailable
-                    | ReadinessCause::MempoolHydrationLagging { .. }
-            );
+            && matches!(current_state.cause, ReadinessCause::CursorAtRisk { .. });
         if warning_owns_cause {
             current_state.current_height = gated_state.current_height;
             current_state.target_height = gated_state.target_height;
@@ -1134,29 +1130,22 @@ mod tests {
 
     #[test]
     fn tip_follow_ready_updates_heights_without_clearing_owned_warning() {
-        let warning_states = [
-            ReadinessState::cursor_at_risk(23, 24, Some(100)),
-            ReadinessState::mempool_cursor_at_risk(59, 60, Some(100)),
-            ReadinessState::mempool_source_unavailable(Some(100)),
-            ReadinessState::mempool_hydration_lagging(3, Some(100)),
-        ];
+        let warning_state = ReadinessState::cursor_at_risk(23, 24, Some(100));
+        let expected_cause = warning_state.cause.clone();
+        let readiness = Readiness::new(warning_state.with_phase(IngestPhase::FollowingTip));
 
-        for warning_state in warning_states {
-            let expected_cause = warning_state.cause.clone();
-            let readiness = Readiness::new(warning_state.with_phase(IngestPhase::FollowingTip));
+        set_tip_follow_readiness(
+            &readiness,
+            ReadinessState::ready_with_target(Some(120), Some(121)),
+            None,
+            None,
+        );
 
-            set_tip_follow_readiness(
-                &readiness,
-                ReadinessState::ready_with_target(Some(120), Some(121)),
-                None,
-            );
-
-            let report = readiness.report();
-            assert_eq!(report.cause, expected_cause);
-            assert_eq!(report.current_height, Some(120));
-            assert_eq!(report.target_height, Some(121));
-            assert_eq!(report.phase, Some(IngestPhase::FollowingTip));
-        }
+        let report = readiness.report();
+        assert_eq!(report.cause, expected_cause);
+        assert_eq!(report.current_height, Some(120));
+        assert_eq!(report.target_height, Some(121));
+        assert_eq!(report.phase, Some(IngestPhase::FollowingTip));
     }
 
     #[tokio::test]

@@ -113,7 +113,7 @@ At connect time, call `ServerInfo` and check:
 2. `contract_revision` meets the consumer's minimum.
 3. Every capability the consumer requires is present in `capabilities`.
 
-One caveat: the wallet-plane mempool capabilities (`wallet.snapshot.mempool_v2`, `wallet.events.mempool_v2`, the `wallet.mempool.*` reads) are always-on and advertised whether or not the deployment wires the ingest-control proxy that feeds them. `wallet.events.chain_v1` is gated on the deployment actually serving the chain-event stream, so a consumer that needs live-plane data probes that capability or issues a live call (for example `MempoolSnapshot`) and handles the failure.
+One caveat: the wallet-plane mempool capabilities (`wallet.snapshot.mempool_v3`, `wallet.events.mempool_v2`, the `wallet.mempool.*` reads) are always-on and advertised whether or not the deployment wires the ingest-control proxy that feeds them. Snapshot and point reads return `UNAVAILABLE` unless the mempool source tip exactly matches the canonical visible tip. Native `MempoolEvents` remains a tip-agnostic durable lifecycle stream; consumers combine it with `ChainEvents` when they need a tip-coherent view. `wallet.events.chain_v1` is gated on the deployment actually serving the chain-event stream, so a consumer that needs live-plane data probes that capability or issues a live call (for example `MempoolSnapshot`) and handles the failure.
 
 ## Server-side wallets
 

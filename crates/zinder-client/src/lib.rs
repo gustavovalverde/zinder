@@ -68,7 +68,7 @@ pub use zinder_proto::capabilities::{
     WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1, WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
     WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
     WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
-    WALLET_SNAPSHOT_MEMPOOL_V2, always_on_capability_strings, capabilities_for_surface,
+    WALLET_SNAPSHOT_MEMPOOL_V3, always_on_capability_strings, capabilities_for_surface,
 };
 #[cfg(feature = "remote")]
 pub use zinder_proto::v1::ops::ErrorReason;

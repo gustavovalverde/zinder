@@ -29,7 +29,7 @@ use super::{
     },
     mempool_lifecycle::{
         MEMPOOL_EVENT_RETENTION_FLOOR_KEY, MEMPOOL_EVENT_SEQUENCE_KEY,
-        validate_mempool_lifecycle_admission,
+        MempoolEventRetentionProgress, validate_mempool_lifecycle_admission,
     },
     publication::validate_ready_publication,
 };
@@ -153,6 +153,8 @@ pub struct RocksDbCanonicalStore {
     /// that handle makes the pruning floor and the durable lease set one
     /// indivisible lifecycle boundary without exposing a second writer API.
     pub(super) lifecycle_lock: Arc<Mutex<()>>,
+    /// Resumable process-local state for bounded mempool retention steps.
+    pub(super) mempool_retention_progress: Mutex<Option<MempoolEventRetentionProgress>>,
 }
 
 impl RocksDbCanonicalStore {
@@ -170,6 +172,7 @@ impl RocksDbCanonicalStore {
             cursor_auth_key,
             ready_evidence: *ready_evidence,
             lifecycle_lock: Arc::new(Mutex::new(())),
+            mempool_retention_progress: Mutex::new(None),
         }
     }
 
@@ -261,6 +264,7 @@ impl RocksDbCanonicalStore {
             cursor_auth_key: opened_control.cursor_auth_key,
             ready_evidence: opened_ready_evidence,
             lifecycle_lock: Arc::new(Mutex::new(())),
+            mempool_retention_progress: Mutex::new(None),
         })
     }
 

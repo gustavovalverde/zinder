@@ -273,6 +273,10 @@ impl IngestControl for TestIngestControl {
             snapshot_age_millis: 0,
             entries: Vec::new(),
             next_cursor: Vec::new(),
+            source_tip: Some(wallet::BlockTip {
+                height: 1,
+                hash: "01".repeat(32),
+            }),
         }))
     }
 

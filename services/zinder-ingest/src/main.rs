@@ -11,9 +11,10 @@ use zinder_ingest::{
     CanonicalCheckpointStagingRoot, CanonicalConstructionConfig, CanonicalControlCommand,
     CanonicalControlGrpcAdapter, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
     CanonicalRunOverrides, CanonicalWriterConfig, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-    IngestError, LiveMempoolOwner, NodeSourceKind, canonical_control_channel, classify_phase,
-    mempool_ready_channel, run_canonical_writer_with_control, run_live_mempool_owner,
-    run_mempool_retention, spawn_runtime_memory_metrics_task, spawn_upstream_health_probe_task,
+    IngestError, LiveMempoolOwner, MempoolIngestSettings, NodeSourceKind,
+    canonical_control_channel, classify_phase, mempool_ready_channel,
+    run_canonical_writer_with_control, run_live_mempool_owner, run_mempool_retention,
+    spawn_runtime_memory_metrics_task, spawn_upstream_health_probe_task,
 };
 use zinder_runtime::{
     OpsEndpointHandle, Readiness, ReadinessState, RuntimeService, StartupPhase,
@@ -21,8 +22,9 @@ use zinder_runtime::{
     spawn_ops_endpoint_for,
 };
 use zinder_source::{
-    JsonRpcMempoolSource, MempoolSource, NodeCapabilities, NodeCapability, NodeSource, NodeTarget,
-    ZebraIndexerMempoolSource, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
+    JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, NodeCapabilities,
+    NodeCapability, NodeSource, NodeTarget, ZebraIndexerMempoolSource,
+    ZebraIndexerMempoolSourceOptions, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
     ZebraJsonRpcSourceOptions,
 };
 use zinder_store::{ChainStoreOptions, MempoolEventRetentionConfig, SecondaryChainStore};
@@ -314,16 +316,19 @@ async fn run_ingest(
         &mut writer_config,
     );
     log_canonical_writer_start(&command_config, &writer_config);
-    let writer_result = run_supervised_canonical_writer(
+    let writer = run_canonical_writer_with_control(
         &source,
-        CanonicalWriterInputs {
-            network_upgrade_activations,
-            writer_config,
-        },
+        network_upgrade_activations,
+        writer_config,
         &readiness,
         &worker_cancel,
+        canonical_control_tasks.commands.take(),
+    );
+    let writer_result = Box::pin(supervise_canonical_writer(
+        writer,
+        &worker_cancel,
         &mut canonical_control_tasks,
-    )
+    ))
     .await;
     coordinate_canonical_writer_lifecycle(
         writer_result,
@@ -360,10 +365,15 @@ fn spawn_canonical_control_tasks(
 ) -> CanonicalControlTasks {
     if let Some(listen_addr) = command_config.ingest_control_listen_addr {
         let (canonical_control_handle, canonical_control_commands) = canonical_control_channel();
-        let mempool_owner = LiveMempoolOwner::default();
+        let mempool = command_config.runtime_config.mempool;
+        let mempool_owner =
+            LiveMempoolOwner::with_reconciliation_batch_target_raw_transaction_bytes(
+                mempool.reconciliation_batch_target_raw_transaction_bytes,
+            );
         let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
         writer_config.follow.mempool_ready_gate = Some(mempool_ready_gate);
-        let mempool_source = build_live_mempool_source(&command_config.runtime_config.node, source);
+        let mempool_source =
+            build_live_mempool_source(&command_config.runtime_config.node, source, mempool);
         let mempool_owner_task = tokio::spawn(run_live_mempool_owner(
             mempool_source,
             canonical_control_handle.clone(),
@@ -378,8 +388,11 @@ fn spawn_canonical_control_tasks(
         let mempool_retention_task = tokio::spawn(run_mempool_retention(
             canonical_control_handle.clone(),
             mempool_owner.clone(),
-            mempool_retention,
-            command_config.retention.mempool_check_interval(),
+            zinder_ingest::MempoolRetentionSettings {
+                retention: mempool_retention,
+                budget: command_config.retention.mempool_step_budget(),
+                check_interval: command_config.retention.mempool_check_interval(),
+            },
             cancel.clone(),
         ));
         let canonical_adapter = CanonicalControlGrpcAdapter::new(
@@ -432,32 +445,22 @@ fn spawn_canonical_control_tasks(
     }
 }
 
-struct CanonicalWriterInputs {
-    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    writer_config: CanonicalWriterConfig,
-}
-
-async fn run_supervised_canonical_writer(
-    source: &ZebraJsonRpcSource,
-    inputs: CanonicalWriterInputs,
-    readiness: &Readiness,
+async fn supervise_canonical_writer<WriterOutput>(
+    writer: impl std::future::Future<Output = Result<WriterOutput, zinder_ingest::CanonicalWriterError>>,
     cancel: &CancellationToken,
     control_tasks: &mut CanonicalControlTasks,
 ) -> Result<(), zinder_ingest::CanonicalWriterError> {
-    let writer = run_canonical_writer_with_control(
-        source,
-        inputs.network_upgrade_activations,
-        inputs.writer_config,
-        readiness,
-        cancel,
-        control_tasks.commands.take(),
-    );
     tokio::pin!(writer);
     let writer_result = if let Some(canonical_control_server) = control_tasks.server.as_mut() {
         tokio::select! {
+            biased;
+            () = cancel.cancelled() => writer.await,
             writer_result = &mut writer => writer_result,
             server_result = canonical_control_server => {
                 control_tasks.server_completed = true;
+                if cancel.is_cancelled() {
+                    return writer.await.map(drop);
+                }
                 cancel.cancel();
                 let reason = match server_result {
                     Ok(Ok(())) => "canonical control server stopped unexpectedly".to_owned(),
@@ -466,11 +469,55 @@ async fn run_supervised_canonical_writer(
                 };
                 Err(zinder_ingest::CanonicalWriterError::ControlServer { reason })
             }
+            mempool_owner_result = await_mempool_owner_exit(&mut control_tasks.mempool_owner) => {
+                let _completed_owner_task = control_tasks.mempool_owner.take();
+                if cancel.is_cancelled() {
+                    return writer.await.map(drop);
+                }
+                cancel.cancel();
+                let reason = match mempool_owner_result {
+                    Ok(()) => "live mempool owner stopped unexpectedly".to_owned(),
+                    Err(join_error) => join_error.to_string(),
+                };
+                Err(zinder_ingest::CanonicalWriterError::MempoolOwner { reason })
+            }
+            mempool_retention_result = await_mempool_retention_exit(
+                &mut control_tasks.mempool_retention,
+            ) => {
+                let _completed_retention_task = control_tasks.mempool_retention.take();
+                if cancel.is_cancelled() {
+                    return writer.await.map(drop);
+                }
+                cancel.cancel();
+                let reason = match mempool_retention_result {
+                    Ok(()) => "mempool retention task stopped unexpectedly".to_owned(),
+                    Err(join_error) => join_error.to_string(),
+                };
+                Err(zinder_ingest::CanonicalWriterError::MempoolRetention { reason })
+            }
         }
     } else {
         writer.await
     };
     writer_result.map(drop)
+}
+
+async fn await_mempool_owner_exit(
+    mempool_owner: &mut Option<JoinHandle<()>>,
+) -> Result<(), tokio::task::JoinError> {
+    match mempool_owner {
+        Some(mempool_owner) => mempool_owner.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn await_mempool_retention_exit(
+    mempool_retention: &mut Option<JoinHandle<()>>,
+) -> Result<(), tokio::task::JoinError> {
+    match mempool_retention {
+        Some(mempool_retention) => mempool_retention.await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn coordinate_canonical_writer_lifecycle<DrainWorkers, ShutdownOps>(
@@ -762,6 +809,7 @@ fn zebra_json_rpc_source_for_target(
 fn build_live_mempool_source(
     node_target: &NodeTarget,
     json_rpc: &ZebraJsonRpcSource,
+    mempool: MempoolIngestSettings,
 ) -> Arc<dyn MempoolSource> {
     node_target.indexer_grpc_addr.as_ref().map_or_else(
         || {
@@ -771,7 +819,13 @@ fn build_live_mempool_source(
                 backend = "zebra-json-rpc-polling",
                 "selected polling mempool source"
             );
-            Arc::new(JsonRpcMempoolSource::new(json_rpc.clone())) as Arc<dyn MempoolSource>
+            Arc::new(JsonRpcMempoolSource::with_options(
+                json_rpc.clone(),
+                JsonRpcMempoolSourceOptions {
+                    admission_limits: mempool.source_admission_limits,
+                    ..JsonRpcMempoolSourceOptions::default()
+                },
+            )) as Arc<dyn MempoolSource>
         },
         |indexer_endpoint| {
             tracing::info!(
@@ -781,9 +835,13 @@ fn build_live_mempool_source(
                 indexer_endpoint = %indexer_endpoint,
                 "selected streaming mempool source"
             );
-            Arc::new(ZebraIndexerMempoolSource::new(
+            Arc::new(ZebraIndexerMempoolSource::with_options(
                 ZebraIndexerSourceTarget::new(indexer_endpoint.clone()),
                 json_rpc.clone(),
+                ZebraIndexerMempoolSourceOptions {
+                    admission_limits: mempool.source_admission_limits,
+                    ..ZebraIndexerMempoolSourceOptions::default()
+                },
             )) as Arc<dyn MempoolSource>
         },
     )
@@ -844,7 +902,7 @@ async fn run_runtime(cli: Cli) -> ExitCode {
         Some(Command::VerifyCanonicalReplay(args)) => {
             run_canonical_replay_verification(config_path, args)
         }
-        None => run_ingest(config_path, overrides).await,
+        None => Box::pin(run_ingest(config_path, overrides)).await,
     };
 
     match runtime_result {
@@ -967,9 +1025,13 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
+    use tokio::task::JoinHandle;
+    use tokio_util::sync::CancellationToken;
+
     use super::{
-        NodeCapabilities, NodeCapability, ZebraJsonRpcSource,
+        CanonicalControlTasks, NodeCapabilities, NodeCapability, ZebraJsonRpcSource,
         coordinate_canonical_writer_lifecycle, require_ingest_node_capabilities,
+        supervise_canonical_writer,
     };
 
     #[tokio::test]
@@ -1109,6 +1171,33 @@ mod tests {
         Ok(())
     }
 
+    fn test_control_tasks(mempool_retention: JoinHandle<()>) -> CanonicalControlTasks {
+        CanonicalControlTasks {
+            server: Some(tokio::spawn(std::future::pending::<
+                Result<(), tonic::transport::Error>,
+            >())),
+            commands: None,
+            mempool_owner: Some(tokio::spawn(std::future::pending())),
+            mempool_retention: Some(mempool_retention),
+            server_completed: false,
+        }
+    }
+
+    async fn stop_test_control_tasks(control_tasks: &mut CanonicalControlTasks) {
+        if let Some(server) = control_tasks.server.take() {
+            server.abort();
+            let _join_result = server.await;
+        }
+        if let Some(mempool_owner) = control_tasks.mempool_owner.take() {
+            mempool_owner.abort();
+            let _join_result = mempool_owner.await;
+        }
+        if let Some(mempool_retention) = control_tasks.mempool_retention.take() {
+            mempool_retention.abort();
+            let _join_result = mempool_retention.await;
+        }
+    }
+
     #[test]
     fn ingest_capability_validation_accepts_zebra_baseline()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1138,6 +1227,99 @@ mod tests {
                 capability: NodeCapability::TreeState
             }
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervisor_fails_closed_when_mempool_retention_stops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cancel = CancellationToken::new();
+        let mut control_tasks = test_control_tasks(tokio::spawn(async {}));
+
+        let error = supervise_canonical_writer(
+            std::future::pending::<Result<(), zinder_ingest::CanonicalWriterError>>(),
+            &cancel,
+            &mut control_tasks,
+        )
+        .await
+        .err()
+        .ok_or("retention exit must fail the canonical writer")?;
+
+        assert!(matches!(
+            error,
+            zinder_ingest::CanonicalWriterError::MempoolRetention { ref reason }
+                if reason == "mempool retention task stopped unexpectedly"
+        ));
+        assert!(cancel.is_cancelled());
+        assert!(control_tasks.mempool_retention.is_none());
+        stop_test_control_tasks(&mut control_tasks).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic,
+        reason = "the supervisor test must inject a panicked retention task"
+    )]
+    async fn supervisor_reports_mempool_retention_join_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cancel = CancellationToken::new();
+        let mempool_retention = tokio::spawn(async {
+            std::panic::panic_any("mempool retention test fault");
+        });
+        let mut control_tasks = test_control_tasks(mempool_retention);
+
+        let error = supervise_canonical_writer(
+            std::future::pending::<Result<(), zinder_ingest::CanonicalWriterError>>(),
+            &cancel,
+            &mut control_tasks,
+        )
+        .await
+        .err()
+        .ok_or("retention join failure must fail the canonical writer")?;
+
+        assert!(matches!(
+            error,
+            zinder_ingest::CanonicalWriterError::MempoolRetention { ref reason }
+                if reason.contains("panicked")
+        ));
+        assert!(cancel.is_cancelled());
+        assert!(control_tasks.mempool_retention.is_none());
+        stop_test_control_tasks(&mut control_tasks).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervisor_prioritizes_cancellation_over_completed_retention()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cancel = CancellationToken::new();
+        let retention_cancel = cancel.clone();
+        let mut control_tasks = test_control_tasks(tokio::spawn(async move {
+            retention_cancel.cancelled().await;
+        }));
+        let writer_cancel = cancel.clone();
+        let cancellation_trigger = cancel.clone();
+        let cancellation_task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancellation_trigger.cancel();
+        });
+
+        supervise_canonical_writer(
+            async move {
+                writer_cancel.cancelled().await;
+                Ok::<(), zinder_ingest::CanonicalWriterError>(())
+            },
+            &cancel,
+            &mut control_tasks,
+        )
+        .await?;
+
+        cancellation_task.await?;
+        assert!(control_tasks.mempool_retention.is_some());
+        stop_test_control_tasks(&mut control_tasks).await;
 
         Ok(())
     }

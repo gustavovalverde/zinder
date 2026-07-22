@@ -55,15 +55,16 @@ pub use memory_pressure::{
     DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, spawn_runtime_memory_metrics_task,
 };
 pub use mempool::{
-    LiveMempoolOwner, MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolReadyGate,
-    MempoolReadySignal, MempoolSnapshotPage, build_mempool_entry, mempool_ready_channel,
-    run_live_mempool_owner, run_mempool_retention,
+    DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES, LiveMempoolOwner,
+    MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolReadyGate,
+    MempoolReadySignal, MempoolRetentionSettings, MempoolSnapshotPage, build_mempool_entry,
+    mempool_ready_channel, run_live_mempool_owner, run_mempool_retention,
 };
 pub use phase::{classify_phase, current_chain_height};
 pub use runtime_config::{
     CanonicalConstructionSettings, CanonicalFollowSettings, CanonicalRunOverrides,
     HistoricalWorkGate, IngestRuntimeConfig, MaterializedViewReplayConfig,
-    MaterializedViewReplayPolicy, PhaseClassificationConfig,
+    MaterializedViewReplayPolicy, MempoolIngestSettings, PhaseClassificationConfig,
 };
 pub use tip_follow::{
     DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, TipFollowConfig, open_tip_follow_store, tip_follow,

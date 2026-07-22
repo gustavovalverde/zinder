@@ -5847,6 +5847,7 @@ dependencies = [
  "futures-util",
  "hex",
  "metrics",
+ "metrics-exporter-prometheus",
  "parking_lot",
  "prost",
  "rust-rocksdb",

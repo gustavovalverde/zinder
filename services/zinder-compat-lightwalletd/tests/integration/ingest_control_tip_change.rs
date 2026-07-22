@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use zinder_compat_lightwalletd::spawn_ingest_control_tip_change_publisher;
 use zinder_core::{
-    BlockHeight, BlockId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
+    BlockHeight, BlockId, ChainEpochId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
     CommitmentTreeFrontiers, Network, NetworkUpgradeActivations, SubtreeRootRange,
 };
 use zinder_ingest::{
@@ -36,6 +36,10 @@ const COINBASE_HEIGHT_OPCODE_OFFSET: usize = 1_534;
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The production publisher contract requires one continuous writer startup, retained-fence capture, post-wait advance, observation, and symmetric shutdown scenario."
+)]
 async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() -> eyre::Result<()>
 {
     let activations = Arc::new(sample_regtest_upgrade_activations());
@@ -60,12 +64,20 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
     let writer_status = tokio::time::timeout(TEST_TIMEOUT, canonical.writer_status())
         .await
         .map_err(|_| eyre::eyre!("canonical writer did not begin serving control requests"))?;
-    if let Err(control_error) = writer_status {
-        return match writer.await? {
-            Ok(()) => Err(control_error.into()),
-            Err(writer_error) => Err(writer_error.into()),
-        };
-    }
+    let initial_event_sequence = match writer_status {
+        Ok(status) => {
+            status
+                .fence
+                .ok_or_else(|| eyre::eyre!("writer status omitted its canonical fence"))?
+                .event_sequence
+        }
+        Err(control_error) => {
+            return match writer.await? {
+                Ok(()) => Err(control_error.into()),
+                Err(writer_error) => Err(writer_error.into()),
+            };
+        }
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
@@ -92,7 +104,9 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
     let (waiting_sender, waiting_receiver) = oneshot::channel();
     let mut waiting = tokio::spawn(async move {
         let _ = waiting_sender.send(());
-        watcher.await_tip_change().await
+        watcher
+            .await_tip_change_after(ChainEpochId::new(initial_event_sequence))
+            .await
     });
     waiting_receiver.await?;
     let mut observed_height = None;
