@@ -637,14 +637,6 @@ where
         while let Some(entry_outcome) = entries.next().await {
             let entry = entry_outcome?;
             let transaction_id = encode_internal_transaction_id(entry.transaction_id());
-            for (exclude_suffix, match_count) in exclude_txid_suffixes
-                .iter()
-                .zip(&mut exclude_suffix_match_counts)
-            {
-                if !exclude_suffix.is_empty() && transaction_id.ends_with(exclude_suffix) {
-                    *match_count = match_count.saturating_add(1);
-                }
-            }
             let compact_message = compact_transaction_data_to_lightwalletd(
                 0,
                 entry.transaction_id(),
@@ -657,6 +649,14 @@ where
             );
             if !compact_transaction_has_payload(&pruned) {
                 continue;
+            }
+            for (exclude_suffix, match_count) in exclude_txid_suffixes
+                .iter()
+                .zip(&mut exclude_suffix_match_counts)
+            {
+                if !exclude_suffix.is_empty() && transaction_id.ends_with(exclude_suffix) {
+                    *match_count = match_count.saturating_add(1);
+                }
             }
             compact_messages.push((transaction_id, pruned));
         }
