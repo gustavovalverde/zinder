@@ -11,6 +11,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use arc_swap::ArcSwap;
 use eyre::eyre;
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
@@ -23,14 +24,18 @@ use tonic::{
 };
 use zinder_client::{
     BlockHeight, BlockHeightRange, Capability, CapabilityDescriptor, ChainEvent, ChainIndex,
-    EndpointBackedIndex, EventStreamStart, Network, RawTransactionBytes, RemoteChainIndex,
-    RemoteOpenOptions, TransactionBroadcastOutcome, TransactionId,
+    EndpointBackedIndex, EventStreamStart, IndexerError, Network, RawTransactionBytes,
+    RemoteChainIndex, RemoteOpenOptions, RetryPolicy, TransactionBroadcastOutcome, TransactionId,
 };
-use zinder_core::wire::encode_zinder_native_chain_name;
+use zinder_core::{NetworkUpgradeActivations, wire::encode_zinder_native_chain_name};
 use zinder_proto::v1::wallet;
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{
+    ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter, WalletServingQuery,
+    WalletServingReadPair,
+};
 use zinder_testkit::{
-    ChainFixture, MockTransactionBroadcaster, StoreFixture, sample_regtest_upgrade_activations,
+    ChainFixture, MockTransactionBroadcaster, StoreFixture, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
 };
 
 #[tokio::test]
@@ -107,6 +112,89 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     ));
     assert!(!first_event.cursor.as_bytes().is_empty());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_chain_index_maps_released_serving_query_stale_pin_to_refresh() -> eyre::Result<()> {
+    let mut delayed_activations = sample_regtest_upgrade_activations().activations().to_vec();
+    for activation in &mut delayed_activations {
+        if matches!(activation.name.as_str(), "Sapling" | "NU5" | "NU6.3") {
+            activation.activation_height = BlockHeight::new(100);
+        }
+    }
+    let activations = Arc::new(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        delayed_activations,
+    )?);
+    let initial_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let replacement_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let mut initial_store =
+        WalletServingStoreFixture::from_chain(&initial_chain, activations.as_ref())?;
+    let (initial_canonical, initial_wallet) = initial_store.take_readers()?;
+    let initial_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(initial_canonical),
+        Arc::new(initial_wallet),
+    )?);
+    let initial_epoch_id = initial_pair.canonical_fence().chain_epoch_id();
+    let serving_slot = Arc::new(ArcSwap::from(initial_pair));
+    let query = WalletServingQuery::from_serving_pair_slot(
+        Arc::clone(&serving_slot),
+        (),
+        Arc::clone(&activations),
+    );
+    let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
+        query,
+        ServerInfoSettings::default(),
+    ))
+    .await?;
+    let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+
+    let snapshot = chain_index.snapshot().await?;
+    assert_eq!(snapshot.chain_epoch().id, initial_epoch_id);
+    let initial_tip = snapshot.visible_tip_block().await?;
+
+    let mut replacement_store = WalletServingStoreFixture::from_chain_after_live_append(
+        &replacement_chain,
+        activations.as_ref(),
+    )?;
+    let (replacement_canonical, replacement_wallet) = replacement_store.take_readers()?;
+    let replacement_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(replacement_canonical),
+        Arc::new(replacement_wallet),
+    )?);
+    let replacement_epoch_id = replacement_pair.canonical_fence().chain_epoch_id();
+    assert!(replacement_epoch_id.value() > initial_epoch_id.value());
+    serving_slot.store(replacement_pair);
+    assert_eq!(chain_index.current_epoch().await?.id, replacement_epoch_id);
+
+    let stale_read = snapshot.visible_tip_block().await;
+    let Err(error) = stale_read else {
+        return Err(eyre!(
+            "the released serving query served a stale snapshot after pair publication"
+        ));
+    };
+
+    assert!(matches!(error, IndexerError::ChainEpochPinUnavailable));
+    assert_eq!(error.retry_policy(), RetryPolicy::RefreshChainEpoch);
+    let stale_artifact_read = snapshot.compact_block_at(initial_tip.height).await;
+    let Err(artifact_error) = stale_artifact_read else {
+        return Err(eyre!(
+            "the released serving query served a stale snapshot artifact"
+        ));
+    };
+    assert!(matches!(
+        artifact_error,
+        IndexerError::ChainEpochPinUnavailable
+    ));
+    assert_eq!(
+        artifact_error.retry_policy(),
+        RetryPolicy::RefreshChainEpoch
+    );
+    assert_ne!(chain_index.visible_tip_block(None).await?, initial_tip);
     Ok(())
 }
 

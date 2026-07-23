@@ -1,17 +1,18 @@
-//! Zallet parity assertions.
+//! Zallet-shaped consumer assertions.
 //!
-//! Zallet (the desktop wallet) is the primary `zinder-client` Rust consumer.
-//! These compile-time assertions ensure the trait methods Zallet depends on
-//! stay present. Base canonical reads live on `ChainIndex`; broadcast,
+//! These checks model the typed shape a wallet adapter needs without claiming
+//! downstream certification. Base canonical reads live on `ChainIndex`; broadcast,
 //! standalone mempool presence, and the chain-event stream need a live
 //! endpoint, so they live on `EndpointBackedIndex` and a consumer that calls
 //! them bounds its handle `T: ChainIndex + EndpointBackedIndex`. Renaming or
 //! removing any referenced method makes this module fail to compile.
 
 use eyre::eyre;
+use std::sync::Arc;
 use zinder_client::{
-    BlockHeight, BlockSelector, ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex,
-    SubtreeRootIndex, SubtreeRootRange, TransactionId, TxStatus,
+    BlockHeight, BlockSelector, ChainIndex, EndpointBackedIndex, LocalChainIndex,
+    OwnedChainSnapshot, RemoteChainIndex, SubtreeRootIndex, SubtreeRootRange, TransactionId,
+    TxStatus,
 };
 use zinder_store::RawBlobRetention;
 use zinder_testkit::FixtureTransactionRows;
@@ -42,11 +43,16 @@ fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
         // ChainCommitted as a typed signal in chain_events
         let _ = T::chain_events;
     }
+    fn assert_storable_chain_view<View: Clone + Send + Sync + 'static>() {}
+
     assert_base_compiles::<LocalChainIndex>();
     assert_base_compiles::<RemoteChainIndex>();
     // Only the endpoint-backed adapter implements EndpointBackedIndex; a
     // LocalChainIndex handle is rejected here at compile time.
     assert_endpoint_compiles::<RemoteChainIndex>();
+
+    assert_storable_chain_view::<OwnedChainSnapshot<LocalChainIndex>>();
+    assert_storable_chain_view::<OwnedChainSnapshot<dyn ChainIndex>>();
 }
 
 #[tokio::test]
@@ -69,35 +75,27 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     let transaction_location = transaction_rows.location;
     let chain_fixture = base_fixture.with_transaction_rows(transaction_rows);
     let store_fixture = committed_store_fixture(&chain_fixture)?;
-    let chain_index = open_local_chain_index(&store_fixture).await?;
+    let chain_index = Arc::new(open_local_chain_index(&store_fixture).await?);
+    let chain_view = OwnedChainSnapshot::capture(chain_index).await?;
 
-    let current_epoch = chain_index.current_epoch().await?;
-    let pinned = Some(current_epoch.id);
-    let visible_tip_block = chain_index.visible_tip_block(pinned).await?;
-    let resolved_by_height = chain_index
-        .block_id_by_selector(BlockSelector::Height(BlockHeight::new(2)), pinned)
+    let visible_tip_block = chain_view.visible_tip_block().await?;
+    let resolved_by_height = chain_view
+        .block_id_by_selector(BlockSelector::Height(BlockHeight::new(2)))
         .await?;
-    let resolved_by_hash = chain_index
-        .block_id_by_selector(BlockSelector::Hash(transaction_block_hash), pinned)
+    let resolved_by_hash = chain_view
+        .block_id_by_selector(BlockSelector::Hash(transaction_block_hash))
         .await?;
-    let tree_state = chain_index
-        .tree_state_at(BlockHeight::new(2), pinned)
+    let tree_state = chain_view.tree_state_at(BlockHeight::new(2)).await?;
+    let subtree_roots = chain_view
+        .subtree_roots_in_range(SubtreeRootRange::new(
+            zinder_client::ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            std::num::NonZeroU32::MIN,
+        ))
         .await?;
-    let subtree_roots = chain_index
-        .subtree_roots_in_range(
-            SubtreeRootRange::new(
-                zinder_client::ShieldedProtocol::Sapling,
-                SubtreeRootIndex::new(0),
-                std::num::NonZeroU32::MIN,
-            ),
-            pinned,
-        )
-        .await?;
-    let mined_status = chain_index
-        .transaction_by_id(transaction_id, pinned)
-        .await?;
-    let missing_status = chain_index
-        .transaction_by_id(TransactionId::from_bytes([0x24; 32]), pinned)
+    let mined_status = chain_view.transaction_by_id(transaction_id).await?;
+    let missing_status = chain_view
+        .transaction_by_id(TransactionId::from_bytes([0x24; 32]))
         .await?;
 
     assert_eq!(visible_tip_block, resolved_by_height);

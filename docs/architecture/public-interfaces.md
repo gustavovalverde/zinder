@@ -27,6 +27,8 @@ and wire contracts that actually carry versions.
 | `MaterializedViewStore` | Independent store for materialized-view rows, cursors, coverage, and schemas |
 | `ChainEvent` | Durable canonical append or replacement transition |
 | `MempoolEvent` | Typed live-pool transition: added, invalidated, or mined |
+| `ChainSnapshot` | Borrowed `ChainIndex` view whose pinnable canonical reads all use one captured `ChainEpoch`; it contains no live mempool surface |
+| `OwnedChainSnapshot` | Cloneable, `Arc`-backed form of `ChainSnapshot` for retained consumer chain views, with the same canonical-only epoch pin |
 | `MempoolSnapshotView` | Bounded live-pool page with a mempool-resume cursor, canonical `ChainEpoch` fence, and matching certified source tip |
 
 Use `canonical` for chain truth, `wallet projection` for wallet query state,
@@ -132,6 +134,14 @@ database engine, raw-byte retention policy, or release topology.
   produced them.
 - A request that combines canonical and projected data captures one
   `WalletServingReadPair` or equivalent snapshot at entry.
+- `zinder-client::ChainSnapshot` is the borrowed consumer view over one
+  captured `ChainEpoch`; `OwnedChainSnapshot` is the `Arc`-backed,
+  cloneable form for adapters that retain a `'static` view. Both remove the
+  epoch argument from pinnable canonical reads and always forward the captured
+  epoch id.
+- Snapshot views are canonical-only. Live mempool state, event subscriptions,
+  broadcast, current address history, and current balance remain on their
+  existing traits and are never presented as epoch-pinned state.
 - Public traits describe consumer capabilities. Concrete RocksDB types remain
   at composition roots and storage adapters.
 

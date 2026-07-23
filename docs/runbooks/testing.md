@@ -114,8 +114,9 @@ with the release evidence. This profile is organized by consumer:
 
 - `parity/zodl.rs` covers the lightwalletd-compatible shapes Zodl and the
   Android SDK hit today.
-- `parity/zallet.rs` covers the Zinder-native `WalletQuery` shape consumed by
-  Zallet.
+- `parity/zallet.rs` covers a Zallet-shaped retained chain-view contract,
+  including the cloneable, `'static` owned snapshot surface. It is not a claim
+  that a downstream Zallet integration has been certified.
 - `parity/lightwalletd_operators.rs` covers public lightwalletd operator
   expectations.
 - `parity/explorers.rs` covers explorer-facing transparent-address read shapes.

@@ -8,7 +8,7 @@ use zinder_core::{
     decode_canonical_block_replay,
 };
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
+    CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend, CanonicalReorgPolicy,
     CanonicalStoreBuildPlan, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
     RocksDbCanonicalSecondary, RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE,
 };
@@ -94,6 +94,128 @@ impl WalletServingStoreFixture {
             UnixTimestampMillis::new(u64::from(tip_block.block_time_seconds).saturating_mul(1_000)),
         ))?;
         let canonical_primary = validated.publish_baseline(publication)?;
+
+        let wallet_outcome = build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: TEST_REORG_DEPTH,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        drop(wallet_outcome.store);
+        drop(canonical_primary);
+
+        let canonical_reader = RocksDbCanonicalSecondary::open_ready(
+            &canonical_primary_path,
+            temporary_directory.path().join("canonical-secondary"),
+            network_upgrade_activations,
+            CanonicalStoreWorkload::Wallet,
+            reorg_policy,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let wallet_reader = RocksDbWalletSecondary::open_ready(
+            &wallet_primary_path,
+            temporary_directory.path().join("wallet-secondary"),
+            chain_fixture.network(),
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+
+        Ok(Self {
+            canonical_reader: Some(canonical_reader),
+            wallet_reader: Some(wallet_reader),
+            _temporary_directory: temporary_directory,
+        })
+    }
+
+    /// Builds a READY pair whose final block was published through the live
+    /// append path, producing a second chain epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture has fewer than two blocks or either
+    /// production store rejects the baseline or live append.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The fixture keeps baseline publication, live append, wallet build, and immutable reader admission in production order."
+    )]
+    pub fn from_chain_after_live_append(
+        chain_fixture: &ChainFixture,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> eyre::Result<Self> {
+        ensure!(
+            chain_fixture.network() == network_upgrade_activations.network(),
+            "chain fixture and network-upgrade activations must use the same network"
+        );
+        let live_tip = chain_fixture
+            .blocks()
+            .last()
+            .ok_or_else(|| eyre!("wallet-serving fixture requires at least two blocks"))?;
+        let baseline_fixture = chain_fixture.fork_at(live_tip.height)?;
+        ensure!(
+            !baseline_fixture.blocks().is_empty(),
+            "wallet-serving live-append fixture requires at least two blocks"
+        );
+        let baseline_chain = baseline_fixture.with_canonical_genesis_parent();
+        let baseline_tip = baseline_chain
+            .blocks()
+            .last()
+            .ok_or_else(|| eyre!("wallet-serving fixture requires a baseline block"))?;
+        let baseline_tip_id = BlockId::new(baseline_tip.height, baseline_tip.hash);
+        let temporary_directory =
+            TempDir::new().wrap_err("create wallet-serving fixture directory")?;
+        let canonical_primary_path = temporary_directory.path().join("canonical-primary");
+        let wallet_primary_path = temporary_directory.path().join("wallet-primary");
+        let reorg_policy = CanonicalReorgPolicy::new(TEST_REORG_DEPTH)?;
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            network_upgrade_activations,
+            baseline_tip.block_time_seconds.saturating_sub(1),
+            baseline_tip_id,
+            reorg_policy,
+        )?;
+        let mut builder = RocksDbCanonicalBuilder::create_fresh(
+            &canonical_primary_path,
+            CanonicalStoreWorkload::Wallet,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        builder.bulk_load_blocks(
+            canonical_build_blocks(&baseline_chain)?
+                .into_iter()
+                .map(Ok::<_, std::convert::Infallible>),
+        )?;
+        builder.load_subtree_roots(std::iter::empty())?;
+        let baseline_checkpoint = CommitmentTreeCheckpoint::new(
+            baseline_tip_id,
+            baseline_tip.block_time_seconds,
+            CommitmentTreeFrontiers::default(),
+        );
+        builder.confirm_source_tip_checkpoint(&baseline_checkpoint)?;
+        let validated = builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+            baseline_tip_id,
+            UnixTimestampMillis::new(
+                u64::from(baseline_tip.block_time_seconds).saturating_mul(1_000),
+            ),
+        ))?;
+        let canonical_primary = validated.publish_baseline(publication)?;
+        let expected_fence = canonical_primary.event_fence();
+        let full_chain = chain_fixture.clone().with_canonical_genesis_parent();
+        let live_block = canonical_build_blocks(&full_chain)?
+            .pop()
+            .ok_or_else(|| eyre!("wallet-serving fixture requires a live block"))?;
+        let (canonical_primary, _) = canonical_primary.commit_live_append(
+            CanonicalLiveAppend::new(
+                expected_fence,
+                live_block,
+                Vec::new(),
+                expected_fence.visible_tip(),
+                UnixTimestampMillis::new(
+                    u64::from(live_tip.block_time_seconds).saturating_mul(1_000),
+                ),
+            ),
+            network_upgrade_activations,
+        )?;
 
         let wallet_outcome = build_wallet_from_canonical(
             &canonical_primary,

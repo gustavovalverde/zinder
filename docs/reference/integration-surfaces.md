@@ -56,6 +56,11 @@ Public deployments terminate TLS, authentication, rate limiting, and quota contr
 
 - `RemoteChainIndex` connects to a `WalletQuery` gRPC endpoint.
 - `LocalChainIndex` opens a local RocksDB secondary when colocated with the writer.
+- `ChainSnapshot<'_, I>` captures one epoch from a borrowed `ChainIndex` and
+  exposes its pinnable canonical reads without a repeated epoch parameter.
+- `OwnedChainSnapshot<I>` provides the same surface over `Arc<I>`, including
+  `Arc<dyn ChainIndex>`, for wallet adapters whose chain view must be cloneable
+  and `'static`.
 
 The contract is split across two async traits so the compiler expresses which calls a handle can serve:
 
@@ -63,6 +68,13 @@ The contract is split across two async traits so the compiler expresses which ca
 - `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
 
 A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`; passing a `LocalChainIndex` there is a compile error rather than a runtime "endpoint not configured" failure. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
+
+Capture calls `current_epoch` once. A stale local secondary or a remote serving
+pair that has advanced returns `IndexerError::ChainEpochPinUnavailable`; its
+retry policy is `RefreshChainEpoch`. The released wallet-serving runtime keeps
+only its current exact read pair, so consumers must refresh rather than assume
+historical epoch retention. Implementations may retain older epochs, but may
+serve a pin only when they can answer that exact canonical epoch.
 
 Native clients get typed errors, capability discovery, epoch-pinned reads,
 chain-event cursors, transaction broadcast outcomes, mempool reads, and

@@ -24,10 +24,10 @@ pub use chain_index::{
     MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
 };
 pub use chain_index::{
-    ChainIndex, IndexStream, TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
-    TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
-    TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
-    TransparentUnspentOutputChunk, TransparentUtxoSetSummaryView,
+    ChainIndex, ChainSnapshot, IndexStream, OwnedChainSnapshot, TransparentAddressTransactionChunk,
+    TransparentAddressTxIdsQuery, TransparentAddressTxIdsStream,
+    TransparentAddressUnspentOutputsQuery, TransparentAddressUnspentOutputsStream,
+    TransparentHistoryCursor, TransparentUnspentOutputChunk, TransparentUtxoSetSummaryView,
 };
 pub use error::{ChainEventCursorRecovery, IndexerError, RetryPolicy};
 #[cfg(feature = "local")]

@@ -177,7 +177,18 @@ impl LocalChainIndex {
                     .current_chain_epoch_reader()
                     .map_err(IndexerError::from_store_error)?,
             };
-            read(&reader)
+            if let Some(at_epoch_id) = at_epoch_id {
+                reader
+                    .validate_epoch_pin()
+                    .map_err(|error| map_epoch_pin_store_error(error, at_epoch_id))?;
+            }
+            let read_outcome = read(&reader);
+            if let Some(at_epoch_id) = at_epoch_id {
+                reader
+                    .validate_epoch_pin()
+                    .map_err(|error| map_epoch_pin_store_error(error, at_epoch_id))?;
+            }
+            read_outcome
         }))
         .await
     }
@@ -716,20 +727,8 @@ impl ChainIndex for LocalChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentSpendsByOutpointResponse, IndexerError> {
         let outpoints = normalize_transparent_outpoints(outpoints)?;
-        let canonical_store = self.store.clone();
         let materialized_view_store = self.materialized_view_store.clone();
-        join_blocking(tokio::task::spawn_blocking(move || {
-            canonical_store
-                .try_catch_up()
-                .map_err(IndexerError::from_store_error)?;
-            let reader = match at_epoch_id {
-                Some(at_epoch_id) => canonical_store
-                    .chain_epoch_reader_at(at_epoch_id)
-                    .map_err(|error| map_epoch_pin_store_error(error, at_epoch_id))?,
-                None => canonical_store
-                    .current_chain_epoch_reader()
-                    .map_err(IndexerError::from_store_error)?,
-            };
+        self.read_at_epoch(at_epoch_id, move |reader| {
             let chain_epoch = reader.chain_epoch();
             let canonical_spends = reader
                 .transparent_spend_facts_by_outpoints(&outpoints)
@@ -759,7 +758,7 @@ impl ChainIndex for LocalChainIndex {
                 let snapshot = materialized_view_store.read_snapshot();
                 for spend in resolve_materialized_transparent_spends(
                     &snapshot,
-                    &reader,
+                    reader,
                     deleted_through_height,
                     &unresolved_outpoints,
                 )? {
@@ -772,7 +771,7 @@ impl ChainIndex for LocalChainIndex {
                 chain_epoch,
                 spends,
             })
-        }))
+        })
         .await
     }
 
@@ -962,13 +961,13 @@ fn transparent_spend_projection_unavailable() -> IndexerError {
 
 #[allow(
     clippy::wildcard_enum_match_arm,
-    reason = "Only a missing pinned epoch becomes a client precondition error; all other storage failures keep the shared storage mapping."
+    reason = "Only missing or conflicting epoch pins become the typed refresh signal; all other storage failures keep the shared storage mapping."
 )]
-fn map_epoch_pin_store_error(error: StoreError, at_epoch_id: ChainEpochId) -> IndexerError {
+fn map_epoch_pin_store_error(error: StoreError, _at_epoch_id: ChainEpochId) -> IndexerError {
     match error {
-        StoreError::ChainEpochMissing { .. } => IndexerError::FailedPrecondition {
-            reason: format!("chain epoch {} is not retained", at_epoch_id.value()),
-        },
+        StoreError::ChainEpochMissing { .. } | StoreError::ChainEpochConflict { .. } => {
+            IndexerError::ChainEpochPinUnavailable
+        }
         error => IndexerError::from_store_error(error),
     }
 }
