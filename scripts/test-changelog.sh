@@ -292,28 +292,105 @@ custom:
   PR: "24"
 YAML
 git -C "$prepare_repository" init -q -b main
+
+set_prepare_product_version() {
+  local product_version="$1"
+  while IFS= read -r -d '' manifest; do
+    sed -i -E \
+      -e \
+      "s/^version = \"[^\"]+\"/version = \"${product_version}\"/" \
+      -e \
+      "s/(path = \"[^\"]+\", version = \")[^\"]+\"/\\1${product_version}\"/g" \
+      "$manifest"
+  done < <(
+    find "$prepare_repository" \
+      -name Cargo.toml \
+      -type f \
+      -print0
+  )
+}
+
 expect_rejected \
   "explicit version that differs from changie next auto" \
   env CHANGIE_BIN="$changie_bin" \
   bash "$prepare_repository/scripts/prepare-changelog-release.sh" 0.5.0
 sed -i 's/Bump: patch/Bump: minor/' \
   "$prepare_repository/.changes/unreleased/fixed-example.yaml"
-sed -i 's/version = "0.5.0"/version = "0.5.1"/' \
-  "$prepare_repository/Cargo.toml"
+set_prepare_product_version 0.5.1
 expect_rejected \
   "release version that differs from the workspace product version" \
   env CHANGIE_BIN="$changie_bin" \
   bash "$prepare_repository/scripts/prepare-changelog-release.sh" 0.5.0
-sed -i 's/version = "0.5.1"/version = "0.5.0"/' \
-  "$prepare_repository/Cargo.toml"
+set_prepare_product_version 0.5.0-rc.1
+env CHANGIE_BIN="$changie_bin" \
+  bash "$prepare_repository/scripts/prepare-changelog-release.sh" \
+    0.5.0-rc.1 >/dev/null
+run_validator release v0.5.0-rc.1 "$prepare_repository"
+[[ -f "$prepare_repository/.changes/v0.5.0-rc.1.md" ]] \
+  || fail "RC1 preparation did not archive its release notes"
+[[ -n "$(find "$prepare_repository/.changes/unreleased" -type f -name '*.yaml' -print -quit)" ]] \
+  || fail "RC1 preparation consumed its release-note fragments"
+rc1_digest="$(sha256sum "$prepare_repository/CHANGELOG.md")"
+env CHANGIE_BIN="$changie_bin" \
+  bash "$prepare_repository/scripts/prepare-changelog-release.sh" \
+    0.5.0-rc.1 >/dev/null
+[[ "$(sha256sum "$prepare_repository/CHANGELOG.md")" == "$rc1_digest" ]] \
+  || fail "repeated RC1 preparation changed CHANGELOG.md"
+
+cat > "$prepare_repository/.changes/unreleased/changed-rc-canary.yaml" <<'YAML'
+kind: changed
+body: Exercise the trusted publication path before the stable release.
+time: 2026-07-22T18:32:51Z
+custom:
+  Bump: patch
+  PR: "31"
+YAML
+expect_rejected \
+  "stale RC1 archive with a newly added fragment" \
+  run_validator release v0.5.0-rc.1 "$prepare_repository"
+
+set_prepare_product_version 0.5.0-rc.2
+env CHANGIE_BIN="$changie_bin" \
+  bash "$prepare_repository/scripts/prepare-changelog-release.sh" \
+    0.5.0-rc.2 >/dev/null
+run_validator release v0.5.0-rc.2 "$prepare_repository"
+[[ ! -e "$prepare_repository/.changes/v0.5.0-rc.1.md" ]] \
+  || fail "RC2 preparation retained the superseded RC1 archive"
+if grep -Fq '## [0.5.0-rc.1] - ' "$prepare_repository/CHANGELOG.md"; then
+  fail "RC2 preparation retained the superseded RC1 changelog section"
+fi
+[[ -f "$prepare_repository/.changes/v0.5.0-rc.2.md" ]] \
+  || fail "RC2 preparation did not archive its cumulative release notes"
+grep -Fq 'Correct an operator-visible release defect.' \
+  "$prepare_repository/.changes/v0.5.0-rc.2.md" \
+  || fail "RC2 archive omitted the RC1 release note"
+grep -Fq 'Exercise the trusted publication path before the stable release.' \
+  "$prepare_repository/.changes/v0.5.0-rc.2.md" \
+  || fail "RC2 archive omitted the newly added release note"
+rc2_digest="$(sha256sum "$prepare_repository/CHANGELOG.md")"
+env CHANGIE_BIN="$changie_bin" \
+  bash "$prepare_repository/scripts/prepare-changelog-release.sh" \
+    0.5.0-rc.2 >/dev/null
+[[ "$(sha256sum "$prepare_repository/CHANGELOG.md")" == "$rc2_digest" ]] \
+  || fail "repeated RC2 preparation changed CHANGELOG.md"
+
+set_prepare_product_version 0.5.0
 env CHANGIE_BIN="$changie_bin" \
   bash "$prepare_repository/scripts/prepare-changelog-release.sh" 0.5.0 >/dev/null
-prepared_digest="$(sha256sum "$prepare_repository/CHANGELOG.md")"
-env CHANGIE_BIN="$changie_bin" \
-  bash "$prepare_repository/scripts/prepare-changelog-release.sh" 0.5.0 >/dev/null
-[[ "$(sha256sum "$prepare_repository/CHANGELOG.md")" == "$prepared_digest" ]] \
-  || fail "repeated release preparation changed CHANGELOG.md"
+run_validator release v0.5.0 "$prepare_repository"
+[[ ! -e "$prepare_repository/.changes/v0.5.0-rc.2.md" ]] \
+  || fail "stable preparation retained the superseded RC2 archive"
+if grep -Fq '## [0.5.0-rc.2] - ' "$prepare_repository/CHANGELOG.md"; then
+  fail "stable preparation retained the superseded RC2 changelog section"
+fi
+[[ -f "$prepare_repository/.changes/v0.5.0.md" ]] \
+  || fail "stable preparation did not archive its release notes"
 [[ -z "$(find "$prepare_repository/.changes/unreleased" -type f -name '*.yaml' -print -quit)" ]] \
-  || fail "release preparation left pending fragments"
+  || fail "stable preparation left pending fragments"
+stable_digest="$(sha256sum "$prepare_repository/CHANGELOG.md")"
+env CHANGIE_BIN="$changie_bin" \
+  bash "$prepare_repository/scripts/prepare-changelog-release.sh" 0.5.0 >/dev/null
+[[ "$(sha256sum "$prepare_repository/CHANGELOG.md")" == "$stable_digest" ]] \
+  || fail "repeated stable preparation changed CHANGELOG.md"
 
 echo "changelog policy tests passed"

@@ -85,11 +85,14 @@ scripts/verify-sdk-packages.sh
 git diff -- Cargo.toml Cargo.lock CHANGELOG.md .changes
 ```
 
-The preparation command fails unless the requested version matches both the
-fragment-derived version and the version inherited by every first-party Cargo
-package. It batches the pending fragments into one dated `CHANGELOG.md`
-section, preserves the fragments in the version archive, and is idempotent
-when rerun after a successful batch.
+The preparation command fails unless the requested stable version, excluding
+any prerelease suffix, matches the version implied by the fragments, and the
+complete requested version matches every first-party Cargo package. A
+prerelease batch uses Changie's `--keep` mode so the next release candidate
+contains the complete pending release. Preparing a later release candidate
+replaces the earlier prerelease section for the same stable version. Preparing
+the stable version removes the prerelease section and consumes the fragments.
+Each preparation is idempotent when rerun for the same version.
 
 Merge the release-preparation change through `main`. Because this pull request
 only consumes notes recorded by earlier changes, check `No release note
@@ -148,27 +151,17 @@ Release.
 
 ## Configure crates.io trusted publication
 
-After each crate exists, configure the same GitHub trusted publisher in the
-crates.io settings for `zinder-core`, `zinder-proto`, and `zinder-client`:
-
-- owner: `gustavovalverde`
-- repository: `zinder`
-- workflow: `release.yml`
-- environment: `release`
-
-The workflow uses `rust-lang/crates-io-auth-action` to exchange GitHub's OIDC
-identity for a short-lived crates.io token. Do not add a repository or
-environment `CARGO_REGISTRY_TOKEN` secret; the token is exposed only to the
-Cargo Release `publish` step.
-
-Trusted publishers cannot be configured before a crate name exists. For the
-first publication only, create a short-lived crates.io token authorized to
-create the three crate names, check out the exact clean release tag, and use
-Cargo 1.95's complete multi-package publication:
+Do not publish the historical `v0.4.0` tag to crates.io. The first public SDK
+publication starts from an exact, clean `v0.5.0-rc.1` tag after its release
+preparation change has merged to `main`. Create the tag locally without pushing
+it, then use a short-lived conventional crates.io token that can create the
+three crate names:
 
 ```console
-git fetch origin --tags
-git switch --detach v0.5.0
+git switch main
+git pull --ff-only
+git tag -a v0.5.0-rc.1 -m "v0.5.0-rc.1"
+git switch --detach v0.5.0-rc.1
 test -z "$(git status --porcelain)"
 export CARGO_REGISTRY_TOKEN='<short-lived-bootstrap-token>'
 scripts/verify-sdk-packages.sh
@@ -184,13 +177,37 @@ unset CARGO_REGISTRY_TOKEN
 The conventional token must create all three crate names. If Cargo stops after
 a partial publication, keep the token active, wait for the accepted versions to
 appear in the sparse index, and repeat `cargo publish` with only the remaining
-`-p` packages. Do not switch to OIDC while any crate name is still missing.
+`-p` packages. Do not switch to OpenID Connect (OIDC) while any crate name is
+still missing.
 
-After all three exact versions resolve from crates.io, revoke the bootstrap
-token, configure the four trusted-publisher fields above on every crate, then
-rerun the failed `publish public SDK crates` release job. The rerun only
-verifies that the published archives came from the validated tag commit before
-the release continues.
+After all three `0.5.0-rc.1` versions resolve from crates.io, revoke the
+bootstrap token and configure the same GitHub trusted publisher in the
+crates.io settings for `zinder-core`, `zinder-proto`, and `zinder-client`:
+
+- owner: `gustavovalverde`
+- repository: `zinder`
+- workflow: `release.yml`
+- environment: `release`
+
+The workflow uses `rust-lang/crates-io-auth-action` to exchange GitHub's OIDC
+identity for a short-lived crates.io token. Do not add a repository or
+environment `CARGO_REGISTRY_TOKEN` secret; the token is exposed only to the
+Cargo Release `publish` step.
+
+Push `v0.5.0-rc.1` only after all 3 trusted publishers are configured. Cargo
+Release verifies the already published archives against the tag commit, while
+the rest of the release workflow publishes the RC1 images and artifacts:
+
+```console
+git switch main
+git push origin v0.5.0-rc.1
+```
+
+Prepare and tag `v0.5.0-rc.2` through the normal release process after RC1
+finishes. RC2 is the OIDC upload canary: the protected workflow must obtain the
+short-lived token, upload all three missing `0.5.0-rc.2` versions in dependency
+order, and pass the fresh registry-only consumer smoke test. Prepare and publish
+`v0.5.0` only after the RC2 workflow and publication verification succeed.
 
 ## Verify publication
 
