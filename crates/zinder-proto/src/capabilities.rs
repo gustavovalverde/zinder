@@ -1390,6 +1390,9 @@ pub enum Capability {
     /// Chain value-pool totals at the upstream tip
     /// (`wallet.read.chain_value_pools_at_tip_v1`).
     ChainValuePools,
+    /// Immutable network-upgrade activation metadata
+    /// (`wallet.read.network_upgrade_activations_v1`).
+    NetworkUpgradeActivations,
     /// Transparent-address balance (`wallet.address.transparent_balance_v1`).
     TransparentAddressBalance,
 }
@@ -1404,6 +1407,7 @@ impl Capability {
             Self::MempoolSnapshot => WALLET_SNAPSHOT_MEMPOOL_V3,
             Self::MempoolEvents => WALLET_EVENTS_MEMPOOL_V2,
             Self::ChainValuePools => WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+            Self::NetworkUpgradeActivations => WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
             Self::TransparentAddressBalance => WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
         }
     }

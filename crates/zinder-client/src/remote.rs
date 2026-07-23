@@ -33,7 +33,7 @@ use zinder_core::{
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact, TxStatus,
 };
-use zinder_proto::capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1;
+use zinder_proto::capabilities::{Capability, CapabilityDescriptor};
 use zinder_proto::v1::wallet::{self, WalletServerInfo, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::{
     WalletWireDecodeError, chain_epoch_from_message,
@@ -215,10 +215,7 @@ impl ChainIndex for RemoteChainIndex {
             .common
             .as_ref()
             .ok_or_else(|| IndexerError::malformed("info.common", "field is missing"))?;
-        ensure_advertised_capability(
-            &common.capabilities,
-            WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
-        )?;
+        ensure_advertised_capability(common, Capability::NetworkUpgradeActivations)?;
 
         let response = self
             .client()
@@ -1206,15 +1203,13 @@ fn ensure_supported_contract_revision(contract_revision: u32) -> Result<(), Inde
 }
 
 fn ensure_advertised_capability(
-    advertised_capabilities: &[String],
-    required_capability: &'static str,
+    descriptor: &impl CapabilityDescriptor,
+    required_capability: Capability,
 ) -> Result<(), IndexerError> {
-    if advertised_capabilities
-        .iter()
-        .any(|capability| capability == required_capability)
-    {
+    if descriptor.supports(required_capability) {
         return Ok(());
     }
+    let required_capability = required_capability.as_str();
     Err(IndexerError::FailedPrecondition {
         reason: format!(
             "remote wallet service does not advertise required capability {required_capability}"
@@ -1252,19 +1247,25 @@ fn network_upgrade_activations_from_message(
 #[cfg(test)]
 mod network_upgrade_activation_tests {
     use super::*;
+    use zinder_proto::v1::ops::ServerInfo;
 
     #[test]
     fn exact_network_upgrade_capability_preflight_accepts_only_advertised_capability() {
-        let advertised = vec![WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1.to_owned()];
+        let advertised = ServerInfo {
+            capabilities: vec![Capability::NetworkUpgradeActivations.as_str().to_owned()],
+            ..ServerInfo::default()
+        };
         assert!(
-            ensure_advertised_capability(&advertised, WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1)
+            ensure_advertised_capability(&advertised, Capability::NetworkUpgradeActivations)
                 .is_ok()
         );
 
-        let error = ensure_advertised_capability(
-            &["wallet.read.network_upgrade_activations_v2".to_owned()],
-            WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
-        );
+        let unadvertised = ServerInfo {
+            capabilities: vec!["wallet.read.network_upgrade_activations_v2".to_owned()],
+            ..ServerInfo::default()
+        };
+        let error =
+            ensure_advertised_capability(&unadvertised, Capability::NetworkUpgradeActivations);
         assert!(matches!(
             error,
             Err(IndexerError::FailedPrecondition { .. })

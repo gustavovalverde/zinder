@@ -165,6 +165,7 @@ fn typed_capability_variants_match_table_strings() {
         Capability::MempoolSnapshot,
         Capability::MempoolEvents,
         Capability::ChainValuePools,
+        Capability::NetworkUpgradeActivations,
         Capability::TransparentAddressBalance,
     ] {
         assert!(
