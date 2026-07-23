@@ -47,7 +47,6 @@ tonic = { workspace = true, features = ["server", "transport"] }
 tonic-prost.workspace = true
 zebra-chain.workspace = true
 zinder-compat-lightwalletd.workspace = true
-zinder-materialized-views.workspace = true
 zinder-query.workspace = true
 zinder-store.workspace = true
 zinder-testkit.workspace = true

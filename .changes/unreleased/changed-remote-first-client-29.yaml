@@ -1,5 +1,5 @@
 kind: changed
-body: Make `zinder-client` remote-first without storage or RocksDB dependencies, move colocated secondary access to the private `zinder-client-local` crate, and add typed network-upgrade discovery for chain-index consumers.
+body: Make `zinder-client` remote-first without RocksDB or storage dependencies, remove the unused storage-backed local adapter, and add typed network-upgrade discovery for chain-index consumers.
 time: 2026-07-22T12:36:56Z
 custom:
   Bump: minor

@@ -146,9 +146,10 @@ database engine, raw-byte retention policy, or release topology.
   snapshot. Remote clients preflight server identity, network, contract
   revision, and `wallet.read.network_upgrade_activations_v1` before discovery.
 - The public, remote-first `zinder-client` surface enables the remote adapter
-  by default and has no normal dependency on storage or RocksDB crates. The
-  private `zinder-client-local` workspace crate owns the colocated secondary
-  adapter.
+  by default and has no normal dependency on storage or RocksDB crates.
+- Zinder serving runtimes compose service-internal reads through
+  `WalletServingQuery` and an admitted `WalletServingReadPair`; they do not
+  expose a storage-backed public client adapter.
 - Public traits describe consumer capabilities. Concrete RocksDB types remain
   at composition roots and storage adapters.
 

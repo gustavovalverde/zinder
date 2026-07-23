@@ -31,8 +31,8 @@ use zinder_client::{
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter, WalletServingQuery,
-    WalletServingReadPair,
+    ServerInfoSettings, WalletCapabilityProfile, WalletQuery, WalletQueryGrpcAdapter,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_testkit::{
     ChainFixture, MockTransactionBroadcaster, StoreFixture, WalletServingStoreFixture,
@@ -119,17 +119,24 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
 #[tokio::test]
 async fn remote_chain_index_returns_typed_network_upgrade_activations() -> eyre::Result<()> {
     let expected = sample_regtest_upgrade_activations();
+    let activations = Arc::new(expected.clone());
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let store_fixture =
-        StoreFixture::with_chain_committed(&chain_fixture, zinder_client::ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(expected.clone()),
-    );
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader),
+        Arc::new(wallet_reader),
+    )?);
+    let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
+    let wallet_query =
+        WalletServingQuery::from_serving_pair_slot(serving_pair_slot, (), activations);
     let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
         wallet_query,
-        ServerInfoSettings::default(),
+        ServerInfoSettings {
+            capability_profile: WalletCapabilityProfile::ExactPair,
+            ..ServerInfoSettings::default()
+        },
     ))
     .await?;
     let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {

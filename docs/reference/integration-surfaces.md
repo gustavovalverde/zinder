@@ -12,7 +12,6 @@ Zebra, Zaino, Zinder, and lightwalletd, see
 | --- | --- | --- |
 | Existing lightwalletd client | `zinder-compat-lightwalletd` | The client already speaks `CompactTxStreamer`; changing the endpoint should not require a protocol rewrite. |
 | Rust wallet or service that needs live events or broadcast | `zinder-client::RemoteChainIndex` | The consumer can link the Zinder Rust crates and reach a deployment that embeds the native `WalletQuery` adapter over gRPC. |
-| Zinder-owned read-only process colocated with canonical storage | `zinder_client_local::LocalChainIndex` | This private workspace optimization opens RocksDB secondaries and is not part of the public SDK surface. It cannot subscribe, broadcast, or read live mempool state unless its optional remote fallback is configured. |
 | Client that cannot link `zinder-client` | Vendored `WalletQuery` protos | The consumer generates a native gRPC client with its own language and toolchain. |
 | Explorer or analytics application | `ExplorerQuery`, with `WalletQuery` where required | The consumer needs derived views rather than only wallet-sync artifacts. |
 
@@ -25,7 +24,7 @@ The wallet codebases below demonstrate integration seams and method demand; they
 | [ZODL](https://github.com/zodl-inc/zodl-android) | Zcash Android SDK `LightWalletEndpoint` | `GetLightdInfo`, `GetLatestBlock`, `GetBlockRange`, `GetTreeState`, `GetSubtreeRoots`, `GetTransaction`, `GetAddressUtxosStream`, `GetTaddressTxids`, `SendTransaction`, `GetMempoolTx`, and `GetMempoolStream` | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; no native Zinder adapter is required. |
 | [Vizor](https://github.com/chainapsis/vizor-wallet) | librustzcash `lightwalletd-tonic` client with a configurable endpoint | `GetLightdInfo`, latest block and block ranges, tree state, subtree roots, transaction lookup, transparent receiver discovery, `SendTransaction`, and mempool methods through librustzcash's sync engine | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; public deployments also need trusted TLS in front of Zinder. |
 | [Zallet](https://github.com/zcash/zallet) | Backend-neutral `Chain` and snapshot-scoped `ChainView` traits | `ServerInfo`, `VisibleTipBlock`, `FullBlocksInRange`, block headers, `SubtreeRootsInRange`, `Transaction`, transparent output and spend lookups, `ChainEvents`, `MempoolSnapshot`, `MempoolEvents`, and `BroadcastTransaction` | Implement a new native `WalletQuery` adapter behind the existing traits. This mapping does not claim that Zallet integration exists on Zinder `main`. |
-| [Zally](https://github.com/gustavovalverde/zally) | `ChainSource` for reads and events, plus `Submitter` for broadcast | `SettledTipBlock`, `VisibleTipBlock`, `CompactBlocksInRange`, `TreeState`, `SubtreeRootsInRange`, `Transaction`, `TransparentAddressUnspentOutputs`, `ChainEvents`, and `BroadcastTransaction` | Map the traits to public `RemoteChainIndex` and `EndpointBackedIndex`; the private `zinder_client_local::LocalChainIndex` cannot satisfy events or broadcast. |
+| [Zally](https://github.com/gustavovalverde/zally) | `ChainSource` for reads and events, plus `Submitter` for broadcast | `SettledTipBlock`, `VisibleTipBlock`, `CompactBlocksInRange`, `TreeState`, `SubtreeRootsInRange`, `Transaction`, `TransparentAddressUnspentOutputs`, `ChainEvents`, and `BroadcastTransaction` | Map the traits to public `RemoteChainIndex` and `EndpointBackedIndex`. |
 
 Method coverage proves that Zinder has an appropriate public primitive. A support claim additionally requires the wallet's create or import, sync, recovery, send, mempool, and reorg flows against the selected wallet release and network.
 
@@ -55,7 +54,6 @@ Public deployments terminate TLS, authentication, rate limiting, and quota contr
 `zinder-client` is the canonical Rust integration crate:
 
 - `RemoteChainIndex` is enabled by default and connects to a `WalletQuery` gRPC endpoint without a RocksDB dependency.
-- `zinder_client_local::LocalChainIndex` is a private workspace adapter for Zinder-owned processes colocated with storage; it is outside the intended publication surface.
 - `ChainSnapshot<'_, I>` captures one epoch from a borrowed `ChainIndex` and
   exposes its pinnable canonical reads without a repeated epoch parameter.
 - `OwnedChainSnapshot<I>` provides the same surface over `Arc<I>`, including
@@ -64,15 +62,15 @@ Public deployments terminate TLS, authentication, rate limiting, and quota contr
 
 The contract is split across two async traits so the compiler expresses which calls a handle can serve:
 
-- `ChainIndex` carries immutable network metadata plus canonical and wallet-projection reads. Remote and private local adapters implement the same typed contract: network-upgrade activations, compact and full blocks, tree state, subtree roots, transparent-address unspent outputs and tx-history, canonical prevout resolution, and the confirmed transparent-address balance.
+- `ChainIndex` carries immutable network metadata plus canonical and wallet-projection reads. `RemoteChainIndex` implements the typed client contract; consumers preflight advertised capabilities before relying on optional reads.
 - `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
 
-A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`; passing the private local adapter there is a compile error rather than a runtime "endpoint not configured" failure. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
+A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
 
-Consumers that need `full_block_at` or `full_blocks_in_range` must preflight `wallet.read.full_block_at_v1` and `wallet.read.full_block_range_v1`. Operators must set `storage.raw_blob_policy = "all"` (or `ZINDER_STORAGE__RAW_BLOB_POLICY=all`) before the first canonical commit. Raw-blob coverage is immutable historical state, so changing this setting on a non-empty store requires a rebuild. Without block-blob retention, point reads return `ArtifactUnavailable` / gRPC `NOT_FOUND`; a range stream can yield its retained prefix and then fail at the first unavailable block.
+The published traits and protocol include full-block and transparent-outpoint methods for consumer compatibility, but the released exact-pair `WalletServingQuery` returns `Unavailable` for those reads and `zinder-query` does not advertise their capabilities. Method presence is not a deployment support claim.
 
-Capture calls `current_epoch` once. A stale local secondary or a remote serving
-pair that has advanced returns `IndexerError::ChainEpochPinUnavailable`; its
+Capture calls `current_epoch` once. A remote serving pair that has advanced
+returns `IndexerError::ChainEpochPinUnavailable`; its
 retry policy is `RefreshChainEpoch`. The released wallet-serving runtime keeps
 only its current exact read pair, so consumers must refresh rather than assume
 historical epoch retention. Implementations may retain older epochs, but may
@@ -82,6 +80,10 @@ Native clients get typed errors, capability discovery, epoch-pinned reads,
 chain-event cursors, transaction broadcast outcomes, mempool reads, and
 transparent-address artifacts without depending on the lightwalletd
 compatibility layer.
+
+Inside Zinder, `zinder-query` and `zinder-compat-lightwalletd` read storage
+through `WalletServingQuery` over an admitted `WalletServingReadPair`. That
+service-internal composition is not a public SDK adapter.
 
 ## Vendoring the protocol
 

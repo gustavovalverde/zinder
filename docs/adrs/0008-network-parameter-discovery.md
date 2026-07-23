@@ -11,7 +11,7 @@
 
 Three pieces of per-network consensus data flow through Zinder's read path: activation heights (Sapling, NU5, NU6, NU6\_1, ...), the consensus branch id active at a given height, and the human-facing upgrade name. Zinder serves them on at least three observable surfaces:
 
-- `WalletQuery.Transaction` (`MinedTransactionChainContext.consensus_branch_id`), consumed by Zinder-native wallets via the native gRPC and by the in-process local client (`zinder-client-local`).
+- `WalletQuery.Transaction` (`MinedTransactionChainContext.consensus_branch_id`), consumed by Zinder-native wallets through the native gRPC endpoint.
 - `compat-lightwalletd::GetLightdInfo` (`saplingActivationHeight`, `consensusBranchId`, `upgradeName`, `upgradeHeight`), consumed by every lightwalletd-compatible wallet: Zodl, librustzcash-based wallets, and any future lightwalletd client.
 - Transparent V5 transaction signing in `zinder-testkit`, which needs the active branch id to compute ZIP-244 sighashes; mismatched heights cause Zebra to reject broadcasts with `incorrect consensus branch id`.
 
@@ -47,9 +47,9 @@ Production code does not consult `RegtestParameters::default()` or library-defau
 ### Wiring contract per service
 
 - **`zinder-ingest`** discovers the activations before canonical construction so transaction parsing and the immutable store identity use the node's exact table. Wallet-serving coverage independently requires complete transparent history.
-- **`zinder-query`** holds `Arc<NetworkUpgradeActivations>` on `WalletQuery` as a required constructor parameter. `MinedTransactionChainContext.consensus_branch_id` always reflects the running node's active branch at the mined height. The production binary errors out at startup if `[node]` is not configured (the table cannot be discovered without an RPC endpoint).
+- **`zinder-query`** holds `Arc<NetworkUpgradeActivations>` on `WalletServingQuery` as a required constructor parameter. `MinedTransactionChainContext.consensus_branch_id` always reflects the running node's active branch at the mined height. The production binary errors out at startup if `[node]` is not configured (the table cannot be discovered without an RPC endpoint).
 - **`zinder-compat-lightwalletd`** holds `Arc<NetworkUpgradeActivations>` on `LightwalletdGrpcAdapter` as a required constructor parameter. `GetLightdInfo` reads the table directly. Same startup-time failure if `[node]` is not configured.
-- **`zinder-client-local`** holds the same `Arc<NetworkUpgradeActivations>` on `LocalChainIndex` via a required `LocalOpenOptions.network_upgrade_activations` field.
+- **`zinder-client`** discovers the table through `RemoteChainIndex::network_upgrade_activations`, after preflighting the native server's identity, network, contract revision, and advertised capability.
 - **`zinder-testkit`** exposes `local_network_from_activations(&activations) -> LocalNetwork` for live tests; `TransparentTestKey::from_seed_with_local_network` accepts the result. `regtest_local_network()` is derived from `sample_regtest_upgrade_activations()` so the two regtest fixtures cannot drift.
 
 ### Regression test

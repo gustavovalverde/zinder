@@ -69,8 +69,8 @@ pub struct RemoteOpenOptions {
 /// `RemoteChainIndex` is the recommended baseline for the Zallet-with-Zinder
 /// operator recipe documented in
 /// [Service operations §Zallet with Zinder](../../../docs/architecture/service-operations.md#zallet-with-zinder).
-/// `zinder_client_local::LocalChainIndex` is the private, in-workspace
-/// colocated optimization for advanced operators.
+/// Zinder services that read storage directly use the service-internal
+/// `WalletServingQuery` composition rather than this public client surface.
 ///
 /// The underlying tonic `Channel` is configured with HTTP/2 keepalive and a
 /// lazy connect: the connection is established on the first call and

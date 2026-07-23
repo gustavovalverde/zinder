@@ -14,20 +14,18 @@ use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
 use zinder_client::{
-    BlockHeight, ChainEpochId, Network, NetworkUpgradeActivations, RemoteChainIndex,
-    RemoteOpenOptions, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentUnspentOutput,
+    BlockHeight, Network, NetworkUpgradeActivations, RemoteChainIndex, RemoteOpenOptions,
+    TransactionId, TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
-use zinder_materialized_views::MaterializedViewStore;
 use zinder_query::{
-    CanonicalReader, ServerInfoSettings, WalletProjectionReader, WalletQuery,
+    CanonicalReader, ServerInfoSettings, WalletCapabilityProfile, WalletProjectionReader,
     WalletQueryGrpcAdapter, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, StoreFixture,
-    WalletServingStoreFixture, sample_regtest_upgrade_activations,
+    ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
 };
 
 const PARITY_TREE_STATE_PAYLOAD: &[u8] =
@@ -59,13 +57,6 @@ fn parity_chain_fixture(block_count: u32) -> ChainFixture {
             BlockHeight::new(block_count),
             PARITY_TREE_STATE_PAYLOAD,
         )
-}
-
-fn committed_store_fixture(chain_fixture: &ChainFixture) -> eyre::Result<StoreFixture> {
-    Ok(StoreFixture::with_chain_committed(
-        chain_fixture,
-        ChainEpochId::new(1),
-    )?)
 }
 
 fn build_transparent_address_serving_fixture() -> eyre::Result<TransparentAddressServingFixture> {
@@ -136,25 +127,27 @@ fn build_transparent_address_adapter(
     )
 }
 
-async fn open_remote_chain_index(
-    store_fixture: &StoreFixture,
-    block_blobs_retained: bool,
-    materialized_view_store: Option<MaterializedViewStore>,
-) -> eyre::Result<RemoteChainIndex> {
-    let transparent_address_history_available = materialized_view_store.is_some();
-    let mut wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
+async fn open_remote_chain_index(chain_fixture: &ChainFixture) -> eyre::Result<RemoteChainIndex> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(chain_fixture, activations.as_ref())?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
+        Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+    )?);
+    let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(
+        serving_pair_slot,
+        MockTransactionBroadcaster::broadcast_disabled(),
+        activations,
     );
-    if let Some(materialized_view_store) = materialized_view_store {
-        wallet_query = wallet_query.with_materialized_view_store(materialized_view_store);
-    }
     let adapter = WalletQueryGrpcAdapter::new(
         wallet_query,
         ServerInfoSettings {
-            block_blobs_retained,
-            transparent_address_history_available,
+            capability_profile: WalletCapabilityProfile::ExactPair,
+            transaction_blobs_retained: true,
+            transparent_address_history_available: true,
             ..ServerInfoSettings::default()
         },
     );
@@ -162,6 +155,7 @@ async fn open_remote_chain_index(
     let address = listener.local_addr()?;
     let incoming = TcpListenerStream::new(listener);
     tokio::spawn(async move {
+        let _store_fixture = store_fixture;
         let _server_result = Server::builder()
             .add_service(adapter.into_server())
             .serve_with_incoming(incoming)

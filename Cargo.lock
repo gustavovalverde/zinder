@@ -5711,27 +5711,6 @@ dependencies = [
  "zebra-chain",
  "zinder-compat-lightwalletd",
  "zinder-core",
- "zinder-materialized-views",
- "zinder-proto",
- "zinder-query",
- "zinder-store",
- "zinder-testkit",
-]
-
-[[package]]
-name = "zinder-client-local"
-version = "0.5.0"
-dependencies = [
- "async-trait",
- "eyre",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tracing",
- "zinder-client",
- "zinder-core",
- "zinder-materialized-views",
  "zinder-proto",
  "zinder-query",
  "zinder-store",

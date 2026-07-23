@@ -112,8 +112,8 @@ on:
 - `BroadcastRejectionReason` is a new `#[non_exhaustive]` enum with
   `Default = Unknown` plus the four typed reasons.
 
-`zinder-client` re-exports the new types so public `RemoteChainIndex` and
-private `zinder_client_local::LocalChainIndex` callers see the same vocabulary.
+`zinder-client` re-exports the new types so `RemoteChainIndex` callers use the
+same vocabulary as the native protocol.
 
 ### Lightwalletd compatibility surface
 

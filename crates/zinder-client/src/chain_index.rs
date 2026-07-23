@@ -1,6 +1,6 @@
 //! Public chain-index trait and consumer-facing domain types.
 
-use std::{num::NonZeroU32, pin::Pin, sync::Arc, time::Duration};
+use std::{num::NonZeroU32, pin::Pin, sync::Arc};
 
 use crate::IndexerError;
 use async_trait::async_trait;
@@ -481,7 +481,10 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
             .await
     }
 
-    /// Reads one retained full block from the captured canonical epoch.
+    /// Requests one retained full block from the captured canonical epoch.
+    ///
+    /// Availability depends on the implementation's advertised full-block
+    /// capability.
     pub async fn full_block_at(
         &self,
         height: BlockHeight,
@@ -491,7 +494,10 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
             .await
     }
 
-    /// Streams retained full blocks from the captured canonical epoch.
+    /// Requests retained full blocks from the captured canonical epoch.
+    ///
+    /// Availability depends on the implementation's advertised full-block
+    /// range capability.
     pub async fn full_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
@@ -555,7 +561,8 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
             .await
     }
 
-    /// Resolves canonical transparent outputs from the captured epoch.
+    /// Requests canonical transparent outputs from the captured epoch when the
+    /// implementation advertises the corresponding capability.
     pub async fn transparent_outputs_by_outpoint(
         &self,
         outpoints: &[TransparentOutPoint],
@@ -565,7 +572,8 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
             .await
     }
 
-    /// Resolves canonical transparent spends from the captured epoch.
+    /// Requests canonical transparent spends from the captured epoch when the
+    /// implementation advertises the corresponding capability.
     pub async fn transparent_spends_by_outpoint(
         &self,
         outpoints: &[TransparentOutPoint],
@@ -575,7 +583,8 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
             .await
     }
 
-    /// Resolves canonical unspent transparent outputs from the captured epoch.
+    /// Requests canonical unspent transparent outputs from the captured epoch
+    /// when the implementation advertises the corresponding capability.
     pub async fn transparent_unspent_outputs_by_outpoint(
         &self,
         outpoints: &[TransparentOutPoint],
@@ -679,7 +688,10 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
         self.borrowed().compact_blocks_in_range(block_range).await
     }
 
-    /// Reads one retained full block from the captured canonical epoch.
+    /// Requests one retained full block from the captured canonical epoch.
+    ///
+    /// Availability depends on the implementation's advertised full-block
+    /// capability.
     pub async fn full_block_at(
         &self,
         height: BlockHeight,
@@ -687,7 +699,10 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
         self.borrowed().full_block_at(height).await
     }
 
-    /// Streams retained full blocks from the captured canonical epoch.
+    /// Requests retained full blocks from the captured canonical epoch.
+    ///
+    /// Availability depends on the implementation's advertised full-block
+    /// range capability.
     pub async fn full_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
@@ -737,7 +752,8 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
             .await
     }
 
-    /// Resolves canonical transparent outputs from the captured epoch.
+    /// Requests canonical transparent outputs from the captured epoch when the
+    /// implementation advertises the corresponding capability.
     pub async fn transparent_outputs_by_outpoint(
         &self,
         outpoints: &[TransparentOutPoint],
@@ -747,7 +763,8 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
             .await
     }
 
-    /// Resolves canonical transparent spends from the captured epoch.
+    /// Requests canonical transparent spends from the captured epoch when the
+    /// implementation advertises the corresponding capability.
     pub async fn transparent_spends_by_outpoint(
         &self,
         outpoints: &[TransparentOutPoint],
@@ -757,7 +774,8 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
             .await
     }
 
-    /// Resolves canonical unspent transparent outputs from the captured epoch.
+    /// Requests canonical unspent transparent outputs from the captured epoch
+    /// when the implementation advertises the corresponding capability.
     pub async fn transparent_unspent_outputs_by_outpoint(
         &self,
         outpoints: &[TransparentOutPoint],
@@ -775,14 +793,11 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
     }
 }
 
-/// Canonical and materialized-view reads served identically by every chain-index
-/// handle.
+/// Typed network metadata plus canonical and wallet-projection reads.
 ///
-/// Both the optional local `RocksDB`-secondary reader and remote `WalletQuery`
-/// gRPC client implement this
-/// trait with identical semantics. Every method here answers from the
-/// canonical chain store or the materialized view, so a handle that cannot
-/// reach a live ingest-control endpoint still honors the full contract.
+/// The public [`crate::RemoteChainIndex`] implements this trait over the native
+/// `WalletQuery` endpoint. Callers preflight the deployment's advertised
+/// capabilities before depending on optional reads.
 ///
 /// Methods that require a live ingest-control/broadcast endpoint (broadcast,
 /// live-mempool reads, the chain-event stream, chain value-pools, the
@@ -959,9 +974,11 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Reads one full serialized block.
     ///
-    /// Served only when the writer deployment retains block blobs
-    /// (`raw_blob_policy = "all"`). Heights with no retained blob return
-    /// [`IndexerError::NotFound`].
+    /// This is an optional protocol method. A serving implementation also
+    /// requires retained block blobs (`raw_blob_policy = "all"`); heights with
+    /// no retained blob return [`IndexerError::ArtifactUnavailable`]. Remote
+    /// callers must preflight `wallet.read.full_block_at_v1`. The released
+    /// exact-pair `zinder-query` profile does not advertise this capability.
     ///
     /// # Examples
     ///
@@ -979,9 +996,11 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Streams full serialized blocks for an inclusive range.
     ///
-    /// Served only when the writer deployment retains block blobs
-    /// (`raw_blob_policy = "all"`); the stream errors on the first height with
-    /// no retained blob.
+    /// This is an optional protocol method. A serving implementation also
+    /// requires retained block blobs (`raw_blob_policy = "all"`); the stream
+    /// errors on the first height with no retained blob. Remote callers must
+    /// preflight `wallet.read.full_block_range_v1`. The released exact-pair
+    /// `zinder-query` profile does not advertise this capability.
     ///
     /// # Examples
     ///
@@ -1002,9 +1021,8 @@ pub trait ChainIndex: Send + Sync + 'static {
     ///
     /// `at_epoch_id = None` resolves to the live tip; `Some(id)` pins the
     /// read to that chain epoch. The returned artifact's height always equals
-    /// `height`: remote clients fill non-checkpoint heights from the query
-    /// plane's upstream node, while local clients serve only stored heights and
-    /// return [`IndexerError::NotFound`] for the gaps.
+    /// `height`. `RemoteChainIndex` asks the query plane, which may fill a
+    /// non-checkpoint height from its configured upstream node.
     ///
     /// # Examples
     ///
@@ -1142,12 +1160,9 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Returns the transparent-address balance summed across `addresses`.
     ///
-    /// The confirmed total is summed from the canonical unspent-output index,
-    /// so both adapters answer it from the store. The signed
-    /// `unconfirmed_delta_zat` overlays the live mempool only when an
-    /// ingest-control endpoint is reachable; a local handle without an
-    /// endpoint reports `unconfirmed_delta_zat = 0`, matching the always-on
-    /// `wallet.address.transparent_balance_v1` capability semantics.
+    /// The confirmed total is summed from the canonical unspent-output index.
+    /// The signed `unconfirmed_delta_zat` overlays the live mempool state
+    /// available to the serving endpoint.
     ///
     /// # Examples
     ///
@@ -1170,7 +1185,10 @@ pub trait ChainIndex: Send + Sync + 'static {
     ///
     /// Implementations reject the coinbase sentinel and silently truncate
     /// requests above
-    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`].
+    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. This is an
+    /// optional protocol method; remote callers must preflight
+    /// `wallet.read.transparent_outputs_by_outpoint_v1`. The released
+    /// exact-pair `zinder-query` profile does not advertise this capability.
     ///
     /// # Examples
     ///
@@ -1197,6 +1215,9 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. This is the
     /// canonical half of a getspentinfo-equivalent lookup; the unmined half is
     /// the endpoint-backed `transparent_mempool_spends_by_outpoint` method.
+    /// This is an optional protocol method; remote callers must preflight
+    /// `wallet.read.transparent_spends_by_outpoint_v1`. The released exact-pair
+    /// `zinder-query` profile does not advertise this capability.
     ///
     /// # Examples
     ///
@@ -1225,6 +1246,9 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. The read is
     /// canonical-only: a mempool-aware caller subtracts the spends returned by
     /// the endpoint-backed `transparent_mempool_spends_by_outpoint` method.
+    /// This is an optional protocol method; remote callers must preflight
+    /// `wallet.read.transparent_unspent_outputs_by_outpoint_v1`. The released
+    /// exact-pair `zinder-query` profile does not advertise this capability.
     ///
     /// # Examples
     ///
@@ -1261,21 +1285,6 @@ pub trait ChainIndex: Send + Sync + 'static {
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentUtxoSetSummaryView, IndexerError>;
-
-    /// Returns the catchup cadence used by local implementations, or `None`
-    /// for purely remote implementations.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::ChainIndex;
-    /// # fn demo<T: ChainIndex>(client: &T) {
-    /// let cadence = client.local_catchup_interval();
-    /// # let _ = cadence; }
-    /// ```
-    fn local_catchup_interval(&self) -> Option<Duration> {
-        None
-    }
 }
 
 /// Live ingest-control reads layered on top of [`ChainIndex`].
@@ -1289,8 +1298,9 @@ pub trait ChainIndex: Send + Sync + 'static {
 /// advertisement.
 ///
 /// A consumer that needs any of these methods bounds its handle as
-/// `T: ChainIndex + EndpointBackedIndex`, so a colocated local reader without
-/// an endpoint is rejected at compile time rather than at call time.
+/// `T: ChainIndex + EndpointBackedIndex`, so a handle whose type does not
+/// provide endpoint operations is rejected at compile time rather than at
+/// call time.
 #[async_trait]
 #[cfg(feature = "remote")]
 pub trait EndpointBackedIndex: ChainIndex {

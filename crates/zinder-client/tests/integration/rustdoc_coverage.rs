@@ -184,7 +184,6 @@ fn extract_chain_index_body_matches_known_method_set() -> Result<()> {
         "transparent_address_tx_ids_in_range",
         "transparent_address_balance",
         "transparent_outputs_by_outpoint",
-        "local_catchup_interval",
     ];
     assert_trait_includes_methods(CHAIN_INDEX_DECLARATION, &must_include)
 }

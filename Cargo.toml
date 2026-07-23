@@ -2,7 +2,6 @@
 members = [
     "crates/zinder-core",
     "crates/zinder-client",
-    "crates/zinder-client-local",
     "crates/zinder-materialized-views",
     "crates/zinder-proto",
     "crates/zinder-rocksdb-bulk-load",
@@ -85,7 +84,6 @@ zebra-chain = "11.0.0"
 zinder-core = { path = "crates/zinder-core" }
 zinder-rocksdb-bulk-load = { path = "crates/zinder-rocksdb-bulk-load" }
 zinder-client = { path = "crates/zinder-client" }
-zinder-client-local = { path = "crates/zinder-client-local" }
 zinder-compat-cipherscan = { path = "services/zinder-compat-cipherscan" }
 zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
 zinder-materialized-views = { path = "crates/zinder-materialized-views" }

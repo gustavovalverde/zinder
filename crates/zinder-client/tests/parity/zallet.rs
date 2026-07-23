@@ -9,16 +9,13 @@
 
 use eyre::eyre;
 use std::sync::Arc;
-use tokio_stream::StreamExt as _;
 use zinder_client::{
-    BlockHeight, BlockHeightRange, BlockSelector, ChainIndex, EndpointBackedIndex,
-    OwnedChainSnapshot, RemoteChainIndex, TransactionId, TxStatus, WALLET_READ_FULL_BLOCK_AT_V1,
-    WALLET_READ_FULL_BLOCK_RANGE_V1,
+    BlockHeight, BlockSelector, ChainIndex, EndpointBackedIndex, OwnedChainSnapshot,
+    RemoteChainIndex, TransactionId, TxStatus,
 };
-use zinder_store::RawBlobRetention;
 use zinder_testkit::FixtureTransactionRows;
 
-use super::{committed_store_fixture, open_remote_chain_index, parity_chain_fixture};
+use super::{open_remote_chain_index, parity_chain_fixture};
 
 #[test]
 fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
@@ -65,7 +62,7 @@ fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
 )]
 async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([0x42; 32]);
-    let base_fixture = parity_chain_fixture(2).with_raw_blob_retention(RawBlobRetention::All);
+    let base_fixture = parity_chain_fixture(2);
     let transaction_block = base_fixture
         .block_at(BlockHeight::new(2))
         .ok_or_else(|| eyre!("fixture must contain block 2"))?;
@@ -80,24 +77,7 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     );
     let transaction_location = transaction_rows.location;
     let chain_fixture = base_fixture.with_transaction_rows(transaction_rows);
-    let store_fixture = committed_store_fixture(&chain_fixture)?;
-    let chain_index = open_remote_chain_index(&store_fixture, true, None).await?;
-    let server_info = chain_index.server_info().await?;
-    let capabilities = &server_info
-        .common
-        .as_ref()
-        .ok_or_else(|| eyre!("remote server info must include common metadata"))?
-        .capabilities;
-    for required in [
-        WALLET_READ_FULL_BLOCK_AT_V1,
-        WALLET_READ_FULL_BLOCK_RANGE_V1,
-    ] {
-        if !capabilities.iter().any(|advertised| advertised == required) {
-            return Err(eyre!(
-                "remote server must advertise required full-block capability {required}"
-            ));
-        }
-    }
+    let chain_index = open_remote_chain_index(&chain_fixture).await?;
     let activations = chain_index.network_upgrade_activations().await?;
     assert_eq!(
         activations,
@@ -145,27 +125,6 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
          consumer reads bytes, location, and confirmations from one response",
     );
     assert_eq!(missing_status, TxStatus::NotFound);
-
-    let full_block = chain_view.full_block_at(BlockHeight::new(2)).await?;
-    assert_eq!(full_block.height, BlockHeight::new(2));
-    assert!(!full_block.raw_block_bytes.is_empty());
-    let mut full_blocks = chain_view
-        .full_blocks_in_range(BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            BlockHeight::new(2),
-        ))
-        .await?;
-    let first_full_block = full_blocks
-        .next()
-        .await
-        .ok_or_else(|| eyre!("missing first full block"))??;
-    let second_full_block = full_blocks
-        .next()
-        .await
-        .ok_or_else(|| eyre!("missing second full block"))??;
-    assert_eq!(first_full_block.height, BlockHeight::new(1));
-    assert_eq!(second_full_block.height, BlockHeight::new(2));
-    assert!(full_blocks.next().await.is_none());
 
     Ok(())
 }

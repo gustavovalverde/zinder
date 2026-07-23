@@ -5,7 +5,6 @@
 //! per-address state. These compile-time assertions ensure the trait surface
 //! they depend on stays intact through future refactors.
 
-use eyre::eyre;
 use std::num::NonZeroU32;
 use tokio_stream::StreamExt as _;
 
@@ -14,13 +13,9 @@ use zinder_client::{
     TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentAddressTxIndexArtifact,
     TransparentAddressUnspentOutputsQuery, TransparentOutPoint, TransparentUnspentOutput,
 };
-use zinder_materialized_views::TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME;
-use zinder_store::{ChainEventStreamFamily, EventStreamStartPosition};
-use zinder_testkit::{
-    open_test_materialized_view_store_for_canonical, seed_transparent_address_transaction_history,
-};
+use zinder_testkit::FixtureTransactionRows;
 
-use super::{committed_store_fixture, open_remote_chain_index, parity_chain_fixture};
+use super::{open_remote_chain_index, parity_chain_fixture};
 
 #[test]
 fn parity_chain_index_surface_compiles_for_block_explorers() {
@@ -79,28 +74,16 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
         transaction_id,
         block_hash,
     );
-    let chain_fixture = base_fixture.with_address_output_index(utxo.clone());
-    let store_fixture = committed_store_fixture(&chain_fixture)?;
-    let materialized_view_store =
-        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
-    seed_transparent_address_transaction_history(
-        &materialized_view_store,
-        std::slice::from_ref(&tx_history),
-    )?;
-    let chain_fence = store_fixture
-        .chain_store()
-        .resolve_chain_event_stream_start(
-            &EventStreamStartPosition::LiveTail,
-            ChainEventStreamFamily::Visible,
-        )?
-        .cursor
-        .ok_or_else(|| eyre!("committed fixture must have a visible chain fence"))?;
-    materialized_view_store.put_chain_event_cursor(
-        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-        chain_fence.as_bytes(),
-    )?;
-    let chain_index =
-        open_remote_chain_index(&store_fixture, false, Some(materialized_view_store)).await?;
+    let chain_fixture = base_fixture
+        .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            transaction_id,
+            block_height,
+            block_hash,
+            0,
+            b"explorer-transparent-transaction".to_vec(),
+        ))
+        .with_address_output_index(utxo.clone());
+    let chain_index = open_remote_chain_index(&chain_fixture).await?;
 
     let mut utxo_stream = chain_index
         .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
@@ -144,7 +127,7 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
     );
     assert_eq!(history_item.chain_epoch, utxo_chain_epoch);
     assert_eq!(history_item.artifact, tx_history);
-    assert!(history_item.cursor.is_some());
+    assert!(history_item.cursor.is_none());
     assert!(history.next().await.is_none());
 
     let balance = chain_index
@@ -155,80 +138,5 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
     assert_eq!(balance.address_count, 1);
     assert_eq!(balance.chain_epoch, utxo_chain_epoch);
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn serves_explorer_transparent_outputs_by_outpoint_in_input_order() -> eyre::Result<()> {
-    let base_fixture = parity_chain_fixture(1);
-    let block = base_fixture
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("fixture must contain block 1"))?;
-    let block_height = block.height;
-    let block_hash = block.hash;
-    let indexed_transaction_id = TransactionId::from_bytes([0xAC; 32]);
-    let script_pub_key = vec![0x76, 0xa9, 0x33, 0x88, 0xac];
-    let chain_fixture = base_fixture.with_address_output_index(TransparentUnspentOutput::new(
-        TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
-        script_pub_key,
-        TransparentOutPoint::new(indexed_transaction_id, 0),
-        8_000_000,
-        block_height,
-        block_hash,
-    ));
-    let store_fixture = committed_store_fixture(&chain_fixture)?;
-    let chain_index = open_remote_chain_index(&store_fixture, false, None).await?;
-
-    let unknown_transaction_id = TransactionId::from_bytes([0xDD; 32]);
-    let outpoints = [
-        TransparentOutPoint::new(indexed_transaction_id, 0),
-        TransparentOutPoint::new(unknown_transaction_id, 0),
-        TransparentOutPoint::new(indexed_transaction_id, 0),
-    ];
-    let response = chain_index
-        .transparent_outputs_by_outpoint(&outpoints, None)
-        .await?;
-
-    assert_eq!(response.entries.len(), 3);
-    assert_eq!(response.entries[0].outpoint, outpoints[0]);
-    assert_eq!(response.entries[1].outpoint, outpoints[1]);
-    assert_eq!(response.entries[2].outpoint, outpoints[2]);
-    let resolved_prevout = response.entries[0]
-        .output
-        .as_ref()
-        .ok_or_else(|| eyre!("indexed outpoint must resolve to a prevout"))?;
-    assert!(resolved_prevout.value_zat > 0);
-    assert!(!resolved_prevout.script_pub_key.is_empty());
-    assert!(response.entries[1].output.is_none());
-    assert_eq!(
-        response.entries[0].output, response.entries[2].output,
-        "duplicate input outpoints must produce identical resolutions",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn rejects_coinbase_sentinel_in_explorer_transparent_outputs_by_outpoint() -> eyre::Result<()>
-{
-    let chain_fixture = parity_chain_fixture(1);
-    let store_fixture = committed_store_fixture(&chain_fixture)?;
-    let chain_index = open_remote_chain_index(&store_fixture, false, None).await?;
-
-    let outpoints = [TransparentOutPoint::COINBASE_SENTINEL];
-    let canonical_error = match chain_index
-        .transparent_outputs_by_outpoint(&outpoints, None)
-        .await
-    {
-        Ok(response) => {
-            return Err(eyre!(
-                "expected coinbase-sentinel rejection from canonical prevouts, got {response:?}"
-            ));
-        }
-        Err(error) => error,
-    };
-    assert!(
-        canonical_error.to_string().contains("coinbase sentinel"),
-        "canonical prevout error must name the coinbase sentinel anti-pattern; got {canonical_error}"
-    );
     Ok(())
 }

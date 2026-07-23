@@ -7,18 +7,23 @@
 //!
 //! Cross-references: [Integration surfaces](../../../../docs/reference/integration-surfaces.md).
 
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
 use zinder_client::{ChainIndex, EndpointBackedIndex, RemoteChainIndex};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
-use zinder_query::WalletQuery;
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_query::{
+    CanonicalReader, WalletProjectionReader, WalletServingQuery, WalletServingReadPair,
+};
+use zinder_testkit::{
+    MockTransactionBroadcaster, WalletServingStoreFixture, sample_regtest_upgrade_activations,
+};
 
 use super::{
     build_transparent_address_adapter, build_transparent_address_serving_fixture,
-    committed_store_fixture, parity_chain_fixture,
+    parity_chain_fixture,
 };
 
 #[test]
@@ -49,12 +54,22 @@ fn parity_chain_index_surface_compiles_for_zodl_use_cases() {
 )]
 async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     let chain_fixture = parity_chain_fixture(2);
-    let store_fixture = committed_store_fixture(&chain_fixture)?;
     let activations = Arc::new(sample_regtest_upgrade_activations());
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(store_fixture.chain_store().clone(), (), activations.clone()),
-        activations,
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
+        Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+    )?);
+    let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
+    let query = WalletServingQuery::from_serving_pair_slot(
+        Arc::clone(&serving_pair_slot),
+        MockTransactionBroadcaster::broadcast_disabled(),
+        Arc::clone(&activations),
     );
+    let adapter =
+        LightwalletdGrpcAdapter::new(query, activations).with_serving_pair_slot(serving_pair_slot);
 
     let visible_tip_block = adapter
         .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
@@ -108,8 +123,8 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     assert_eq!(second_ranged_block.height, 2);
     assert!(compact_blocks.next().await.is_none());
     assert_eq!(tree_state.height, 2);
-    assert_eq!(tree_state.sapling_tree, "000000");
-    assert_eq!(tree_state.orchard_tree, "111111");
+    assert!(tree_state.sapling_tree.is_empty());
+    assert!(tree_state.orchard_tree.is_empty());
     assert_eq!(lightd_info.vendor, "Zinder");
     assert_eq!(lightd_info.chain_name, "test");
     assert_eq!(lightd_info.block_height, visible_tip_block.height);

@@ -45,15 +45,18 @@ pub const WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2: &str = "wallet.read.compact_blo
 /// The serialized block bytes are present only when the writer deployment
 /// retains block blobs (ingest `raw_blob_policy` is `all`). Reads for
 /// unretained heights return `ArtifactUnavailable` (gRPC `NOT_FOUND`). The
-/// server advertises this capability only when block-blob retention is
-/// enabled.
+/// complete wallet-query profile advertises this capability only when
+/// block-blob retention is enabled. The released exact-pair `zinder-query`
+/// profile does not implement or advertise it.
 pub const WALLET_READ_FULL_BLOCK_AT_V1: &str = "wallet.read.full_block_at_v1";
 /// Capability advertised for `WalletQuery.FullBlocksInRange`.
 ///
 /// Same block-blob retention requirement as
 /// [`WALLET_READ_FULL_BLOCK_AT_V1`]: the stream yields serialized blocks only
-/// when the writer deployment sets `raw_blob_policy = "all"`, and the server
-/// advertises this capability only for such deployments.
+/// when the writer deployment sets `raw_blob_policy = "all"`. The complete
+/// wallet-query profile advertises this capability only for such deployments;
+/// the released exact-pair `zinder-query` profile does not implement or
+/// advertise it.
 pub const WALLET_READ_FULL_BLOCK_RANGE_V1: &str = "wallet.read.full_block_range_v1";
 /// Capability advertised for `WalletQuery.TreeStateAtHeight`.
 pub const WALLET_READ_TREE_STATE_AT_HEIGHT_V2: &str = "wallet.read.tree_state_at_height_v2";
@@ -88,21 +91,27 @@ pub const WALLET_READ_SERVER_INFO_V2: &str = "wallet.read.server_info_v2";
 pub const WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1: &str =
     "wallet.read.network_upgrade_activations_v1";
 /// Capability advertised for `WalletQuery.TransparentOutputsByOutpoint`.
+///
+/// The complete wallet-query profile implements and advertises the canonical
+/// output resolver. The released exact-pair `zinder-query` profile does not.
 pub const WALLET_READ_TRANSPARENT_OUTPUTS_V1: &str =
     "wallet.read.transparent_outputs_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.TransparentSpendsByOutpoint`.
 ///
-/// The canonical (confirmed) reverse-spend resolver; reads the always-present
-/// canonical spend-fact index, so it is advertised by every wallet-plane
-/// deployment. The unmined half is
+/// The complete wallet-query profile implements the canonical (confirmed)
+/// reverse-spend resolver over the canonical spend-fact index and advertises
+/// this capability. The released exact-pair `zinder-query` profile does not
+/// implement or advertise it. The unmined half is
 /// [`WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1`].
 pub const WALLET_READ_TRANSPARENT_SPENDS_V1: &str = "wallet.read.transparent_spends_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.TransparentUnspentOutputsByOutpoint`.
 ///
-/// The canonical single-outpoint unspent probe (gettxout-equivalent). It
-/// composes the always-present canonical output and spend-fact indexes, so it
-/// is advertised by every wallet-plane deployment. Mempool-aware unspent-ness
-/// composes with [`WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1`].
+/// The complete wallet-query profile implements this canonical single-outpoint
+/// unspent probe (gettxout-equivalent) over the canonical output and spend-fact
+/// indexes and advertises the capability. The released exact-pair
+/// `zinder-query` profile does not implement or advertise it. Mempool-aware
+/// unspent-ness composes with
+/// [`WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1`].
 pub const WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
     "wallet.read.transparent_unspent_outputs_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.ChainValuePoolsAtTip`.
@@ -530,13 +539,14 @@ pub enum CapabilitySurface {
 /// Declarative gate a `ServerInfo` builder evaluates before advertising a
 /// capability.
 ///
-/// Each variant names a precondition that a single surface's builder resolves
-/// against its own runtime context. A variant never appears on a
+/// Each variant names a deployment precondition that a single surface's
+/// builder resolves against its own runtime context after filtering for the
+/// selected implementation profile. A variant never appears on a
 /// [`CapabilitySpec`] whose surface cannot evaluate it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AdvertisePolicy {
-    /// Advertised by every deployment of the owning surface.
+    /// No additional deployment gate after implementation-profile filtering.
     AlwaysOn,
     /// Wallet: advertised when a transaction broadcaster is configured.
     RequiresBroadcaster,
@@ -575,8 +585,8 @@ pub enum AdvertisePolicy {
     /// Explorer: advertised when transaction history has verified full
     /// coverage through its typed projection position and wallet-query is online.
     RequiresCompleteTransactionHistory,
-    /// Wallet: advertised when the store retains full block blobs
-    /// (ingest `raw_blob_policy = all`).
+    /// Wallet: a supported implementation advertises when the store retains
+    /// full block blobs (ingest `raw_blob_policy = all`).
     RequiresBlockBlobs,
     /// Wallet: advertised when the store retains transaction blobs
     /// (ingest `raw_blob_policy` in `{transactions, all}`).
