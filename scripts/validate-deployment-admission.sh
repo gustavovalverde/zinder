@@ -420,6 +420,27 @@ EOF
     exit 1
   fi
 
+  trigger_block="$(sed -n '/^on:/,/^permissions:/p' "$release_workflow")"
+  if ! grep -Fq '  push:' <<< "$trigger_block" \
+    || ! grep -Fq '    tags:' <<< "$trigger_block" \
+    || ! grep -Fq '      - "v*"' <<< "$trigger_block" \
+    || grep -Eq 'pull_request:|schedule:|workflow_call:|branches:' <<< "$trigger_block"; then
+    cat >&2 <<'EOF'
+release admission rejected: the publishing workflow must run only for pushed
+release tags matching v*.
+EOF
+    exit 1
+  fi
+
+  if ! grep -Fq '  group: release-publication' "$release_workflow" \
+    || ! grep -Fq '  cancel-in-progress: false' "$release_workflow"; then
+    cat >&2 <<'EOF'
+release admission rejected: crate and image publication must share the global
+release-publication concurrency group without cancellation.
+EOF
+    exit 1
+  fi
+
   release_before_stable_promotion="$(sed '/^  promote-latest:/,$d' "$release_workflow")"
   if grep -Fq ':latest' <<< "$release_before_stable_promotion"; then
     cat >&2 <<'EOF'
@@ -429,24 +450,131 @@ EOF
     exit 1
   fi
 
-  authorization_job="$(
+  cargo_release_policy="$repository_root/.github/cargo-release.yml"
+  if [[ ! -r "$cargo_release_policy" ]] \
+    || [[ "$(tr -d '\r' < "$cargo_release_policy")" != 'tagTemplate: "{name}-v{version}"' ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: Cargo Release policy must use one immutable,
+package-specific tag identity while Zinder owns the product GitHub Release.
+EOF
+    exit 1
+  fi
+
+  if ! grep -Fq 'base_commit: ${{ steps.identity.outputs.base_commit }}' \
+    "$release_workflow" \
+    || ! grep -Fq 'git describe \' "$release_workflow" \
+    || ! grep -Fq -- '--first-parent' "$release_workflow" \
+    || ! grep -Fq -- "--match 'v[0-9]*'" "$release_workflow" \
+    || ! grep -Fq "semver_pattern='^(0|[1-9][0-9]*)" "$release_workflow" \
+    || ! grep -Fq 'previous_commit="$(git rev-parse "${previous_tag}^{commit}")"' \
+      "$release_workflow"; then
+    cat >&2 <<'EOF'
+release admission rejected: the release identity job must derive the immutable
+Cargo Release base from the preceding reachable product tag.
+EOF
+    exit 1
+  fi
+
+  sdk_package_job="$(
     awk '
-      $0 == "  authorize:" { in_job = 1; next }
+      $0 == "  sdk-packages:" { in_job = 1; next }
       in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
       in_job { print }
     ' "$release_workflow"
   )"
-  if [[ -z "$authorization_job" ]] \
-    || ! grep -Fq 'environment: release' <<< "$authorization_job"; then
+  if [[ -z "$sdk_package_job" ]] \
+    || ! grep -Fq 'needs: validate' <<< "$sdk_package_job" \
+    || ! grep -Fq 'fetch-depth: 0' <<< "$sdk_package_job" \
+    || ! grep -Fq 'persist-credentials: false' <<< "$sdk_package_job" \
+    || ! grep -Fq 'toolchain: 1.95.0' <<< "$sdk_package_job" \
+    || ! grep -Fq 'scripts/verify-sdk-packages.sh' <<< "$sdk_package_job" \
+    || ! grep -Fq 'uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac' \
+      <<< "$sdk_package_job" \
+    || ! grep -Fq 'phase: check' <<< "$sdk_package_job" \
+    || ! grep -Fq 'base-sha: ${{ needs.validate.outputs.base_commit }}' \
+      <<< "$sdk_package_job" \
+    || ! grep -Fq 'target-sha: ${{ needs.validate.outputs.commit }}' \
+      <<< "$sdk_package_job" \
+    || ! grep -Fq 'github-token: ${{ github.token }}' <<< "$sdk_package_job" \
+    || [[ "$(grep -Fc 'PROTOC: /does/not/exist' <<< "$sdk_package_job")" -ne 2 ]] \
+    || grep -Fq 'CARGO_REGISTRY_TOKEN' <<< "$sdk_package_job" \
+    || grep -Fq 'crates-io-auth-action' <<< "$sdk_package_job" \
+    || grep -Fq 'actions/upload-artifact' <<< "$sdk_package_job"; then
     cat >&2 <<'EOF'
-release admission rejected: publication requires one protected
-release-environment authorization gate.
+release admission rejected: the pre-auth SDK package job must use exact Rust
+1.95, verify the hermetic package catalog, run the complete Cargo Release
+readiness check, and receive no registry credential.
+EOF
+    exit 1
+  fi
+
+  crate_publication_job="$(
+    awk '
+      $0 == "  publish-sdk-crates:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  auth_line="$(grep -nF 'uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5' <<< "$crate_publication_job" | cut -d: -f1)"
+  publish_line="$(grep -nF 'uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac' <<< "$crate_publication_job" | cut -d: -f1)"
+  consumer_line="$(grep -nF 'scripts/verify-published-sdk.sh "$SDK_VERSION"' <<< "$crate_publication_job" | cut -d: -f1)"
+  registry_verifier="$repository_root/scripts/verify-published-sdk.sh"
+  if [[ -z "$crate_publication_job" ]] \
+    || ! grep -Eq '^[[:space:]]+- validate$' <<< "$crate_publication_job" \
+    || ! grep -Eq '^[[:space:]]+- api-docs$' <<< "$crate_publication_job" \
+    || ! grep -Eq '^[[:space:]]+- sdk-packages$' <<< "$crate_publication_job" \
+    || ! grep -Fq 'environment: release' <<< "$crate_publication_job" \
+    || ! grep -Fq 'contents: read' <<< "$crate_publication_job" \
+    || ! grep -Fq 'id-token: write' <<< "$crate_publication_job" \
+    || ! grep -Fq 'fetch-depth: 0' <<< "$crate_publication_job" \
+    || ! grep -Fq 'persist-credentials: false' <<< "$crate_publication_job" \
+    || ! grep -Fq 'ref: ${{ needs.validate.outputs.commit }}' <<< "$crate_publication_job" \
+    || ! grep -Fq 'id: crates-io-auth' <<< "$crate_publication_job" \
+    || [[ -z "$auth_line" || -z "$publish_line" ]] \
+    || (( auth_line >= publish_line )) \
+    || ! grep -Fq 'phase: publish' <<< "$crate_publication_job" \
+    || ! grep -Fq 'base-sha: ${{ needs.validate.outputs.base_commit }}' \
+      <<< "$crate_publication_job" \
+    || ! grep -Fq 'target-sha: ${{ needs.validate.outputs.commit }}' \
+      <<< "$crate_publication_job" \
+    || ! grep -Fq 'github-token: ${{ github.token }}' <<< "$crate_publication_job" \
+    || ! grep -Fq 'CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}' \
+      <<< "$crate_publication_job" \
+    || ! grep -Fq 'PROTOC: /does/not/exist' <<< "$crate_publication_job" \
+    || [[ -z "$consumer_line" ]] \
+    || ! grep -Fq 'timeout-minutes: 30' <<< "$crate_publication_job" \
+    || ! grep -Fq 'SDK_VERSION: ${{ needs.validate.outputs.version }}' \
+      <<< "$crate_publication_job" \
+    || (( publish_line >= consumer_line )) \
+    || [[ ! -x "$registry_verifier" ]] \
+    || ! grep -Fq 'CARGO_HOME="$consumer_directory/cargo-home"' \
+      "$registry_verifier" \
+    || ! grep -Fq 'cargo +1.95.0 check' "$registry_verifier" \
+    || [[ "$(grep -Fc 'CARGO_REGISTRY_TOKEN:' <<< "$crate_publication_job")" -ne 1 ]] \
+    || grep -Eq 'secrets\.(CARGO_REGISTRY_TOKEN|CRATES_IO_TOKEN)' <<< "$crate_publication_job" \
+    || grep -Fq 'needs.validate.outputs.stable' <<< "$crate_publication_job" \
+    || grep -Eq 'phase: (all|finalize)' <<< "$crate_publication_job" \
+    || grep -Fq 'actions/download-artifact' <<< "$crate_publication_job"; then
+    cat >&2 <<'EOF'
+release admission rejected: SDK publication must follow validated package and
+API jobs, delegate resumable publication to the pinned Cargo Release action,
+expose the OIDC token only to that publication step, and compile a fresh
+registry-only consumer before image publication.
+EOF
+    exit 1
+  fi
+
+  if grep -Eq 'secrets\.(CARGO_REGISTRY_TOKEN|CRATES_IO_TOKEN)' "$release_workflow" \
+    || [[ "$(grep -Fc 'CARGO_REGISTRY_TOKEN:' "$release_workflow")" -ne 1 ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: the release workflow must not contain a static
+crates.io token or expose the trusted-publisher token outside publication.
 EOF
     exit 1
   fi
 
   publishing_jobs=(build merge prepare-release publish-release promote-latest)
-  required_predecessors=(authorize build merge prepare-release publish-release)
+  required_predecessors=(publish-sdk-crates build merge prepare-release publish-release)
   for index in "${!publishing_jobs[@]}"; do
     publishing_job="${publishing_jobs[$index]}"
     required_predecessor="${required_predecessors[$index]}"

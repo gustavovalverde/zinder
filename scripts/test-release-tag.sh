@@ -69,3 +69,23 @@ if bash "$dependency_requirement_validator" \
   "^0.6.0" >/dev/null 2>&1; then
   fail "a stable SDK dependency requirement admitted a prerelease workspace"
 fi
+
+registry_verifier="$repository_root/scripts/verify-published-sdk.sh"
+[[ -x "$registry_verifier" ]] \
+  || fail "registry-only SDK consumer verifier is not executable"
+if "$registry_verifier" "$wrong_patch_version" >/dev/null 2>&1; then
+  fail "registry-only SDK consumer verifier admitted a different version"
+fi
+
+crate_publication_job="$(
+  awk '
+    $0 == "  publish-sdk-crates:" { in_job = 1; next }
+    in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+    in_job { print }
+  ' "$repository_root/.github/workflows/release.yml"
+)"
+[[ -n "$crate_publication_job" ]] \
+  || fail "release workflow has no SDK publication job"
+if grep -Fq 'needs.validate.outputs.stable' <<< "$crate_publication_job"; then
+  fail "SDK publication is incorrectly restricted to stable tags"
+fi
