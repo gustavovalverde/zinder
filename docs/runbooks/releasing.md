@@ -153,14 +153,22 @@ Release.
 
 Do not publish the historical `v0.4.0` tag to crates.io. The first public SDK
 publication starts from an exact, clean `v0.5.0-rc.1` tag after its release
-preparation change has merged to `main`. Create the tag locally without pushing
-it, then use a short-lived conventional crates.io token that can create the
-three crate names:
+preparation change has merged to `main`. Create and push the tag, then let the
+credential-free validation, API artifact, and SDK package jobs pass. Keep the
+protected `release` environment unapproved so no workflow requests registry
+credentials or writes release artifacts:
 
 ```console
 git switch main
 git pull --ff-only
 git tag -a v0.5.0-rc.1 -m "v0.5.0-rc.1"
+git push origin v0.5.0-rc.1
+```
+
+From the same exact tag, use a short-lived conventional crates.io token that
+can create the three crate names:
+
+```console
 git switch --detach v0.5.0-rc.1
 test -z "$(git status --porcelain)"
 export CARGO_REGISTRY_TOKEN='<short-lived-bootstrap-token>'
@@ -194,14 +202,10 @@ identity for a short-lived crates.io token. Do not add a repository or
 environment `CARGO_REGISTRY_TOKEN` secret; the token is exposed only to the
 Cargo Release `publish` step.
 
-Push `v0.5.0-rc.1` only after all 3 trusted publishers are configured. Cargo
-Release verifies the already published archives against the tag commit, while
-the rest of the release workflow publishes the RC1 images and artifacts:
-
-```console
-git switch main
-git push origin v0.5.0-rc.1
-```
+Approve the waiting `release` environment only after all 3 trusted publishers
+are configured. Cargo Release then verifies the already published archives
+against the tag commit, while the rest of the release workflow publishes the
+RC1 images and artifacts.
 
 Prepare and tag `v0.5.0-rc.2` through the normal release process after RC1
 finishes. RC2 is the OIDC upload canary: the protected workflow must obtain the
