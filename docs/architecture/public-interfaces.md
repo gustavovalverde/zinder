@@ -142,6 +142,14 @@ database engine, raw-byte retention policy, or release topology.
 - Snapshot views are canonical-only. Live mempool state, event subscriptions,
   broadcast, current address history, and current balance remain on their
   existing traits and are never presented as epoch-pinned state.
+- Immutable network-upgrade activations live on `ChainIndex` itself, not on a
+  snapshot. Remote clients preflight server identity, network, contract
+  revision, and `wallet.read.network_upgrade_activations_v1` before discovery.
+- The public, remote-first `zinder-client` surface enables the remote adapter
+  by default and has no normal dependency on storage or RocksDB crates.
+- Zinder serving runtimes compose service-internal reads through
+  `WalletServingQuery` and an admitted `WalletServingReadPair`; they do not
+  expose a storage-backed public client adapter.
 - Public traits describe consumer capabilities. Concrete RocksDB types remain
   at composition roots and storage adapters.
 

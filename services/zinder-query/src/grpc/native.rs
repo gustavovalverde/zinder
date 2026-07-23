@@ -165,16 +165,16 @@ impl WalletCapabilityProfile {
             | capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1
             | capabilities::WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1
             | capabilities::WALLET_ADDRESS_TRANSPARENT_BALANCE_V1
-            | capabilities::WALLET_READ_FULL_BLOCK_AT_V1
-            | capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
-            | capabilities::WALLET_READ_TRANSPARENT_OUTPUTS_V1
-            | capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1
-            | capabilities::WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1
             | capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1
             | capabilities::WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1
             | capabilities::WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1
             | capabilities::WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
             | capabilities::WALLET_EVENTS_CHAIN_V1 => Some(true),
+            capabilities::WALLET_READ_FULL_BLOCK_AT_V1
+            | capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
+            | capabilities::WALLET_READ_TRANSPARENT_OUTPUTS_V1
+            | capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1
+            | capabilities::WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1 => Some(false),
             _ => None,
         }
     }
@@ -1055,9 +1055,10 @@ mod server_info_tests {
     use zinder_proto::capabilities::{
         CAPABILITIES, CapabilitySurface, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
         WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_FULL_BLOCK_AT_V1,
-        WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_SETTLED_TIP_BLOCK_V1,
-        WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1,
-        WALLET_READ_TRANSPARENT_OUTPUTS_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
+        WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+        WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
+        WALLET_READ_TRANSACTION_BYTES_V1, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
+        WALLET_READ_TRANSPARENT_SPENDS_V1, WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
         WALLET_READ_VISIBLE_TIP_BLOCK_V1,
     };
 
@@ -1208,11 +1209,25 @@ mod server_info_tests {
             &capabilities,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2
         ));
-        assert!(advertises(&capabilities, WALLET_READ_TRANSACTION_BY_ID_V2));
         assert!(advertises(
+            &capabilities,
+            WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1
+        ));
+        assert!(advertises(&capabilities, WALLET_READ_TRANSACTION_BY_ID_V2));
+        assert!(!advertises(
             &capabilities,
             WALLET_READ_TRANSPARENT_OUTPUTS_V1
         ));
+        assert!(!advertises(
+            &capabilities,
+            WALLET_READ_TRANSPARENT_SPENDS_V1
+        ));
+        assert!(!advertises(
+            &capabilities,
+            WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1
+        ));
+        assert!(!advertises(&capabilities, WALLET_READ_FULL_BLOCK_AT_V1));
+        assert!(!advertises(&capabilities, WALLET_READ_FULL_BLOCK_RANGE_V1));
         assert!(advertises(
             &capabilities,
             WALLET_ADDRESS_TRANSPARENT_HISTORY_V1

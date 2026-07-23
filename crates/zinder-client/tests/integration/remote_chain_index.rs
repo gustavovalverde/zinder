@@ -24,14 +24,15 @@ use tonic::{
 };
 use zinder_client::{
     BlockHeight, BlockHeightRange, Capability, CapabilityDescriptor, ChainEvent, ChainIndex,
-    EndpointBackedIndex, EventStreamStart, IndexerError, Network, RawTransactionBytes,
-    RemoteChainIndex, RemoteOpenOptions, RetryPolicy, TransactionBroadcastOutcome, TransactionId,
+    ConsensusBranchId, EndpointBackedIndex, EventStreamStart, IndexerError, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, RemoteChainIndex,
+    RemoteOpenOptions, RetryPolicy, TransactionBroadcastOutcome, TransactionId,
 };
-use zinder_core::{NetworkUpgradeActivations, wire::encode_zinder_native_chain_name};
+use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter, WalletServingQuery,
-    WalletServingReadPair,
+    ServerInfoSettings, WalletCapabilityProfile, WalletQuery, WalletQueryGrpcAdapter,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_testkit::{
     ChainFixture, MockTransactionBroadcaster, StoreFixture, WalletServingStoreFixture,
@@ -112,6 +113,53 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     ));
     assert!(!first_event.cursor.as_bytes().is_empty());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_chain_index_returns_typed_network_upgrade_activations() -> eyre::Result<()> {
+    let expected = sample_regtest_upgrade_activations();
+    let activations = Arc::new(expected.clone());
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader),
+        Arc::new(wallet_reader),
+    )?);
+    let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
+    let wallet_query =
+        WalletServingQuery::from_serving_pair_slot(serving_pair_slot, (), activations);
+    let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
+        wallet_query,
+        ServerInfoSettings {
+            capability_profile: WalletCapabilityProfile::ExactPair,
+            ..ServerInfoSettings::default()
+        },
+    ))
+    .await?;
+    let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+
+    let activations = chain_index.network_upgrade_activations().await?;
+    let erased: &dyn ChainIndex = &chain_index;
+    let erased_activations = erased.network_upgrade_activations().await?;
+
+    assert_eq!(activations, expected);
+    assert_eq!(erased_activations, expected);
+    let first = activations
+        .activations()
+        .first()
+        .ok_or_else(|| eyre!("fixture activation table must not be empty"))?;
+    let expected_first = NetworkUpgradeActivation {
+        branch_id: ConsensusBranchId::new(0x5BA8_1B19),
+        activation_height: BlockHeight::new(1),
+        name: "Overwinter".to_owned(),
+    };
+    assert_eq!(first, &expected_first);
     Ok(())
 }
 

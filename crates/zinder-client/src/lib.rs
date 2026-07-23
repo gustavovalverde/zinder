@@ -11,8 +11,6 @@
 
 mod chain_index;
 mod error;
-#[cfg(feature = "local")]
-mod local;
 #[cfg(feature = "remote")]
 mod remote;
 
@@ -30,22 +28,20 @@ pub use chain_index::{
     TransparentHistoryCursor, TransparentUnspentOutputChunk, TransparentUtxoSetSummaryView,
 };
 pub use error::{ChainEventCursorRecovery, IndexerError, RetryPolicy};
-#[cfg(feature = "local")]
-pub use local::{DEFAULT_INITIAL_CATCHUP_TIMEOUT, LocalChainIndex, LocalOpenOptions};
 #[cfg(feature = "remote")]
 pub use remote::{MIN_SUPPORTED_CONTRACT_REVISION, RemoteChainIndex, RemoteOpenOptions};
 pub use zinder_core::{
     BlockHash, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
     BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainEpoch, ChainEpochId,
-    ChainValuePool, ChainValuePools, ChainValuePoolsAtTip, CompactBlockArtifact,
+    ChainValuePool, ChainValuePools, ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId,
     MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, MempoolEntry, MempoolEvictionReason, MinedTransaction,
-    MinedTransactionChainContext, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentMempoolOutput, TransparentMempoolOutputsRequest, TransparentMempoolSpend,
-    TransparentOutPoint, TransparentUnspentOutput, TransparentUtxoSetCommitment, TreeStateArtifact,
-    TxStatus, UtxoSetCommitmentScheme,
+    MinedTransactionChainContext, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastOutcome, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentUnspentOutput,
+    TransparentUtxoSetCommitment, TreeStateArtifact, TxStatus, UtxoSetCommitmentScheme,
 };
 #[cfg(feature = "remote")]
 pub use zinder_proto::capabilities::{
@@ -63,12 +59,14 @@ pub use zinder_proto::capabilities::{
     WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1, WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
     WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
     WALLET_READ_COMPACT_BLOCK_AT_V2, WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
-    WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
-    WALLET_READ_SERVER_INFO_V2, WALLET_READ_SETTLED_TIP_BLOCK_V1,
-    WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1, WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
-    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-    WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
-    WALLET_SNAPSHOT_MEMPOOL_V3, always_on_capability_strings, capabilities_for_surface,
+    WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_FULL_BLOCK_AT_V1,
+    WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
+    WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1, WALLET_READ_SERVER_INFO_V2,
+    WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
+    WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
+    WALLET_READ_TRANSPARENT_OUTPUTS_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+    WALLET_READ_VISIBLE_TIP_BLOCK_V1, WALLET_SNAPSHOT_MEMPOOL_V3, always_on_capability_strings,
+    capabilities_for_surface,
 };
 #[cfg(feature = "remote")]
 pub use zinder_proto::v1::ops::ErrorReason;

@@ -8,7 +8,7 @@
 
 use tokio_stream::StreamExt as _;
 use tonic::Request;
-use zinder_client::{ChainIndex, EndpointBackedIndex, LocalChainIndex, RemoteChainIndex};
+use zinder_client::{ChainIndex, EndpointBackedIndex, RemoteChainIndex};
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 
 use super::{build_transparent_address_adapter, build_transparent_address_serving_fixture};
@@ -29,7 +29,6 @@ fn parity_chain_index_surface_compiles_for_lightwalletd_operators() {
         // ChainCommitted typed signal for the live chain-event stream
         let _ = T::chain_events;
     }
-    assert_base_compiles::<LocalChainIndex>();
     assert_base_compiles::<RemoteChainIndex>();
     assert_endpoint_compiles::<RemoteChainIndex>();
 }

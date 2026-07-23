@@ -13,10 +13,14 @@
 //! or removing any of those trait methods makes this file fail to compile, so
 //! the wallet capability surface stays bound to the trait at build time.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use zinder_client::{
     CAPABILITIES, Capability, CapabilityDescriptor, CapabilitySurface, ChainIndex, ChainSnapshot,
-    EndpointBackedIndex, INGEST_WRITER_PHASE_V1, OwnedChainSnapshot, always_on_capability_strings,
+    EndpointBackedIndex, INGEST_WRITER_PHASE_V1, OwnedChainSnapshot, RemoteChainIndex,
+    always_on_capability_strings,
 };
+use zinder_proto::capabilities::*;
 
 #[test]
 fn every_capability_row_has_a_non_empty_string() {
@@ -54,7 +58,9 @@ fn ingest_writer_phase_is_always_on() {
     reason = "compile-time existence check for ChainIndex methods backing wallet capabilities"
 )]
 fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
+    let _ = T::network_upgrade_activations;
     let _ = T::visible_tip_block;
+    let _ = T::settled_tip_block;
     let _ = T::block_id_by_selector;
     let _ = T::block_header_by_selector;
     let _ = T::compact_block_at;
@@ -71,6 +77,7 @@ fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::transparent_address_unspent_outputs;
     let _ = T::transparent_address_tx_ids_in_range;
     let _ = T::transparent_address_balance;
+    let _ = T::transparent_utxo_set_summary;
 }
 
 #[allow(
@@ -158,6 +165,7 @@ fn typed_capability_variants_match_table_strings() {
         Capability::MempoolSnapshot,
         Capability::MempoolEvents,
         Capability::ChainValuePools,
+        Capability::NetworkUpgradeActivations,
         Capability::TransparentAddressBalance,
     ] {
         assert!(
@@ -186,4 +194,162 @@ fn capability_descriptor_supports_reads_typed_variant() {
     };
     assert!(descriptor.supports(Capability::Broadcast));
     assert!(!descriptor.supports(Capability::ChainValuePools));
+}
+
+/// Every wallet capability is classified against the typed client operation
+/// that consumes its RPC or gated response field.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The exhaustive wallet-capability classification stays in one test so additions fail one auditable gate."
+)]
+fn typed_chain_index_covers_every_advertised_wallet_capability() {
+    assert_wallet_chain_index_methods_compile::<RemoteChainIndex>();
+    assert_wallet_endpoint_methods_compile::<RemoteChainIndex>();
+    assert_chain_snapshot_methods_compile::<RemoteChainIndex>();
+    assert_owned_chain_snapshot_methods_compile::<RemoteChainIndex>();
+
+    let coverage_rows = [
+        (
+            WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+            "ChainIndex::visible_tip_block",
+        ),
+        (
+            WALLET_READ_SETTLED_TIP_BLOCK_V1,
+            "ChainIndex::settled_tip_block",
+        ),
+        (
+            WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+            "ChainIndex::block_id_by_selector",
+        ),
+        (
+            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
+            "ChainIndex::block_header_by_selector",
+        ),
+        (
+            WALLET_READ_COMPACT_BLOCK_AT_V2,
+            "ChainIndex::compact_block_at",
+        ),
+        (
+            WALLET_READ_COMPACT_BLOCK_RANGE_V2,
+            "ChainIndex::compact_blocks_in_range",
+        ),
+        (
+            WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
+            "ChainIndex::compact_block_at",
+        ),
+        (WALLET_READ_FULL_BLOCK_AT_V1, "ChainIndex::full_block_at"),
+        (
+            WALLET_READ_FULL_BLOCK_RANGE_V1,
+            "ChainIndex::full_blocks_in_range",
+        ),
+        (
+            WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+            "ChainIndex::tree_state_at",
+        ),
+        (
+            WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
+            "ChainIndex::latest_tree_state_checkpoint",
+        ),
+        (
+            WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
+            "ChainIndex::subtree_roots_in_range",
+        ),
+        (
+            WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
+            "ChainIndex::subtree_roots_in_range",
+        ),
+        (
+            WALLET_READ_TRANSACTION_BY_ID_V2,
+            "ChainIndex::transaction_by_id",
+        ),
+        (
+            WALLET_READ_TRANSACTION_BYTES_V1,
+            "ChainIndex::transaction_by_id",
+        ),
+        (
+            WALLET_READ_SERVER_INFO_V2,
+            "EndpointBackedIndex::server_info",
+        ),
+        (
+            WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+            "ChainIndex::network_upgrade_activations",
+        ),
+        (
+            WALLET_READ_TRANSPARENT_OUTPUTS_V1,
+            "ChainIndex::transparent_outputs_by_outpoint",
+        ),
+        (
+            WALLET_READ_TRANSPARENT_SPENDS_V1,
+            "ChainIndex::transparent_spends_by_outpoint",
+        ),
+        (
+            WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+            "ChainIndex::transparent_unspent_outputs_by_outpoint",
+        ),
+        (
+            WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+            "EndpointBackedIndex::chain_value_pools_at_tip",
+        ),
+        (
+            WALLET_BROADCAST_TRANSACTION_V1,
+            "EndpointBackedIndex::broadcast_transaction",
+        ),
+        (WALLET_EVENTS_CHAIN_V1, "EndpointBackedIndex::chain_events"),
+        (
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+            "EndpointBackedIndex::mempool_snapshot",
+        ),
+        (
+            WALLET_EVENTS_MEMPOOL_V2,
+            "EndpointBackedIndex::mempool_events",
+        ),
+        (
+            WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
+            "EndpointBackedIndex::transparent_mempool_outputs_by_address",
+        ),
+        (
+            WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
+            "EndpointBackedIndex::transparent_mempool_spends_by_outpoint",
+        ),
+        (
+            WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1,
+            "EndpointBackedIndex::transparent_mempool_outputs_by_outpoint",
+        ),
+        (
+            WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+            "ChainIndex::transparent_address_unspent_outputs",
+        ),
+        (
+            WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+            "ChainIndex::transparent_address_tx_ids_in_range",
+        ),
+        (
+            WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
+            "ChainIndex::transparent_address_balance",
+        ),
+        (
+            WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
+            "ChainIndex::transparent_utxo_set_summary",
+        ),
+        (
+            WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1,
+            "ChainIndex::transparent_utxo_set_summary",
+        ),
+    ];
+    let covered: BTreeMap<_, _> = coverage_rows.into_iter().collect();
+    assert_eq!(
+        covered.len(),
+        coverage_rows.len(),
+        "each wallet capability must have exactly one client coverage classification"
+    );
+    let advertised: BTreeSet<_> = CAPABILITIES
+        .iter()
+        .filter(|spec| spec.surface == CapabilitySurface::Wallet)
+        .map(|spec| spec.string)
+        .collect();
+    let classified: BTreeSet<_> = covered.keys().copied().collect();
+
+    assert_eq!(classified, advertised);
+    assert!(covered.values().all(|operation| !operation.is_empty()));
 }

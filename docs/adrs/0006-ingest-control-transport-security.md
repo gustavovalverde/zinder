@@ -11,8 +11,7 @@
 
 [ADR-0003](0003-canonical-storage-access-boundary.md) settles that `zinder-ingest`
 exposes a private `IngestControl` gRPC endpoint and that
-`zinder-query`, `zinder-compat-lightwalletd`, and embedded
-`zinder-client::LocalChainIndex` consumers reach the writer's live state
+`zinder-query` and `zinder-compat-lightwalletd` reach the writer's live state
 through it. The endpoint serves `WriterStatus`, `VisibleChainEvents`,
 `MempoolSnapshot`, and `MempoolEvents`. Anyone who can route a TCP
 connection to the listen address can subscribe to chain events, read the
@@ -116,8 +115,7 @@ section:
 
 - `[ingest_control] bearer_token_path` on every process — the writer
   (`zinder-ingest`) reads the file to verify, and every reader
-  (`zinder-query`, `zinder-compat-lightwalletd`, embedded
-  `zinder-client::LocalChainIndex` consumers) reads the same file to
+  (`zinder-query` and `zinder-compat-lightwalletd`) reads the same file to
   present.
 - The same value lives in the file referenced by every process.
 

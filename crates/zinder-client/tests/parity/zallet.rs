@@ -10,14 +10,12 @@
 use eyre::eyre;
 use std::sync::Arc;
 use zinder_client::{
-    BlockHeight, BlockSelector, ChainIndex, EndpointBackedIndex, LocalChainIndex,
-    OwnedChainSnapshot, RemoteChainIndex, SubtreeRootIndex, SubtreeRootRange, TransactionId,
-    TxStatus,
+    BlockHeight, BlockSelector, ChainIndex, EndpointBackedIndex, OwnedChainSnapshot,
+    RemoteChainIndex, TransactionId, TxStatus,
 };
-use zinder_store::RawBlobRetention;
 use zinder_testkit::FixtureTransactionRows;
 
-use super::{committed_store_fixture, open_local_chain_index, parity_chain_fixture};
+use super::{open_remote_chain_index, parity_chain_fixture};
 
 #[test]
 fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
@@ -30,6 +28,11 @@ fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
         let _ = T::block_header_by_selector;
         // typed TxStatus envelope (mined / mempool / not found)
         let _ = T::transaction_by_id;
+        // immutable network metadata used to choose consensus branch ids
+        let _ = T::network_upgrade_activations;
+        // typed raw full-block artifact reads
+        let _ = T::full_block_at;
+        let _ = T::full_blocks_in_range;
         // tree_state_at with Option<ChainEpoch>
         let _ = T::tree_state_at;
         // typed SubtreeRootHash + ShieldedProtocol enum
@@ -45,21 +48,21 @@ fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
     }
     fn assert_storable_chain_view<View: Clone + Send + Sync + 'static>() {}
 
-    assert_base_compiles::<LocalChainIndex>();
     assert_base_compiles::<RemoteChainIndex>();
-    // Only the endpoint-backed adapter implements EndpointBackedIndex; a
-    // LocalChainIndex handle is rejected here at compile time.
     assert_endpoint_compiles::<RemoteChainIndex>();
 
-    assert_storable_chain_view::<OwnedChainSnapshot<LocalChainIndex>>();
+    assert_storable_chain_view::<OwnedChainSnapshot<RemoteChainIndex>>();
     assert_storable_chain_view::<OwnedChainSnapshot<dyn ChainIndex>>();
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The Zallet-shaped remote snapshot scenario keeps capability preflight and epoch-bound reads in one consumer flow."
+)]
 async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([0x42; 32]);
-    let base_fixture =
-        parity_chain_fixture(2).with_raw_blob_retention(RawBlobRetention::Transactions);
+    let base_fixture = parity_chain_fixture(2);
     let transaction_block = base_fixture
         .block_at(BlockHeight::new(2))
         .ok_or_else(|| eyre!("fixture must contain block 2"))?;
@@ -74,8 +77,14 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     );
     let transaction_location = transaction_rows.location;
     let chain_fixture = base_fixture.with_transaction_rows(transaction_rows);
-    let store_fixture = committed_store_fixture(&chain_fixture)?;
-    let chain_index = Arc::new(open_local_chain_index(&store_fixture).await?);
+    let chain_index = open_remote_chain_index(&chain_fixture).await?;
+    let activations = chain_index.network_upgrade_activations().await?;
+    assert_eq!(
+        activations,
+        zinder_testkit::sample_regtest_upgrade_activations()
+    );
+
+    let chain_index = Arc::new(chain_index);
     let chain_view = OwnedChainSnapshot::capture(chain_index).await?;
 
     let visible_tip_block = chain_view.visible_tip_block().await?;
@@ -86,13 +95,6 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
         .block_id_by_selector(BlockSelector::Hash(transaction_block_hash))
         .await?;
     let tree_state = chain_view.tree_state_at(BlockHeight::new(2)).await?;
-    let subtree_roots = chain_view
-        .subtree_roots_in_range(SubtreeRootRange::new(
-            zinder_client::ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            std::num::NonZeroU32::MIN,
-        ))
-        .await?;
     let mined_status = chain_view.transaction_by_id(transaction_id).await?;
     let missing_status = chain_view
         .transaction_by_id(TransactionId::from_bytes([0x24; 32]))
@@ -102,7 +104,6 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     assert_eq!(visible_tip_block, resolved_by_hash);
     assert_eq!(tree_state.height, BlockHeight::new(2));
     assert_eq!(tree_state.block_hash, transaction_block_hash);
-    assert_eq!(subtree_roots.len(), 1);
     let TxStatus::Mined(mined) = mined_status else {
         return Err(eyre!("expected mined transaction, got {mined_status:?}"));
     };
