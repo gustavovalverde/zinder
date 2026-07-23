@@ -153,12 +153,10 @@ Test functions under `tests/live/` use plain `snake_case_describing_behavior` na
 
 ## Coding Constraints
 
-The workspace and runtime MSRV is Rust 1.95. The public `zinder-core`,
-`zinder-proto`, and `zinder-client` packages have a separate Rust 1.88 MSRV;
-their package manifests and the SDK package CI lane enforce it. Keep the root
-toolchain files, CI actions, and Docker `RUST_VERSION` args aligned when the
-workspace toolchain moves, and do not raise the public-package MSRV without an
-explicit SDK compatibility decision.
+The workspace MSRV is Rust 1.95. Public crates inherit that version alongside
+the internal crates and release binaries. Keep `Cargo.toml`,
+`rust-toolchain.toml`, CI toolchain actions, and Docker `RUST_VERSION` args
+aligned whenever it changes.
 
 The workspace `Cargo.toml` denies (not warns):
 

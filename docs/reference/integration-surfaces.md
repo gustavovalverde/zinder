@@ -71,7 +71,7 @@ The contract is split across two async traits so the compiler expresses which ca
 
 A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
 
-The published traits and protocol include full-block and transparent-outpoint methods for consumer compatibility, but the released exact-pair `WalletServingQuery` returns `Unavailable` for those reads and `zinder-query` does not advertise their capabilities. Method presence is not a deployment support claim.
+The public traits and protocol include full-block and transparent-outpoint methods for consumer compatibility, but the released exact-pair `WalletServingQuery` returns `Unavailable` for those reads and `zinder-query` does not advertise their capabilities. Method presence is not a deployment support claim.
 
 Capture calls `current_epoch` once. A remote serving pair that has advanced
 returns `IndexerError::ChainEpochPinUnavailable`; its
@@ -90,8 +90,8 @@ through `WalletServingQuery` over an admitted `WalletServingReadPair`. That
 service-internal composition is not a public SDK adapter.
 
 The registry-ready Rust SDK consists of `zinder-core`, `zinder-proto`, and
-`zinder-client`, all at the lockstep product version with Rust 1.88 as their
-package MSRV. Package CI builds each feature mode, checks documentation without
+`zinder-client`, all at the lockstep product version and workspace Rust 1.95
+MSRV. Package CI builds each feature mode, checks documentation without
 `protoc`, and compiles a standalone consumer from the extracted crate archives.
 The packages become installable from crates.io only after a release publishes
 that lockstep version; local repository consumers continue to resolve the same

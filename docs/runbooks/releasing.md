@@ -21,8 +21,7 @@ first-party package inherits it. Exactly `zinder-core`, `zinder-proto`, and
 `zinder-client` allow publication to crates.io; all other workspace packages
 remain non-publishable. Public-package dependencies carry both repository paths
 and a requirement for the same lockstep version, including its prerelease
-suffix. The public packages declare Rust 1.88 as their MSRV, while the internal
-workspace and runtime binaries use Rust 1.95.
+suffix. The public packages inherit the workspace Rust 1.95 MSRV.
 
 The release tag must equal `v` followed by the workspace version. Stable
 versions use `vMAJOR.MINOR.PATCH`, while prereleases may add a SemVer suffix

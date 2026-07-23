@@ -237,13 +237,14 @@ resolver = "3"
 version = "0.5.0"
 edition = "2024"
 publish = false
+rust-version = "1.95"
 TOML
 cat > "$prepare_repository/crates/zinder-core/Cargo.toml" <<'TOML'
 [package]
 name = "zinder-core"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.88"
+rust-version.workspace = true
 publish = ["crates-io"]
 readme = "README.md"
 include = ["src/**", "Cargo.toml", "README.md"]
@@ -253,7 +254,7 @@ cat > "$prepare_repository/crates/zinder-proto/Cargo.toml" <<'TOML'
 name = "zinder-proto"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.88"
+rust-version.workspace = true
 publish = ["crates-io"]
 readme = "README.md"
 include = ["src/**", "Cargo.toml", "README.md"]
@@ -266,7 +267,7 @@ cat > "$prepare_repository/crates/zinder-client/Cargo.toml" <<'TOML'
 name = "zinder-client"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.88"
+rust-version.workspace = true
 publish = ["crates-io"]
 readme = "README.md"
 include = ["src/**", "Cargo.toml", "README.md"]

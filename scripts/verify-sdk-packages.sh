@@ -54,11 +54,6 @@ RUSTDOCFLAGS='-D warnings' CARGO_INCREMENTAL=0 \
     -p zinder-proto \
     -p zinder-client
 
-for package_name in "${packages[@]}"; do
-  CARGO_INCREMENTAL=0 \
-    cargo +1.88.0 check --locked -p "$package_name" --all-features
-done
-
 extraction_root="$(mktemp -d /tmp/zinder-sdk-package-consumer.XXXXXX)"
 trap 'rm -rf "$extraction_root"' EXIT
 for package_name in "${packages[@]}"; do
@@ -98,4 +93,4 @@ pub fn preserve_future_reason(reason: &str) -> ErrorReason {
 RUST
 
 PROTOC=/does/not/exist CARGO_INCREMENTAL=0 \
-  cargo +1.88.0 check --manifest-path "$consumer_dir/Cargo.toml"
+  cargo check --manifest-path "$consumer_dir/Cargo.toml"

@@ -8,7 +8,7 @@ keywords = ["zcash", "indexer", "protocol"]
 categories = ["network-programming"]
 license.workspace = true
 repository.workspace = true
-rust-version = "1.88"
+rust-version.workspace = true
 publish = ["crates-io"]
 include = [
     "/src/**",

@@ -114,11 +114,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// OS-level TCP keepalive idle interval. Belt-and-braces alongside the
 /// application-level HTTP/2 PING: detects connections dropped silently by
 /// intermediaries that don't surface the failure to userspace.
-#[allow(
-    clippy::duration_suboptimal_units,
-    reason = "Duration::from_mins postdates the public SDK's Rust 1.88 MSRV"
-)]
-const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 /// Oldest native wallet contract revision this client can safely consume.
 pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 4;

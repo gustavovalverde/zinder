@@ -3,6 +3,8 @@ name: protocol-contracts
 on:
   pull_request:
     paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
       - "buf.gen.yaml"
       - "buf.yaml"
       - "scripts/generate-api-artifacts.sh"
@@ -18,6 +20,8 @@ on:
     branches:
       - main
     paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
       - "buf.gen.yaml"
       - "buf.yaml"
       - "scripts/generate-api-artifacts.sh"

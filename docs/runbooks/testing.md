@@ -92,13 +92,13 @@ scripts/verify-sdk-packages.sh
 ```
 
 The gate permits exactly those three crates for crates.io, verifies their
-lockstep dependency requirements and Rust 1.88 MSRV, packages them in
+lockstep dependency requirements and workspace MSRV, packages them in
 dependency order, checks default and feature-extreme builds, and builds their
 documentation with `PROTOC` unavailable. It then extracts the `.crate`
-archives and compiles a standalone consumer against the extracted packages.
-This catches workspace path leakage, missing package files, accidental test
-inclusion, generated-code dependencies, and public protobuf vocabulary that a
-normal workspace build can hide.
+archives and compiles a standalone consumer against the extracted packages
+using the workspace toolchain. This catches workspace path leakage, missing
+package files, accidental test inclusion, generated-code dependencies, and
+public protobuf vocabulary that a normal workspace build can hide.
 
 ## PostgreSQL driver integration gate
 

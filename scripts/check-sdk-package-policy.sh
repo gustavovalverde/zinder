@@ -4,6 +4,10 @@ set -euo pipefail
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 metadata="$(cargo metadata --format-version 1 --no-deps --manifest-path "$repository_root/Cargo.toml")"
 dependency_requirement_validator="$repository_root/scripts/check-sdk-dependency-requirement.sh"
+workspace_rust_version="$(
+  sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' "$repository_root/Cargo.toml" \
+    | head -n 1
+)"
 
 fail() {
   echo >&2 "SDK package policy rejected: $*"
@@ -11,6 +15,8 @@ fail() {
 }
 
 expected_catalog='["zinder-client","zinder-core","zinder-proto"]'
+[[ -n "$workspace_rust_version" ]] \
+  || fail "workspace rust-version is missing"
 workspace_version="$(
   jq -r '.packages[] | select(.name == "zinder-core") | .version' <<< "$metadata"
 )"
@@ -43,8 +49,8 @@ unexpected_publishers="$({
 
 for package_name in zinder-core zinder-proto zinder-client; do
   rust_version="$(jq -r --arg name "$package_name" '.packages[] | select(.name == $name) | .rust_version' <<< "$metadata")"
-  [[ "$rust_version" == "1.88" ]] \
-    || fail "$package_name rust-version is $rust_version, expected 1.88"
+  [[ "$rust_version" == "$workspace_rust_version" ]] \
+    || fail "$package_name rust-version is $rust_version, expected workspace $workspace_rust_version"
 
   manifest_path="$(jq -r --arg name "$package_name" '.packages[] | select(.name == $name) | .manifest_path' <<< "$metadata")"
   grep -Fq 'readme = "README.md"' "$manifest_path" \
