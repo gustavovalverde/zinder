@@ -6,8 +6,8 @@ use tonic::Code;
 #[cfg(feature = "remote")]
 use tonic_types::StatusExt;
 use zinder_core::Network;
-#[cfg(feature = "remote")]
-use zinder_proto::v1::ops::ErrorReason;
+
+use crate::ErrorReason;
 
 /// Domain Zinder services set on every `google.rpc.ErrorInfo`.
 ///
@@ -150,6 +150,17 @@ pub enum IndexerError {
         /// Stable diagnostic reason.
         reason: String,
     },
+
+    /// A remote service returned a typed reason without a richer local recovery variant.
+    #[error("remote service returned {reason:?}: {message}")]
+    RemoteFailure {
+        /// Exact known or additive reason returned by the server.
+        reason: ErrorReason,
+        /// Human-readable gRPC status message.
+        message: String,
+        /// Retry policy derived conservatively from the canonical gRPC code.
+        retry_policy: RetryPolicy,
+    },
 }
 
 impl IndexerError {
@@ -163,7 +174,7 @@ impl IndexerError {
         let details = status.get_error_details();
         let Some(zinder_reason) = details.error_info().and_then(|error_info| {
             if error_info.domain == ZINDER_ERROR_DOMAIN {
-                ErrorReason::from_str_name(&error_info.reason)
+                Some(ErrorReason::from_wire_name(&error_info.reason))
             } else {
                 None
             }
@@ -174,7 +185,7 @@ impl IndexerError {
         };
 
         if status.code() == Code::NotFound
-            && matches!(zinder_reason, ErrorReason::ArtifactUnavailable)
+            && matches!(&zinder_reason, ErrorReason::ArtifactUnavailable)
             && let Some(resource_info) = details.resource_info()
         {
             return Self::ArtifactUnavailable {
@@ -184,36 +195,21 @@ impl IndexerError {
         }
 
         if status.code() == Code::FailedPrecondition
-            && matches!(zinder_reason, ErrorReason::ChainEventCursorExpired)
+            && matches!(&zinder_reason, ErrorReason::ChainEventCursorExpired)
         {
             return Self::ChainEventCursorExpired {
                 recovery: ChainEventCursorRecovery::EarliestRetained,
             };
         }
 
-        match status.code() {
-            _ if matches!(zinder_reason, ErrorReason::ChainEpochPinUnavailable) => {
-                Self::ChainEpochPinUnavailable
-            }
-            Code::InvalidArgument => Self::InvalidRequest { reason: message },
-            Code::FailedPrecondition => Self::FailedPrecondition { reason: message },
-            Code::NotFound => Self::NotFound {
-                resource: "artifact",
-            },
-            Code::DataLoss => Self::DataLoss { reason: message },
-            Code::Ok
-            | Code::Cancelled
-            | Code::Unknown
-            | Code::DeadlineExceeded
-            | Code::AlreadyExists
-            | Code::PermissionDenied
-            | Code::ResourceExhausted
-            | Code::Aborted
-            | Code::OutOfRange
-            | Code::Unimplemented
-            | Code::Internal
-            | Code::Unavailable
-            | Code::Unauthenticated => Self::ServiceUnavailable { reason: message },
+        if matches!(&zinder_reason, ErrorReason::ChainEpochPinUnavailable) {
+            return Self::ChainEpochPinUnavailable;
+        }
+
+        Self::RemoteFailure {
+            retry_policy: retry_policy_for_remote(&zinder_reason, status.code()),
+            reason: zinder_reason,
+            message,
         }
     }
 
@@ -226,22 +222,22 @@ impl IndexerError {
     #[must_use]
     #[cfg(feature = "remote")]
     pub fn reason(&self) -> Option<ErrorReason> {
-        // Variant-level inference: each variant is most commonly produced by
-        // one reason. The full reason is available on the wire via
-        // ErrorInfo; this accessor exposes the variant's canonical mapping
-        // so consumers can pattern-match without parsing strings.
+        // Rich recovery variants have a one-to-one wire reason. Generic
+        // remote failures retain the exact parsed reason instead of inferring
+        // from a gRPC code shared by several reasons.
         match self {
             Self::ChainEpochPinUnavailable => Some(ErrorReason::ChainEpochPinUnavailable),
             Self::ChainEventCursorExpired { .. } => Some(ErrorReason::ChainEventCursorExpired),
-            Self::NotFound { .. } => Some(ErrorReason::BlockNotInBestChain),
             Self::ArtifactUnavailable { .. } => Some(ErrorReason::ArtifactUnavailable),
-            Self::StorageUnavailable { .. } => Some(ErrorReason::StorageUnavailable),
-            Self::ServiceUnavailable { .. } => Some(ErrorReason::NodeUnavailable),
-            Self::BlockingTaskFailed { .. } => Some(ErrorReason::BlockingTaskFailed),
+            Self::RemoteFailure { reason, .. } => Some(reason.clone()),
             Self::NoVisibleChainEpoch
+            | Self::NotFound { .. }
             | Self::InvalidRequest { .. }
             | Self::FailedPrecondition { .. }
             | Self::DataLoss { .. }
+            | Self::StorageUnavailable { .. }
+            | Self::ServiceUnavailable { .. }
+            | Self::BlockingTaskFailed { .. }
             | Self::MalformedResponse { .. }
             | Self::NetworkMismatch { .. } => None,
         }
@@ -263,6 +259,7 @@ impl IndexerError {
             | Self::ServiceUnavailable { .. }
             | Self::StorageUnavailable { .. }
             | Self::BlockingTaskFailed { .. } => RetryPolicy::RetryWithBackoff,
+            Self::RemoteFailure { retry_policy, .. } => *retry_policy,
             Self::FailedPrecondition { .. }
             | Self::DataLoss { .. }
             | Self::NetworkMismatch { .. } => RetryPolicy::OperatorActionRequired,
@@ -288,6 +285,80 @@ impl IndexerError {
     }
 }
 
+#[cfg(feature = "remote")]
+const fn retry_policy_for_status(code: Code) -> RetryPolicy {
+    match code {
+        Code::InvalidArgument | Code::OutOfRange => RetryPolicy::ClientError,
+        Code::FailedPrecondition
+        | Code::PermissionDenied
+        | Code::Unauthenticated
+        | Code::Unimplemented => RetryPolicy::OperatorActionRequired,
+        Code::Ok
+        | Code::Cancelled
+        | Code::Unknown
+        | Code::DeadlineExceeded
+        | Code::NotFound
+        | Code::AlreadyExists
+        | Code::ResourceExhausted
+        | Code::Aborted
+        | Code::Internal
+        | Code::Unavailable
+        | Code::DataLoss => RetryPolicy::RetryWithBackoff,
+    }
+}
+
+#[cfg(feature = "remote")]
+const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolicy {
+    match reason {
+        ErrorReason::ChainEpochPinUnavailable => RetryPolicy::RefreshChainEpoch,
+        ErrorReason::ChainEventCursorExpired => RetryPolicy::RestartFromEarliestRetained,
+        ErrorReason::InvalidBlockRange
+        | ErrorReason::CompactBlockRangeTooLarge
+        | ErrorReason::ChainEventCursorInvalid
+        | ErrorReason::AddressOutputCursorInvalid
+        | ErrorReason::TransparentHistoryCursorInvalid
+        | ErrorReason::InvalidAddress
+        | ErrorReason::UnsupportedShieldedProtocol
+        | ErrorReason::InvalidChainStoreOptions
+        | ErrorReason::ArtifactPayloadTooLarge
+        | ErrorReason::InvalidChainEpochArtifacts
+        | ErrorReason::TransparentBalanceAddressCountExceeded
+        | ErrorReason::SnapshotPageCursorInvalid
+        | ErrorReason::BroadcastTransactionTooLarge => RetryPolicy::ClientError,
+        ErrorReason::BroadcastDisabled
+        | ErrorReason::MempoolEventCursorExpired
+        | ErrorReason::SnapshotPageCursorExpired
+        | ErrorReason::SchemaMismatch
+        | ErrorReason::SchemaTooNew
+        | ErrorReason::ReorgWindowExceeded
+        | ErrorReason::ChainEpochConflict
+        | ErrorReason::ChainEpochNetworkMismatch
+        | ErrorReason::CompactBlockPayloadMalformed
+        | ErrorReason::ArtifactCorrupt
+        | ErrorReason::EntropyUnavailable
+        | ErrorReason::ExplorerInternal
+        | ErrorReason::MaterializedViewUnavailable
+        | ErrorReason::NodeCapabilityMissing
+        | ErrorReason::ExplorerPreconditionUnsatisfied
+        | ErrorReason::ExplorerMethodDisabled
+        | ErrorReason::DependencyNotConfigured
+        | ErrorReason::Unspecified => RetryPolicy::OperatorActionRequired,
+        ErrorReason::ArtifactUnavailable
+        | ErrorReason::ChainEpochMissing
+        | ErrorReason::BlockNotInBestChain
+        | ErrorReason::UnsupportedChainEvent
+        | ErrorReason::UnsupportedBlockSelector
+        | ErrorReason::UnsupportedTransactionStatus
+        | ErrorReason::BlockingTaskFailed
+        | ErrorReason::NodeUnavailable
+        | ErrorReason::StorageUnavailable
+        | ErrorReason::UnsupportedWalletEncoding
+        | ErrorReason::NoVisibleChainEpoch
+        | ErrorReason::UpstreamUnreachable => RetryPolicy::RetryWithBackoff,
+        ErrorReason::Unknown(_) => retry_policy_for_status(code),
+    }
+}
+
 #[cfg(all(test, feature = "remote"))]
 mod tests {
     use tonic_types::ErrorDetails;
@@ -300,7 +371,7 @@ mod tests {
             Code::FailedPrecondition,
             "requested chain epoch is not retained",
             ErrorDetails::with_error_info(
-                ErrorReason::ChainEpochPinUnavailable.as_str_name(),
+                ErrorReason::ChainEpochPinUnavailable.as_str(),
                 ZINDER_ERROR_DOMAIN,
                 [],
             ),
@@ -335,5 +406,61 @@ mod tests {
             error.retry_policy(),
             RetryPolicy::RestartFromEarliestRetained
         );
+    }
+
+    #[test]
+    fn generic_known_remote_reason_is_preserved() {
+        let status = tonic::Status::with_error_details(
+            Code::InvalidArgument,
+            "invalid transparent address",
+            ErrorDetails::with_error_info(
+                ErrorReason::InvalidAddress.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(error.reason(), Some(ErrorReason::InvalidAddress));
+        assert_eq!(error.retry_policy(), RetryPolicy::ClientError);
+        assert!(matches!(error, IndexerError::RemoteFailure { .. }));
+    }
+
+    #[test]
+    fn unknown_remote_reason_is_preserved_with_status_retry_policy() {
+        let status = tonic::Status::with_error_details(
+            Code::Unavailable,
+            "new server failure",
+            ErrorDetails::with_error_info("FUTURE_SERVER_REASON", ZINDER_ERROR_DOMAIN, []),
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(
+            error.reason(),
+            Some(ErrorReason::Unknown("FUTURE_SERVER_REASON".to_owned()))
+        );
+        assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
+        assert!(matches!(error, IndexerError::RemoteFailure { .. }));
+    }
+
+    #[test]
+    fn data_loss_and_internal_reasons_are_not_retried() {
+        for (code, reason) in [
+            (Code::DataLoss, ErrorReason::ArtifactCorrupt),
+            (Code::Internal, ErrorReason::EntropyUnavailable),
+        ] {
+            let status = tonic::Status::with_error_details(
+                code,
+                "operator intervention required",
+                ErrorDetails::with_error_info(reason.as_str(), ZINDER_ERROR_DOMAIN, []),
+            );
+
+            let error = IndexerError::from_status(status);
+
+            assert_eq!(error.reason(), Some(reason));
+            assert_eq!(error.retry_policy(), RetryPolicy::OperatorActionRequired);
+        }
     }
 }

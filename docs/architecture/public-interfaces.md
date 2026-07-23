@@ -150,6 +150,11 @@ database engine, raw-byte retention policy, or release topology.
 - Zinder serving runtimes compose service-internal reads through
   `WalletServingQuery` and an admitted `WalletServingReadPair`; they do not
   expose a storage-backed public client adapter.
+- Transport metadata and errors cross the SDK boundary as client-owned
+  `ServerInfo`, `Capability`, `CapabilityDescriptor`, and `ErrorReason` types.
+  Unknown wire capability and reason strings remain available through typed
+  `Unknown(String)` variants; generated protobuf types are not public SDK
+  vocabulary.
 - Public traits describe consumer capabilities. Concrete RocksDB types remain
   at composition roots and storage adapters.
 

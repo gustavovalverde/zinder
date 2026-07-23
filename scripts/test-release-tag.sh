@@ -3,6 +3,7 @@ set -euo pipefail
 
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 validator="$repository_root/scripts/validate-release-tag.sh"
+dependency_requirement_validator="$repository_root/scripts/check-sdk-dependency-requirement.sh"
 workspace_version="$(
   cargo metadata \
     --format-version 1 \
@@ -55,3 +56,16 @@ expect_rejected "v1.2.03"
 expect_rejected "v1.2.3-01"
 expect_rejected "v1.2"
 expect_rejected "vlatest"
+
+bash "$dependency_requirement_validator" \
+  "0.6.0-rc.1" \
+  zinder-proto \
+  zinder-core \
+  "^0.6.0-rc.1"
+if bash "$dependency_requirement_validator" \
+  "0.6.0-rc.1" \
+  zinder-proto \
+  zinder-core \
+  "^0.6.0" >/dev/null 2>&1; then
+  fail "a stable SDK dependency requirement admitted a prerelease workspace"
+fi

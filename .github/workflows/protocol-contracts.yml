@@ -3,25 +3,35 @@ name: protocol-contracts
 on:
   pull_request:
     paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
       - "buf.gen.yaml"
       - "buf.yaml"
       - "scripts/generate-api-artifacts.sh"
+      - "scripts/regenerate-zinder-proto.sh"
       - "crates/zinder-client/src/**"
       - "crates/zinder-client/tests/integration/capability_coverage.rs"
+      - "crates/zinder-proto/generated/**"
       - "crates/zinder-proto/proto/**"
       - "crates/zinder-proto/src/capabilities.rs"
+      - "tools/zinder-proto-codegen/**"
       - ".github/workflows/protocol-contracts.yml"
   push:
     branches:
       - main
     paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
       - "buf.gen.yaml"
       - "buf.yaml"
       - "scripts/generate-api-artifacts.sh"
+      - "scripts/regenerate-zinder-proto.sh"
       - "crates/zinder-client/src/**"
       - "crates/zinder-client/tests/integration/capability_coverage.rs"
+      - "crates/zinder-proto/generated/**"
       - "crates/zinder-proto/proto/**"
       - "crates/zinder-proto/src/capabilities.rs"
+      - "tools/zinder-proto-codegen/**"
       - ".github/workflows/protocol-contracts.yml"
   workflow_dispatch:
 
@@ -34,6 +44,35 @@ env:
   PROTOC_VERSION: "29.3"
 
 jobs:
+  generated-proto:
+    name: checked-in generated proto
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
+
+      - name: Install Buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: ${{ env.BUF_VERSION }}
+          github_token: ${{ github.token }}
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Verify checked-in Rust and descriptors
+        run: PROTOC="$(command -v protoc)" scripts/regenerate-zinder-proto.sh --check
+
   proto-breaking:
     name: proto breaking
     if: github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'allow-proto-breaking')
@@ -90,14 +129,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
 
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          version: ${{ env.PROTOC_VERSION }}
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Check ChainIndex capability coverage
+        env:
+          PROTOC: /does/not/exist
         run: cargo test -p zinder-client typed_chain_index_covers_every_advertised_wallet_capability

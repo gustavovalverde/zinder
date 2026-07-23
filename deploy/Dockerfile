@@ -21,21 +21,14 @@ ARG DEBIAN_RELEASE=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS zinder-build-base
 
-ARG PROTOC_VERSION=29.3
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         clang \
         cmake \
-        curl \
         libclang-dev \
         pkg-config \
-        unzip \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSLo /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-$(uname -m | sed 's/aarch64/aarch_64/').zip" \
-    && unzip -q /tmp/protoc.zip -d /usr/local \
-    && rm -f /tmp/protoc.zip
+    && rm -rf /var/lib/apt/lists/*
 
 ENV CARGO_TARGET_DIR=/workspace/target
 WORKDIR /workspace
@@ -61,14 +54,10 @@ ENV ZINDER_BUILD_GIT_COMMIT=${ZINDER_BUILD_GIT_COMMIT}
 
 COPY . .
 
-# A persisted target cache can contain prost output newer than Docker's copied
-# source mtimes. Clean only this package so every image regenerates native
-# contracts while retaining dependency and downstream compilation caches.
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/workspace/target,sharing=locked \
-    cargo clean --release -p zinder-proto \
-    && cargo build --locked --release \
+    cargo build --locked --release \
         --bin zinder-ingest \
         --bin zinder-projector \
         --bin zinder-query \

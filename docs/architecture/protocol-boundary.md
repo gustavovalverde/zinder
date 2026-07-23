@@ -4,6 +4,19 @@
 protobufs, generated Rust modules, and wire-level byte conventions. Domain and
 storage crates use their own types and convert at service adapters.
 
+The crate is the low-level Rust wire-binding surface and is prepared in
+lockstep with `zinder-core` and `zinder-client`. Wallet and application
+consumers should prefer the typed `zinder-client` API; direct `zinder-proto`
+use is for service implementations, custom transports, reflection, and
+protocol tooling.
+
+Generated Rust modules and descriptor sets are checked in under
+`crates/zinder-proto/generated/`. Normal builds and downstream package builds
+therefore require neither `protoc` nor a build script. The private repository
+codegen tool is the only place that depends on `prost-build` and
+`tonic-prost-build`; the protocol workflow runs it with the pinned Buf and
+protoc versions and rejects generated-file drift.
+
 Upstream node protocols belong to [Node source boundary](node-source-boundary.md).
 Storage encodings belong to [Storage backend](storage-backend.md).
 
@@ -106,12 +119,17 @@ domain value.
 
 ## Evolution and verification
 
-- Additive fields receive new tags. This pre-compat native protocol may reuse a
-  deleted native tag as part of an explicitly breaking contract change.
-- Vendored compatibility schemas retain upstream field and reservation rules.
-- Breaking native shapes use a new capability version or package version.
-- Compatibility schemas change only with an explicit upstream-pin update.
+- Native schemas evolve compatibly within a versioned package: additive fields
+  receive new tags, and removed fields reserve their tags and names.
+- Breaking native wire shapes use a new versioned package. Versioned
+  capabilities describe optional behavior without weakening protobuf
+  compatibility.
+- Vendored lightwalletd and external Zebra schemas retain upstream field and
+  reservation rules and change only with an explicit update to their pinned
+  source commits and provenance records.
 - Proto tests cover golden decoding, byte order, enum mappings, pagination, and
   epoch identity.
+- `scripts/regenerate-zinder-proto.sh --check` proves that checked-in Rust and
+  descriptors match the source schemas with the pinned code generators.
 - `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps`
   keeps generated and adapter documentation references valid.

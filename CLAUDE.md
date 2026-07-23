@@ -153,9 +153,10 @@ Test functions under `tests/live/` use plain `snake_case_describing_behavior` na
 
 ## Coding Constraints
 
-The workspace MSRV is Rust 1.95. Keep `Cargo.toml`,
-`rust-toolchain.toml`, `clippy.toml`, CI toolchain actions, and Docker
-`RUST_VERSION` args in sync whenever the toolchain moves.
+The workspace MSRV is Rust 1.95. Public crates inherit that version alongside
+the internal crates and release binaries. Keep `Cargo.toml`,
+`rust-toolchain.toml`, CI toolchain actions, and Docker `RUST_VERSION` args
+aligned whenever it changes.
 
 The workspace `Cargo.toml` denies (not warns):
 
@@ -184,9 +185,25 @@ Practical effects:
 
 ## Protobuf Generation
 
-`crates/zinder-proto/build.rs` compiles three `.proto` files via `tonic-prost-build` at build time. Generated code lives in `OUT_DIR` and is included via `include!`. The lightwalletd schemas under `proto/compat/lightwalletd/` are vendored from `zcash/lightwallet-protocol` (commit pinned in `crates/zinder-proto/proto/compat/lightwalletd/COMMIT`, surfaced as `zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT`). Do not edit them; the `vendored-proto` CI job diffs them against upstream.
+`zinder-proto` compiles from checked-in Rust modules and descriptor sets under
+`crates/zinder-proto/generated/`; package consumers do not need `protoc` or a
+build script. The private `zinder-proto-codegen` tool regenerates those files
+with Buf 1.68.2 and protoc 29.3. Run
+`PROTOC="$(command -v protoc)" scripts/regenerate-zinder-proto.sh --check` to
+detect drift or replace `--check` with `--write` after an intentional protocol
+change. Only repository maintainers run this tool; it is not part of the
+published crate.
 
-Native protocol changes go in `crates/zinder-proto/proto/zinder/v1/wallet.proto`. After editing, add a generated message round-trip test in `crates/zinder-proto/tests/`.
+The lightwalletd schemas under `proto/compat/lightwalletd/` are vendored from
+`zcash/lightwallet-protocol` (commit pinned in
+`crates/zinder-proto/proto/compat/lightwalletd/COMMIT`, surfaced as
+`zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT`). Do not
+edit them; the `vendored-proto` CI job diffs them against upstream.
+
+Native protocol changes go under
+`crates/zinder-proto/proto/zinder/v1/`. After editing, regenerate the checked-in
+artifacts and add a generated message round-trip test in
+`crates/zinder-proto/tests/`.
 
 ## Local Storage Conventions
 

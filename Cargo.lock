@@ -5925,14 +5925,19 @@ version = "0.5.0"
 dependencies = [
  "eyre",
  "prost",
- "prost-build",
  "prost-types",
  "thiserror 2.0.18",
  "tonic",
  "tonic-prost",
- "tonic-prost-build",
  "tonic-types",
  "zinder-core",
+]
+
+[[package]]
+name = "zinder-proto-codegen"
+version = "0.5.0"
+dependencies = [
+ "tonic-prost-build",
 ]
 
 [[package]]

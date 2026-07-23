@@ -29,7 +29,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NEXTEST_VERSION: "0.9.116"
-  PROTOC_VERSION: "29.3"
+  PROTOC: /does/not/exist
   REFERENCE_LIGHTWALLETD_IMAGE: docker.io/electriccoinco/lightwalletd:v0.4.19@sha256:a3dfb04b4054b78ae3107dcc804c3a15a6e38d1f0dfcadeac48da482dd1d3448
   ZEBRA_REFERENCE_IMAGE: docker.io/zfnd/zebra:6.0.0-rc.0@sha256:998178a61a67b4776ea7104d05c481d86f069a688595e99fcff7f090ae4b7e2b
   PARITY_REGTEST_PREMINE_BLOCKS: "125"
@@ -71,12 +71,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          version: ${{ env.PROTOC_VERSION }}
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1

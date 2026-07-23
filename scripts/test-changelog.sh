@@ -206,7 +206,9 @@ expect_rejected \
 prepare_repository="$temporary_directory/prepare-repository"
 mkdir -p \
   "$prepare_repository/.changes/unreleased" \
-  "$prepare_repository/crates/example/src" \
+  "$prepare_repository/crates/zinder-client/src" \
+  "$prepare_repository/crates/zinder-core/src" \
+  "$prepare_repository/crates/zinder-proto/src" \
   "$prepare_repository/scripts"
 cp "$repository_root/.changie.yaml" "$prepare_repository/.changie.yaml"
 cp "$repository_root/.changes/header.tpl.md" "$prepare_repository/.changes/header.tpl.md"
@@ -218,26 +220,69 @@ cp "$preparer" "$prepare_repository/scripts/prepare-changelog-release.sh"
 cp "$validator" "$prepare_repository/scripts/validate-changelog.sh"
 cp "$repository_root/scripts/validate-release-tag.sh" \
   "$prepare_repository/scripts/validate-release-tag.sh"
+cp "$repository_root/scripts/check-sdk-package-policy.sh" \
+  "$prepare_repository/scripts/check-sdk-package-policy.sh"
+cp "$repository_root/scripts/check-sdk-dependency-requirement.sh" \
+  "$prepare_repository/scripts/check-sdk-dependency-requirement.sh"
 cat > "$prepare_repository/Cargo.toml" <<'TOML'
 [workspace]
-members = ["crates/example"]
+members = [
+  "crates/zinder-client",
+  "crates/zinder-core",
+  "crates/zinder-proto",
+]
 resolver = "3"
 
 [workspace.package]
 version = "0.5.0"
 edition = "2024"
 publish = false
+rust-version = "1.95"
 TOML
-cat > "$prepare_repository/crates/example/Cargo.toml" <<'TOML'
+cat > "$prepare_repository/crates/zinder-core/Cargo.toml" <<'TOML'
 [package]
-name = "example"
+name = "zinder-core"
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+readme = "README.md"
+include = ["src/**", "Cargo.toml", "README.md"]
 TOML
-cat > "$prepare_repository/crates/example/src/lib.rs" <<'RUST'
+cat > "$prepare_repository/crates/zinder-proto/Cargo.toml" <<'TOML'
+[package]
+name = "zinder-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+readme = "README.md"
+include = ["src/**", "Cargo.toml", "README.md"]
+
+[dependencies]
+zinder-core = { path = "../zinder-core", version = "0.5.0" }
+TOML
+cat > "$prepare_repository/crates/zinder-client/Cargo.toml" <<'TOML'
+[package]
+name = "zinder-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = ["crates-io"]
+readme = "README.md"
+include = ["src/**", "Cargo.toml", "README.md"]
+
+[dependencies]
+zinder-core = { path = "../zinder-core", version = "0.5.0" }
+zinder-proto = { path = "../zinder-proto", version = "0.5.0" }
+TOML
+for package_name in zinder-client zinder-core zinder-proto; do
+  printf '# %s\n' "$package_name" \
+    > "$prepare_repository/crates/$package_name/README.md"
+  cat > "$prepare_repository/crates/$package_name/src/lib.rs" <<'RUST'
 pub fn example() {}
 RUST
+done
 cat > "$prepare_repository/.changes/unreleased/fixed-example.yaml" <<'YAML'
 kind: fixed
 body: Correct an operator-visible release defect.

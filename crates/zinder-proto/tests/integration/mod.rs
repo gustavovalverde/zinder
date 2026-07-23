@@ -3,6 +3,7 @@ mod capability_docs;
 mod capability_string_uniqueness;
 mod error_reason_policy_drift;
 mod explorer_protocol;
+mod hermetic_artifacts;
 mod lightwalletd_protocol;
 mod wallet_blob_capability_gating;
 mod wallet_protocol;
