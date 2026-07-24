@@ -663,14 +663,16 @@ jobs:
 
           mkdir -p dist/image-evidence
           manifest_path="dist/image-evidence/${IMAGE_NAME}.manifest.json"
-          docker buildx imagetools inspect "${image}:${RELEASE_TAG}" \
-            --format '{{json .Manifest}}' > "$manifest_path"
+          scripts/resolve-release-image-manifest.sh \
+            --image "$image" \
+            --tag "$RELEASE_TAG" \
+            --commit "$BUILD_GIT_COMMIT" \
+            --amd64-build-digest "$amd64_build_digest" \
+            --arm64-build-digest "$arm64_build_digest" \
+            --output "$manifest_path"
           root_digest="$(jq -r '.digest' "$manifest_path")"
           amd64_digest="$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' "$manifest_path")"
           arm64_digest="$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' "$manifest_path")"
-          tag_digest="$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" --format '{{json .Manifest}}' | jq -r '.digest')"
-          commit_digest="$(docker buildx imagetools inspect "${image}:sha-${BUILD_GIT_COMMIT}" --format '{{json .Manifest}}' | jq -r '.digest')"
-          [[ "$root_digest" == "$tag_digest" && "$tag_digest" == "$commit_digest" ]]
 
           amd64_sbom="dist/image-evidence/${IMAGE_NAME}-linux-amd64.spdx.json"
           arm64_sbom="dist/image-evidence/${IMAGE_NAME}-linux-arm64.spdx.json"
@@ -737,27 +739,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          certificate_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}"
-          cosign verify \
-            --certificate-identity "$certificate_identity" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "${IMAGE}@${ROOT_DIGEST}"
-          common_attestation_args=(
-            --repo "$GITHUB_REPOSITORY"
-            --cert-identity "$certificate_identity"
-            --deny-self-hosted-runners
-            --signer-digest "$BUILD_GIT_COMMIT"
-            --source-ref "refs/tags/${RELEASE_TAG}"
-            --source-digest "$BUILD_GIT_COMMIT"
-            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
-          )
-          gh attestation verify "oci://${IMAGE}@${ROOT_DIGEST}" \
-            "${common_attestation_args[@]}"
-          for child_digest in "$AMD64_DIGEST" "$ARM64_DIGEST"; do
-            gh attestation verify "oci://${IMAGE}@${child_digest}" \
-              "${common_attestation_args[@]}" \
-              --predicate-type https://spdx.dev/Document/v2.3
-          done
+          scripts/verify-release-image-attestations.sh \
+            --image "$IMAGE" \
+            --root-digest "$ROOT_DIGEST" \
+            --amd64-digest "$AMD64_DIGEST" \
+            --arm64-digest "$ARM64_DIGEST" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow release.yml \
+            --tag "$RELEASE_TAG" \
+            --commit "$BUILD_GIT_COMMIT"
 
   assemble-and-sign:
     name: assemble and sign release assets
