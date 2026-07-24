@@ -12,6 +12,22 @@ fail() {
   exit 1
 }
 
+write_baseline_changelog() {
+  local destination="$1"
+  {
+    cat "$repository_root/.changes/header.tpl.md"
+    printf '\n\n## [Unreleased]\n\n'
+    cat "$repository_root/.changes/v0.4.0.md"
+  } > "$destination"
+}
+
+require_canonical_changelog_end() {
+  local changelog_path="$1"
+  local release_label="$2"
+  [[ -n "$(tail -n 1 "$changelog_path")" ]] \
+    || fail "$release_label preparation left a trailing blank line"
+}
+
 [[ -x "$validator" ]] || fail "missing executable validator: $validator"
 [[ -x "$extractor" ]] || fail "missing executable release-note extractor: $extractor"
 [[ -x "$preparer" ]] || fail "missing executable release preparer: $preparer"
@@ -27,7 +43,7 @@ cp "$repository_root/.changes/header.tpl.md" "$fixture_repository/.changes/heade
 cp "$repository_root/.changes/v0.4.0.md" "$fixture_repository/.changes/v0.4.0.md"
 cp "$repository_root/.changes/unreleased/.gitkeep" \
   "$fixture_repository/.changes/unreleased/.gitkeep"
-cp "$repository_root/CHANGELOG.md" "$fixture_repository/CHANGELOG.md"
+write_baseline_changelog "$fixture_repository/CHANGELOG.md"
 
 git -C "$fixture_repository" init -q -b main
 git -C "$fixture_repository" config user.email "changelog-policy@example.invalid"
@@ -215,7 +231,7 @@ cp "$repository_root/.changes/header.tpl.md" "$prepare_repository/.changes/heade
 cp "$repository_root/.changes/v0.4.0.md" "$prepare_repository/.changes/v0.4.0.md"
 cp "$repository_root/.changes/unreleased/.gitkeep" \
   "$prepare_repository/.changes/unreleased/.gitkeep"
-cp "$repository_root/CHANGELOG.md" "$prepare_repository/CHANGELOG.md"
+write_baseline_changelog "$prepare_repository/CHANGELOG.md"
 cp "$preparer" "$prepare_repository/scripts/prepare-changelog-release.sh"
 cp "$validator" "$prepare_repository/scripts/validate-changelog.sh"
 cp "$repository_root/scripts/validate-release-tag.sh" \
@@ -326,6 +342,9 @@ env CHANGIE_BIN="$changie_bin" \
   bash "$prepare_repository/scripts/prepare-changelog-release.sh" \
     0.5.0-rc.1 >/dev/null
 run_validator release v0.5.0-rc.1 "$prepare_repository"
+require_canonical_changelog_end \
+  "$prepare_repository/CHANGELOG.md" \
+  "RC1"
 [[ -f "$prepare_repository/.changes/v0.5.0-rc.1.md" ]] \
   || fail "RC1 preparation did not archive its release notes"
 [[ -n "$(find "$prepare_repository/.changes/unreleased" -type f -name '*.yaml' -print -quit)" ]] \
@@ -354,6 +373,9 @@ env CHANGIE_BIN="$changie_bin" \
   bash "$prepare_repository/scripts/prepare-changelog-release.sh" \
     0.5.0-rc.2 >/dev/null
 run_validator release v0.5.0-rc.2 "$prepare_repository"
+require_canonical_changelog_end \
+  "$prepare_repository/CHANGELOG.md" \
+  "RC2"
 [[ ! -e "$prepare_repository/.changes/v0.5.0-rc.1.md" ]] \
   || fail "RC2 preparation retained the superseded RC1 archive"
 if grep -Fq '## [0.5.0-rc.1] - ' "$prepare_repository/CHANGELOG.md"; then
@@ -378,6 +400,9 @@ set_prepare_product_version 0.5.0
 env CHANGIE_BIN="$changie_bin" \
   bash "$prepare_repository/scripts/prepare-changelog-release.sh" 0.5.0 >/dev/null
 run_validator release v0.5.0 "$prepare_repository"
+require_canonical_changelog_end \
+  "$prepare_repository/CHANGELOG.md" \
+  "stable"
 [[ ! -e "$prepare_repository/.changes/v0.5.0-rc.2.md" ]] \
   || fail "stable preparation retained the superseded RC2 archive"
 if grep -Fq '## [0.5.0-rc.2] - ' "$prepare_repository/CHANGELOG.md"; then
