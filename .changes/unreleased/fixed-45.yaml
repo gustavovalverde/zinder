@@ -1,0 +1,6 @@
+kind: fixed
+body: Check out the validated release commit before preparing draft GitHub Release assets.
+time: 2026-07-24T23:55:35Z
+custom:
+  Bump: patch
+  PR: "45"
