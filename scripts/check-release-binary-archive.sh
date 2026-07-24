@@ -34,10 +34,12 @@ done
 case "$rust_target" in
   x86_64-unknown-linux-gnu)
     release_platform=x86_64-v3-unknown-linux-gnu
+    cpu_baseline=x86-64-v3
     elf_machine='Advanced Micro Devices X86-64'
     ;;
   aarch64-unknown-linux-gnu)
     release_platform=aarch64-unknown-linux-gnu
+    cpu_baseline=armv8-a
     elf_machine=AArch64
     ;;
   *) usage ;;
@@ -163,6 +165,7 @@ jq -e \
   --arg commit "$commit" \
   --arg rust_target "$rust_target" \
   --arg release_platform "$release_platform" \
+  --arg cpu_baseline "$cpu_baseline" \
   --argjson source_date_epoch "$source_date_epoch" '
     .schema_version == 1
     and .version == $version
@@ -170,6 +173,7 @@ jq -e \
     and .commit == $commit
     and .rust_target == $rust_target
     and .release_platform == $release_platform
+    and .cpu_baseline == $cpu_baseline
     and .libc.family == "glibc"
     and .libc.minimum_runtime_version == "2.34"
     and .libc.dynamic_libstdcpp == true

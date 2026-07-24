@@ -94,6 +94,51 @@ if ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
   fail "an archive with the wrong expected commit was admitted"
 fi
 
+cpu_baseline_root="$temporary_directory/cpu-baseline"
+mkdir -p "$cpu_baseline_root"
+tar --extract --gzip --same-permissions --file "$first_asset" --directory "$cpu_baseline_root"
+root_name="$(find "$cpu_baseline_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')"
+jq '.cpu_baseline = "x86-64-v2"' \
+  "$cpu_baseline_root/$root_name/BUILD-INFO.json" \
+  > "$cpu_baseline_root/$root_name/BUILD-INFO.json.updated"
+mv \
+  "$cpu_baseline_root/$root_name/BUILD-INFO.json.updated" \
+  "$cpu_baseline_root/$root_name/BUILD-INFO.json"
+(
+  cd "$cpu_baseline_root/$root_name"
+  find bin -maxdepth 1 -type f -printf '%p\n' \
+    | LC_ALL=C sort \
+    | xargs sha256sum
+  printf '%s\n' BUILD-INFO.json LICENSE README.md \
+    | LC_ALL=C sort \
+    | xargs sha256sum
+) | LC_ALL=C sort -k2 > "$cpu_baseline_root/$root_name/SHA256SUMS"
+chmod 0644 \
+  "$cpu_baseline_root/$root_name/BUILD-INFO.json" \
+  "$cpu_baseline_root/$root_name/SHA256SUMS"
+find "$cpu_baseline_root/$root_name" -exec touch -h -d '@1735689600' {} +
+wrong_cpu_baseline_asset="$temporary_directory/wrong-cpu-baseline.tar.gz"
+LC_ALL=C tar \
+  --directory "$cpu_baseline_root" \
+  --sort=name \
+  --format=gnu \
+  --mtime='@1735689600' \
+  --owner=0 \
+  --group=0 \
+  --numeric-owner \
+  -cf - \
+  "$root_name" \
+  | gzip -n > "$wrong_cpu_baseline_asset"
+if ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
+  "$checker" "$wrong_cpu_baseline_asset" \
+    --version 0.5.0-rc.1 \
+    --tag v0.5.0-rc.1 \
+    --commit 0123456789abcdef0123456789abcdef01234567 \
+    --target x86_64-unknown-linux-gnu \
+    --source-date-epoch 1735689600 >/dev/null 2>&1; then
+  fail "an archive with the wrong CPU baseline was admitted"
+fi
+
 tamper_root="$temporary_directory/tamper"
 mkdir -p "$tamper_root"
 tar --extract --gzip --same-permissions --file "$first_asset" --directory "$tamper_root"
