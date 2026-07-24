@@ -53,6 +53,7 @@ bash scripts/test-release-tag.sh
 bash scripts/test-deployment-admission.sh
 scripts/test-release-binary-archive.sh
 scripts/test-release-sbom.sh
+scripts/test-release-image-publication.sh
 scripts/test-changelog.sh
 scripts/validate-changelog.sh fragments
 scripts/check-sdk-package-policy.sh
@@ -310,6 +311,21 @@ platform digests or an editable draft Release; rerunning the failed workflow
 jobs is safe because the workflow replaces draft assets and recreates exact
 tags from the same validated commit. A published immutable Release causes
 validation to fail closed rather than modify public assets.
+
+GHCR may briefly return the previous value of an exact or commit image tag
+after a manifest update. The release workflow waits until both tags resolve to
+the same root manifest and that manifest contains the platform digests produced
+by the current build. If this convergence gate expires, inspect GHCR for both
+tags before retrying; do not bypass the topology check or publish the GitHub
+Release from partially converged tags.
+
+GitHub attestation verification accepts only one workflow identity selector.
+Zinder uses the full tag-scoped `--cert-identity` together with the source and
+signer digests; do not add `--signer-workflow` to the same command. If a
+prerelease publishes crates or image digests but fails before creating its
+GitHub Release, leave its tag and published artifacts immutable. Merge the
+workflow fix, prepare the next release candidate, and run the complete
+publication path from the new tag.
 
 If only the final stable promotion fails, rerun the failed
 `promote stable image tags` job. It verifies all 4 exact manifests before moving
