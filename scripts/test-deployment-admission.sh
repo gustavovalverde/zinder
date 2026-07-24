@@ -479,12 +479,21 @@ expect_rejected \
   --release-workflow "$bypassed_manifest_dependency_workflow"
 
 unprotected_authorization_workflow="$temporary_directory/unprotected-authorization-release.yml"
-sed '0,/^    environment: release$/d' \
+sed '/^  authorize-release:/,/^  binary-archives:/ {
+  /^    environment: release$/d
+}' \
   "$repository_root/.github/workflows/release.yml" \
   > "$unprotected_authorization_workflow"
-expect_rejected \
-  "a release workflow without protected pre-OIDC authorization" \
-  --release-workflow "$unprotected_authorization_workflow"
+unprotected_authorization_error="$temporary_directory/unprotected-authorization-error.txt"
+if bash "$validator" \
+  --release-workflow "$unprotected_authorization_workflow" \
+  > /dev/null 2> "$unprotected_authorization_error"; then
+  fail "a release workflow without protected pre-OIDC authorization was admitted"
+fi
+grep -Fq \
+  'release admission rejected: the protected release authorization must follow' \
+  "$unprotected_authorization_error" \
+  || fail "the unprotected authorization workflow was rejected for an unrelated reason"
 
 early_oidc_workflow="$temporary_directory/early-oidc-release.yml"
 sed '/^  sdk-packages:/a\    permissions:\n      id-token: write' \
