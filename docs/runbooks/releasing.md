@@ -125,26 +125,25 @@ both outcomes and includes the complete plan and observed state in the job
 summary. It also builds each GNU/Linux binary platform twice, confirms identical
 binary and archive hashes, and validates the four-binary catalog, embedded
 commit, ELF machine, dynamic library closure, GLIBC symbol ceiling, and clean
-Debian runtime probes. The `release` environment then requires approval before
-the first registry write.
+Debian runtime probes. The workflow generates and validates the native proto
+source closure, OpenAPI documents, and descriptor set, then collects the
+x86-64-v3 and AArch64 GNU archives with their sorted external `SHA256SUMS`.
+These credential-free jobs must succeed before the `release` environment
+requests approval for the first registry write.
 
 After approval, the workflow performs these operations in order:
 
-1. Generate and validate the native proto source closure, OpenAPI documents,
-   and descriptor set.
-2. Collect the x86-64-v3 and AArch64 GNU archives and their sorted external
-   `SHA256SUMS`.
-3. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
+1. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
    publish only missing SDK crates in Cargo's dependency order and verify their
    source provenance.
-4. Compile a fresh registry-only consumer against the exact published
+2. Compile a fresh registry-only consumer against the exact published
    `zinder-client` version after sparse-index propagation.
-5. Build the 4 runtime images natively for Linux amd64 and arm64.
-6. Publish exact `vX.Y.Z` and `sha-<commit>` multi-architecture manifests.
-7. Create a draft GitHub Release from the exact versioned changelog section and
-   attach the API artifacts.
-8. Publish the GitHub Release after every exact image manifest succeeds.
-9. For a stable release, verify all 4 exact manifests and promote their
+3. Build the 4 runtime images natively for Linux amd64 and arm64.
+4. Publish exact `vX.Y.Z` and `sha-<commit>` multi-architecture manifests.
+5. Create a draft GitHub Release from the exact versioned changelog section and
+   attach the API artifacts, binary bundles, and `SHA256SUMS`.
+6. Publish the GitHub Release after every exact image manifest succeeds.
+7. For a stable release, verify all 4 exact manifests and promote their
    `latest` tags in one final job.
 
 Stable and prerelease tags publish the same three-crate SDK catalog.
