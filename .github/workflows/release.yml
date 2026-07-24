@@ -88,10 +88,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          release_json="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" 2>/dev/null \
-              || true
-          )"
+          release_json="$(scripts/find-github-release.sh "$RELEASE_TAG")"
           if [[ -n "$release_json" ]]; then
             jq -e '.draft == true' <<< "$release_json" >/dev/null || {
               echo "published GitHub Release ${RELEASE_TAG} already exists" >&2
@@ -649,10 +646,7 @@ jobs:
               || true
           )"
           if [[ -n "$existing_manifest" ]]; then
-            release_json="$(
-              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" 2>/dev/null \
-                || true
-            )"
+            release_json="$(scripts/find-github-release.sh "$RELEASE_TAG")"
             if [[ -n "$release_json" ]]; then
               jq -e '.draft == true' <<< "$release_json" >/dev/null || {
                 echo "an exact image tag may only be replaced before release publication" >&2
@@ -906,10 +900,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          release_json="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" 2>/dev/null \
-              || true
-          )"
+          release_json="$(scripts/find-github-release.sh "$RELEASE_TAG")"
           if [[ -n "$release_json" ]]; then
             jq -e '.draft == true' <<< "$release_json" >/dev/null || {
               echo "published GitHub Release ${RELEASE_TAG} already exists" >&2
