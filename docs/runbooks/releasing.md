@@ -3,12 +3,10 @@
 Zinder releases one lockstep product version across every first-party crate and
 service. A tagged release publishes 4 multi-architecture runtime images, the
 native protocol source and descriptor, generated OpenAPI documents, and one
-GitHub Release. The same version also prepares a registry-ready Rust SDK formed
-by `zinder-core`, `zinder-proto`, and `zinder-client`. The tagged workflow does
-not publish those crates to crates.io yet; crate publication remains a separate
-release phase until registry credentials and first-publication ordering are
-admitted. The optional explorer and Cipherscan services, benchmark executable,
-and internal Rust crates are not release artifacts.
+GitHub Release. The same tag publishes the Rust SDK formed by `zinder-core`,
+`zinder-proto`, and `zinder-client` to crates.io in dependency order. The
+optional explorer and Cipherscan services, benchmark executable, and internal
+Rust crates are not release artifacts.
 
 `deploy/release-images.json` is the authoritative published image set. The PR
 smoke build and tagged release both consume the exact catalog value validated
@@ -27,6 +25,11 @@ The release tag must equal `v` followed by the workspace version. Stable
 versions use `vMAJOR.MINOR.PATCH`, while prereleases may add a SemVer suffix
 such as `v0.5.0-rc.1`. Build metadata is rejected because `+` cannot be
 represented in an OCI image tag without changing the version.
+
+The release workflow resolves the preceding complete SemVer tag from `main`'s
+first-parent history as the Cargo Release base and the validated tag commit as
+its target. Cargo Release compares those 2 immutable commits to reconstruct the
+complete publishable package set.
 
 Every user-visible pull request records its release note as an independent
 Changie fragment under `.changes/unreleased/`. Each fragment separates its
@@ -82,11 +85,14 @@ scripts/verify-sdk-packages.sh
 git diff -- Cargo.toml Cargo.lock CHANGELOG.md .changes
 ```
 
-The preparation command fails unless the requested version matches both the
-fragment-derived version and the version inherited by every first-party Cargo
-package. It batches the pending fragments into one dated `CHANGELOG.md`
-section, preserves the fragments in the version archive, and is idempotent
-when rerun after a successful batch.
+The preparation command fails unless the requested stable version, excluding
+any prerelease suffix, matches the version implied by the fragments, and the
+complete requested version matches every first-party Cargo package. A
+prerelease batch uses Changie's `--keep` mode so the next release candidate
+contains the complete pending release. Preparing a later release candidate
+replaces the earlier prerelease section for the same stable version. Preparing
+the stable version removes the prerelease section and consumes the fragments.
+Each preparation is idempotent when rerun for the same version.
 
 Merge the release-preparation change through `main`. Because this pull request
 only consumes notes recorded by earlier changes, check `No release note
@@ -107,32 +113,121 @@ git push origin v0.5.0
 The tag must be reachable from `main`. The `release` workflow validates the tag
 against Cargo metadata, requires a matching non-empty changelog section, and
 rejects pending fragments before it logs in to GitHub Container Registry
-(GHCR). The `release` environment then requires approval before the first
-registry write.
+(GHCR) or requests a crates.io identity token. Before credentials are
+available, it validates exactly the three SDK archives with the workspace Rust
+1.95 toolchain, compiles an extracted consumer without `protoc`, and uses Cargo
+Release to dry-run the complete dependency-aware publication plan. Missing
+crate versions and package tags are expected during this read-only check. The
+package and Cargo Release checks run independently, then one final gate reports
+both outcomes and includes the complete plan and observed state in the job
+summary.
+The `release` environment then requires approval before the first registry
+write.
 
 After approval, the workflow performs these operations in order:
 
 1. Generate and validate the native proto source closure, OpenAPI documents,
    and descriptor set.
-2. Build the 4 runtime images natively for Linux amd64 and arm64.
-3. Publish exact `vX.Y.Z` and `sha-<commit>` multi-architecture manifests.
-4. Create a draft GitHub Release from the exact versioned changelog section and
+2. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
+   publish only missing SDK crates in Cargo's dependency order and verify their
+   source provenance.
+3. Compile a fresh registry-only consumer against the exact published
+   `zinder-client` version after sparse-index propagation.
+4. Build the 4 runtime images natively for Linux amd64 and arm64.
+5. Publish exact `vX.Y.Z` and `sha-<commit>` multi-architecture manifests.
+6. Create a draft GitHub Release from the exact versioned changelog section and
    attach the API artifacts.
-5. Publish the GitHub Release after every exact image manifest succeeds.
-6. For a stable release, verify all 4 exact manifests and promote their
+7. Publish the GitHub Release after every exact image manifest succeeds.
+8. For a stable release, verify all 4 exact manifests and promote their
    `latest` tags in one final job.
 
-Prereleases never move `latest`, and GitHub marks their Releases as
-prereleases. The release workflow has no manual-dispatch path. Use the manual
-`build-images` workflow for a build-only smoke test; it does not authenticate to
-GHCR, publish an image, create a manifest, or create a GitHub Release.
+Stable and prerelease tags publish the same three-crate SDK catalog.
+Prereleases never move image `latest`, and GitHub marks their Releases as
+prereleases. The release workflow has no manual-dispatch path and globally
+serializes publication, so two tags cannot race the same crates or image tags.
+Use the manual `build-images` workflow for a build-only smoke test; it does not
+authenticate to crates.io or GHCR, publish an artifact, or create a GitHub
+Release.
+
+## Configure crates.io trusted publication
+
+Do not publish the historical `v0.4.0` tag to crates.io. The first public SDK
+publication starts from an exact, clean `v0.5.0-rc.1` tag after its release
+preparation change has merged to `main`. Create and push the tag, then let the
+credential-free validation, API artifact, and SDK package jobs pass. Keep the
+protected `release` environment unapproved so no workflow requests registry
+credentials or writes release artifacts:
+
+```console
+git switch main
+git pull --ff-only
+git tag -a v0.5.0-rc.1 -m "v0.5.0-rc.1"
+git push origin v0.5.0-rc.1
+```
+
+From the same exact tag, use a short-lived conventional crates.io token that
+can create the three crate names:
+
+```console
+git switch --detach v0.5.0-rc.1
+test -z "$(git status --porcelain)"
+export CARGO_REGISTRY_TOKEN='<short-lived-bootstrap-token>'
+scripts/verify-sdk-packages.sh
+cargo +1.95.0 publish \
+  --locked \
+  --registry crates-io \
+  -p zinder-core \
+  -p zinder-proto \
+  -p zinder-client
+unset CARGO_REGISTRY_TOKEN
+```
+
+The conventional token must create all three crate names. If Cargo stops after
+a partial publication, keep the token active, wait for the accepted versions to
+appear in the sparse index, and repeat `cargo publish` with only the remaining
+`-p` packages. Do not switch to OpenID Connect (OIDC) while any crate name is
+still missing.
+
+After all three `0.5.0-rc.1` versions resolve from crates.io, revoke the
+bootstrap token and configure the same GitHub trusted publisher in the
+crates.io settings for `zinder-core`, `zinder-proto`, and `zinder-client`:
+
+- owner: `gustavovalverde`
+- repository: `zinder`
+- workflow: `release.yml`
+- environment: `release`
+
+The workflow uses `rust-lang/crates-io-auth-action` to exchange GitHub's OIDC
+identity for a short-lived crates.io token. Do not add a repository or
+environment `CARGO_REGISTRY_TOKEN` secret; the token is exposed only to the
+Cargo Release `publish` step.
+
+Approve the waiting `release` environment only after all 3 trusted publishers
+are configured. Cargo Release then verifies the already published archives
+against the tag commit, while the rest of the release workflow publishes the
+RC1 images and artifacts.
+
+Prepare and tag `v0.5.0-rc.2` through the normal release process after RC1
+finishes. RC2 is the OIDC upload canary: the protected workflow must obtain the
+short-lived token, upload all three missing `0.5.0-rc.2` versions in dependency
+order, and pass the fresh registry-only consumer smoke test. Prepare and publish
+`v0.5.0` only after the RC2 workflow and publication verification succeed.
 
 ## Verify publication
 
-Confirm the Release and each exact image before changing a deployment:
+Check out the exact release tag so the smoke test compiles against the API
+surface named by that version, then confirm the Release and each exact image
+before changing a deployment:
 
 ```console
+git switch --detach v0.5.0
 gh release view v0.5.0
+
+for package_name in zinder-core zinder-proto zinder-client; do
+  cargo info "${package_name}@0.5.0"
+done
+
+scripts/verify-published-sdk.sh 0.5.0
 
 for image in \
   zinder-ingest \
@@ -155,6 +250,27 @@ uses `:local` only for source builds and does not treat `latest` as a deployment
 identity.
 
 ## Recover a failed release
+
+Crate publication is resumable. Every run reconstructs the complete release
+from the preceding product tag and the immutable target commit, dry-runs all
+planned crates together, observes crates.io, and publishes only missing
+versions. An existing version is accepted only when its packaged
+`.cargo_vcs_info.json` records the target commit without a dirty source flag.
+A version published from another commit fails closed and must be investigated;
+never yank or replace a version to make the release continue.
+
+A nonzero Cargo publication may represent an uncertain upload, so Cargo
+Release reobserves crates.io before deciding the operation failed. If registry
+propagation times out, rerun the same `publish public SDK crates` job;
+successfully published predecessors are verified and skipped. The pinned action
+always dry-runs the complete plan, including when every crate is already
+published, and removes its read-only GitHub token before Cargo can execute
+package build scripts.
+
+`.github/cargo-release.yml` defines package-specific tag identities required by
+Cargo Release's reconciliation model. Zinder invokes only the action's `check`
+and `publish` phases: the existing product tag, artifact-rich GitHub Release,
+and `latest` image promotion remain owned by the Zinder workflow.
 
 The workflow creates the public GitHub Release only after all exact image tags
 exist. A failure before publication may leave untagged platform digests or an

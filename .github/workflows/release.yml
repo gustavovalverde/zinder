@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-publication
   cancel-in-progress: false
 
 env:
@@ -26,6 +26,7 @@ jobs:
     name: validate release identity
     runs-on: ubuntu-latest
     outputs:
+      base_commit: ${{ steps.identity.outputs.base_commit }}
       commit: ${{ steps.identity.outputs.commit }}
       release_images: ${{ steps.images.outputs.release_images }}
       stable: ${{ steps.identity.outputs.stable }}
@@ -55,6 +56,30 @@ jobs:
             exit 1
           }
           printf 'commit=%s\n' "$release_commit" >> "$GITHUB_OUTPUT"
+          previous_tag="$(
+            git describe \
+              --first-parent \
+              --tags \
+              --abbrev=0 \
+              --match 'v[0-9]*' \
+              "${release_commit}^"
+          )"
+          previous_version="${previous_tag#v}"
+          semver_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+          [[ "$previous_tag" == v* && "$previous_version" =~ $semver_pattern ]] || {
+            echo "preceding product tag is not complete SemVer: ${previous_tag}" >&2
+            exit 1
+          }
+          prerelease="${BASH_REMATCH[5]:-}"
+          IFS=. read -r -a prerelease_identifiers <<< "$prerelease"
+          for identifier in "${prerelease_identifiers[@]}"; do
+            [[ ! "$identifier" =~ ^0[0-9]+$ ]] || {
+              echo "preceding product tag has a numeric prerelease identifier with a leading zero" >&2
+              exit 1
+            }
+          done
+          previous_commit="$(git rev-parse "${previous_tag}^{commit}")"
+          printf 'base_commit=%s\n' "$previous_commit" >> "$GITHUB_OUTPUT"
 
       - name: Verify and extract release changelog
         env:
@@ -126,23 +151,134 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  authorize:
-    name: authorize publication
+  sdk-packages:
+    name: verify public SDK packages
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
+        with:
+          toolchain: 1.95.0
+
+      - name: Verify public SDK packages
+        id: package-readiness
+        continue-on-error: true
+        env:
+          PROTOC: /does/not/exist
+        run: scripts/verify-sdk-packages.sh
+
+      - name: Check desired SDK release state
+        id: cargo-release
+        continue-on-error: true
+        uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac
+        with:
+          phase: check
+          base-sha: ${{ needs.validate.outputs.base_commit }}
+          target-sha: ${{ needs.validate.outputs.commit }}
+          github-token: ${{ github.token }}
+        env:
+          CARGO_INCREMENTAL: "0"
+          PROTOC: /does/not/exist
+
+      - name: Summarize SDK release readiness
+        if: always()
+        env:
+          CARGO_RELEASE_RESULT: ${{ steps.cargo-release.outcome }}
+          PACKAGE_RESULT: ${{ steps.package-readiness.outcome }}
+          PLAN: ${{ steps.cargo-release.outputs.plan }}
+          REPORT: ${{ steps.cargo-release.outputs.report }}
+        run: |
+          {
+            echo "## SDK release readiness"
+            echo "| Validation | Result |"
+            echo "| --- | --- |"
+            echo "| Hermetic packages | \`${PACKAGE_RESULT}\` |"
+            echo "| Cargo Release | \`${CARGO_RELEASE_RESULT}\` |"
+            if [[ -n "${PLAN}" ]]; then
+              echo "### Plan"
+              echo '```json'
+              jq . <<< "${PLAN}"
+              echo '```'
+            fi
+            if [[ -n "${REPORT}" ]]; then
+              echo "### Observed state"
+              echo '```json'
+              jq . <<< "${REPORT}"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require successful SDK release readiness
+        if: always()
+        env:
+          CARGO_RELEASE_RESULT: ${{ steps.cargo-release.outcome }}
+          PACKAGE_RESULT: ${{ steps.package-readiness.outcome }}
+        run: |
+          if [[ "$PACKAGE_RESULT" != success || "$CARGO_RELEASE_RESULT" != success ]]; then
+            echo "::error::Review each failed SDK readiness step and the job summary."
+            exit 1
+          fi
+
+  publish-sdk-crates:
+    name: publish public SDK crates
     needs:
       - validate
       - api-docs
+      - sdk-packages
     environment: release
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     steps:
-      - name: Record release approval
-        run: echo "release publication approved for ${GITHUB_REF_NAME}"
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
+        with:
+          toolchain: 1.95.0
+
+      - name: Authenticate to crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish and verify missing SDK crates
+        uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac
+        with:
+          phase: publish
+          base-sha: ${{ needs.validate.outputs.base_commit }}
+          target-sha: ${{ needs.validate.outputs.commit }}
+          github-token: ${{ github.token }}
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+          PROTOC: /does/not/exist
+
+      - name: Verify the published SDK from crates.io
+        timeout-minutes: 30
+        env:
+          SDK_VERSION: ${{ needs.validate.outputs.version }}
+        run: scripts/verify-published-sdk.sh "$SDK_VERSION"
 
   build:
     name: build image digests (${{ matrix.platform.name }})
     needs:
       - validate
       - api-docs
-      - authorize
+      - publish-sdk-crates
     permissions:
       contents: read
       packages: write

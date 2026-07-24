@@ -17,6 +17,9 @@ if [[ ! "$release_version" =~ $semver_pattern ]]; then
   echo >&2 "release version must be complete SemVer without build metadata"
   exit 1
 fi
+stable_version="${release_version%%-*}"
+prerelease=false
+[[ "$release_version" == "$stable_version" ]] || prerelease=true
 
 bash "$release_identity_validator" "v${release_version}" >/dev/null
 
@@ -32,22 +35,48 @@ escaped_release_version="${release_version//./\\.}"
 section_heading_pattern="^## \\[${escaped_release_version}\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$"
 section_count="$(grep -Ec -- "$section_heading_pattern" "$repository_root/CHANGELOG.md" || true)"
 
-if [[ -z "$pending_fragment" ]]; then
+if [[ "$section_count" -ne 0 ]]; then
   bash "$validator" release "v${release_version}" "$repository_root"
   echo "changelog v${release_version} is already prepared"
   exit 0
 fi
-if [[ "$section_count" -ne 0 ]]; then
-  echo >&2 \
-    "pending fragments exist but CHANGELOG.md already contains a v${release_version} section"
-  exit 1
+if [[ -z "$pending_fragment" ]]; then
+  bash "$validator" release "v${release_version}" "$repository_root"
 fi
 
 next_version="$(
-  cd "$repository_root"
-  "$changie_bin" next auto
+  (
+    cd "$repository_root"
+    prerelease_staging_directory="$(
+      mktemp -d "${TMPDIR:-/tmp}/zinder-changie-prereleases.XXXXXX"
+    )"
+    restore_prerelease_versions() {
+      while IFS= read -r -d '' staged_version; do
+        mv "$staged_version" "$repository_root/.changes/"
+      done < <(
+        find "$prerelease_staging_directory" \
+          -maxdepth 1 \
+          -type f \
+          -print0
+      )
+      rmdir "$prerelease_staging_directory"
+    }
+    trap restore_prerelease_versions EXIT
+
+    while IFS= read -r -d '' prerelease_version; do
+      mv "$prerelease_version" "$prerelease_staging_directory/"
+    done < <(
+      find "$repository_root/.changes" \
+        -maxdepth 1 \
+        -type f \
+        -name 'v*-*.md' \
+        -print0
+    )
+
+    "$changie_bin" next auto
+  )
 )"
-if [[ "${next_version#v}" != "$release_version" ]]; then
+if [[ "${next_version#v}" != "$stable_version" ]]; then
   echo >&2 \
     "requested v${release_version}, but pending fragment impacts require ${next_version}"
   exit 1
@@ -55,7 +84,32 @@ fi
 
 (
   cd "$repository_root"
-  "$changie_bin" batch "v${release_version}"
+  if [[ "$prerelease" == true ]]; then
+    earlier_prerelease="$(
+      find "$repository_root/.changes" \
+        -maxdepth 1 \
+        -type f \
+        -name "v${stable_version}-*.md" \
+        -print \
+        -quit
+    )"
+    if [[ -n "$earlier_prerelease" ]]; then
+      "$changie_bin" batch \
+        "v${release_version}" \
+        --keep \
+        --remove-prereleases \
+        --allow-no-changes=false
+    fi
+    "$changie_bin" batch \
+      "v${release_version}" \
+      --keep \
+      --allow-no-changes=false
+  else
+    "$changie_bin" batch \
+      "v${release_version}" \
+      --remove-prereleases \
+      --allow-no-changes=false
+  fi
   "$changie_bin" merge --include-unreleased '## [Unreleased]'
 )
 bash "$validator" release "v${release_version}" "$repository_root"

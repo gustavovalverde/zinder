@@ -102,10 +102,41 @@ validate_release() {
   [[ "$release_version" =~ $semver_pattern ]] \
     || fail "release tag must contain a complete SemVer version without build metadata"
 
-  [[ -z "$(pending_fragment "$repository_root")" ]] \
-    || fail "release has pending .changes/unreleased/*.yaml fragments"
+  local stable_version="${release_version%%-*}"
   local escaped_release_version="${release_version//./\\.}"
   local section_heading_pattern="^## \\[${escaped_release_version}\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$"
+  if [[ "$release_version" == "$stable_version" ]]; then
+    [[ -z "$(pending_fragment "$repository_root")" ]] \
+      || fail "stable release has pending .changes/unreleased/*.yaml fragments"
+  else
+    [[ -n "$(pending_fragment "$repository_root")" ]] \
+      || fail "prerelease must retain its .changes/unreleased/*.yaml fragments"
+    validate_pending_fragments "$repository_root"
+
+    local archived_prerelease="$repository_root/.changes/v${release_version}.md"
+    [[ -f "$archived_prerelease" ]] \
+      || fail "prerelease is missing its archived Changie version"
+    head -n 1 "$archived_prerelease" \
+      | grep -Eq -- "$section_heading_pattern" \
+      || fail "prerelease archive has an invalid version heading"
+
+    local rendered_prerelease
+    rendered_prerelease="$(
+      cd "$repository_root"
+      "$changie_bin" batch \
+        "v${release_version}" \
+        --dry-run \
+        --keep \
+        --allow-no-changes=false
+    )" || fail "prerelease fragments could not be rendered"
+
+    local rendered_prerelease_body="${rendered_prerelease#*$'\n'}"
+    local archived_prerelease_body
+    archived_prerelease_body="$(tail -n +2 "$archived_prerelease")"
+    [[ "$rendered_prerelease_body" == "$archived_prerelease_body" ]] \
+      || fail "prerelease archive does not match the retained fragments"
+  fi
+
   local section_count
   section_count="$(grep -Ec -- "$section_heading_pattern" "$repository_root/CHANGELOG.md" || true)"
   [[ "$section_count" -eq 1 ]] \

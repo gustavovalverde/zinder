@@ -48,6 +48,9 @@ expect_rejected \
 bash "$validator" \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --release-images-catalog "$release_images_catalog"
+grep -Fq 'group: release-publication' \
+  "$repository_root/.github/workflows/release.yml" \
+  || fail "the release workflow does not globally serialize publication"
 bash "$validator" \
   --build-images-workflow "$repository_root/.github/workflows/build-images.yml" \
   --release-images-catalog "$release_images_catalog"
@@ -328,9 +331,9 @@ expect_rejected \
 
 unprotected_release_workflow="$temporary_directory/unprotected-release.yml"
 awk '
-  /^  authorize:/ { in_authorize = 1 }
-  in_authorize && /^    environment: release$/ { next }
-  in_authorize && /^  build:/ { in_authorize = 0 }
+  /^  publish-sdk-crates:/ { in_publication = 1 }
+  in_publication && /^    environment: release$/ { next }
+  in_publication && /^  build:/ { in_publication = 0 }
   { print }
 ' "$repository_root/.github/workflows/release.yml" \
   > "$unprotected_release_workflow"
@@ -339,12 +342,117 @@ expect_rejected \
   --release-workflow "$unprotected_release_workflow"
 
 bypassed_authorization_workflow="$temporary_directory/bypassed-authorization-release.yml"
-sed '/^[[:space:]]*- authorize$/d' \
+sed '/^[[:space:]]*- publish-sdk-crates$/d' \
   "$repository_root/.github/workflows/release.yml" \
   > "$bypassed_authorization_workflow"
 expect_rejected \
   "a release workflow whose first registry writer bypasses approval" \
   --release-workflow "$bypassed_authorization_workflow"
+
+parallel_publication_workflow="$temporary_directory/parallel-publication-release.yml"
+sed 's/group: release-publication/group: release-${{ github.ref }}/' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$parallel_publication_workflow"
+expect_rejected \
+  "a release workflow that allows concurrent crate publications" \
+  --release-workflow "$parallel_publication_workflow"
+
+untrusted_crate_publication_workflow="$temporary_directory/untrusted-crate-publication-release.yml"
+sed '/^[[:space:]]*id-token: write$/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$untrusted_crate_publication_workflow"
+expect_rejected \
+  "a release workflow without trusted-publisher identity permission" \
+  --release-workflow "$untrusted_crate_publication_workflow"
+
+unpinned_crate_auth_workflow="$temporary_directory/unpinned-crate-auth-release.yml"
+sed 's#rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 #rust-lang/crates-io-auth-action@main #' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$unpinned_crate_auth_workflow"
+expect_rejected \
+  "a release workflow with an unpinned crates.io authentication action" \
+  --release-workflow "$unpinned_crate_auth_workflow"
+
+unpinned_cargo_release_workflow="$temporary_directory/unpinned-cargo-release.yml"
+sed 's#ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac#ZcashFoundation/cargo-release@main#g' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$unpinned_cargo_release_workflow"
+expect_rejected \
+  "a release workflow with an unpinned Cargo Release action" \
+  --release-workflow "$unpinned_cargo_release_workflow"
+
+credentialed_checkout_workflow="$temporary_directory/credentialed-checkout-release.yml"
+sed '/persist-credentials: false/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$credentialed_checkout_workflow"
+expect_rejected \
+  "a release workflow exposing checkout credentials to Cargo build scripts" \
+  --release-workflow "$credentialed_checkout_workflow"
+
+unchecked_cargo_release_workflow="$temporary_directory/unchecked-cargo-release.yml"
+awk '
+  !changed && /phase: check/ {
+    sub(/phase: check/, "phase: publish")
+    changed = 1
+  }
+  { print }
+' "$repository_root/.github/workflows/release.yml" \
+  > "$unchecked_cargo_release_workflow"
+expect_rejected \
+  "a release workflow without a pre-auth Cargo Release check" \
+  --release-workflow "$unchecked_cargo_release_workflow"
+
+side_branch_base_workflow="$temporary_directory/side-branch-base-release.yml"
+sed '/--first-parent/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$side_branch_base_workflow"
+expect_rejected \
+  "a release workflow that can derive its Cargo Release base from a side branch" \
+  --release-workflow "$side_branch_base_workflow"
+
+protoc_dependent_release_workflow="$temporary_directory/protoc-dependent-release.yml"
+sed '/PROTOC: \/does\/not\/exist/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$protoc_dependent_release_workflow"
+expect_rejected \
+  "a release workflow that permits package consumers to require protoc" \
+  --release-workflow "$protoc_dependent_release_workflow"
+
+static_crate_token_workflow="$temporary_directory/static-crate-token-release.yml"
+# The literal workflow expressions are the credential contract being mutated.
+# shellcheck disable=SC2016
+sed 's/${{ steps.crates-io-auth.outputs.token }}/${{ secrets.CARGO_REGISTRY_TOKEN }}/' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$static_crate_token_workflow"
+expect_rejected \
+  "a release workflow with a static crates.io token fallback" \
+  --release-workflow "$static_crate_token_workflow"
+
+leaked_oidc_token_workflow="$temporary_directory/leaked-oidc-token-release.yml"
+# The literal workflow expression is the credential contract being duplicated.
+# shellcheck disable=SC2016
+sed '/name: verify public SDK packages/a\    env:\n      CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$leaked_oidc_token_workflow"
+expect_rejected \
+  "a release workflow exposing the OIDC token before publication" \
+  --release-workflow "$leaked_oidc_token_workflow"
+
+unverified_registry_consumer_workflow="$temporary_directory/unverified-registry-consumer-release.yml"
+sed '/scripts\/verify-published-sdk.sh "$SDK_VERSION"/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$unverified_registry_consumer_workflow"
+expect_rejected \
+  "a release workflow without a registry-only SDK consumer check" \
+  --release-workflow "$unverified_registry_consumer_workflow"
+
+stable_only_crate_workflow="$temporary_directory/stable-only-crate-release.yml"
+sed '/^  publish-sdk-crates:/a\    if: needs.validate.outputs.stable == '\''true'\''' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$stable_only_crate_workflow"
+expect_rejected \
+  "a release workflow that omits prerelease crates" \
+  --release-workflow "$stable_only_crate_workflow"
 
 bypassed_manifest_dependency_workflow="$temporary_directory/bypassed-manifest-release.yml"
 sed '/^[[:space:]]*- build$/d' \
