@@ -527,6 +527,28 @@ expect_rejected \
   "a release workflow that does not verify each immutable release asset" \
   --release-workflow "$mutable_release_verification_workflow"
 
+conflicting_archive_identity_workflow="$temporary_directory/conflicting-archive-identity-release.yml"
+sed '/^  assemble-and-sign:/,/^  prepare-release:/ {
+  /--cert-identity "\$certificate_identity"/a\
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+}' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$conflicting_archive_identity_workflow"
+expect_rejected \
+  "a release workflow combining archive certificate and signer identities" \
+  --release-workflow "$conflicting_archive_identity_workflow"
+
+conflicting_promotion_identity_workflow="$temporary_directory/conflicting-promotion-identity-release.yml"
+sed '/^  promote-latest:/,$ {
+  /--cert-identity "\$certificate_identity"/a\
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+}' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$conflicting_promotion_identity_workflow"
+expect_rejected \
+  "a release workflow combining promotion certificate and signer identities" \
+  --release-workflow "$conflicting_promotion_identity_workflow"
+
 unverified_image_attestations_workflow="$temporary_directory/unverified-image-attestations-release.yml"
 sed 's#scripts/verify-release-image-attestations.sh#scripts/skip-release-image-attestations.sh#' \
   "$repository_root/.github/workflows/release.yml" \

@@ -807,8 +807,11 @@ EOF
     || ! grep -Fq -- '--tag "$RELEASE_TAG"' <<< "$image_attestation_verification" \
     || ! grep -Fq -- '--commit "$BUILD_GIT_COMMIT"' <<< "$image_attestation_verification" \
     || ! grep -Fq 'SHA256SUMS.sigstore.json' <<< "$assemble_release_job" \
+    || ! grep -Fq -- '--cert-identity "$certificate_identity"' \
+      <<< "$assemble_release_job" \
     || ! grep -Fq -- '--deny-self-hosted-runners' <<< "$assemble_release_job" \
-    || ! grep -Fq -- '--signer-digest "$BUILD_GIT_COMMIT"' <<< "$assemble_release_job"; then
+    || ! grep -Fq -- '--signer-digest "$BUILD_GIT_COMMIT"' <<< "$assemble_release_job" \
+    || grep -Fq -- '--signer-workflow' <<< "$assemble_release_job"; then
     cat >&2 <<'EOF'
 release admission rejected: release archives and images must preserve the
 pinned attestation, SBOM, provenance, signature, and verifier policy.
@@ -821,6 +824,9 @@ EOF
     || ! grep -Fq 'gh release verify-asset "$RELEASE_TAG" "$asset"' <<< "$verify_release_job" \
     || ! grep -Fq 'cosign verify' <<< "$promote_latest_job" \
     || ! grep -Fq 'gh attestation verify' <<< "$promote_latest_job" \
+    || ! grep -Fq -- '--cert-identity "$certificate_identity"' \
+      <<< "$promote_latest_job" \
+    || grep -Fq -- '--signer-workflow' <<< "$promote_latest_job" \
     || ! grep -Fq '[[ "$latest_digest" == "$exact_digest" ]]' <<< "$promote_latest_job"; then
     cat >&2 <<'EOF'
 release admission rejected: immutable release verification and signed exact

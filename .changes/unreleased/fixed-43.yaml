@@ -1,0 +1,6 @@
+kind: fixed
+body: Verify release archives and stable image promotion with compatible attestation identity selectors.
+time: 2026-07-24T22:44:55Z
+custom:
+  Bump: patch
+  PR: "43"
