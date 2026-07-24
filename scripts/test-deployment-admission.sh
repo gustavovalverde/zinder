@@ -527,6 +527,16 @@ expect_rejected \
   "a release workflow that does not verify each immutable release asset" \
   --release-workflow "$mutable_release_verification_workflow"
 
+unchecked_draft_release_workflow="$temporary_directory/unchecked-draft-release.yml"
+sed '/^  prepare-release:/,/^  publish-release:/ {
+  /- name: Checkout validated commit/,/ref: \${{ needs.validate.outputs.commit }}/d
+}' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$unchecked_draft_release_workflow"
+expect_rejected \
+  "a draft release job without the validated source tree" \
+  --release-workflow "$unchecked_draft_release_workflow"
+
 conflicting_archive_identity_workflow="$temporary_directory/conflicting-archive-identity-release.yml"
 sed '/^  assemble-and-sign:/,/^  prepare-release:/ {
   /--cert-identity "\$certificate_identity"/a\

@@ -755,6 +755,12 @@ EOF
     || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$assemble_release_job" \
     || ! grep -Fq 'name: release-binary-assets' <<< "$assemble_release_job" \
     || ! grep -Eq '^[[:space:]]+- assemble-and-sign$' <<< "$prepare_release_job" \
+    || ! grep -Fq 'name: Checkout validated commit' <<< "$prepare_release_job" \
+    || ! grep -Fq 'uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6' \
+      <<< "$prepare_release_job" \
+    || ! grep -Fq 'ref: ${{ needs.validate.outputs.commit }}' \
+      <<< "$prepare_release_job" \
+    || ! grep -Fq 'persist-credentials: false' <<< "$prepare_release_job" \
     || ! grep -Fq 'name: release-assets-final' <<< "$prepare_release_job"; then
     cat >&2 <<'EOF'
 release admission rejected: release binaries must build twice for both GNU
