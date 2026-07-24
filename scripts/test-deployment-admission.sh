@@ -478,6 +478,63 @@ expect_rejected \
   "a release workflow whose manifest publisher bypasses digest builds" \
   --release-workflow "$bypassed_manifest_dependency_workflow"
 
+unprotected_authorization_workflow="$temporary_directory/unprotected-authorization-release.yml"
+sed '/^  authorize-release:/,/^  binary-archives:/ {
+  /^    environment: release$/d
+}' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$unprotected_authorization_workflow"
+unprotected_authorization_error="$temporary_directory/unprotected-authorization-error.txt"
+if bash "$validator" \
+  --release-workflow "$unprotected_authorization_workflow" \
+  > /dev/null 2> "$unprotected_authorization_error"; then
+  fail "a release workflow without protected pre-OIDC authorization was admitted"
+fi
+grep -Fq \
+  'release admission rejected: the protected release authorization must follow' \
+  "$unprotected_authorization_error" \
+  || fail "the unprotected authorization workflow was rejected for an unrelated reason"
+
+early_oidc_workflow="$temporary_directory/early-oidc-release.yml"
+sed '/^  sdk-packages:/a\    permissions:\n      id-token: write' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$early_oidc_workflow"
+expect_rejected \
+  "a release workflow granting OIDC before authorization" \
+  --release-workflow "$early_oidc_workflow"
+
+unpinned_attestation_workflow="$temporary_directory/unpinned-attestation-release.yml"
+sed 's#actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 #actions/attest@main #' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$unpinned_attestation_workflow"
+expect_rejected \
+  "a release workflow with an unpinned attestation action" \
+  --release-workflow "$unpinned_attestation_workflow"
+
+storage_record_workflow="$temporary_directory/storage-record-release.yml"
+sed 's/create-storage-record: false/create-storage-record: true/' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$storage_record_workflow"
+expect_rejected \
+  "a personal-owner release workflow creating artifact storage records" \
+  --release-workflow "$storage_record_workflow"
+
+mutable_release_verification_workflow="$temporary_directory/mutable-release-verification.yml"
+sed '/gh release verify-asset/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$mutable_release_verification_workflow"
+expect_rejected \
+  "a release workflow that does not verify each immutable release asset" \
+  --release-workflow "$mutable_release_verification_workflow"
+
+latest_without_identity_workflow="$temporary_directory/latest-without-identity-release.yml"
+sed '/--deny-self-hosted-runners/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$latest_without_identity_workflow"
+expect_rejected \
+  "a release workflow that accepts self-hosted attestation identities" \
+  --release-workflow "$latest_without_identity_workflow"
+
 catalogless_build_workflow="$temporary_directory/catalogless-build-images.yml"
 sed '/RELEASE_IMAGES_JSON: \${{ needs.verify.outputs.release_images }}/d' \
   "$repository_root/.github/workflows/build-images.yml" \

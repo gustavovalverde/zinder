@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Release artifacts, Linux runtime compatibility |
-| Related | [Releasing Zinder](../runbooks/releasing.md), [VM deployment](../runbooks/deploying-on-a-vm.md), [Canonical storage topologies](0035-canonical-storage-topologies.md) |
+| Related | [Releasing Zinder](../runbooks/releasing.md), [VM deployment](../runbooks/deploying-on-a-vm.md), [Canonical storage topologies](0035-canonical-storage-topologies.md), [Release provenance and SBOMs](0037-release-artifact-provenance-and-sboms.md) |
 
 ## Context
 
@@ -57,6 +57,5 @@ epoch, and every binary hash and size.
 ## Deferred work
 
 Musl builds are a separate portability product and are not aliases for these
-GNU artifacts. Artifact signing, SBOMs, attestations, and broader provenance
-publication require their own trust and verification design; this decision
-does not imply those guarantees.
+GNU artifacts. Artifact signing, SBOMs, and attestations are defined separately
+by [ADR-0037](0037-release-artifact-provenance-and-sboms.md).

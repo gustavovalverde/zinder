@@ -81,6 +81,24 @@ jobs:
           previous_commit="$(git rev-parse "${previous_tag}^{commit}")"
           printf 'base_commit=%s\n' "$previous_commit" >> "$GITHUB_OUTPUT"
 
+      - name: Require an unpublished tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          release_json="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" 2>/dev/null \
+              || true
+          )"
+          if [[ -n "$release_json" ]]; then
+            jq -e '.draft == true' <<< "$release_json" >/dev/null || {
+              echo "published GitHub Release ${RELEASE_TAG} already exists" >&2
+              exit 1
+            }
+          fi
+
       - name: Verify and extract release changelog
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -105,9 +123,29 @@ jobs:
         id: images
         run: printf 'release_images=%s\n' "$(jq -c '.' "$RELEASE_IMAGES_FILE")" >> "$GITHUB_OUTPUT"
 
+  authorize-release:
+    name: authorize release publication
+    needs:
+      - validate
+      - api-docs
+      - sdk-packages
+    environment: release
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record release authorization
+        run: echo "release publication authorized for ${{ github.ref_name }}"
+
   binary-archives:
     name: build binary archive (${{ matrix.platform.name }})
-    needs: validate
+    needs:
+      - validate
+      - authorize-release
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
@@ -129,6 +167,11 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.44.0
 
       - name: Build, verify, and reproduce archive
         env:
@@ -199,11 +242,39 @@ jobs:
           mkdir -p dist/binary-archive
           cp "$first_archive" dist/binary-archive/
 
-      - name: Upload binary archive
+          sbom_path="dist/binary-archive/zinder-${RELEASE_VERSION}-${{ matrix.platform.name }}.spdx.json"
+          scripts/generate-release-sbom.sh \
+            --archive "dist/binary-archive/$(basename -- "$first_archive")" \
+            --output "$sbom_path" \
+            --version "$RELEASE_VERSION" \
+            --platform "${{ matrix.platform.name }}" \
+            --commit "$RELEASE_COMMIT"
+          scripts/check-release-sbom.sh "$sbom_path" \
+            --archive "dist/binary-archive/$(basename -- "$first_archive")" \
+            --version "$RELEASE_VERSION" \
+            --platform "${{ matrix.platform.name }}" \
+            --commit "$RELEASE_COMMIT"
+
+      - name: Attest binary provenance
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: dist/binary-archive/*.tar.gz
+          create-storage-record: false
+
+      - name: Attest binary SBOM
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: dist/binary-archive/*.tar.gz
+          sbom-path: dist/binary-archive/zinder-${{ needs.validate.outputs.version }}-${{ matrix.platform.name }}.spdx.json
+          create-storage-record: false
+
+      - name: Upload binary archive and SBOM
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-binary-${{ matrix.platform.name }}
-          path: dist/binary-archive/*.tar.gz
+          path: |
+            dist/binary-archive/*.tar.gz
+            dist/binary-archive/*.spdx.json
           if-no-files-found: error
           retention-days: 7
 
@@ -229,15 +300,13 @@ jobs:
 
           expected="$({
             printf '%s\n' \
+              "zinder-${RELEASE_VERSION}-aarch64-unknown-linux-gnu.spdx.json" \
               "zinder-${RELEASE_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+              "zinder-${RELEASE_VERSION}-x86_64-v3-unknown-linux-gnu.spdx.json" \
               "zinder-${RELEASE_VERSION}-x86_64-v3-unknown-linux-gnu.tar.gz"
           })"
           actual="$(find dist/binaries -maxdepth 1 -type f -printf '%f\n' | sort)"
           [[ "$actual" == "$expected" ]]
-          (
-            cd dist/binaries
-            sha256sum *.tar.gz | sort -k2 > SHA256SUMS
-          )
 
       - name: Upload binary release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -373,6 +442,7 @@ jobs:
     name: publish public SDK crates
     needs:
       - validate
+      - authorize-release
       - api-docs
       - collect-binary-assets
       - sdk-packages
@@ -479,6 +549,8 @@ jobs:
               --label "org.opencontainers.image.revision=${BUILD_GIT_COMMIT}" \
               --label "org.opencontainers.image.version=${RELEASE_TAG}" \
               --label "org.opencontainers.image.licenses=MIT" \
+              --provenance=mode=max \
+              --sbom=true \
               --output "type=image,name=${image_ref},push-by-digest=true,name-canonical=true,push=true" \
               --cache-from "type=gha,scope=${CACHE_SCOPE}" \
               --cache-to "type=gha,scope=${CACHE_SCOPE},mode=max" \
@@ -491,7 +563,7 @@ jobs:
               exit 1
             fi
             mkdir -p "/tmp/digests/${image_name}"
-            touch "/tmp/digests/${image_name}/${digest#sha256:}"
+            touch "/tmp/digests/${image_name}/${{ matrix.platform.name }}-${digest#sha256:}"
           done <<< "$image_names"
 
       - name: Upload image digests
@@ -503,12 +575,14 @@ jobs:
           retention-days: 1
 
   merge:
-    name: publish exact ${{ matrix.image }} manifest
+    name: attest and publish exact ${{ matrix.image }} manifest
     needs:
       - validate
       - build
     permissions:
+      attestations: write
       contents: read
+      id-token: write
       packages: write
     runs-on: ubuntu-latest
     strategy:
@@ -516,6 +590,11 @@ jobs:
       matrix:
         image: ${{ fromJSON(needs.validate.outputs.release_images) }}
     steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
       - name: Download image digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -526,6 +605,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.44.0
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Install exact release verification tools
+        run: |
+          scripts/install-release-gh.sh "$RUNNER_TEMP/release-tools"
+          printf '%s\n' "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
+
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -533,10 +625,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish exact and commit image tags
-        working-directory: /tmp/digests/${{ matrix.image }}
+      - name: Publish and inspect exact image tags
+        id: evidence
         env:
           BUILD_GIT_COMMIT: ${{ needs.validate.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
           IMAGE_NAME: ${{ matrix.image }}
           OWNER_RAW: ${{ github.repository_owner }}
           RELEASE_TAG: ${{ github.ref_name }}
@@ -545,32 +638,258 @@ jobs:
 
           owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
           image="ghcr.io/${owner_lc}/${IMAGE_NAME}"
-          refs=()
-          for digest in *; do
-            refs+=("${image}@sha256:${digest}")
-          done
+          digest_directory="/tmp/digests/${IMAGE_NAME}"
+          amd64_build_digest="sha256:$(basename "${digest_directory}"/amd64-* | sed 's/^amd64-//')"
+          arm64_build_digest="sha256:$(basename "${digest_directory}"/arm64-* | sed 's/^arm64-//')"
+          [[ "$amd64_build_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$arm64_build_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          existing_manifest="$(
+            docker buildx imagetools inspect "${image}:${RELEASE_TAG}" --raw 2>/dev/null \
+              || true
+          )"
+          if [[ -n "$existing_manifest" ]]; then
+            release_json="$(
+              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" 2>/dev/null \
+                || true
+            )"
+            if [[ -n "$release_json" ]]; then
+              jq -e '.draft == true' <<< "$release_json" >/dev/null || {
+                echo "an exact image tag may only be replaced before release publication" >&2
+                exit 1
+              }
+            fi
+          fi
 
           docker buildx imagetools create \
             -t "${image}:${RELEASE_TAG}" \
             -t "${image}:sha-${BUILD_GIT_COMMIT}" \
-            "${refs[@]}"
-          docker buildx imagetools inspect "${image}:${RELEASE_TAG}"
+            "${image}@${amd64_build_digest}" \
+            "${image}@${arm64_build_digest}"
 
-  prepare-release:
-    name: prepare draft GitHub Release
+          mkdir -p dist/image-evidence
+          manifest_path="dist/image-evidence/${IMAGE_NAME}.manifest.json"
+          docker buildx imagetools inspect "${image}:${RELEASE_TAG}" \
+            --format '{{json .Manifest}}' > "$manifest_path"
+          root_digest="$(jq -r '.digest' "$manifest_path")"
+          amd64_digest="$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' "$manifest_path")"
+          arm64_digest="$(jq -r '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' "$manifest_path")"
+          tag_digest="$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" --format '{{json .Manifest}}' | jq -r '.digest')"
+          commit_digest="$(docker buildx imagetools inspect "${image}:sha-${BUILD_GIT_COMMIT}" --format '{{json .Manifest}}' | jq -r '.digest')"
+          [[ "$root_digest" == "$tag_digest" && "$tag_digest" == "$commit_digest" ]]
+
+          amd64_sbom="dist/image-evidence/${IMAGE_NAME}-linux-amd64.spdx.json"
+          arm64_sbom="dist/image-evidence/${IMAGE_NAME}-linux-arm64.spdx.json"
+          scripts/generate-release-sbom.sh \
+            --image "$image" --tag "$RELEASE_TAG" --commit "$BUILD_GIT_COMMIT" \
+            --architecture amd64 --digest "$amd64_digest" --output "$amd64_sbom"
+          scripts/generate-release-sbom.sh \
+            --image "$image" --tag "$RELEASE_TAG" --commit "$BUILD_GIT_COMMIT" \
+            --architecture arm64 --digest "$arm64_digest" --output "$arm64_sbom"
+          scripts/check-release-image-evidence.sh "$manifest_path" \
+            --image "$image" --tag "$RELEASE_TAG" --commit "$BUILD_GIT_COMMIT" \
+            --root-digest "$root_digest" \
+            --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
+            --amd64-sbom "$amd64_sbom" --arm64-sbom "$arm64_sbom"
+
+          {
+            printf 'image=%s\n' "$image"
+            printf 'root_digest=%s\n' "$root_digest"
+            printf 'amd64_digest=%s\n' "$amd64_digest"
+            printf 'arm64_digest=%s\n' "$arm64_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest amd64 image SBOM
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ steps.evidence.outputs.image }}
+          subject-digest: ${{ steps.evidence.outputs.amd64_digest }}
+          sbom-path: dist/image-evidence/${{ matrix.image }}-linux-amd64.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest arm64 image SBOM
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ steps.evidence.outputs.image }}
+          subject-digest: ${{ steps.evidence.outputs.arm64_digest }}
+          sbom-path: dist/image-evidence/${{ matrix.image }}-linux-arm64.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest multi-platform image provenance
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ steps.evidence.outputs.image }}
+          subject-digest: ${{ steps.evidence.outputs.root_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Sign the multi-platform image
+        env:
+          IMAGE: ${{ steps.evidence.outputs.image }}
+          ROOT_DIGEST: ${{ steps.evidence.outputs.root_digest }}
+        run: cosign sign --yes "${IMAGE}@${ROOT_DIGEST}"
+
+      - name: Verify image signature and attestations
+        env:
+          AMD64_DIGEST: ${{ steps.evidence.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.evidence.outputs.arm64_digest }}
+          BUILD_GIT_COMMIT: ${{ needs.validate.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.evidence.outputs.image }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          ROOT_DIGEST: ${{ steps.evidence.outputs.root_digest }}
+        run: |
+          set -euo pipefail
+
+          certificate_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}"
+          cosign verify \
+            --certificate-identity "$certificate_identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}@${ROOT_DIGEST}"
+          common_attestation_args=(
+            --repo "$GITHUB_REPOSITORY"
+            --cert-identity "$certificate_identity"
+            --deny-self-hosted-runners
+            --signer-digest "$BUILD_GIT_COMMIT"
+            --source-ref "refs/tags/${RELEASE_TAG}"
+            --source-digest "$BUILD_GIT_COMMIT"
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+          )
+          gh attestation verify "oci://${IMAGE}@${ROOT_DIGEST}" \
+            "${common_attestation_args[@]}"
+          for child_digest in "$AMD64_DIGEST" "$ARM64_DIGEST"; do
+            gh attestation verify "oci://${IMAGE}@${child_digest}" \
+              "${common_attestation_args[@]}" \
+              --predicate-type https://spdx.dev/Document/v2.3
+          done
+
+  assemble-and-sign:
+    name: assemble and sign release assets
     needs:
       - validate
       - api-docs
       - collect-binary-assets
       - merge
     permissions:
-      contents: write
+      attestations: read
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
       - name: Download API artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-api-docs
+          path: dist/release-assets
+
+      - name: Download binary release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-binary-assets
+          path: dist/release-assets
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Install exact release verification tools
+        run: |
+          scripts/install-release-gh.sh "$RUNNER_TEMP/release-tools"
+          printf '%s\n' "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
+
+      - name: Verify attestations and assemble the exact catalog
+        env:
+          BUILD_GIT_COMMIT: ${{ needs.validate.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          expected="$({
+            printf '%s\n' \
+              "zinder-${RELEASE_VERSION}-aarch64-unknown-linux-gnu.spdx.json" \
+              "zinder-${RELEASE_VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+              "zinder-${RELEASE_VERSION}-x86_64-v3-unknown-linux-gnu.spdx.json" \
+              "zinder-${RELEASE_VERSION}-x86_64-v3-unknown-linux-gnu.tar.gz" \
+              "zinder-api-docs-${RELEASE_TAG}.tar.gz" \
+              "zinder.v1.descriptor.bin"
+          })"
+          actual="$(find dist/release-assets -maxdepth 1 -type f -printf '%f\n' | sort)"
+          [[ "$actual" == "$expected" ]] || {
+            echo "release asset candidates differ from the exact catalog" >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          }
+
+          certificate_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}"
+          common_attestation_args=(
+            --repo "$GITHUB_REPOSITORY"
+            --cert-identity "$certificate_identity"
+            --deny-self-hosted-runners
+            --signer-digest "$BUILD_GIT_COMMIT"
+            --source-ref "refs/tags/${RELEASE_TAG}"
+            --source-digest "$BUILD_GIT_COMMIT"
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+          )
+          for platform in aarch64-unknown-linux-gnu x86_64-v3-unknown-linux-gnu; do
+            archive="dist/release-assets/zinder-${RELEASE_VERSION}-${platform}.tar.gz"
+            sbom="dist/release-assets/zinder-${RELEASE_VERSION}-${platform}.spdx.json"
+            scripts/check-release-sbom.sh "$sbom" \
+              --archive "$archive" \
+              --version "$RELEASE_VERSION" \
+              --platform "$platform" \
+              --commit "$BUILD_GIT_COMMIT"
+            gh attestation verify "$archive" "${common_attestation_args[@]}"
+            gh attestation verify "$archive" \
+              "${common_attestation_args[@]}" \
+              --predicate-type https://spdx.dev/Document/v2.3
+          done
+
+          (
+            cd dist/release-assets
+            sha256sum \
+              zinder-*.tar.gz \
+              zinder-*.spdx.json \
+              zinder.v1.descriptor.bin \
+              | sort -k2 > SHA256SUMS
+          )
+          cosign sign-blob --yes \
+            --bundle dist/release-assets/SHA256SUMS.sigstore.json \
+            dist/release-assets/SHA256SUMS
+          cosign verify-blob \
+            --bundle dist/release-assets/SHA256SUMS.sigstore.json \
+            --certificate-identity "$certificate_identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dist/release-assets/SHA256SUMS
+
+      - name: Upload final release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-assets-final
+          path: dist/release-assets
+          if-no-files-found: error
+          retention-days: 7
+
+  prepare-release:
+    name: prepare draft GitHub Release
+    needs:
+      - validate
+      - assemble-and-sign
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download final release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-assets-final
           path: dist
 
       - name: Download release notes
@@ -578,12 +897,6 @@ jobs:
         with:
           name: release-notes
           path: release-notes
-
-      - name: Download binary release assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-binary-assets
-          path: dist
 
       - name: Create or update draft release
         env:
@@ -604,6 +917,12 @@ jobs:
             }
             gh release edit "$RELEASE_TAG" \
               --notes-file release-notes/release-notes.md
+            expected_assets="$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)"
+            while IFS= read -r existing_asset; do
+              if ! grep -Fxq "$existing_asset" <<< "$expected_assets"; then
+                gh release delete-asset "$RELEASE_TAG" "$existing_asset" --yes
+              fi
+            done < <(jq -r '.assets[].name' <<< "$release_json")
             gh release upload "$RELEASE_TAG" dist/* --clobber
           else
             release_args=(
@@ -644,19 +963,95 @@ jobs:
           fi
           gh "${publish_args[@]}"
 
+  verify-release:
+    name: verify immutable GitHub Release
+    needs:
+      - validate
+      - assemble-and-sign
+      - publish-release
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Download final release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-assets-final
+          path: dist
+
+      - name: Install exact release verification tools
+        run: |
+          scripts/install-release-gh.sh "$RUNNER_TEMP/release-tools"
+          printf '%s\n' "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
+
+      - name: Verify immutable release and every asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          release_json=""
+          for attempt in $(seq 1 12); do
+            release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isImmutable,assets)"
+            if jq -e '.isDraft == false and .isImmutable == true' <<< "$release_json" >/dev/null \
+              && gh release verify "$RELEASE_TAG"; then
+              break
+            fi
+            if [[ "$attempt" -eq 12 ]]; then
+              echo "immutable release verification did not converge" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --argjson expected_count "$(find dist -maxdepth 1 -type f | wc -l)" '
+              .tagName == $tag
+              and .isDraft == false
+              and .isImmutable == true
+              and (.assets | length) == $expected_count
+            ' <<< "$release_json" >/dev/null
+          expected_assets="$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)"
+          actual_assets="$(jq -r '.assets[].name' <<< "$release_json" | sort)"
+          [[ "$actual_assets" == "$expected_assets" ]]
+
+          while IFS= read -r asset; do
+            gh release verify-asset "$RELEASE_TAG" "$asset"
+          done < <(find dist -maxdepth 1 -type f | sort)
+
   promote-latest:
     name: promote stable image tags
     if: needs.validate.outputs.stable == 'true'
     needs:
       - validate
-      - publish-release
+      - verify-release
     permissions:
+      attestations: read
       contents: read
       packages: write
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Install exact release verification tools
+        run: |
+          scripts/install-release-gh.sh "$RUNNER_TEMP/release-tools"
+          printf '%s\n' "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -667,6 +1062,8 @@ jobs:
 
       - name: Verify exact manifests and promote latest
         env:
+          BUILD_GIT_COMMIT: ${{ needs.validate.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
           OWNER_RAW: ${{ github.repository_owner }}
           RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}
           RELEASE_TAG: ${{ github.ref_name }}
@@ -675,15 +1072,36 @@ jobs:
 
           owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
           image_names="$(jq -r '.[]' <<< "$RELEASE_IMAGES_JSON")"
+          certificate_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}"
 
           while IFS= read -r image_name; do
-            docker buildx imagetools inspect \
-              "ghcr.io/${owner_lc}/${image_name}:${RELEASE_TAG}" >/dev/null
+            image="ghcr.io/${owner_lc}/${image_name}"
+            exact_digest="$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" --format '{{json .Manifest}}' | jq -r '.digest')"
+            commit_digest="$(docker buildx imagetools inspect "${image}:sha-${BUILD_GIT_COMMIT}" --format '{{json .Manifest}}' | jq -r '.digest')"
+            [[ "$exact_digest" =~ ^sha256:[0-9a-f]{64}$ && "$exact_digest" == "$commit_digest" ]]
+            cosign verify \
+              --certificate-identity "$certificate_identity" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${image}@${exact_digest}"
+            gh attestation verify "oci://${image}@${exact_digest}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --cert-identity "$certificate_identity" \
+              --deny-self-hosted-runners \
+              --signer-digest "$BUILD_GIT_COMMIT" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+              --source-ref "refs/tags/${RELEASE_TAG}" \
+              --source-digest "$BUILD_GIT_COMMIT"
           done <<< "$image_names"
           while IFS= read -r image_name; do
             image="ghcr.io/${owner_lc}/${image_name}"
+            exact_digest="$(docker buildx imagetools inspect "${image}:${RELEASE_TAG}" --format '{{json .Manifest}}' | jq -r '.digest')"
             docker buildx imagetools create \
               -t "${image}:latest" \
-              "${image}:${RELEASE_TAG}"
-            docker buildx imagetools inspect "${image}:latest"
+              "${image}@${exact_digest}"
+            latest_digest="$(docker buildx imagetools inspect "${image}:latest" --format '{{json .Manifest}}' | jq -r '.digest')"
+            [[ "$latest_digest" == "$exact_digest" ]]
+            cosign verify \
+              --certificate-identity "$certificate_identity" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${image}@${latest_digest}"
           done <<< "$image_names"

@@ -148,6 +148,9 @@ jobs:
       - name: Test release binary archive policy
         run: scripts/test-release-binary-archive.sh
 
+      - name: Test release SBOM and image evidence policy
+        run: scripts/test-release-sbom.sh
+
       - name: Test storage benchmark contracts
         run: |
           scripts/test-container-resource-evidence.sh

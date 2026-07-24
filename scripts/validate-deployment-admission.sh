@@ -497,6 +497,7 @@ EOF
       <<< "$sdk_package_job" \
     || ! grep -Fq 'github-token: ${{ github.token }}' <<< "$sdk_package_job" \
     || [[ "$(grep -Fc 'PROTOC: /does/not/exist' <<< "$sdk_package_job")" -ne 2 ]] \
+    || grep -Fq 'id-token: write' <<< "$sdk_package_job" \
     || grep -Fq 'CARGO_REGISTRY_TOKEN' <<< "$sdk_package_job" \
     || grep -Fq 'crates-io-auth-action' <<< "$sdk_package_job" \
     || grep -Fq 'actions/upload-artifact' <<< "$sdk_package_job"; then
@@ -573,8 +574,8 @@ EOF
     exit 1
   fi
 
-  publishing_jobs=(build merge prepare-release publish-release promote-latest)
-  required_predecessors=(publish-sdk-crates build merge prepare-release publish-release)
+  publishing_jobs=(build merge assemble-and-sign prepare-release publish-release verify-release promote-latest)
+  required_predecessors=(publish-sdk-crates build merge assemble-and-sign prepare-release publish-release verify-release)
   for index in "${!publishing_jobs[@]}"; do
     publishing_job="${publishing_jobs[$index]}"
     required_predecessor="${required_predecessors[$index]}"
@@ -662,6 +663,8 @@ EOF
     || ! grep -Fq -- '--remap-path-prefix=/workspace=/usr/src/zinder' "$dockerfile" \
     || ! grep -Fq -- '--remap-path-prefix=/usr/local/cargo=/cargo' "$dockerfile" \
     || ! grep -Fq 'ENV CARGO_PROFILE_RELEASE_STRIP=symbols' "$dockerfile" \
+    || ! grep -Fq 'cargo install cargo-auditable --version 0.7.4 --locked' "$dockerfile" \
+    || ! grep -Fq 'cargo auditable build --locked --release' "$dockerfile" \
     || ! grep -Fq 'libstdc++6' "$dockerfile"; then
     cat >&2 <<'EOF'
 release admission rejected: the Docker release-binaries target must export
@@ -692,23 +695,123 @@ EOF
       in_job { print }
     ' "$release_workflow"
   )"
+  authorization_job="$(
+    awk '
+      $0 == "  authorize-release:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  assemble_release_job="$(
+    awk '
+      $0 == "  assemble-and-sign:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  merge_job="$(
+    awk '
+      $0 == "  merge:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  verify_release_job="$(
+    awk '
+      $0 == "  verify-release:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  promote_latest_job="$(
+    awk '
+      $0 == "  promote-latest:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
   if [[ -z "$binary_archive_job" || -z "$collected_binary_job" ]] \
-    || ! grep -Fq 'needs: validate' <<< "$binary_archive_job" \
+    || ! grep -Eq '^[[:space:]]+- validate$' <<< "$binary_archive_job" \
+    || ! grep -Eq '^[[:space:]]+- authorize-release$' <<< "$binary_archive_job" \
     || ! grep -Fq 'for build_number in 1 2' <<< "$binary_archive_job" \
     || ! grep -Fq -- '--no-cache' <<< "$binary_archive_job" \
     || ! grep -Fq -- '--target release-binaries' <<< "$binary_archive_job" \
     || ! grep -Fq 'scripts/check-release-binary-archive.sh' <<< "$binary_archive_job" \
     || ! grep -Fq 'x86_64-v3-unknown-linux-gnu' <<< "$binary_archive_job" \
     || ! grep -Fq 'aarch64-unknown-linux-gnu' <<< "$binary_archive_job" \
+    || ! grep -Fq 'scripts/generate-release-sbom.sh' <<< "$binary_archive_job" \
+    || ! grep -Fq 'scripts/check-release-sbom.sh' <<< "$binary_archive_job" \
+    || [[ "$(grep -Fc 'uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0' <<< "$binary_archive_job")" -ne 2 ]] \
     || ! grep -Eq '^[[:space:]]+- binary-archives$' <<< "$collected_binary_job" \
-    || ! grep -Fq 'SHA256SUMS' <<< "$collected_binary_job" \
+    || ! grep -Fq 'spdx.json' <<< "$collected_binary_job" \
     || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$crate_publication_job" \
-    || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$prepare_release_job" \
-    || ! grep -Fq 'name: release-binary-assets' <<< "$prepare_release_job"; then
+    || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$assemble_release_job" \
+    || ! grep -Fq 'name: release-binary-assets' <<< "$assemble_release_job" \
+    || ! grep -Eq '^[[:space:]]+- assemble-and-sign$' <<< "$prepare_release_job" \
+    || ! grep -Fq 'name: release-assets-final' <<< "$prepare_release_job"; then
     cat >&2 <<'EOF'
 release admission rejected: release binaries must build twice for both GNU
-platforms, collect exactly before crates.io authentication, and be downloaded
-into the draft GitHub Release assets.
+platforms, generate and attest exact SBOMs before crates.io authentication,
+and be assembled into the final draft GitHub Release assets.
+EOF
+    exit 1
+  fi
+
+  workflow_before_authorization="$(sed '/^  authorize-release:/,$d' "$release_workflow")"
+  api_docs_job="$(
+    awk '
+      $0 == "  api-docs:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  if [[ -z "$authorization_job" ]] \
+    || ! grep -Fq 'environment: release' <<< "$authorization_job" \
+    || ! grep -Eq '^[[:space:]]+- validate$' <<< "$authorization_job" \
+    || ! grep -Eq '^[[:space:]]+- api-docs$' <<< "$authorization_job" \
+    || ! grep -Eq '^[[:space:]]+- sdk-packages$' <<< "$authorization_job" \
+    || grep -Fq 'id-token: write' <<< "$authorization_job" \
+    || grep -Fq 'id-token: write' <<< "$api_docs_job" \
+    || grep -Fq 'id-token: write' <<< "$workflow_before_authorization"; then
+    cat >&2 <<'EOF'
+release admission rejected: the protected release authorization must follow
+pre-auth validation and no earlier job may receive an OIDC token.
+EOF
+    exit 1
+  fi
+
+  if [[ "$(grep -Fc 'uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0' "$release_workflow")" -ne 5 ]] \
+    || [[ "$(grep -Fc 'create-storage-record: false' "$release_workflow")" -ne 5 ]] \
+    || [[ "$(grep -Fc 'uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0' "$release_workflow")" -ne 2 ]] \
+    || [[ "$(grep -Fc 'uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2' "$release_workflow")" -ne 3 ]] \
+    || [[ "$(grep -Fc 'scripts/install-release-gh.sh' "$release_workflow")" -ne 4 ]] \
+    || grep -Fq 'artifact-metadata:' "$release_workflow" \
+    || ! grep -Fq -- '--provenance=mode=max' "$release_workflow" \
+    || ! grep -Fq -- '--sbom=true' "$release_workflow" \
+    || ! grep -Fq 'scripts/check-release-image-evidence.sh' "$release_workflow" \
+    || ! grep -Fq 'cosign sign --yes' <<< "$merge_job" \
+    || ! grep -Fq 'gh attestation verify' <<< "$merge_job" \
+    || ! grep -Fq -- '--deny-self-hosted-runners' <<< "$merge_job" \
+    || ! grep -Fq -- '--signer-digest "$BUILD_GIT_COMMIT"' <<< "$merge_job" \
+    || ! grep -Fq 'SHA256SUMS.sigstore.json' <<< "$assemble_release_job" \
+    || ! grep -Fq -- '--deny-self-hosted-runners' <<< "$assemble_release_job" \
+    || ! grep -Fq -- '--signer-digest "$BUILD_GIT_COMMIT"' <<< "$assemble_release_job"; then
+    cat >&2 <<'EOF'
+release admission rejected: release archives and images must preserve the
+pinned attestation, SBOM, provenance, signature, and verifier policy.
+EOF
+    exit 1
+  fi
+
+  if ! grep -Fq '.isImmutable == true' <<< "$verify_release_job" \
+    || ! grep -Fq 'gh release verify "$RELEASE_TAG"' <<< "$verify_release_job" \
+    || ! grep -Fq 'gh release verify-asset "$RELEASE_TAG" "$asset"' <<< "$verify_release_job" \
+    || ! grep -Fq 'cosign verify' <<< "$promote_latest_job" \
+    || ! grep -Fq 'gh attestation verify' <<< "$promote_latest_job" \
+    || ! grep -Fq '[[ "$latest_digest" == "$exact_digest" ]]' <<< "$promote_latest_job"; then
+    cat >&2 <<'EOF'
+release admission rejected: immutable release verification and signed exact
+digest re-verification must complete before stable latest tags move.
 EOF
     exit 1
   fi
