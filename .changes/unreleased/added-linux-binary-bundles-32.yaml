@@ -1,0 +1,6 @@
+kind: added
+body: Publish deterministic x86-64-v3 and AArch64 GNU/Linux bundles containing the four supported Zinder runtime executables with checksums and build metadata.
+time: 2026-07-22T14:24:57Z
+custom:
+  Bump: minor
+  PR: "32"

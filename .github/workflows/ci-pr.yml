@@ -145,6 +145,9 @@ jobs:
       - name: Verify release identity policy
         run: scripts/test-release-tag.sh
 
+      - name: Test release binary archive policy
+        run: scripts/test-release-binary-archive.sh
+
       - name: Test storage benchmark contracts
         run: |
           scripts/test-container-resource-evidence.sh

@@ -3,9 +3,10 @@
 Zinder releases one lockstep product version across every first-party crate and
 service. A tagged release publishes 4 multi-architecture runtime images, the
 native protocol source and descriptor, generated OpenAPI documents, and one
-GitHub Release. The same tag publishes the Rust SDK formed by `zinder-core`,
-`zinder-proto`, and `zinder-client` to crates.io in dependency order. The
-optional explorer and Cipherscan services, benchmark executable, and internal
+GitHub Release. It also publishes deterministic GNU/Linux binary bundles for
+x86-64-v3 and AArch64 and the Rust SDK formed by `zinder-core`, `zinder-proto`,
+and `zinder-client` to crates.io in dependency order. The optional explorer and
+Cipherscan services, benchmark executable, code-generation tools, and internal
 Rust crates are not release artifacts.
 
 `deploy/release-images.json` is the authoritative published image set. The PR
@@ -50,6 +51,7 @@ Run the local release-policy checks before opening the version change:
 ```console
 bash scripts/test-release-tag.sh
 bash scripts/test-deployment-admission.sh
+scripts/test-release-binary-archive.sh
 scripts/test-changelog.sh
 scripts/validate-changelog.sh fragments
 scripts/check-sdk-package-policy.sh
@@ -120,25 +122,28 @@ Release to dry-run the complete dependency-aware publication plan. Missing
 crate versions and package tags are expected during this read-only check. The
 package and Cargo Release checks run independently, then one final gate reports
 both outcomes and includes the complete plan and observed state in the job
-summary.
-The `release` environment then requires approval before the first registry
-write.
+summary. It also builds each GNU/Linux binary platform twice, confirms identical
+binary and archive hashes, and validates the four-binary catalog, embedded
+commit, ELF machine, dynamic library closure, GLIBC symbol ceiling, and clean
+Debian runtime probes. The workflow generates and validates the native proto
+source closure, OpenAPI documents, and descriptor set, then collects the
+x86-64-v3 and AArch64 GNU archives with their sorted external `SHA256SUMS`.
+These credential-free jobs must succeed before the `release` environment
+requests approval for the first registry write.
 
 After approval, the workflow performs these operations in order:
 
-1. Generate and validate the native proto source closure, OpenAPI documents,
-   and descriptor set.
-2. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
+1. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
    publish only missing SDK crates in Cargo's dependency order and verify their
    source provenance.
-3. Compile a fresh registry-only consumer against the exact published
+2. Compile a fresh registry-only consumer against the exact published
    `zinder-client` version after sparse-index propagation.
-4. Build the 4 runtime images natively for Linux amd64 and arm64.
-5. Publish exact `vX.Y.Z` and `sha-<commit>` multi-architecture manifests.
-6. Create a draft GitHub Release from the exact versioned changelog section and
-   attach the API artifacts.
-7. Publish the GitHub Release after every exact image manifest succeeds.
-8. For a stable release, verify all 4 exact manifests and promote their
+3. Build the 4 runtime images natively for Linux amd64 and arm64.
+4. Publish exact `vX.Y.Z` and `sha-<commit>` multi-architecture manifests.
+5. Create a draft GitHub Release from the exact versioned changelog section and
+   attach the API artifacts, binary bundles, and `SHA256SUMS`.
+6. Publish the GitHub Release after every exact image manifest succeeds.
+7. For a stable release, verify all 4 exact manifests and promote their
    `latest` tags in one final job.
 
 Stable and prerelease tags publish the same three-crate SDK catalog.
@@ -223,6 +228,11 @@ before changing a deployment:
 git switch --detach v0.5.0
 gh release view v0.5.0
 
+gh release download v0.5.0 \
+  --pattern 'zinder-0.5.0-*-unknown-linux-gnu.tar.gz' \
+  --pattern SHA256SUMS
+sha256sum --check SHA256SUMS
+
 for package_name in zinder-core zinder-proto zinder-client; do
   cargo info "${package_name}@0.5.0"
 done
@@ -240,14 +250,16 @@ do
 done
 ```
 
-The GitHub Release must contain `zinder.v1.descriptor.bin` and the versioned
-`zinder-api-docs` archive. The archive contains the exact native `.proto`
-source closure alongside OpenAPI and the descriptor, so non-Rust consumers can
-generate clients without a repository checkout. Each image must contain amd64
-and arm64 manifests, and its OCI revision label must equal the tag-target
-commit. Deployments should pin the verified image digests. The Compose file
-uses `:local` only for source builds and does not treat `latest` as a deployment
-identity.
+The GitHub Release must contain `zinder.v1.descriptor.bin`, the versioned
+`zinder-api-docs` archive, both versioned GNU/Linux binary archives, and the
+external `SHA256SUMS`. The API archive contains the exact native `.proto`
+source closure alongside OpenAPI and the descriptor. Each binary archive is
+rooted and contains exactly `bin/` with the four runtime executables plus
+`BUILD-INFO.json`, `LICENSE`, `README.md`, and an internal `SHA256SUMS`. Each
+image must contain amd64 and arm64 manifests, and its OCI revision label must
+equal the tag-target commit. Deployments should pin verified image digests or
+binary archive checksums. The Compose file uses `:local` only for source builds
+and does not treat `latest` as a deployment identity.
 
 ## Recover a failed release
 
