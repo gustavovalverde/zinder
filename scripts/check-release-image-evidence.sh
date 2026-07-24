@@ -44,6 +44,15 @@ digest_pattern='^sha256:[0-9a-f]{64}$'
 [[ "$root_digest" =~ $digest_pattern && "$amd64_digest" =~ $digest_pattern && "$arm64_digest" =~ $digest_pattern ]] || usage
 service_name="${image##*/}"
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+release_package_dependencies='[]'
+if [[ "$service_name" == "zinder-compat-lightwalletd" ]]; then
+  grep -Fqx 'zinder-query.workspace = true' \
+    "$repository_root/services/zinder-compat-lightwalletd/Cargo.toml" || {
+      echo >&2 "compatibility image evidence requires the declared zinder-query dependency"
+      exit 1
+    }
+  release_package_dependencies='["zinder-query"]'
+fi
 rocksdb_version="$(awk '
   $0 == "name = \"rust-librocksdb-sys\"" { found = 1; next }
   found && /^version = / { gsub(/^version = "|"$/, ""); print; exit }
@@ -86,8 +95,10 @@ check_child_sbom() {
     --arg architecture "$architecture" \
     --arg digest "$digest" \
     --arg service "$service_name" \
-    --arg rocksdb_version "$rocksdb_version" '
-      .spdxVersion == "SPDX-2.3"
+    --arg rocksdb_version "$rocksdb_version" \
+    --argjson release_package_dependencies "$release_package_dependencies" '
+      . as $document
+      | .spdxVersion == "SPDX-2.3"
       and any(.packages[]?;
         (.name == $image or .name == ($image + "@" + $digest))
         and .licenseConcluded == "NOASSERTION"
@@ -103,6 +114,16 @@ check_child_sbom() {
         and any(.externalRefs[]?;
           .referenceType == "purl"
           and (.referenceLocator | startswith("pkg:cargo/" + $service + "@"))
+        )
+      )
+      and all($release_package_dependencies[];
+        . as $dependency
+        | any($document.packages[]?;
+          .name == $dependency
+          and any(.externalRefs[]?;
+            .referenceType == "purl"
+            and (.referenceLocator | startswith("pkg:cargo/" + $dependency + "@"))
+          )
         )
       )
       and any(.packages[]?;
@@ -122,8 +143,10 @@ check_child_sbom() {
       )
       and all(.packages[]?;
         (.name as $name
-          | ["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd"]
-          | map(select(. != $service))
+          | (
+            ["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd"]
+            - ([$service] + $release_package_dependencies)
+          )
           | index($name)) == null
       )
     ' "$sbom" >/dev/null

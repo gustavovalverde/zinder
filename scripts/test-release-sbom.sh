@@ -213,6 +213,64 @@ expect_rejected "an image SBOM containing another service executable package" \
     --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
     --amd64-sbom "$foreign_service_sbom" --arm64-sbom "$arm64_sbom"
 
+compat_image=ghcr.io/example/zinder-compat-lightwalletd
+compat_fixture="$scratch/compat-syft-fixture.json"
+jq '.packages += [{
+  SPDXID:"SPDXRef-Package-CompatService",
+  name:"zinder-compat-lightwalletd",
+  versionInfo:"0.0.0",
+  downloadLocation:"NOASSERTION",
+  filesAnalyzed:false,
+  externalRefs:[{
+    referenceCategory:"PACKAGE-MANAGER",
+    referenceType:"purl",
+    referenceLocator:"pkg:cargo/zinder-compat-lightwalletd@0.0.0"
+  }]
+}]' "$fixture" > "$compat_fixture"
+compat_amd64_sbom="$scratch/compat-amd64.spdx.json"
+compat_arm64_sbom="$scratch/compat-arm64.spdx.json"
+for architecture in amd64 arm64; do
+  digest_variable="${architecture}_digest"
+  output_variable="compat_${architecture}_sbom"
+  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$compat_fixture" \
+    "$repository_root/scripts/generate-release-sbom.sh" \
+      --image "$compat_image" --tag "$image_tag" --commit "$commit" \
+      --architecture "$architecture" --digest "${!digest_variable}" \
+      --output "${!output_variable}"
+done
+"$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
+  --image "$compat_image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
+  --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
+  --amd64-sbom "$compat_amd64_sbom" --arm64-sbom "$compat_arm64_sbom"
+
+compat_missing_query_sbom="$scratch/compat-missing-query.spdx.json"
+jq 'del(.packages[] | select(.name == "zinder-query"))' \
+  "$compat_amd64_sbom" > "$compat_missing_query_sbom"
+expect_rejected "a compatibility image SBOM without its declared query dependency" \
+  "$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
+    --image "$compat_image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
+    --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
+    --amd64-sbom "$compat_missing_query_sbom" --arm64-sbom "$compat_arm64_sbom"
+
+compat_foreign_service_sbom="$scratch/compat-foreign-service.spdx.json"
+jq '.packages += [{
+  SPDXID:"SPDXRef-ForeignCompatService",
+  name:"zinder-ingest",
+  versionInfo:"0.0.0",
+  downloadLocation:"NOASSERTION",
+  filesAnalyzed:false,
+  externalRefs:[{
+    referenceCategory:"PACKAGE-MANAGER",
+    referenceType:"purl",
+    referenceLocator:"pkg:cargo/zinder-ingest@0.0.0"
+  }]
+}]' "$compat_amd64_sbom" > "$compat_foreign_service_sbom"
+expect_rejected "a compatibility image SBOM containing an undeclared service package" \
+  "$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
+    --image "$compat_image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
+    --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
+    --amd64-sbom "$compat_foreign_service_sbom" --arm64-sbom "$compat_arm64_sbom"
+
 three_platform_manifest="$scratch/three-platforms.json"
 jq '.manifests += [.manifests[0] | .platform.architecture = "s390x"]' \
   "$manifest" > "$three_platform_manifest"

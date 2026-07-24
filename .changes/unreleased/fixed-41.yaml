@@ -1,0 +1,6 @@
+kind: fixed
+body: Accept the compatibility image's declared native query dependency in release SBOM evidence.
+time: 2026-07-24T21:26:00Z
+custom:
+  Bump: patch
+  PR: "41"
