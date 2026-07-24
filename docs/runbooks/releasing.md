@@ -327,6 +327,14 @@ GitHub Release, leave its tag and published artifacts immutable. Merge the
 workflow fix, prepare the next release candidate, and run the complete
 publication path from the new tag.
 
+Image SBOM evidence may contain another runtime-named Rust package only when
+the owning service declares it as a production dependency. In particular,
+`zinder-compat-lightwalletd` includes and must report `zinder-query`; all other
+sibling runtime packages remain rejected. If image evidence fails, regenerate
+the SBOM from the exact child digest and compare its runtime-named packages
+with the owning service manifest before changing the policy. Do not remove a
+declared dependency from the evidence or broaden the allowed package set.
+
 If only the final stable promotion fails, rerun the failed
 `promote stable image tags` job. It verifies all 4 exact manifests before moving
 any `latest` tag. Do not move a release tag or rebuild it from another commit.
