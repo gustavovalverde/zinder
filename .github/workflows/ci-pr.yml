@@ -154,6 +154,9 @@ jobs:
       - name: Test release SBOM and image evidence policy
         run: scripts/test-release-sbom.sh
 
+      - name: Test deployment admission
+        run: scripts/test-deployment-admission.sh
+
       - name: Test release image publication
         run: scripts/test-release-image-publication.sh
 

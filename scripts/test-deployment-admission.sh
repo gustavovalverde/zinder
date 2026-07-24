@@ -527,6 +527,24 @@ expect_rejected \
   "a release workflow that does not verify each immutable release asset" \
   --release-workflow "$mutable_release_verification_workflow"
 
+unverified_image_attestations_workflow="$temporary_directory/unverified-image-attestations-release.yml"
+sed 's#scripts/verify-release-image-attestations.sh#scripts/skip-release-image-attestations.sh#' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$unverified_image_attestations_workflow"
+expect_rejected \
+  "a release workflow that bypasses strict image attestation verification" \
+  --release-workflow "$unverified_image_attestations_workflow"
+
+unbound_image_attestations_workflow="$temporary_directory/unbound-image-attestations-release.yml"
+sed '/scripts\/verify-release-image-attestations.sh/,/--commit "\$BUILD_GIT_COMMIT"/ {
+  s/--commit "\$BUILD_GIT_COMMIT"/--commit "\$GITHUB_SHA"/
+}' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$unbound_image_attestations_workflow"
+expect_rejected \
+  "a release workflow that does not bind image attestations to the validated commit" \
+  --release-workflow "$unbound_image_attestations_workflow"
+
 latest_without_identity_workflow="$temporary_directory/latest-without-identity-release.yml"
 sed '/--deny-self-hosted-runners/d' \
   "$repository_root/.github/workflows/release.yml" \

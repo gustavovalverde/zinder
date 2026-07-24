@@ -730,6 +730,13 @@ EOF
       in_job { print }
     ' "$release_workflow"
   )"
+  image_attestation_verification="$(
+    awk '
+      /scripts\/verify-release-image-attestations\.sh/ { in_call = 1 }
+      in_call { print }
+      in_call && /--commit / { exit }
+    ' <<< "$merge_job"
+  )"
   if [[ -z "$binary_archive_job" || -z "$collected_binary_job" ]] \
     || ! grep -Eq '^[[:space:]]+- validate$' <<< "$binary_archive_job" \
     || ! grep -Eq '^[[:space:]]+- authorize-release$' <<< "$binary_archive_job" \
@@ -790,9 +797,15 @@ EOF
     || ! grep -Fq -- '--sbom=true' "$release_workflow" \
     || ! grep -Fq 'scripts/check-release-image-evidence.sh' "$release_workflow" \
     || ! grep -Fq 'cosign sign --yes' <<< "$merge_job" \
-    || ! grep -Fq 'gh attestation verify' <<< "$merge_job" \
-    || ! grep -Fq -- '--deny-self-hosted-runners' <<< "$merge_job" \
-    || ! grep -Fq -- '--signer-digest "$BUILD_GIT_COMMIT"' <<< "$merge_job" \
+    || ! grep -Fq 'scripts/verify-release-image-attestations.sh' <<< "$image_attestation_verification" \
+    || ! grep -Fq -- '--image "$IMAGE"' <<< "$image_attestation_verification" \
+    || ! grep -Fq -- '--root-digest "$ROOT_DIGEST"' <<< "$image_attestation_verification" \
+    || ! grep -Fq -- '--amd64-digest "$AMD64_DIGEST"' <<< "$image_attestation_verification" \
+    || ! grep -Fq -- '--arm64-digest "$ARM64_DIGEST"' <<< "$image_attestation_verification" \
+    || ! grep -Fq -- '--repository "$GITHUB_REPOSITORY"' <<< "$image_attestation_verification" \
+    || ! grep -Fq -- '--workflow release.yml' <<< "$image_attestation_verification" \
+    || ! grep -Fq -- '--tag "$RELEASE_TAG"' <<< "$image_attestation_verification" \
+    || ! grep -Fq -- '--commit "$BUILD_GIT_COMMIT"' <<< "$image_attestation_verification" \
     || ! grep -Fq 'SHA256SUMS.sigstore.json' <<< "$assemble_release_job" \
     || ! grep -Fq -- '--deny-self-hosted-runners' <<< "$assemble_release_job" \
     || ! grep -Fq -- '--signer-digest "$BUILD_GIT_COMMIT"' <<< "$assemble_release_job"; then
