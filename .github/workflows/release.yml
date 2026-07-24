@@ -820,7 +820,6 @@ jobs:
             --signer-digest "$BUILD_GIT_COMMIT"
             --source-ref "refs/tags/${RELEASE_TAG}"
             --source-digest "$BUILD_GIT_COMMIT"
-            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
           )
           for platform in aarch64-unknown-linux-gnu x86_64-v3-unknown-linux-gnu; do
             archive="dist/release-assets/zinder-${RELEASE_VERSION}-${platform}.tar.gz"
@@ -1069,7 +1068,6 @@ jobs:
               --cert-identity "$certificate_identity" \
               --deny-self-hosted-runners \
               --signer-digest "$BUILD_GIT_COMMIT" \
-              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
               --source-ref "refs/tags/${RELEASE_TAG}" \
               --source-digest "$BUILD_GIT_COMMIT"
           done <<< "$image_names"
