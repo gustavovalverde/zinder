@@ -39,9 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make release image publication wait for GHCR tag convergence and verify attestations with compatible strict identity constraints. ([#39](https://github.com/gustavovalverde/zinder/pull/39))
 - Keep deployment admission aligned with the strict release image attestation verifier. ([#40](https://github.com/gustavovalverde/zinder/pull/40))
 - Accept the compatibility image's declared native query dependency in release SBOM evidence. ([#41](https://github.com/gustavovalverde/zinder/pull/41))
+- Verify release archives and stable image promotion with compatible attestation identity selectors. ([#43](https://github.com/gustavovalverde/zinder/pull/43))
 
 
-## [0.5.0-rc.5] - 2026-07-24
+## [0.5.0-rc.6] - 2026-07-24
 
 ### Added
 
@@ -72,6 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make release image publication wait for GHCR tag convergence and verify attestations with compatible strict identity constraints. ([#39](https://github.com/gustavovalverde/zinder/pull/39))
 - Keep deployment admission aligned with the strict release image attestation verifier. ([#40](https://github.com/gustavovalverde/zinder/pull/40))
 - Accept the compatibility image's declared native query dependency in release SBOM evidence. ([#41](https://github.com/gustavovalverde/zinder/pull/41))
+- Verify release archives and stable image promotion with compatible attestation identity selectors. ([#43](https://github.com/gustavovalverde/zinder/pull/43))
 
 
 ## [0.4.0] - 2026-07-11
