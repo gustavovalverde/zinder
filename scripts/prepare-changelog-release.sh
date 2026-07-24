@@ -17,6 +17,13 @@ if [[ ! "$release_version" =~ $semver_pattern ]]; then
   echo >&2 "release version must be complete SemVer without build metadata"
   exit 1
 fi
+
+normalize_changelog_end() {
+  while [[ -z "$(tail -n 1 "$repository_root/CHANGELOG.md")" ]]; do
+    sed -i '${/^$/d;}' "$repository_root/CHANGELOG.md"
+  done
+}
+
 stable_version="${release_version%%-*}"
 prerelease=false
 [[ "$release_version" == "$stable_version" ]] || prerelease=true
@@ -36,6 +43,7 @@ section_heading_pattern="^## \\[${escaped_release_version}\\] - [0-9]{4}-[0-9]{2
 section_count="$(grep -Ec -- "$section_heading_pattern" "$repository_root/CHANGELOG.md" || true)"
 
 if [[ "$section_count" -ne 0 ]]; then
+  normalize_changelog_end
   bash "$validator" release "v${release_version}" "$repository_root"
   echo "changelog v${release_version} is already prepared"
   exit 0
@@ -112,5 +120,6 @@ fi
   fi
   "$changie_bin" merge --include-unreleased '## [Unreleased]'
 )
+normalize_changelog_end
 bash "$validator" release "v${release_version}" "$repository_root"
 echo "prepared changelog v${release_version}"
