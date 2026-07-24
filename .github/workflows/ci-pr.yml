@@ -145,6 +145,9 @@ jobs:
       - name: Verify release identity policy
         run: scripts/test-release-tag.sh
 
+      - name: Test GitHub release discovery
+        run: scripts/test-github-release-lookup.sh
+
       - name: Test release binary archive policy
         run: scripts/test-release-binary-archive.sh
 

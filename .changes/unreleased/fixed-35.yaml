@@ -1,0 +1,6 @@
+kind: fixed
+body: Allow tagged release retries to find and resume an existing draft GitHub Release while still rejecting published releases and API failures.
+time: 2026-07-24T13:24:58Z
+custom:
+  Bump: patch
+  PR: "35"
