@@ -27,7 +27,7 @@ zinder-client = "=${version}"
 TOML
 
 cat > "$consumer_directory/src/lib.rs" <<'RUST'
-use zinder_client::{Capability, ErrorReason, ServerInfo};
+use zinder_client::{Capability, CapabilityDescriptor, ErrorReason, ServerInfo};
 
 pub fn supports_full_blocks(server: &ServerInfo) -> bool {
     server.supports(Capability::FullBlock)
