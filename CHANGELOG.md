@@ -35,9 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve configured artifact-store contracts when canonical ingest opens or rebuilds storage. ([#20](https://github.com/gustavovalverde/zinder/pull/20))
 - Keep the ingest operations endpoint available after a reorg exceeds the configured window so operators can inspect the drained state and rebuild or restore without a crash loop. ([#25](https://github.com/gustavovalverde/zinder/pull/25))
 - Allow tagged release retries to find and resume an existing draft GitHub Release while still rejecting published releases and API failures. ([#35](https://github.com/gustavovalverde/zinder/pull/35))
+- Restore post-publication SDK verification against a fresh crates.io-only consumer. ([#37](https://github.com/gustavovalverde/zinder/pull/37))
 
 
-## [0.5.0-rc.2] - 2026-07-24
+## [0.5.0-rc.3] - 2026-07-24
 
 ### Added
 
@@ -64,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve configured artifact-store contracts when canonical ingest opens or rebuilds storage. ([#20](https://github.com/gustavovalverde/zinder/pull/20))
 - Keep the ingest operations endpoint available after a reorg exceeds the configured window so operators can inspect the drained state and rebuild or restore without a crash loop. ([#25](https://github.com/gustavovalverde/zinder/pull/25))
 - Allow tagged release retries to find and resume an existing draft GitHub Release while still rejecting published releases and API failures. ([#35](https://github.com/gustavovalverde/zinder/pull/35))
+- Restore post-publication SDK verification against a fresh crates.io-only consumer. ([#37](https://github.com/gustavovalverde/zinder/pull/37))
 
 
 ## [0.4.0] - 2026-07-11
