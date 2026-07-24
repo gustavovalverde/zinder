@@ -1,0 +1,6 @@
+kind: fixed
+body: Restore post-publication SDK verification against a fresh crates.io-only consumer.
+time: 2026-07-24T17:12:11Z
+custom:
+  Bump: patch
+  PR: "37"
