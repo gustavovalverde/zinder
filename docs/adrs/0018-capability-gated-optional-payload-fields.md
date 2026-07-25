@@ -48,10 +48,8 @@ convention. Specifically:
    (`Resolved | Partial | Unavailable | Unspecified`), which is set on
    every row so the handler renders a chip rather than guessing.
 
-3. The capability string is registered in `zinder-proto::capabilities`,
-   added to `ZINDER_CAPABILITIES`, and added to the
-   `capability-coverage` test's `EXPECTED_METHOD_NAMES` table with the
-   method that owns the field.
+3. The capability string is registered in `zinder-proto::capabilities` and
+   added to the `CAPABILITIES` table with the method that owns the field.
 
 4. The handler returns the field as `None` / empty whenever the
    underlying upstream is unavailable, and the field is fully populated
