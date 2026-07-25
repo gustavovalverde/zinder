@@ -176,6 +176,11 @@ pub(crate) fn decide_recovery(
             }
         }
         IngestError::Store(_)
+        | IngestError::CanonicalStore(_)
+        | IngestError::MaterializedViewHistoryIncomplete { .. }
+        | IngestError::TransparentPrevoutUnresolved { .. }
+        | IngestError::CommitmentTreeCheckpointMissing { .. }
+        | IngestError::CommitmentTreeState { .. }
         | IngestError::ReorgWindowExceeded { .. }
         | IngestError::CanonicalWriterReorgWindowMismatch { .. }
         | IngestError::UnknownNodeSource { .. }
@@ -197,6 +202,7 @@ pub(crate) fn decide_recovery(
         | IngestError::BlockingTaskFailed { .. }
         | IngestError::SourceSegmentFetchTaskStopped { .. }
         | IngestError::MaterializedViewDispatch(_)
+        | IngestError::MaterializedViewCursorUnreadable { .. }
         | IngestError::MaterializedViewStore(_) => SourceRecoveryDecision::Exit,
     }
 }

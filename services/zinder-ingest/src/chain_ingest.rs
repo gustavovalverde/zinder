@@ -17,19 +17,21 @@ use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_na
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
     BlockHeightRange, BlockTransactionIndexArtifact, CanonicalBlockReplayEnvelope,
-    CanonicalTransactionFacts, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
-    Network, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, TransactionBlobArtifact,
-    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalancesArtifact,
-    TransactionLocation, TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact,
-    TreeStateArtifact, UnixTimestampMillis,
+    CanonicalTransactionFacts, ChainEpoch, ChainEpochId, ChainTipMetadata,
+    CommitmentTreeAccumulatorError, CompactBlockArtifact, Network, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootIndex, TransactionBlobArtifact, TransactionFactsArtifact,
+    TransactionId, TransactionIntrinsicValueBalancesArtifact, TransactionLocation,
+    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
+    UnixTimestampMillis,
 };
 use zinder_source::{
     NodeCapability, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError, SourceFailureClass, SourceSubtreeRoots, SourceTreeState,
 };
 use zinder_store::{
-    ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent, ChainStoreOptions, PrimaryChainStore,
-    ReorgWindowChange, RocksDbResourceBudget, StoreError, StoreReadCaller,
+    CanonicalStoreError, ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent,
+    ChainStoreOptions, PrimaryChainStore, ReorgWindowChange, RocksDbResourceBudget, StoreError,
+    StoreReadCaller,
 };
 
 use crate::{
@@ -140,6 +142,57 @@ pub enum IngestError {
     /// Materialized-view store open or operation failed.
     #[error(transparent)]
     MaterializedViewStore(#[from] zinder_materialized_views::MaterializedViewStoreError),
+
+    /// A persisted materialized-view cursor is not a canonical event cursor.
+    #[error(
+        "materialized-view consumer cursors in {path} are not canonical event cursors; delete that directory and let the tailer rebuild it"
+    )]
+    MaterializedViewCursorUnreadable {
+        /// Materialized-view store directory holding the undecodable cursor.
+        path: std::path::PathBuf,
+        /// Exact decode failure.
+        #[source]
+        source: CanonicalStoreError,
+    },
+
+    /// Materialized views were requested on a store built from a checkpoint.
+    #[error(
+        "materialized views require canonical history from height 1; this store starts at {first_available_height:?}"
+    )]
+    MaterializedViewHistoryIncomplete {
+        /// First height the canonical store retains.
+        first_available_height: BlockHeight,
+    },
+
+    /// A non-coinbase transparent input references an unresolvable previous output.
+    #[error(
+        "transparent prevout {transaction_id:?}:{output_index} cannot be resolved from canonical storage: {reason}"
+    )]
+    TransparentPrevoutUnresolved {
+        /// Transaction that created the referenced output.
+        transaction_id: TransactionId,
+        /// Output index referenced by the spending transaction input.
+        output_index: u32,
+        /// Exact resolution failure.
+        reason: &'static str,
+    },
+
+    /// The canonical commitment-tree checkpoint required to seed derivation is absent.
+    #[error("canonical commitment-tree checkpoint is absent at or before height {height:?}")]
+    CommitmentTreeCheckpointMissing {
+        /// Height whose predecessor state was required.
+        height: BlockHeight,
+    },
+
+    /// The ordered commitment-tree accumulator rejected a seed or block update.
+    #[error("canonical commitment-tree state failed at height {height:?}")]
+    CommitmentTreeState {
+        /// Height being seeded or applied.
+        height: BlockHeight,
+        /// Exact accumulator failure.
+        #[source]
+        source: CommitmentTreeAccumulatorError,
+    },
 
     /// Internal batching produced an empty commit.
     #[error("internal error: attempted to commit an empty canonical batch")]
@@ -278,6 +331,10 @@ pub enum IngestError {
     /// Canonical store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    /// Canonical storage failed.
+    #[error(transparent)]
+    CanonicalStore(#[from] CanonicalStoreError),
 
     /// A `spawn_blocking` task hosting a `RocksDB` call failed to join
     /// (panic or runtime shutdown).
@@ -1671,9 +1728,21 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         Some(IngestError::Source(_)) => "source",
         Some(IngestError::CanonicalBlockConstruction(_)) => "canonical_block_construction",
         Some(IngestError::Store(_)) => "store",
+        Some(IngestError::CanonicalStore(_)) => "canonical_store",
         Some(IngestError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(IngestError::MaterializedViewDispatch(_)) => "materialized_view_dispatch",
         Some(IngestError::MaterializedViewStore(_)) => "materialized_view_store",
+        Some(IngestError::MaterializedViewCursorUnreadable { .. }) => {
+            "materialized_view_cursor_unreadable"
+        }
+        Some(IngestError::MaterializedViewHistoryIncomplete { .. }) => {
+            "materialized_view_history_incomplete"
+        }
+        Some(IngestError::TransparentPrevoutUnresolved { .. }) => "transparent_prevout_unresolved",
+        Some(IngestError::CommitmentTreeCheckpointMissing { .. }) => {
+            "commitment_tree_checkpoint_missing"
+        }
+        Some(IngestError::CommitmentTreeState { .. }) => "commitment_tree_state",
     }
 }
 
