@@ -155,8 +155,8 @@ Test functions under `tests/live/` use plain `snake_case_describing_behavior` na
 
 The workspace MSRV is Rust 1.95. Public crates inherit that version alongside
 the internal crates and release binaries. Keep `Cargo.toml`,
-`rust-toolchain.toml`, CI toolchain actions, and Docker `RUST_VERSION` args
-aligned whenever it changes.
+`rust-toolchain.toml`, `clippy.toml`, CI toolchain actions, and Docker
+`RUST_VERSION` args aligned whenever it changes.
 
 The workspace `Cargo.toml` denies (not warns):
 

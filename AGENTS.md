@@ -5,7 +5,13 @@ follow it before making changes; this file is a concise project reference.
 
 ## Project Structure & Module Organization
 
-This is a Rust 2024 workspace. Domain crates live under `crates/`: `zinder-core` for shared types, `zinder-store` for RocksDB-backed canonical storage, `zinder-source` for upstream node adapters and the shared `NodeTarget` config type, `zinder-proto` for generated protocol modules, `zinder-runtime` for the operational HTTP surface and config loader, and `zinder-testkit` for fixtures and the `live::` test-helper module. Service crates live under `services/`: `zinder-ingest` owns bulk catchup and canonical writes, `zinder-query` owns wallet-facing read APIs, `zinder-compat-lightwalletd` translates the lightwalletd protocol. Integration tests sit beside each crate in `tests/{integration,live,perf}/` as documented in the [Testing Runbook](docs/runbooks/testing.md). Architecture, ADRs, references, and runbooks live under `docs/`; update them when a change alters boundaries, protocol bytes, storage semantics, or public vocabulary.
+This is a Rust 2024 workspace.
+
+Domain crates live under `crates/`: `zinder-core` for shared types, `zinder-store` for canonical storage contracts and the RocksDB adapter, `zinder-rocksdb-bulk-load` for the bulk-load and SST mechanics the storage engines share, `zinder-source` for upstream node adapters and the shared `NodeTarget` config type, `zinder-proto` for generated protocol modules, `zinder-materialized-views` for the materialized-view plane SDK and its bundled consumers, `zinder-wallet-projection` for wallet projection domain and encoding contracts, `zinder-wallet-rocksdb` for wallet projection storage and construction, `zinder-client` for the typed consumer client surface, `zinder-runtime` for the operational HTTP surface and config loader, and `zinder-testkit` for fixtures and the `live::` test-helper module.
+
+Service crates live under `services/`. Three are release runtimes: `zinder-ingest` owns bulk catchup and canonical writes, `zinder-projector` builds wallet projections, and `zinder-compat-lightwalletd` translates the lightwalletd protocol. `zinder-query` owns the wallet and application query boundary and ships as both a library and a binary. `zinder-explorer` serves the explorer plane, `zinder-compat-cipherscan` serves a Cipherscan-compatible REST surface, and `zinder-bench` is the storage benchmark harness. `tools/zinder-proto-codegen` regenerates the checked-in protocol modules.
+
+Integration tests sit beside each crate in `tests/{integration,live,perf}/` as documented in the [Testing Runbook](docs/runbooks/testing.md). Architecture, ADRs, references, and runbooks live under `docs/`; update them when a change alters boundaries, protocol bytes, storage semantics, or public vocabulary.
 
 ## Build, Test, and Development Commands
 
