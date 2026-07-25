@@ -32,18 +32,19 @@ repository = "https://github.com/gustavovalverde/zinder"
 rust-version = "1.95"
 
 [workspace.dependencies]
-arc-swap = "1.7"
-async-trait = "0.1.89"
+arc-swap = "1.9"
+async-trait = "0.1.91"
 blake2b_simd = "1.0.4"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
-base64 = "0.22.1"
-bytes = "1.12.0"
-clap = "4.6.1"
+# Zinder uses the scalar engines; avoid Base64 0.23's default `simd-unsafe` feature.
+base64 = { version = "0.23.0", default-features = false, features = ["std"] }
+bytes = "1.12.1"
+clap = "4.6.4"
 color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
 config = { version = "0.15.25", default-features = false, features = ["toml"] }
 eyre = "0.6.12"
-futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
-getrandom = { version = "0.4.2", features = ["std"] }
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
+getrandom = { version = "0.4.3", features = ["std"] }
 hex = "0.4.3"
 hmac = "0.12.1"
 http-body-util = "0.1"
@@ -53,25 +54,25 @@ jsonrpsee = { version = "0.26.0", default-features = false, features = ["http-cl
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 parking_lot = "0.12.5"
-orchard = "0.15.0"
+orchard = "0.15.4"
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rust-rocksdb = { version = "0.51.0", features = ["multi-threaded-cf"] }
 secrecy = "0.10.3"
-serde = "1.0.228"
-serde_json = "1.0.150"
+serde = "1.0.229"
+serde_json = "1.0.151"
 sha2 = "0.10.9"
 subtle = "2.6.1"
 tempfile = "3.27.0"
-thiserror = "2.0.18"
-time = { version = "0.3.53", features = ["formatting"] }
-tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+thiserror = "2.0.19"
+time = { version = "0.3.54", features = ["formatting"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-postgres = { version = "=0.7.18", default-features = false, features = ["runtime"] }
-tokio-stream = { version = "0.1.18", features = ["net", "sync"] }
-tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
-toml = "1.1.2"
+tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
+tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
+toml = "1.1.3"
 tonic = { version = "0.14.6", features = ["tls-ring", "tls-native-roots"] }
 tonic-health = "0.14.6"
 tonic-prost = "0.14.6"
@@ -81,7 +82,7 @@ tonic-types = "0.14.6"
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "smallvec", "std", "tracing-log"] }
-zebra-chain = "11.0.0"
+zebra-chain = "11.2.0"
 zinder-core = { version = "0.5.0-rc.8", path = "crates/zinder-core" }
 zinder-rocksdb-bulk-load = { path = "crates/zinder-rocksdb-bulk-load" }
 zinder-client = { version = "0.5.0-rc.8", path = "crates/zinder-client" }

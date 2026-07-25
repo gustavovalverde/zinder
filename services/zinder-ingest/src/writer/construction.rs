@@ -1,6 +1,5 @@
 //! Fresh canonical construction from one ordered node-source pass.
 
-pub(crate) mod abort_on_drop;
 pub(crate) mod source_fetch;
 pub(crate) mod watermark;
 

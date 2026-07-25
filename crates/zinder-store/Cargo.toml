@@ -14,7 +14,7 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
-getrandom = { version = "0.4.2", features = ["std"] }
+getrandom = { version = "0.4.3", features = ["std"] }
 hmac.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
