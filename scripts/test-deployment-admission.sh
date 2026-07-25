@@ -537,6 +537,16 @@ expect_rejected \
   "a draft release job without the validated source tree" \
   --release-workflow "$unchecked_draft_release_workflow"
 
+unbound_publish_release_workflow="$temporary_directory/unbound-publish-release.yml"
+sed '/^  publish-release:/,/^  verify-release:/ {
+  /GH_REPO: \${{ github.repository }}/d
+}' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$unbound_publish_release_workflow"
+expect_rejected \
+  "a GitHub Release publisher without an explicit repository" \
+  --release-workflow "$unbound_publish_release_workflow"
+
 conflicting_archive_identity_workflow="$temporary_directory/conflicting-archive-identity-release.yml"
 sed '/^  assemble-and-sign:/,/^  prepare-release:/ {
   /--cert-identity "\$certificate_identity"/a\

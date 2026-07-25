@@ -695,6 +695,13 @@ EOF
       in_job { print }
     ' "$release_workflow"
   )"
+  publish_release_job="$(
+    awk '
+      $0 == "  publish-release:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
   authorization_job="$(
     awk '
       $0 == "  authorize-release:" { in_job = 1; next }
@@ -825,7 +832,8 @@ EOF
     exit 1
   fi
 
-  if ! grep -Fq '.isImmutable == true' <<< "$verify_release_job" \
+  if ! grep -Fq 'GH_REPO: ${{ github.repository }}' <<< "$publish_release_job" \
+    || ! grep -Fq '.isImmutable == true' <<< "$verify_release_job" \
     || ! grep -Fq 'gh release verify "$RELEASE_TAG"' <<< "$verify_release_job" \
     || ! grep -Fq 'gh release verify-asset "$RELEASE_TAG" "$asset"' <<< "$verify_release_job" \
     || ! grep -Fq 'cosign verify' <<< "$promote_latest_job" \
