@@ -22,8 +22,8 @@ use zinder_testkit::{
 };
 
 use super::{
-    build_transparent_address_adapter, build_transparent_address_serving_fixture,
-    parity_chain_fixture,
+    address_history_filter, build_transparent_address_adapter,
+    build_transparent_address_serving_fixture, parity_chain_fixture,
 };
 
 #[test]
@@ -200,21 +200,4 @@ async fn serves_zodl_transparent_discovery_shape_from_production_pair() -> eyre:
     assert!(txids.next().await.is_none());
     assert!(transactions.next().await.is_none());
     Ok(())
-}
-
-fn address_history_filter(address: String) -> lightwalletd::TransparentAddressBlockFilter {
-    lightwalletd::TransparentAddressBlockFilter {
-        address,
-        range: Some(lightwalletd::BlockRange {
-            start: Some(lightwalletd::BlockId {
-                height: 1,
-                hash: Vec::new(),
-            }),
-            end: Some(lightwalletd::BlockId {
-                height: 1,
-                hash: Vec::new(),
-            }),
-            pool_types: Vec::new(),
-        }),
-    }
 }

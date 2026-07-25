@@ -31,7 +31,7 @@ use zinder_proto::v1::explorer::{
     ValuePoolSummaryRequest, ValuePoolSummaryResponse,
     explorer_query_server::ExplorerQuery as ExplorerQueryService,
 };
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::WalletQuery;
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
     ChainStoreOptions, PrimaryChainStore, RocksDbCanonicalStore, RocksDbResourceBudget,
@@ -39,7 +39,10 @@ use zinder_store::{
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
-use crate::common::{fetch_live_network_upgrade_activations, fetch_live_tip_height};
+use crate::common::{
+    WalletQueryServerOptions, await_grpc_endpoint, fetch_live_network_upgrade_activations,
+    fetch_live_tip_height, serve_wallet_query_grpc,
+};
 
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 const CANONICAL_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -176,8 +179,10 @@ impl ValuePoolSummaryFixture {
                 .await?;
         let (wallet_grpc_addr, wallet_server_handle) = serve_wallet_query_grpc(
             wallet_query,
-            network,
-            format!("http://{ingest_control_addr}"),
+            WalletQueryServerOptions {
+                network: Some(network),
+                ingest_control_endpoint: Some(format!("http://{ingest_control_addr}")),
+            },
         )
         .await?;
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
@@ -304,32 +309,6 @@ async fn wait_for_writer(canonical: &zinder_ingest::CanonicalControlHandle) -> R
     Ok(())
 }
 
-async fn serve_wallet_query_grpc(
-    wallet_query: WalletQuery<PrimaryChainStore>,
-    network: Network,
-    ingest_control_endpoint: String,
-) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let server_info = ServerInfoSettings {
-        network: encode_zinder_native_chain_name(network).to_owned(),
-        ..ServerInfoSettings::default()
-    };
-    let adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
-        wallet_query,
-        server_info,
-        ingest_control_endpoint,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    await_grpc_endpoint(addr).await?;
-    Ok((addr, handle))
-}
-
 async fn serve_ingest_control_grpc(
     network: Network,
     canonical: zinder_ingest::CanonicalControlHandle,
@@ -360,13 +339,4 @@ async fn serve_ingest_control_grpc(
     });
     await_grpc_endpoint(addr).await?;
     Ok((addr, handle))
-}
-async fn await_grpc_endpoint(addr: SocketAddr) -> Result<()> {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    Err(eyre!("gRPC endpoint {addr} did not become reachable"))
 }

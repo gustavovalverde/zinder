@@ -11,7 +11,10 @@ use tonic::Request;
 use zinder_client::{ChainIndex, EndpointBackedIndex, RemoteChainIndex};
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 
-use super::{build_transparent_address_adapter, build_transparent_address_serving_fixture};
+use super::{
+    address_history_filter, build_transparent_address_adapter,
+    build_transparent_address_serving_fixture,
+};
 
 #[test]
 fn parity_chain_index_surface_compiles_for_lightwalletd_operators() {
@@ -97,21 +100,4 @@ async fn serves_public_transparent_address_shape_from_production_pair() -> eyre:
     assert!(txids.next().await.is_none());
     assert!(transactions.next().await.is_none());
     Ok(())
-}
-
-fn address_history_filter(address: String) -> lightwalletd::TransparentAddressBlockFilter {
-    lightwalletd::TransparentAddressBlockFilter {
-        address,
-        range: Some(lightwalletd::BlockRange {
-            start: Some(lightwalletd::BlockId {
-                height: 1,
-                hash: Vec::new(),
-            }),
-            end: Some(lightwalletd::BlockId {
-                height: 1,
-                hash: Vec::new(),
-            }),
-            pool_types: Vec::new(),
-        }),
-    }
 }

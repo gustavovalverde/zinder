@@ -18,6 +18,7 @@ use zinder_client::{
     TransactionId, TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
+use zinder_proto::compat::lightwalletd;
 use zinder_query::{
     CanonicalReader, ServerInfoSettings, WalletCapabilityProfile, WalletProjectionReader,
     WalletQueryGrpcAdapter, WalletServingQuery, WalletServingReadPair,
@@ -125,6 +126,23 @@ fn build_transparent_address_adapter(
             .with_serving_pair_slot(serving_pair_slot)
             .with_transparent_address_support(),
     )
+}
+
+fn address_history_filter(address: String) -> lightwalletd::TransparentAddressBlockFilter {
+    lightwalletd::TransparentAddressBlockFilter {
+        address,
+        range: Some(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }),
+    }
 }
 
 async fn open_remote_chain_index(chain_fixture: &ChainFixture) -> eyre::Result<RemoteChainIndex> {

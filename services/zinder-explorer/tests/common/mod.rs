@@ -13,19 +13,26 @@
 )]
 
 use std::{
+    net::SocketAddr,
     num::{NonZeroU32, NonZeroU64},
     path::Path,
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
-use eyre::Result;
+use eyre::{Result, eyre};
+use tempfile::{TempDir, tempdir};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_stream::{Stream, wrappers::TcpListenerStream};
 use tonic::{Request, Response, Status};
-use zinder_core::{BlockHeight, NetworkUpgradeActivations};
-use zinder_ingest::{BulkCatchupRunConfig, CanonicalPipelineLimits, NodeSourceKind};
+use zinder_core::{
+    BlockHeight, Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name,
+};
+use zinder_ingest::{
+    BulkCatchupRunConfig, CanonicalPipelineLimits, NodeSourceKind, run_bulk_catchup,
+};
 use zinder_proto::v1::{
     ingest::{
         MempoolTransactionRequest, ServerInfoRequest, ServerInfoResponse, WriterStatusRequest,
@@ -34,8 +41,12 @@ use zinder_proto::v1::{
     },
     wallet,
 };
+use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::LiveTestEnv;
+
+const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 
 /// Builds a [`BulkCatchupRunConfig`] from a resolved live-test env plus per-test
 /// runtime knobs.
@@ -147,6 +158,96 @@ pub(crate) async fn fetch_live_network_upgrade_activations(
     ))
 }
 
+/// Bulk catches up the window ending at the live upstream tip and opens the
+/// resulting canonical store.
+pub(crate) async fn bulk_catchup_store(
+    env: &LiveTestEnv,
+) -> Result<(TempDir, PrimaryChainStore, BlockHeight)> {
+    let tip_height = fetch_live_tip_height(env).await?;
+    if tip_height.value() <= BACKFILL_DEPTH_BLOCKS {
+        return Err(eyre!(
+            "tip height {} is at or below the minimum {BACKFILL_DEPTH_BLOCKS}",
+            tip_height.value(),
+        ));
+    }
+    let checkpoint_height = BlockHeight::new(tip_height.value() - BACKFILL_DEPTH_BLOCKS - 1);
+    let from_height = BlockHeight::new(checkpoint_height.value() + 1);
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(env).await?;
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
+        env,
+        &storage_path,
+        from_height,
+        tip_height,
+        NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
+        true,
+        activations,
+    );
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(
+            checkpoint_height,
+            &bulk_catchup_config.network_upgrade_activations,
+        )
+        .await?;
+    bulk_catchup_config.checkpoint = Some(checkpoint);
+    run_bulk_catchup(&bulk_catchup_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
+    let store =
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
+    Ok((tempdir, store, tip_height))
+}
+
+/// Per-test knobs for the in-process `WalletQuery` gRPC fixture.
+pub(crate) struct WalletQueryServerOptions {
+    /// Overrides the advertised `ServerInfo` chain name.
+    pub(crate) network: Option<Network>,
+    /// Routes ingest-owned reads through an in-process `IngestControl` server.
+    pub(crate) ingest_control_endpoint: Option<String>,
+}
+
+/// Serves `WalletQuery` over gRPC on an ephemeral loopback port.
+pub(crate) async fn serve_wallet_query_grpc(
+    wallet_query: WalletQuery<PrimaryChainStore>,
+    options: WalletQueryServerOptions,
+) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
+    let server_info = options
+        .network
+        .map_or_else(ServerInfoSettings::default, |network| ServerInfoSettings {
+            network: encode_zinder_native_chain_name(network).to_owned(),
+            ..ServerInfoSettings::default()
+        });
+    let adapter = match options.ingest_control_endpoint {
+        Some(endpoint) => {
+            WalletQueryGrpcAdapter::with_ingest_control_proxy(wallet_query, server_info, endpoint)
+        }
+        None => WalletQueryGrpcAdapter::new(wallet_query, server_info),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    await_grpc_endpoint(addr).await?;
+    Ok((addr, handle))
+}
+
+/// Waits until `addr` accepts connections.
+pub(crate) async fn await_grpc_endpoint(addr: SocketAddr) -> Result<()> {
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err(eyre!("gRPC endpoint {addr} did not become reachable"))
+}
+
 type TestChainEventStream =
     Pin<Box<dyn Stream<Item = Result<wallet::ChainEventEnvelope, Status>> + Send>>;
 type TestMempoolEventStream =
@@ -159,10 +260,7 @@ type TestMempoolEventStream =
 /// the current private responses that Explorer reaches through `WalletQuery`.
 pub(crate) async fn serve_test_ingest_control(
     value_pools_response: Option<wallet::ChainValuePoolsAtTipResponse>,
-) -> Result<(
-    std::net::SocketAddr,
-    JoinHandle<Result<(), tonic::transport::Error>>,
-)> {
+) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let handle = tokio::spawn(async move {
