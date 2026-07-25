@@ -2,7 +2,7 @@
 
 use zinder_core::{BlockHeight, BlockHeightRange, ChainEpoch};
 
-use crate::StreamCursorTokenV1;
+use crate::{CanonicalEventKind, CanonicalRetainedEvent, CanonicalStoreError, StreamCursorTokenV1};
 
 /// Result returned after a chain epoch commit becomes durable and visible.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +88,62 @@ impl ChainEvent {
     #[must_use]
     pub const fn is_chain_committed(&self) -> bool {
         matches!(self, Self::ChainCommitted { .. })
+    }
+
+    /// Reconstructs the dispatchable event for one retained canonical transition.
+    ///
+    /// `resulting_epoch` is the epoch the transition made visible.
+    /// `reverted_epoch` is the epoch that contained the replaced range and is
+    /// required only by a reorg transition.
+    pub fn from_canonical_retained(
+        retained: CanonicalRetainedEvent,
+        resulting_epoch: ChainEpoch,
+        reverted_epoch: Option<ChainEpoch>,
+    ) -> Result<Self, CanonicalStoreError> {
+        if resulting_epoch.id != retained.resulting_epoch_id() {
+            return Err(retained_event_mismatch(
+                retained,
+                "resulting epoch does not match the retained canonical event",
+            ));
+        }
+        let committed = ChainEpochCommitted::new(resulting_epoch, retained.committed_range());
+        match retained.kind() {
+            CanonicalEventKind::Committed => Ok(Self::ChainCommitted { committed }),
+            CanonicalEventKind::Reorged => {
+                let reverted_range = retained.reverted_range().ok_or_else(|| {
+                    retained_event_mismatch(
+                        retained,
+                        "reorged canonical event carries no reverted range",
+                    )
+                })?;
+                let reverted_epoch = reverted_epoch.ok_or_else(|| {
+                    retained_event_mismatch(
+                        retained,
+                        "reorged canonical event requires its reverted epoch",
+                    )
+                })?;
+                if Some(reverted_epoch.id) != retained.previous_epoch_id() {
+                    return Err(retained_event_mismatch(
+                        retained,
+                        "reverted epoch does not match the retained canonical event",
+                    ));
+                }
+                Ok(Self::ChainReorged {
+                    reverted: ChainRangeReverted::new(reverted_epoch, reverted_range),
+                    committed,
+                })
+            }
+        }
+    }
+}
+
+fn retained_event_mismatch(
+    retained: CanonicalRetainedEvent,
+    reason: &'static str,
+) -> CanonicalStoreError {
+    CanonicalStoreError::CanonicalEventRecordMalformed {
+        event_sequence: retained.cursor().event_sequence(),
+        reason,
     }
 }
 

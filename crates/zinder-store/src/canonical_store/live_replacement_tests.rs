@@ -31,8 +31,8 @@ use super::{
     rocksdb::{BLOCK_HASH_INDEX_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY},
 };
 use crate::{
-    ChainEvent, ChainEventHistoryRequest, ChainEventStreamFamily, EventStreamStartPosition,
-    RocksDbResourceBudget, StreamCursorTokenV1,
+    ChainEpochCommitted, ChainEvent, ChainEventHistoryRequest, ChainEventStreamFamily,
+    ChainRangeReverted, EventStreamStartPosition, RocksDbResourceBudget, StreamCursorTokenV1,
     format::{ChainEventCursorAnchor, ChainEventLocator},
 };
 
@@ -882,6 +882,97 @@ fn ready_open_rejects_missing_or_inconsistent_reorg_archive_rows()
     replace_archive_row(&store_path, &[0x00], Some(&original_state))?;
     let reopened = open_store(&store_path, &activations, 2)?;
     assert_eq!(reopened.displaced_block_count()?, 2);
+    Ok(())
+}
+
+#[test]
+fn secondary_point_reads_agree_with_the_bounded_replay_range_scan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let secondary_path = temporary.path().join("secondary");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let _store = published_store(&store_path, 2, BlockHeight::new(4), BlockHeight::new(2))?;
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        &secondary_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        CanonicalReorgPolicy::new(2)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    let scanned = secondary
+        .scan_canonical_replay_range(BlockHeightRange::inclusive(
+            BlockHeight::new(1),
+            BlockHeight::new(4),
+        ))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(scanned.len(), 4);
+    for replay in &scanned {
+        assert_eq!(
+            secondary
+                .block_replay_facts_at(replay.facts().block_header.height)?
+                .as_ref(),
+            Some(replay.facts())
+        );
+    }
+
+    assert_eq!(secondary.block_replay_facts_at(BlockHeight::new(0))?, None);
+    assert_eq!(secondary.block_replay_facts_at(BlockHeight::new(5))?, None);
+    Ok(())
+}
+
+#[test]
+fn retained_canonical_events_convert_into_dispatchable_chain_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = replaced_store(&temporary.path().join("canonical"))?;
+    let page = store.canonical_event_history(CanonicalEventHistoryRequest::new(
+        None,
+        NonZeroU32::new(10).ok_or("zero page limit")?,
+    ))?;
+    let [baseline, reorged] = page.as_slice() else {
+        return Err("expected one baseline event and one reorg event".into());
+    };
+    assert_eq!(baseline.kind(), CanonicalEventKind::Committed);
+    assert_eq!(reorged.kind(), CanonicalEventKind::Reorged);
+
+    let baseline_epoch = store.chain_epoch_at(baseline.resulting_epoch_id())?;
+    assert_eq!(
+        ChainEvent::from_canonical_retained(*baseline, baseline_epoch, None)?,
+        ChainEvent::ChainCommitted {
+            committed: ChainEpochCommitted::new(baseline_epoch, baseline.committed_range()),
+        }
+    );
+
+    let reorged_epoch = store.chain_epoch_at(reorged.resulting_epoch_id())?;
+    let reverted_epoch = store.chain_epoch_at(
+        reorged
+            .previous_epoch_id()
+            .ok_or("reorg event carries no previous epoch")?,
+    )?;
+    assert_eq!(
+        ChainEvent::from_canonical_retained(*reorged, reorged_epoch, Some(reverted_epoch))?,
+        ChainEvent::ChainReorged {
+            reverted: ChainRangeReverted::new(
+                reverted_epoch,
+                reorged
+                    .reverted_range()
+                    .ok_or("reorg event carries no reverted range")?,
+            ),
+            committed: ChainEpochCommitted::new(reorged_epoch, reorged.committed_range()),
+        }
+    );
+
+    assert!(matches!(
+        ChainEvent::from_canonical_retained(*reorged, reorged_epoch, None),
+        Err(CanonicalStoreError::CanonicalEventRecordMalformed { .. })
+    ));
+    assert!(matches!(
+        ChainEvent::from_canonical_retained(*baseline, reorged_epoch, None),
+        Err(CanonicalStoreError::CanonicalEventRecordMalformed { .. })
+    ));
     Ok(())
 }
 
