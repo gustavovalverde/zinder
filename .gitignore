@@ -16,5 +16,11 @@ lcov.info
 # Private local agent memory (auto-loaded by Claude Code, never committed).
 CLAUDE.local.md
 
+# Local discovery notes. The documentation tree carries architecture, ADRs,
+# reference, and runbooks only; these directories stay out of the repository.
+docs/investigations/
+docs/plans/
+docs/prd/
+
 # Browser-automation scratch (Playwright MCP).
 .playwright-mcp/
