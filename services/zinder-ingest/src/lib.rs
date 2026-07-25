@@ -7,10 +7,10 @@
 mod artifact_builder;
 pub mod bench_support;
 mod bulk_catchup;
+mod canonical_block_context;
 mod chain_ingest;
 mod conventional_fee_distribution_backfill;
-mod materialized_view_consumers;
-mod materialized_view_status_reader;
+mod materialized_view_replay;
 mod memory_pressure;
 mod mempool;
 mod phase;
@@ -18,7 +18,6 @@ mod runtime_config;
 mod source_recovery;
 mod tip_follow;
 mod transaction_component_backfill;
-mod transparent_address_ranking_snapshot;
 mod upstream_health_probe;
 mod writer;
 
@@ -31,6 +30,7 @@ pub use bulk_catchup::{
     BulkCatchupRunConfig, run_bulk_catchup, run_bulk_catchup_until_complete,
     run_bulk_catchup_with_store,
 };
+pub use canonical_block_context::{CanonicalBlockContextReader, require_genesis_complete_history};
 pub use chain_ingest::{
     DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE, IngestError, NodeSourceKind,
@@ -39,17 +39,10 @@ pub use conventional_fee_distribution_backfill::{
     ConventionalFeeDistributionBackfillConfig, ConventionalFeeDistributionBackfillContext,
     spawn_conventional_fee_distribution_backfill_task,
 };
-pub use materialized_view_consumers::{
-    DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, catch_up_materialized_view_store_to_canonical,
-    catch_up_materialized_view_store_to_canonical_until_handoff,
-    open_primary_materialized_view_store_for_canonical,
-    open_primary_materialized_view_store_for_canonical_with_materialized_view_preset,
-    seed_backfill_owned_consumer_cursors, spawn_materialized_view_replay_budget_metrics_task,
-    spawn_materialized_view_tailer_task,
-};
-pub use materialized_view_status_reader::{
-    MaterializedViewStatusReadError, MaterializedViewStatusReader,
-    RocksDbMaterializedViewStatusReader,
+pub use materialized_view_replay::{
+    DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, MaterializedViewTailer,
+    open_primary_materialized_view_store, seed_backfill_owned_consumer_cursors,
+    spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
 };
 pub use memory_pressure::{
     DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, spawn_runtime_memory_metrics_task,
@@ -73,9 +66,6 @@ pub use tip_follow::{
 pub use transaction_component_backfill::{
     TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
     spawn_transaction_component_backfill_task,
-};
-pub use transparent_address_ranking_snapshot::{
-    TransparentAddressRankingBootstrapOutcome, bootstrap_transparent_address_ranking,
 };
 pub use upstream_health_probe::spawn_upstream_health_probe_task;
 pub use writer::construction::{

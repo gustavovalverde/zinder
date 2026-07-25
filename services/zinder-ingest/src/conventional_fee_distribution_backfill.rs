@@ -1,29 +1,35 @@
 //! Resumable historical backfill and startup-tail seeding for ZIP-317
 //! conventional-fee distribution.
 
-use std::{num::NonZeroU32, time::Duration};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
+use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zinder_core::BlockHeight;
+use zinder_core::{BlockHeight, BlockHeightRange, NetworkUpgradeActivations};
 use zinder_materialized_views::{
-    ConventionalFeeDistributionBackfillCoverage, ConventionalFeeDistributionConsumer,
-    ConventionalFeeDistributionTailCoverage, MaterializedViewStore,
+    BlockCommitContext, ConventionalFeeDistributionBackfillCoverage,
+    ConventionalFeeDistributionConsumer, ConventionalFeeDistributionTailCoverage,
+    MaterializedViewStore,
 };
-use zinder_store::PrimaryChainStore;
+use zinder_store::RocksDbCanonicalSecondary;
 
 use crate::{
     IngestError,
-    materialized_view_consumers::materialized_view_write_guard,
-    runtime_config::{HistoricalWorkGate, wait_until_historical_work_or_cancelled},
-    transaction_component_backfill::{canonical_history_bounds, read_canonical_context_batch},
+    materialized_view_replay::materialized_view_write_guard,
+    runtime_config::{
+        HistoricalWorkGate, nonzero_u32, sleep_or_cancel, wait_until_historical_work_or_cancelled,
+    },
+    transaction_component_backfill::read_canonical_context_batch,
 };
 
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const BACKFILL_CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const BACKFILL_BATCH_BLOCKS: NonZeroU32 = nonzero_u32(256);
 
 pub(crate) fn seed_conventional_fee_distribution_visible_tail(
-    chain_store: &PrimaryChainStore,
+    canonical: &RocksDbCanonicalSecondary,
+    activations: &NetworkUpgradeActivations,
     materialized_view_store: &MaterializedViewStore,
     through_height: BlockHeight,
     batch_blocks: NonZeroU32,
@@ -53,7 +59,11 @@ pub(crate) fn seed_conventional_fee_distribution_visible_tail(
                 .saturating_add(batch_blocks.get().saturating_sub(1))
                 .min(through_height.value()),
         );
-        let contexts = read_canonical_context_batch(chain_store, next_height, batch_end)?;
+        let contexts = read_canonical_context_batch(
+            canonical,
+            activations,
+            BlockHeightRange::inclusive(next_height, batch_end),
+        )?;
         let _write_guard = materialized_view_write_guard();
         ConventionalFeeDistributionConsumer::new()
             .write_tail_seed_batch(materialized_view_store, &contexts)
@@ -64,28 +74,36 @@ pub(crate) fn seed_conventional_fee_distribution_visible_tail(
 /// Bounded controls for the ingest-owned conventional-fee distribution backfill.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConventionalFeeDistributionBackfillConfig {
-    /// Whether the background task runs.
-    pub enabled: bool,
     /// Maximum canonical blocks processed per durable coverage update.
     pub batch_blocks: NonZeroU32,
+}
+
+impl ConventionalFeeDistributionBackfillConfig {
+    /// Limits the ingest runtime runs the backfill with.
+    pub const DEFAULT: Self = Self {
+        batch_blocks: BACKFILL_BATCH_BLOCKS,
+    };
 }
 
 /// Existing storage handles used by the conventional-fee distribution backfill.
 #[derive(Clone)]
 pub struct ConventionalFeeDistributionBackfillContext {
-    chain_store: PrimaryChainStore,
+    canonical: Arc<RwLock<RocksDbCanonicalSecondary>>,
+    activations: Arc<NetworkUpgradeActivations>,
     materialized_view_store: MaterializedViewStore,
 }
 
 impl ConventionalFeeDistributionBackfillContext {
-    /// Groups the canonical and materialized-view stores for task startup.
+    /// Groups the canonical secondary and materialized-view store for task startup.
     #[must_use]
-    pub fn new(
-        chain_store: PrimaryChainStore,
+    pub const fn new(
+        canonical: Arc<RwLock<RocksDbCanonicalSecondary>>,
+        activations: Arc<NetworkUpgradeActivations>,
         materialized_view_store: MaterializedViewStore,
     ) -> Self {
         Self {
-            chain_store,
+            canonical,
+            activations,
             materialized_view_store,
         }
     }
@@ -98,22 +116,13 @@ pub fn spawn_conventional_fee_distribution_backfill_task(
     context: ConventionalFeeDistributionBackfillContext,
     historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
-) -> Option<JoinHandle<()>> {
-    if !config.enabled {
-        tracing::info!(
-            target: "zinder::ingest",
-            event = "conventional_fee_distribution_backfill_disabled",
-            "conventional-fee distribution historical backfill is disabled"
-        );
-        return None;
-    }
-
-    Some(tokio::spawn(run_conventional_fee_distribution_backfill(
+) -> JoinHandle<()> {
+    tokio::spawn(run_conventional_fee_distribution_backfill(
         config,
         context,
         historical_work_gate,
         cancel,
-    )))
+    ))
 }
 
 async fn run_conventional_fee_distribution_backfill(
@@ -217,72 +226,116 @@ fn backfill_next_batch_blocking(
 ) -> Result<BackfillProgress, IngestError> {
     let coverage =
         ConventionalFeeDistributionConsumer::backfill_coverage(&context.materialized_view_store)?;
-    let Some(chain_epoch) = context.chain_store.current_chain_epoch()? else {
-        return Ok(BackfillProgress::CaughtUp {
-            through_height: coverage.map(|coverage| coverage.complete_through_height),
-        });
+    let batch = match read_next_backfill_batch(config, context, coverage)? {
+        BackfillBatch::CaughtUp => {
+            return Ok(BackfillProgress::CaughtUp {
+                through_height: coverage.map(|coverage| coverage.complete_through_height),
+            });
+        }
+        BackfillBatch::Ready(batch) => batch,
     };
-    let history_bounds = canonical_history_bounds(&context.chain_store)?;
-    let first_available_height = history_bounds.first_available_height();
-    let next_height = next_backfill_height(coverage, first_available_height)?;
+    let transaction_count = batch
+        .contexts
+        .iter()
+        .map(|block| block.transactions.len())
+        .sum();
+    let next_coverage = ConventionalFeeDistributionBackfillCoverage::new(
+        coverage.map_or(batch.first_available_height, |coverage| {
+            coverage.complete_from_height
+        }),
+        batch.through_height,
+        coverage.map_or(batch.first_block_time_unix_seconds, |coverage| {
+            coverage.complete_from_time_unix_seconds
+        }),
+        batch.last_block_time_unix_seconds,
+    );
+    let _write_guard = materialized_view_write_guard();
+    ConventionalFeeDistributionConsumer::new()
+        .write_backfill_batch(
+            &context.materialized_view_store,
+            &batch.contexts,
+            next_coverage,
+        )
+        .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
+
+    Ok(BackfillProgress::Advanced {
+        from_height: batch.from_height,
+        through_height: batch.through_height,
+        transaction_count,
+    })
+}
+
+/// Outcome of resolving the next settled range to backfill.
+enum BackfillBatch {
+    CaughtUp,
+    Ready(HydratedBackfillBatch),
+}
+
+/// One hydrated settled range plus the coverage inputs it advances.
+struct HydratedBackfillBatch {
+    from_height: BlockHeight,
+    through_height: BlockHeight,
+    first_available_height: BlockHeight,
+    first_block_time_unix_seconds: i64,
+    last_block_time_unix_seconds: i64,
+    contexts: Vec<BlockCommitContext>,
+}
+
+/// Hydrates the next settled range while holding the canonical read lock.
+///
+/// The lock is released before the materialized-view write so a long batch
+/// write never blocks the tailer from advancing the shared secondary.
+fn read_next_backfill_batch(
+    config: ConventionalFeeDistributionBackfillConfig,
+    context: &ConventionalFeeDistributionBackfillContext,
+    coverage: Option<ConventionalFeeDistributionBackfillCoverage>,
+) -> Result<BackfillBatch, IngestError> {
+    let canonical = context.canonical.read();
+    let chain_epoch = canonical.chain_epoch()?;
+    let first_available_height = canonical.history_bounds().first_available_height();
+    let from_height = next_backfill_height(coverage, first_available_height)?;
     let Some(target_height) = historical_backfill_target(
         chain_epoch.settled_tip_height,
         ConventionalFeeDistributionConsumer::tail_coverage(&context.materialized_view_store)?,
     ) else {
-        return Ok(BackfillProgress::CaughtUp {
-            through_height: coverage.map(|coverage| coverage.complete_through_height),
-        });
+        return Ok(BackfillBatch::CaughtUp);
     };
-    if next_height > target_height {
-        return Ok(BackfillProgress::CaughtUp {
-            through_height: coverage.map(|coverage| coverage.complete_through_height),
-        });
+    if from_height > target_height {
+        return Ok(BackfillBatch::CaughtUp);
     }
-
-    let batch_end = BlockHeight::new(
-        next_height
+    let through_height = BlockHeight::new(
+        from_height
             .value()
             .saturating_add(config.batch_blocks.get().saturating_sub(1))
             .min(target_height.value()),
     );
-    let contexts = read_canonical_context_batch(&context.chain_store, next_height, batch_end)?;
-    let transaction_count = contexts.iter().map(|block| block.transactions.len()).sum();
-    let first_block_time = contexts
+    let contexts = read_canonical_context_batch(
+        &canonical,
+        &context.activations,
+        BlockHeightRange::inclusive(from_height, through_height),
+    )?;
+    drop(canonical);
+    let empty_batch = || {
+        IngestError::MaterializedViewDispatch(
+            "conventional-fee distribution backfill hydrated an empty batch".to_owned(),
+        )
+    };
+    let first_block_time_unix_seconds = contexts
         .first()
-        .ok_or_else(|| {
-            IngestError::MaterializedViewDispatch(
-                "conventional-fee distribution backfill hydrated an empty batch".to_owned(),
-            )
-        })?
+        .ok_or_else(empty_batch)?
         .block_time_unix_seconds;
-    let last_block_time = contexts
+    let last_block_time_unix_seconds = contexts
         .last()
-        .ok_or_else(|| {
-            IngestError::MaterializedViewDispatch(
-                "conventional-fee distribution backfill hydrated an empty batch".to_owned(),
-            )
-        })?
+        .ok_or_else(empty_batch)?
         .block_time_unix_seconds;
-    let next_coverage = ConventionalFeeDistributionBackfillCoverage::new(
-        coverage.map_or(first_available_height, |coverage| {
-            coverage.complete_from_height
-        }),
-        batch_end,
-        coverage.map_or(first_block_time, |coverage| {
-            coverage.complete_from_time_unix_seconds
-        }),
-        last_block_time,
-    );
-    let _write_guard = materialized_view_write_guard();
-    ConventionalFeeDistributionConsumer::new()
-        .write_backfill_batch(&context.materialized_view_store, &contexts, next_coverage)
-        .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
-
-    Ok(BackfillProgress::Advanced {
-        from_height: next_height,
-        through_height: batch_end,
-        transaction_count,
-    })
+    Ok(BackfillBatch::Ready(HydratedBackfillBatch {
+        from_height,
+        through_height,
+        first_available_height,
+        first_block_time_unix_seconds,
+        last_block_time_unix_seconds,
+        contexts,
+    }))
 }
 
 fn historical_backfill_target(
@@ -317,13 +370,6 @@ fn next_backfill_height(
             "conventional-fee distribution backfill height overflow".to_owned(),
         )
     })
-}
-
-async fn sleep_or_cancel(duration: Duration, cancel: &CancellationToken) -> bool {
-    tokio::select! {
-        () = cancel.cancelled() => true,
-        () = tokio::time::sleep(duration) => false,
-    }
 }
 
 #[cfg(test)]
@@ -384,12 +430,5 @@ mod tests {
             historical_backfill_target(BlockHeight::new(99), Some(tail)),
             Some(BlockHeight::new(99))
         );
-    }
-
-    #[tokio::test]
-    async fn cancellation_interrupts_backfill_wait() {
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        assert!(sleep_or_cancel(Duration::from_mins(1), &cancel).await);
     }
 }

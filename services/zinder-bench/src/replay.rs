@@ -16,19 +16,12 @@ use zinder_ingest::{
     BulkCatchupRunConfig, CanonicalPipelineLimits, RawBlobPolicy,
     bench_support::{
         BENCH_MAX_RESPONSE_BYTES, BenchBulkCatchupParams, bench_bulk_catchup_run_config,
-        bench_materialized_view_config,
     },
-    bootstrap_transparent_address_ranking, catch_up_materialized_view_store_to_canonical,
-    open_primary_materialized_view_store_for_canonical_with_materialized_view_preset,
     run_bulk_catchup_with_store,
 };
-use zinder_materialized_views::{
-    MaterializedViewPreset, MaterializedViewStore, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
-};
 use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, CURRENT_STORE_SCHEMA_VERSION, ChainEventStreamFamily,
-    ChainStoreOptions, EventStreamStartPosition, PrimaryChainStore, RocksDbResourceBudget,
-    StreamCursorTokenV1,
+    CURRENT_ARTIFACT_SCHEMA_VERSION, CURRENT_STORE_SCHEMA_VERSION, ChainStoreOptions,
+    PrimaryChainStore, RocksDbResourceBudget,
 };
 
 use crate::{
@@ -70,12 +63,6 @@ pub struct ReplayConfig {
     pub source_segment_delay_millis: u64,
     /// Optional canonical block-cache override in bytes (the cache-size knob).
     pub canonical_block_cache_bytes: Option<u64>,
-    /// Materialized-view preset to replay after canonical ingest, or `None` for a
-    /// canonical-only run.
-    pub materialized_view_preset: Option<MaterializedViewPreset>,
-    /// Portion of canonical event history presented to the selected
-    /// materialized views.
-    pub materialized_view_replay_scope: MaterializedViewReplayScope,
     /// Source revision of the measured binary, when known.
     pub software_revision: Option<String>,
     /// Campaign trial identity, paired with `fixture_cache_policy` when supplied.
@@ -141,11 +128,6 @@ impl ReplayConfig {
         let Some(_thresholds) = self.canonical_fixture_replay_thresholds else {
             return Ok(());
         };
-        if self.materialized_view_preset.is_some() {
-            return Err(BenchError::invalid_argument(
-                "canonical fixture replay thresholds require a canonical-only run without --materialized-view-preset",
-            ));
-        }
         require_nonblank_provenance(self.software_revision.as_deref(), "--software-revision")?;
         require_nonblank_provenance(self.runner_id.as_deref(), "--runner-id")?;
         require_nonblank_provenance(self.image_reference.as_deref(), "--image-reference")?;
@@ -178,39 +160,6 @@ fn require_nonblank_provenance(candidate: Option<&str>, flag: &str) -> Result<()
     Ok(())
 }
 
-/// Canonical event-history scope used for a materialized-view benchmark arm.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum MaterializedViewReplayScope {
-    /// Seed fresh materialized-view cursors at the cloned store tip, then measure only
-    /// events produced by the captured range.
-    #[default]
-    FixedRange,
-    /// Start fresh materialized views without cursors and rebuild all retained
-    /// canonical event history.
-    RetainedHistory,
-}
-
-impl MaterializedViewReplayScope {
-    /// Stable report spelling for this benchmark scope.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::FixedRange => "fixed-range",
-            Self::RetainedHistory => "retained-history",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct MaterializedViewMeasurements {
-    wall_clock_seconds: Option<f64>,
-    row_count: Option<u64>,
-    event_cursor_at_tip: Option<bool>,
-    store_bytes: Option<u64>,
-    reopen_seconds: Option<f64>,
-    logical_write_bytes: Option<u64>,
-}
-
 #[derive(Clone, Debug)]
 struct CanonicalReplayMeasurements {
     wall_clock_seconds: f64,
@@ -220,7 +169,6 @@ struct CanonicalReplayMeasurements {
 
 struct ReplayRunMeasurements {
     canonical: CanonicalReplayMeasurements,
-    materialized_view: MaterializedViewMeasurements,
     pipeline_limits: CanonicalPipelineLimits,
     completed_at_unix_millis: u64,
 }
@@ -288,8 +236,6 @@ pub async fn replay_fixture(
         manifest.from_height,
         &starting_canonical_state,
     )?;
-    let materialized_view_replay_start_cursor = prepare_materialized_view_replay(&config, &store)?;
-
     let run_config = benchmark_run_config(
         &config,
         &manifest,
@@ -311,27 +257,16 @@ pub async fn replay_fixture(
             .as_ref()
             .map(|chain_epoch| hex::encode(chain_epoch.visible_tip_hash.as_bytes())),
     };
-    let materialized_view_store =
-        open_materialized_view_store(&config, materialized_view_replay_start_cursor.as_ref())?;
-
-    let materialized_view_measurements = measure_materialized_view_replay(
-        &config.store_path,
-        &store,
-        config.materialized_view_preset,
-        materialized_view_store,
-    )
-    .await?;
     let run_completed_at_unix_millis = UnixTimestampMillis::now().value();
     let exposition = metrics_handle.map(|handle| handle.render());
     let fixture = FixtureSummary::try_from(&manifest)?;
     let run = ReplayRunMeasurements {
         canonical: canonical_measurements,
-        materialized_view: materialized_view_measurements,
         pipeline_limits: run_config.pipeline_limits,
         completed_at_unix_millis: run_completed_at_unix_millis,
     };
     let measurements =
-        assemble_replay_measurements(&config, canonical_options, starting_canonical_state, run)?;
+        assemble_replay_measurements(&config, canonical_options, starting_canonical_state, run);
     Ok(build_canonical_store_range_replay_report(
         fixture,
         &measurements,
@@ -436,14 +371,13 @@ fn assemble_replay_measurements(
     canonical_options: ChainStoreOptions,
     starting_canonical_state: StartingCanonicalState,
     run: ReplayRunMeasurements,
-) -> Result<CanonicalStoreRangeReplayMeasurements, BenchError> {
+) -> CanonicalStoreRangeReplayMeasurements {
     let ReplayRunMeasurements {
         canonical,
-        materialized_view,
         pipeline_limits,
         completed_at_unix_millis,
     } = run;
-    Ok(CanonicalStoreRangeReplayMeasurements {
+    CanonicalStoreRangeReplayMeasurements {
         block_prepare_concurrency: pipeline_limits.block_prepare_concurrency.get(),
         max_response_bytes: pipeline_limits.max_response_bytes.get(),
         source_segment_max_blocks: pipeline_limits.source_segment_max_blocks.get(),
@@ -459,24 +393,12 @@ fn assemble_replay_measurements(
             .get(),
         source_segment_delay_millis: config.source_segment_delay_millis,
         canonical_writer: canonical_writer_settings(canonical_options),
-        materialized_view_preset: config
-            .materialized_view_preset
-            .map(MaterializedViewPreset::as_str),
-        materialized_view_replay_scope: config
-            .materialized_view_preset
-            .map(|_| config.materialized_view_replay_scope.as_str()),
         wall_clock_seconds: canonical.wall_clock_seconds,
         starting_canonical_state,
         tip_height_after: canonical.tip_height_after,
         tip_hash_after_hex: canonical.tip_hash_after_hex,
-        materialized_view_build_wall_clock_seconds: materialized_view.wall_clock_seconds,
-        materialized_view_row_count: materialized_view.row_count,
-        materialized_view_event_cursor_at_tip: materialized_view.event_cursor_at_tip,
-        materialized_view_store_bytes: materialized_view.store_bytes,
-        materialized_view_store_reopen_seconds: materialized_view.reopen_seconds,
-        materialized_view_logical_write_bytes: materialized_view.logical_write_bytes,
         peak_rss: peak_rss(),
-        storage_candidate: storage_candidate_identity(config.materialized_view_preset)?,
+        storage_candidate: StorageCandidateIdentity::rocksdb_canonical_store_range_replay(),
         software_revision: config.software_revision.clone(),
         trial_id: config.trial_id.clone(),
         fixture_cache_policy: config.fixture_cache_policy,
@@ -488,7 +410,7 @@ fn assemble_replay_measurements(
         storage_class: config.storage_class.clone(),
         image_reference: config.image_reference.clone(),
         canonical_fixture_replay_thresholds: config.canonical_fixture_replay_thresholds,
-    })
+    }
 }
 
 fn validate_acceptance_starting_state(
@@ -512,20 +434,6 @@ fn validate_acceptance_starting_state(
         )));
     }
     Ok(())
-}
-
-fn storage_candidate_identity(
-    materialized_view_preset: Option<MaterializedViewPreset>,
-) -> Result<StorageCandidateIdentity, BenchError> {
-    match materialized_view_preset {
-        None => Ok(StorageCandidateIdentity::rocksdb_canonical_store_range_replay()),
-        Some(MaterializedViewPreset::Wallet | MaterializedViewPreset::Explorer) => {
-            Ok(StorageCandidateIdentity::rocksdb_canonical_store_range_replay_with_diagnostic_materialized_view())
-        }
-        Some(_) => Err(BenchError::invalid_argument(
-            "unsupported materialized-view preset for benchmark candidate identity",
-        )),
-    }
 }
 
 fn read_starting_checkpoint_manifest(
@@ -680,184 +588,6 @@ fn canonical_writer_settings(
     }
 }
 
-fn prepare_materialized_view_replay(
-    config: &ReplayConfig,
-    canonical_store: &PrimaryChainStore,
-) -> Result<Option<StreamCursorTokenV1>, BenchError> {
-    if config.materialized_view_preset.is_none() {
-        return Ok(None);
-    }
-    let materialized_view_store_path =
-        MaterializedViewStore::path_for_canonical(&config.store_path);
-    if materialized_view_store_path.exists() {
-        return Err(BenchError::invalid_argument(format!(
-            "materialized-view replay requires a fresh materialized-view store, but {} already exists; create the throwaway canonical clone without its materialized-views subdirectory",
-            materialized_view_store_path.display()
-        )));
-    }
-    if config.materialized_view_replay_scope == MaterializedViewReplayScope::RetainedHistory {
-        return Ok(None);
-    }
-    canonical_store
-        .resolve_chain_event_stream_start(
-            &EventStreamStartPosition::LiveTail,
-            ChainEventStreamFamily::Visible,
-        )
-        .map(|position| position.cursor)
-        .map_err(BenchError::from)
-}
-
-fn open_materialized_view_store(
-    config: &ReplayConfig,
-    fixed_range_start_cursor: Option<&StreamCursorTokenV1>,
-) -> Result<Option<MaterializedViewStore>, BenchError> {
-    let Some(materialized_view_preset) = config.materialized_view_preset else {
-        return Ok(None);
-    };
-    let materialized_view_store =
-        open_primary_materialized_view_store_for_canonical_with_materialized_view_preset(
-            &config.store_path,
-            RocksDbResourceBudget::materialized_view_writer_defaults(),
-            materialized_view_preset,
-        )?;
-    if config.materialized_view_replay_scope == MaterializedViewReplayScope::FixedRange {
-        seed_materialized_view_consumers(&materialized_view_store, fixed_range_start_cursor)?;
-    }
-    Ok(Some(materialized_view_store))
-}
-
-async fn measure_materialized_view_replay(
-    store_path: &Path,
-    canonical_store: &PrimaryChainStore,
-    materialized_view_preset: Option<MaterializedViewPreset>,
-    materialized_view_store: Option<MaterializedViewStore>,
-) -> Result<MaterializedViewMeasurements, BenchError> {
-    let (Some(materialized_view_preset), Some(materialized_view_store)) =
-        (materialized_view_preset, materialized_view_store)
-    else {
-        return Ok(MaterializedViewMeasurements::default());
-    };
-    let materialized_view_build_started_at = Instant::now();
-    let logical_write_bytes_before = materialized_view_store.logical_write_bytes();
-    catch_up_materialized_view_store_to_canonical(
-        canonical_store,
-        &materialized_view_store,
-        bench_materialized_view_config(),
-    )
-    .await?;
-    if materialized_view_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME) {
-        let _ = bootstrap_transparent_address_ranking(canonical_store, &materialized_view_store)
-            .await?;
-    }
-    let wall_clock_seconds = materialized_view_build_started_at.elapsed().as_secs_f64();
-    let logical_write_bytes = materialized_view_store
-        .logical_write_bytes()
-        .saturating_sub(logical_write_bytes_before);
-    materialized_view_store.refresh_rocksdb_resource_metrics();
-    let row_count =
-        materialized_view_row_count(&materialized_view_store, materialized_view_preset)?;
-    let materialized_view_store_path = MaterializedViewStore::path_for_canonical(store_path);
-    let store_bytes = directory_bytes(&materialized_view_store_path)?;
-    drop(materialized_view_store);
-
-    let reopen_started_at = Instant::now();
-    let reopened =
-        open_primary_materialized_view_store_for_canonical_with_materialized_view_preset(
-            store_path,
-            RocksDbResourceBudget::materialized_view_writer_defaults(),
-            materialized_view_preset,
-        )?;
-    let reopen_seconds = reopen_started_at.elapsed().as_secs_f64();
-    validate_materialized_view_reached_canonical_tip(canonical_store, &reopened)?;
-    drop(reopened);
-
-    Ok(MaterializedViewMeasurements {
-        wall_clock_seconds: Some(wall_clock_seconds),
-        row_count: Some(row_count),
-        event_cursor_at_tip: Some(true),
-        store_bytes: Some(store_bytes),
-        reopen_seconds: Some(reopen_seconds),
-        logical_write_bytes: Some(logical_write_bytes),
-    })
-}
-
-fn validate_materialized_view_reached_canonical_tip(
-    canonical_store: &PrimaryChainStore,
-    materialized_view_store: &MaterializedViewStore,
-) -> Result<(), BenchError> {
-    let expected_cursor = canonical_store
-        .resolve_chain_event_stream_start(
-            &EventStreamStartPosition::LiveTail,
-            ChainEventStreamFamily::Visible,
-        )?
-        .cursor;
-    let consumer_names = materialized_view_store
-        .chain_event_consumer_names()
-        .chain(materialized_view_store.event_only_chain_event_consumer_names());
-    for consumer_name in consumer_names {
-        let consumer_cursor = materialized_view_store.get_chain_event_cursor(consumer_name)?;
-        let cursor_matches = match (&expected_cursor, &consumer_cursor) {
-            (None, None) => true,
-            (Some(expected), Some(actual)) => expected.as_bytes() == actual,
-            _ => false,
-        };
-        if !cursor_matches {
-            return Err(BenchError::materialized_view_build_incomplete(format!(
-                "materialized view {} did not reach the canonical event tip",
-                consumer_name.as_str()
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Seeds every selected materialized-view consumer at the canonical store's current
-/// event cursor so a fixed-range benchmark excludes earlier retained history.
-///
-/// The materialized-view store must be fresh. Production recovery must never call this
-/// helper because it intentionally declares earlier history out of scope.
-pub fn seed_materialized_view_replay_at_canonical_tip(
-    canonical_store: &PrimaryChainStore,
-    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
-) -> Result<Option<StreamCursorTokenV1>, BenchError> {
-    let cursor = canonical_store
-        .resolve_chain_event_stream_start(
-            &EventStreamStartPosition::LiveTail,
-            ChainEventStreamFamily::Visible,
-        )?
-        .cursor;
-    seed_materialized_view_consumers(materialized_view_store, cursor.as_ref())?;
-    Ok(cursor)
-}
-
-fn seed_materialized_view_consumers(
-    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
-    cursor: Option<&StreamCursorTokenV1>,
-) -> Result<(), BenchError> {
-    let consumer_names = materialized_view_store
-        .chain_event_consumer_names()
-        .filter(|name| *name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
-        .chain(materialized_view_store.event_only_chain_event_consumer_names())
-        .collect::<Vec<_>>();
-    for consumer_name in &consumer_names {
-        if materialized_view_store
-            .get_chain_event_cursor(*consumer_name)?
-            .is_some()
-        {
-            return Err(BenchError::invalid_argument(
-                "fixed-range materialized-view replay requires a fresh materialized-view store",
-            ));
-        }
-    }
-
-    if let Some(cursor) = cursor {
-        for consumer_name in consumer_names {
-            materialized_view_store.put_chain_event_cursor(consumer_name, cursor.as_bytes())?;
-        }
-    }
-    Ok(())
-}
-
 fn validate_starting_tip(
     fixture_from_height: u32,
     starting_tip_height: Option<u32>,
@@ -872,38 +602,6 @@ fn validate_starting_tip(
             "fixture starts at height {fixture_from_height}, but the cloned store tip is {starting_tip_height:?}"
         )))
     }
-}
-
-fn materialized_view_row_count(
-    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
-    materialized_view_preset: MaterializedViewPreset,
-) -> Result<u64, BenchError> {
-    let mut row_count = 0_u64;
-    for schema in materialized_view_preset.consumer_schemas() {
-        for column_family in schema.column_families {
-            row_count = row_count
-                .saturating_add(materialized_view_store.consumer_row_count(column_family)?);
-        }
-    }
-    Ok(row_count)
-}
-
-fn directory_bytes(path: &Path) -> Result<u64, BenchError> {
-    let entries = std::fs::read_dir(path).map_err(|source| BenchError::io(path, source))?;
-    let mut bytes = 0_u64;
-    for entry in entries {
-        let entry = entry.map_err(|source| BenchError::io(path, source))?;
-        let entry_path = entry.path();
-        let metadata = entry
-            .metadata()
-            .map_err(|source| BenchError::io(&entry_path, source))?;
-        bytes = if metadata.is_dir() {
-            bytes.saturating_add(directory_bytes(&entry_path)?)
-        } else {
-            bytes.saturating_add(metadata.len())
-        };
-    }
-    Ok(bytes)
 }
 
 #[cfg(test)]

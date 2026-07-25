@@ -15,22 +15,11 @@ use zinder_bench::{
         SubtreeRootSet, write_segment,
     },
     recorder::install_recorder,
-    replay::{
-        MaterializedViewReplayScope, ReplayConfig, replay_fixture,
-        seed_materialized_view_replay_at_canonical_tip,
-    },
+    replay::{ReplayConfig, replay_fixture},
     report::{AcceptanceThresholds, StartingCanonicalStateKind},
 };
 use zinder_core::{BlockHeight, Network, wire::encode_zinder_native_chain_name};
-use zinder_ingest::open_primary_materialized_view_store_for_canonical_with_materialized_view_preset;
-use zinder_materialized_views::{
-    MaterializedViewPreset, TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TransparentAddressRankingConsumer,
-};
 use zinder_source::SourceBlock;
-use zinder_store::{
-    ChainEventStreamFamily, EventStreamStartPosition, PrimaryChainStore, RocksDbResourceBudget,
-};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 const REGTEST_BLOCK_1: &str =
@@ -100,11 +89,7 @@ fn write_regtest_fixture_from_json(fixture_json: &str) -> Result<TempDir> {
     Ok(fixture_directory)
 }
 
-fn replay_config(
-    fixture_directory: &TempDir,
-    store_directory: &TempDir,
-    materialized_view_preset: Option<MaterializedViewPreset>,
-) -> Result<ReplayConfig> {
+fn replay_config(fixture_directory: &TempDir, store_directory: &TempDir) -> Result<ReplayConfig> {
     Ok(ReplayConfig {
         fixture_directory: fixture_directory.path().to_path_buf(),
         store_path: store_directory.path().join("canonical"),
@@ -117,8 +102,6 @@ fn replay_config(
         block_prepare_memory_watermark_bytes: None,
         source_segment_delay_millis: 0,
         canonical_block_cache_bytes: None,
-        materialized_view_preset,
-        materialized_view_replay_scope: MaterializedViewReplayScope::FixedRange,
         software_revision: Some("test-revision".to_owned()),
         trial_id: None,
         fixture_cache_policy: None,
@@ -136,7 +119,7 @@ fn replay_config(
 async fn replay_reports_source_admission_and_delay_settings() -> Result<()> {
     let fixture_directory = write_regtest_fixture()?;
     let store_directory = tempdir()?;
-    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    let mut config = replay_config(&fixture_directory, &store_directory)?;
     config.max_response_bytes = NonZeroU64::new(67_108_864);
     config.source_segment_max_blocks = NonZeroU32::new(64);
     config.source_segment_target_response_bytes = NonZeroU64::new(33_554_432);
@@ -167,7 +150,7 @@ async fn replay_reports_source_admission_and_delay_settings() -> Result<()> {
 async fn replay_resolves_pipeline_watermarks_from_the_resource_envelope() -> Result<()> {
     let fixture_directory = write_regtest_fixture()?;
     let store_directory = tempdir()?;
-    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    let mut config = replay_config(&fixture_directory, &store_directory)?;
     config.cpu_limit_cores = Some(10.0);
     config.memory_limit_bytes = Some(10 * 1024 * 1024 * 1024);
     config.max_response_bytes = NonZeroU64::new(64 * 1024 * 1024);
@@ -192,7 +175,7 @@ async fn replay_resolves_pipeline_watermarks_from_the_resource_envelope() -> Res
 async fn replay_rejects_source_segment_target_above_response_limit() -> Result<()> {
     let fixture_directory = write_regtest_fixture()?;
     let store_directory = tempdir()?;
-    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    let mut config = replay_config(&fixture_directory, &store_directory)?;
     config.max_response_bytes = NonZeroU64::new(64 * 1024 * 1024);
     config.source_segment_target_response_bytes = NonZeroU64::new(128 * 1024 * 1024);
 
@@ -227,141 +210,11 @@ fn write_starting_checkpoint_manifest(
     Ok(())
 }
 
-fn assert_materialized_view_report(
-    report: &zinder_bench::report::CanonicalStoreRangeReplayReport,
-    materialized_view_preset: &'static str,
-) {
-    assert_eq!(report.fixture.workload_density.block_count, 1);
-    assert_eq!(report.fixture.workload_density.transaction_count, 1);
-    assert_eq!(report.replay.tip_height_after, Some(1));
-    assert_eq!(report.replay.starting_canonical_state.tip_height, None);
-    assert_eq!(
-        report.replay.starting_canonical_state.tip_hash_rpc_hex,
-        None
-    );
-    assert_eq!(report.replay.starting_canonical_state.chain_epoch_id, None);
-    assert_eq!(
-        report
-            .replay
-            .starting_canonical_state
-            .artifact_schema_version,
-        None
-    );
-    assert_eq!(
-        report
-            .replay
-            .starting_canonical_state
-            .checkpoint_manifest_sha256,
-        None
-    );
-    assert_eq!(report.replay.blocks_committed, 1);
-    assert_materialized_view_replay_measurements(report, materialized_view_preset);
-    assert_eq!(report.fixture.digest_sha256.len(), 64);
-    assert!(
-        report
-            .replay
-            .canonical_writer
-            .rocksdb_resource_budget
-            .block_cache_bytes
-            > 0
-    );
-    assert_eq!(report.storage_candidate.canonical_engine, "rocksdb");
-    assert_eq!(report.storage_candidate.topology, "rocksdb-single-host");
-    assert_eq!(
-        report.provenance.software_revision.as_deref(),
-        Some("test-revision")
-    );
-    assert_eq!(report.provenance.runner.id.as_deref(), Some("test-runner"));
-    assert_eq!(
-        report.acceptance.canonical_fixture_replay.scope,
-        "fixture-range"
-    );
-}
-
-fn assert_materialized_view_replay_measurements(
-    report: &zinder_bench::report::CanonicalStoreRangeReplayReport,
-    materialized_view_preset: &'static str,
-) {
-    assert_eq!(
-        report.replay.materialized_view_preset,
-        Some(materialized_view_preset)
-    );
-    assert_eq!(
-        report.replay.materialized_view_replay_scope,
-        Some("fixed-range")
-    );
-    assert!(
-        report
-            .replay
-            .materialized_view_build_wall_clock_seconds
-            .is_some()
-    );
-    assert!(
-        report
-            .replay
-            .materialized_view_logical_write_bytes
-            .is_some_and(|bytes| bytes > 0)
-    );
-    assert!(report.replay.materialized_view_row_count.is_some());
-    assert_eq!(
-        report.replay.materialized_view_event_cursor_at_tip,
-        Some(true)
-    );
-    assert!(
-        report
-            .replay
-            .materialized_view_store_bytes
-            .is_some_and(|bytes| bytes > 0)
-    );
-    assert!(
-        report
-            .replay
-            .materialized_view_store_reopen_seconds
-            .is_some()
-    );
-}
-
-fn assert_no_target_wallet_acceptance_claim(
-    report: &zinder_bench::report::CanonicalStoreRangeReplayReport,
-) -> Result<()> {
-    let report = serde_json::to_value(report)?;
-    assert!(report.get("lifecycle").is_none());
-    assert!(report["acceptance"].get("wallet_build").is_none());
-    assert!(report["acceptance"].get("wallet_build_lifecycle").is_none());
-    assert!(report["acceptance"].get("wallet_ready").is_none());
-    Ok(())
-}
-
-fn assert_materialized_view_at_canonical_tip(
-    canonical_store: &PrimaryChainStore,
-    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
-) -> Result<()> {
-    let expected_cursor = canonical_store
-        .resolve_chain_event_stream_start(
-            &EventStreamStartPosition::LiveTail,
-            ChainEventStreamFamily::Visible,
-        )?
-        .cursor
-        .ok_or_else(|| eyre!("committed fixture must expose a canonical event cursor"))?;
-    for consumer_name in materialized_view_store
-        .chain_event_consumer_names()
-        .chain(materialized_view_store.event_only_chain_event_consumer_names())
-    {
-        assert_eq!(
-            materialized_view_store.get_chain_event_cursor(consumer_name)?,
-            Some(expected_cursor.as_bytes().to_vec()),
-            "materialized view {} must reach the canonical event tip",
-            consumer_name.as_str()
-        );
-    }
-    Ok(())
-}
-
 #[test]
 fn thresholded_config_requires_immutable_structured_provenance_and_telemetry() -> Result<()> {
     let fixture_directory = write_regtest_fixture()?;
     let store_directory = tempdir()?;
-    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    let mut config = replay_config(&fixture_directory, &store_directory)?;
     config.canonical_fixture_replay_thresholds = Some(
         AcceptanceThresholds::try_from_seconds(10.0, 20.0)
             .map_err(|error| eyre!(error.to_string()))?,
@@ -376,203 +229,7 @@ fn thresholded_config_requires_immutable_structured_provenance_and_telemetry() -
     config.cpu_limit_cores = None;
     assert!(config.validate(true).is_err());
     config.cpu_limit_cores = Some(2.0);
-    config.materialized_view_preset = Some(MaterializedViewPreset::Wallet);
-    assert!(config.validate(true).is_err());
-    config.materialized_view_preset = None;
     config.validate(true)?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn current_materialized_view_presets_report_diagnostics_not_wallet_acceptance() -> Result<()>
-{
-    let fixture_directory = write_regtest_fixture()?;
-    let wallet_store_directory = tempdir()?;
-    let wallet_report = replay_fixture(
-        replay_config(
-            &fixture_directory,
-            &wallet_store_directory,
-            Some(MaterializedViewPreset::Wallet),
-        )?,
-        None,
-    )
-    .await?;
-    assert_materialized_view_report(&wallet_report, "wallet");
-    assert_eq!(
-        wallet_report
-            .storage_candidate
-            .diagnostic_materialized_view_engine,
-        Some("rocksdb")
-    );
-    assert_no_target_wallet_acceptance_claim(&wallet_report)?;
-
-    let explorer_store_directory = tempdir()?;
-    let explorer_report = replay_fixture(
-        replay_config(
-            &fixture_directory,
-            &explorer_store_directory,
-            Some(MaterializedViewPreset::Explorer),
-        )?,
-        None,
-    )
-    .await?;
-    assert_materialized_view_report(&explorer_report, "explorer");
-    assert_eq!(
-        explorer_report
-            .storage_candidate
-            .diagnostic_materialized_view_engine,
-        Some("rocksdb")
-    );
-    assert_no_target_wallet_acceptance_claim(&explorer_report)?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explorer_replay_bootstraps_ranking_while_wallet_remains_ranking_free() -> Result<()> {
-    let fixture_directory = write_regtest_fixture()?;
-    let explorer_store_directory = tempdir()?;
-    replay_fixture(
-        replay_config(
-            &fixture_directory,
-            &explorer_store_directory,
-            Some(MaterializedViewPreset::Explorer),
-        )?,
-        None,
-    )
-    .await?;
-
-    let explorer_store_path = explorer_store_directory.path().join("canonical");
-    let explorer_store =
-        open_primary_materialized_view_store_for_canonical_with_materialized_view_preset(
-            &explorer_store_path,
-            RocksDbResourceBudget::materialized_view_writer_defaults(),
-            MaterializedViewPreset::Explorer,
-        )?;
-    let explorer_canonical_store = PrimaryChainStore::open(
-        &explorer_store_path,
-        zinder_store::ChainStoreOptions::for_network(Network::ZcashRegtest),
-    )?;
-    assert_materialized_view_at_canonical_tip(&explorer_canonical_store, &explorer_store)?;
-    let active = TransparentAddressRankingConsumer::active_metadata(&explorer_store)?
-        .ok_or_else(|| eyre!("explorer replay must activate a ranking generation"))?;
-    assert!(active.generation > 0);
-    assert_eq!(
-        active.coverage.balance_complete_through_height,
-        BlockHeight::new(1)
-    );
-    assert!(TransparentAddressRankingConsumer::build_metadata(&explorer_store)?.is_none());
-    let ranking_cursor = explorer_store
-        .get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
-        .ok_or_else(|| eyre!("explorer replay must commit the ranking cursor"))?;
-    assert_eq!(
-        Some(ranking_cursor),
-        explorer_store.get_chain_event_cursor(TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME)?
-    );
-    drop(explorer_store);
-
-    let wallet_store_directory = tempdir()?;
-    replay_fixture(
-        replay_config(
-            &fixture_directory,
-            &wallet_store_directory,
-            Some(MaterializedViewPreset::Wallet),
-        )?,
-        None,
-    )
-    .await?;
-
-    let wallet_store_path = wallet_store_directory.path().join("canonical");
-    let wallet_store =
-        open_primary_materialized_view_store_for_canonical_with_materialized_view_preset(
-            &wallet_store_path,
-            RocksDbResourceBudget::materialized_view_writer_defaults(),
-            MaterializedViewPreset::Wallet,
-        )?;
-    let wallet_canonical_store = PrimaryChainStore::open(
-        &wallet_store_path,
-        zinder_store::ChainStoreOptions::for_network(Network::ZcashRegtest),
-    )?;
-    assert_materialized_view_at_canonical_tip(&wallet_canonical_store, &wallet_store)?;
-    assert!(!wallet_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME));
-    assert_eq!(
-        wallet_store.get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?,
-        None
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fixed_range_seeds_selected_consumers_at_the_starting_tip() -> Result<()> {
-    let fixture_directory = write_regtest_fixture()?;
-    let store_directory = tempdir()?;
-    let range_store_path = store_directory.path().join("canonical");
-    let canonical_report = replay_fixture(
-        replay_config(&fixture_directory, &store_directory, None)?,
-        None,
-    )
-    .await?;
-    assert_eq!(canonical_report.replay.tip_height_after, Some(1));
-
-    let canonical_store = zinder_store::PrimaryChainStore::open(
-        &range_store_path,
-        zinder_store::ChainStoreOptions::for_network(Network::ZcashRegtest),
-    )?;
-    let materialized_view_store =
-        zinder_materialized_views::MaterializedViewStore::open_with_materialized_view_preset(
-            zinder_materialized_views::MaterializedViewStore::path_for_canonical(&range_store_path),
-            MaterializedViewPreset::Explorer,
-            zinder_materialized_views::MaterializedViewStoreOptions {
-                sync_writes: false,
-                consumers: MaterializedViewPreset::Explorer.consumer_schemas(),
-                rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-            },
-        )?;
-    let seeded_cursor =
-        seed_materialized_view_replay_at_canonical_tip(&canonical_store, &materialized_view_store)?
-            .ok_or_else(|| eyre!("committed canonical history must have a cursor"))?;
-    for consumer_name in materialized_view_store.chain_event_consumer_names() {
-        let cursor = materialized_view_store.get_chain_event_cursor(consumer_name)?;
-        if consumer_name == TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME {
-            assert_eq!(cursor, None);
-        } else {
-            assert_eq!(cursor, Some(seeded_cursor.as_bytes().to_vec()));
-        }
-    }
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn materialized_view_replay_rejects_a_preexisting_materialized_view_store() -> Result<()> {
-    let fixture_directory = write_regtest_fixture()?;
-    let store_directory = tempdir()?;
-    let config = replay_config(
-        &fixture_directory,
-        &store_directory,
-        Some(MaterializedViewPreset::Wallet),
-    )?;
-    std::fs::create_dir_all(&config.store_path)?;
-    let materialized_view_store =
-        zinder_materialized_views::MaterializedViewStore::open_with_materialized_view_preset(
-            zinder_materialized_views::MaterializedViewStore::path_for_canonical(
-                &config.store_path,
-            ),
-            MaterializedViewPreset::Wallet,
-            zinder_materialized_views::MaterializedViewStoreOptions {
-                sync_writes: false,
-                consumers: MaterializedViewPreset::Wallet.consumer_schemas(),
-                rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-            },
-        )?;
-    drop(materialized_view_store);
-
-    let Some(error) = replay_fixture(config, None).await.err() else {
-        return Err(eyre!(
-            "materialized-view replay must reject a populated starting materialized-view path"
-        ));
-    };
-    assert!(error.to_string().contains("fresh materialized-view store"));
     Ok(())
 }
 
@@ -580,7 +237,7 @@ async fn materialized_view_replay_rejects_a_preexisting_materialized_view_store(
 async fn thresholded_genesis_replay_accepts_a_proven_empty_start_without_manifest() -> Result<()> {
     let fixture_directory = write_regtest_fixture()?;
     let store_directory = tempdir()?;
-    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    let mut config = replay_config(&fixture_directory, &store_directory)?;
     config.canonical_fixture_replay_thresholds = Some(
         AcceptanceThresholds::try_from_seconds(10.0, 20.0)
             .map_err(|error| eyre!(error.to_string()))?,
@@ -622,7 +279,7 @@ async fn thresholded_genesis_replay_accepts_a_proven_empty_start_without_manifes
 async fn thresholded_non_genesis_replay_requires_a_checkpoint_manifest() -> Result<()> {
     let fixture_directory = write_non_genesis_manifest_fixture()?;
     let store_directory = tempdir()?;
-    let mut config = replay_config(&fixture_directory, &store_directory, None)?;
+    let mut config = replay_config(&fixture_directory, &store_directory)?;
     config.canonical_fixture_replay_thresholds = Some(
         AcceptanceThresholds::try_from_seconds(10.0, 20.0)
             .map_err(|error| eyre!(error.to_string()))?,
@@ -644,7 +301,7 @@ async fn thresholded_non_genesis_replay_requires_a_checkpoint_manifest() -> Resu
 async fn replay_rejects_checkpoint_manifest_position_that_disagrees_with_store() -> Result<()> {
     let fixture_directory = write_regtest_fixture()?;
     let store_directory = tempdir()?;
-    let config = replay_config(&fixture_directory, &store_directory, None)?;
+    let config = replay_config(&fixture_directory, &store_directory)?;
     write_starting_checkpoint_manifest(
         &config.store_path,
         &serde_json::json!({

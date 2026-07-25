@@ -56,6 +56,50 @@ fn print_config_validates_and_redacts_basic_auth() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn print_config_resolves_the_materialized_view_writer_budget() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("materialized-view-budget-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("[storage.materialized_views.rocksdb]"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("block_cache_bytes = 268435456"), "{stdout}");
+
+    Ok(())
+}
+
+#[test]
+fn print_config_applies_materialized_view_budget_overrides() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("materialized-view-override-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let config = format!(
+        "{}\n[storage.materialized_views.rocksdb]\nmax_open_files = 96\n",
+        ingest_config_toml(&storage_path)?
+    );
+    fs::write(&config_path, config)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("max_open_files = 96"), "{stdout}");
+
+    Ok(())
+}
+
+#[test]
 fn print_config_accepts_zebra_cookie_auth() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("cookie-auth-store");

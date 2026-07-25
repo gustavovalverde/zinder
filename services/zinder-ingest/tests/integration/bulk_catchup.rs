@@ -5,7 +5,6 @@
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
-    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -20,13 +19,8 @@ use zinder_core::{
     CommitmentTreeFrontiers, Network, ShieldedProtocol, SubtreeRootIndex,
 };
 use zinder_ingest::{
-    BulkCatchupRunConfig, CanonicalPipelineLimits, MaterializedViewReplayConfig,
-    MaterializedViewReplayPolicy, NodeSourceKind, catch_up_materialized_view_store_to_canonical,
-    run_bulk_catchup, run_bulk_catchup_until_complete,
-};
-use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, MaterializedViewPreset,
-    MaterializedViewStoreError, decode_stored_record,
+    BulkCatchupRunConfig, CanonicalPipelineLimits, NodeSourceKind, run_bulk_catchup,
+    run_bulk_catchup_until_complete,
 };
 use zinder_query::{ArtifactKey, QueryError, WalletQuery, WalletQueryApi};
 use zinder_runtime::{Readiness, ReadinessCause};
@@ -53,19 +47,6 @@ fn test_pipeline_limits() -> CanonicalPipelineLimits {
         block_prepare_memory_watermark_bytes: NonZeroU64::new(128 * 1024 * 1024)
             .unwrap_or(NonZeroU64::MIN),
     }
-}
-
-fn bundled_materialized_view_store(
-    storage_path: &Path,
-) -> Result<zinder_materialized_views::MaterializedViewStore> {
-    Ok(zinder_materialized_views::MaterializedViewStore::open(
-        zinder_materialized_views::MaterializedViewStore::path_for_canonical(storage_path),
-        zinder_materialized_views::MaterializedViewStoreOptions {
-            sync_writes: false,
-            consumers: zinder_materialized_views::MaterializedViewStore::bundled_consumers(),
-            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-        },
-    )?)
 }
 
 fn empty_checkpoint(block_id: BlockId) -> CommitmentTreeCheckpoint {
@@ -183,194 +164,6 @@ async fn bulk_catchup_bootstraps_empty_store_from_checkpoint() -> Result<()> {
     assert_eq!(tree_state.height, source_block.height);
     assert_eq!(tree_state.block_hash, source_block.hash);
 
-    Ok(())
-}
-
-#[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "scenario covers checkpoint bootstrap, run_bulk_catchup, materialized-view replay, and materialized-view assertions end to end"
-)]
-async fn materialized_view_replay_catches_up_checkpoint_bootstrap_and_block_commit() -> Result<()> {
-    let source_block = fixture_source_block()?;
-    let checkpoint_height = BlockHeight::new(source_block.height.value().saturating_sub(1));
-    let checkpoint = empty_checkpoint(BlockId::new(checkpoint_height, source_block.parent_hash));
-    let source = FixtureCheckpointSource {
-        block: source_block.clone(),
-        tip_height: BlockHeight::new(source_block.height.value().saturating_add(200)),
-        fetched_heights: Arc::new(Mutex::new(Vec::new())),
-        pending_retryable_fetch_failures: Arc::new(Mutex::new(0)),
-    };
-
-    let tempdir = tempdir()?;
-    let storage_path = tempdir
-        .path()
-        .join("materialized-view replay-catchup-store");
-    let bulk_catchup_config = BulkCatchupRunConfig {
-        node: NodeTarget::new(
-            Network::ZcashTestnet,
-            "http://127.0.0.1:39232".to_owned(),
-            NodeAuth::None,
-            Duration::from_secs(30),
-            DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
-        ),
-        node_source: NodeSourceKind::ZebraJsonRpc,
-        canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-        storage_path: storage_path.clone(),
-        reorg_window_blocks: 100,
-        raw_blob_policy: zinder_ingest::RawBlobPolicy::All,
-        network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
-        from_height: source_block.height,
-        to_height: source_block.height,
-        canonical_batch_max_blocks: NonZeroU32::new(1)
-            .ok_or_else(|| eyre!("invalid batch size"))?,
-        canonical_batch_max_artifact_bytes: NonZeroU64::new(512 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid batch artifact bytes"))?,
-        canonical_batch_max_estimated_write_bytes: NonZeroU64::new(
-            zinder_ingest::DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
-        )
-        .ok_or_else(|| eyre!("invalid estimated write bytes"))?,
-        canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32::new(
-            zinder_ingest::DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
-        )
-        .ok_or_else(|| eyre!("invalid estimated write close floor"))?,
-        pipeline_limits: test_pipeline_limits(),
-        commit_reassembly_max_queued_artifact_bytes: NonZeroU64::new(128 * 1024 * 1024)
-            .ok_or_else(|| eyre!("invalid commit reassembly bytes"))?,
-        flush_interval_epochs: NonZeroU32::new(5).ok_or_else(|| eyre!("invalid flush cadence"))?,
-        upstream_tip_hint: None,
-        allow_reorg_window_settlement: false,
-        checkpoint: Some(checkpoint),
-    };
-    let store =
-        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
-    let readiness = Readiness::default();
-
-    run_bulk_catchup_until_complete(&bulk_catchup_config, &source, &store, &readiness)
-        .await?
-        .ok_or_else(|| eyre!("expected bulk catchup to commit"))?;
-
-    let replay = store
-        .current_chain_epoch_reader()?
-        .current_transparent_spend_replay_at_height(source_block.height)?
-        .ok_or_else(|| eyre!("checkpoint block did not persist its transparent input set"))?;
-    assert_eq!(replay.block_hash, source_block.hash);
-    assert!(!replay.input_outpoints.is_empty());
-    assert!(
-        replay.spend_facts.is_empty(),
-        "parents older than the checkpoint must remain explicitly unresolved"
-    );
-
-    let materialized_view_store = bundled_materialized_view_store(&storage_path)?;
-    let materialized_view_config = MaterializedViewReplayConfig {
-        replay_batch_blocks: NonZeroU32::new(1)
-            .ok_or_else(|| eyre!("invalid replay batch blocks"))?,
-        replay_policy: MaterializedViewReplayPolicy::DEFAULT,
-        memory_budget_bytes: None,
-        memory_degrade_ratio: 0.85,
-        memory_pause_ratio: 0.95,
-        memory_resume_ratio: 0.75,
-        min_replay_batch_blocks: NonZeroU32::new(1)
-            .ok_or_else(|| eyre!("invalid minimum replay batch blocks"))?,
-        startup_handoff_lag_blocks: 1_000,
-    };
-    catch_up_materialized_view_store_to_canonical(
-        &store,
-        &materialized_view_store,
-        materialized_view_config,
-    )
-    .await?;
-
-    assert_chain_event_cursors_advanced(&materialized_view_store)?;
-    assert_block_summary_materialized(&materialized_view_store, source_block.height)?;
-    assert_paid_fee_live_tail_seeded(&materialized_view_store, source_block.height)?;
-
-    let wallet_materialized_view_store =
-        zinder_materialized_views::MaterializedViewStore::open_with_materialized_view_preset(
-            storage_path.join("wallet-materialized-views"),
-            MaterializedViewPreset::Wallet,
-            zinder_materialized_views::MaterializedViewStoreOptions {
-                rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-                ..zinder_materialized_views::MaterializedViewStoreOptions::default()
-            },
-        )?;
-    catch_up_materialized_view_store_to_canonical(
-        &store,
-        &wallet_materialized_view_store,
-        materialized_view_config,
-    )
-    .await?;
-    for schema in MaterializedViewPreset::Wallet.consumer_schemas() {
-        assert!(
-            wallet_materialized_view_store
-                .get_chain_event_cursor(schema.name)?
-                .is_some(),
-            "wallet projection {} must advance through retained canonical events",
-            schema.name.as_str()
-        );
-    }
-    assert!(matches!(
-        wallet_materialized_view_store.consumer_column_family(BLOCK_SUMMARY_COLUMN_FAMILY),
-        Err(MaterializedViewStoreError::ConsumerColumnFamilyMissing { name })
-            if name == BLOCK_SUMMARY_COLUMN_FAMILY
-    ));
-
-    Ok(())
-}
-
-fn assert_paid_fee_live_tail_seeded(
-    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
-    block_height: BlockHeight,
-) -> Result<()> {
-    let tail = zinder_materialized_views::PaidFeeDistributionConsumer::tail_coverage(
-        materialized_view_store,
-    )?
-    .ok_or_else(|| eyre!("materialized-view replay did not seed the paid-fee live tail"))?;
-    assert_eq!(tail.boundary_height, block_height);
-    assert_eq!(tail.complete_through_height, Some(block_height));
-    Ok(())
-}
-
-fn assert_chain_event_cursors_advanced(
-    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
-) -> Result<()> {
-    for consumer_name in
-        zinder_materialized_views::MaterializedViewStore::bundled_chain_event_consumer_names()
-    {
-        if *consumer_name == zinder_materialized_views::TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME {
-            assert!(
-                materialized_view_store
-                    .get_chain_event_cursor(*consumer_name)?
-                    .is_none(),
-                "snapshot-owned ranking must not adopt a cursor before bootstrap activation"
-            );
-            continue;
-        }
-        assert!(
-            materialized_view_store
-                .get_chain_event_cursor(*consumer_name)?
-                .is_some(),
-            "materialized-view replay must advance {consumer_name:?} through the retained canonical events"
-        );
-    }
-    Ok(())
-}
-
-fn assert_block_summary_materialized(
-    materialized_view_store: &zinder_materialized_views::MaterializedViewStore,
-    block_height: BlockHeight,
-) -> Result<()> {
-    let record_bytes = materialized_view_store
-        .get_consumer(
-            BLOCK_SUMMARY_COLUMN_FAMILY,
-            &BlockSummaryConsumer::key_for_height(block_height),
-        )?
-        .ok_or_else(|| eyre!("materialized-view replay did not materialize the block summary"))?;
-    let block_summary_record = decode_stored_record(&record_bytes)?;
-    let summary = block_summary_record
-        .summary
-        .ok_or_else(|| eyre!("block summary record did not carry a summary"))?;
-    assert_eq!(summary.block_height, block_height.value());
     Ok(())
 }
 

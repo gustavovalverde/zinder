@@ -121,12 +121,9 @@ systemctl start zinder
 This stopped-store copy is a benchmark fixture, not a production recovery
 artifact. Production recovery remains blocked until the canonical writer and
 wallet projector can publish and verify one coherent, schema-admitted checkpoint
-bundle. Materialized-view benchmarks require a fresh materialized-view store for both
-fixed-range and retained-history construction. The
-harness rejects a pre-existing materialized view path instead of silently timing an
-incremental catch-up. The clone's canonical tip must equal `from_height - 1`.
-Replay writes into the clone, so use one throwaway copy per run (or per
-configuration in a sweep).
+bundle. The clone's canonical tip must equal `from_height - 1`. Replay writes
+into the clone, so use one throwaway copy per run (or per configuration in a
+sweep).
 
 Threshold-bearing non-genesis ranges require a benchmark-only
 `zinder-benchmark-starting-store.json` beside the cloned canonical store. The
@@ -187,15 +184,6 @@ identical runs (each against a fresh store clone):
   segment response, which makes transport-latency A/B runs repeatable without
   changing the captured bytes.
 - `--block-cache-bytes <N>` for the canonical block-cache-size sweep.
-- `--materialized-view-preset wallet|explorer` to drive one explicit materialized view
-  diagnostic over the committed range. Neither preset builds ADR-0035's wallet
-  plane: they do not own its live set, balances, address index, undo state, or
-  readiness contract. `explorer` also does not drive materialized view-startup
-  historical backfills or the coverage verifier. Neither preset can produce a
-  wallet construction or wallet-ready acceptance result.
-- `--materialized view-replay-scope fixed-range|retained-history` to compare only the
-  captured range (the default) or a full rebuild from retained canonical event
-  history. Fixed-range replay requires a fresh materialized-view store in the clone.
 
 The source-planner controls exercise the source lane shared by production bulk
 catchup and canonical construction. This command
@@ -245,9 +233,7 @@ with the paired flags:
 - `--canonical-fixture-replay-target-secs`;
 - `--canonical-fixture-replay-hard-limit-secs`.
 
-The target must be positive and no greater than the hard limit. Thresholded
-canonical fixture replay is canonical-only and rejects `--materialized-view-preset`,
-which keeps materialized view caches and work outside the accepted measurement. The
+The target must be positive and no greater than the hard limit. The
 report validates final height, fixture-order tip hash, committed block count,
 and required telemetry before evaluating time. Production snapshot restore,
 canonical-replay-storage canonical construction, materialized view construction, following, and
@@ -476,22 +462,6 @@ component diagnostics in the external resource artifacts.
 - `replay.canonical_writer`: actual canonical store/artifact schema versions,
   sync-write and WAL/fsync durability mode, and the complete effective RocksDB
   resource budget, including the default cache size when no override is given.
-- `replay.materialized_view_preset`: the materialized-view workload replayed after canonical
-  ingest, or `null` for a canonical-only run.
-- `replay.materialized_view_replay_scope`: whether the materialized view arm measured only
-  the fixed range or rebuilt all retained history.
-- `replay.materialized_view_row_count`, `replay.materialized_view_store_bytes`: selected
-  materialized view rows and final materialized-view store disk use.
-- `replay.materialized_view_logical_write_bytes`,
-  `replay.materialized_view_compaction_bytes`: serialized materialized-view WriteBatch bytes
-  and compaction I/O for the run. Logical write bytes are not WAL bytes;
-  compaction bytes are `null` when both required RocksDB ticker families were
-  not covered.
-- `replay.materialized_view_event_cursor_at_tip`: `true` only after every selected
-  cursor in the reopened materialized-view store equals canonical `LiveTail`.
-- `replay.materialized_view_build_wall_clock_seconds`,
-  `replay.materialized_view_store_reopen_seconds`: materialized view construction and
-  populated-store reopen time.
 - `replay.epochs_committed`: committed chain epochs, or `null` when its metric
   family was not covered.
 - `replay.commit_fallback_reads`: commit-fallback read calls, or `null` without

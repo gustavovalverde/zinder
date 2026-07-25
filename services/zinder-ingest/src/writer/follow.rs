@@ -1086,7 +1086,26 @@ fn set_follow_readiness(
         store.event_fence().visible_tip(),
         mempool_ready_gate,
     );
-    readiness.set(state.with_phase(IngestPhase::FollowingTip));
+    publish_follow_readiness(readiness, state.with_phase(IngestPhase::FollowingTip));
+}
+
+/// Publishes one follow observation without clearing an orthogonal warning.
+///
+/// The materialized-view tailer owns [`ReadinessCause::CursorAtRisk`], which
+/// still permits traffic. A lag-derived `Ready` advances the observed heights
+/// underneath it instead of replacing it.
+fn publish_follow_readiness(readiness: &Readiness, state: ReadinessState) {
+    readiness.update(|current_state| {
+        let warning_owns_cause = matches!(state.cause, ReadinessCause::Ready)
+            && matches!(current_state.cause, ReadinessCause::CursorAtRisk { .. });
+        if warning_owns_cause {
+            current_state.current_height = state.current_height;
+            current_state.target_height = state.target_height;
+            current_state.phase = state.phase;
+            return;
+        }
+        *current_state = state;
+    });
 }
 
 fn gate_canonical_readiness_on_mempool_hydration(
@@ -1157,11 +1176,54 @@ mod tests {
 
     use super::{
         await_follow_preparation_or_mempool_change, gate_canonical_readiness_on_mempool_hydration,
-        live_subtree_root_ranges, next_settled_height, wait_for_mempool_hydration_change,
-        withdraw_follow_readiness_for_mempool_hydration,
+        live_subtree_root_ranges, next_settled_height, publish_follow_readiness,
+        wait_for_mempool_hydration_change, withdraw_follow_readiness_for_mempool_hydration,
     };
     use crate::mempool_ready_channel;
     use zinder_runtime::{IngestPhase, Readiness, ReadinessCause, ReadinessState};
+
+    #[test]
+    fn ready_follow_observation_keeps_an_active_cursor_at_risk_warning() {
+        let readiness = Readiness::default();
+        readiness.set(ReadinessState::cursor_at_risk(25, 168, Some(90)));
+
+        publish_follow_readiness(
+            &readiness,
+            ReadinessState::ready_with_target(Some(100), Some(100))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+
+        let report = readiness.report();
+        assert!(matches!(
+            report.cause,
+            ReadinessCause::CursorAtRisk {
+                oldest_retained_age_hours: 25,
+                retention_hours: 168,
+            }
+        ));
+        assert_eq!(report.current_height, Some(100));
+        assert_eq!(report.target_height, Some(100));
+        assert_eq!(report.phase, Some(IngestPhase::FollowingTip));
+    }
+
+    #[test]
+    fn lagging_follow_observation_replaces_a_cursor_at_risk_warning() {
+        let readiness = Readiness::default();
+        readiness.set(ReadinessState::cursor_at_risk(25, 168, Some(90)));
+
+        publish_follow_readiness(
+            &readiness,
+            ReadinessState::syncing(Some(10), Some(90), Some(100))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::Syncing {
+                lag_blocks: Some(10)
+            }
+        ));
+    }
 
     fn block_id(height: u32, hash_tag: u8) -> BlockId {
         BlockId::new(
