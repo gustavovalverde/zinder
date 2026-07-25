@@ -8,7 +8,7 @@ each serve process-owned immutable readers admitted at one exact fence.
 
 | Boundary | Owns | Must not own |
 | --- | --- | --- |
-| `zinder-ingest` | Zebra chain and mempool sources, canonical construction and following, reorg authority, canonical events, canonical leases, checkpoint coordination, live mempool state | Wallet rows, wallet-store promotion, or public wallet traffic |
+| `zinder-ingest` | Zebra chain and mempool sources, canonical construction and following, reorg authority, canonical events, canonical leases, checkpoint coordination, live mempool state, materialized-view construction and following | Wallet rows, wallet-store promotion, or public wallet traffic |
 | `zinder-projector` | Wallet construction, projection build leases, continuous canonical-event following, wallet reorg reconciliation, wallet-store primary | Canonical writes, chain selection, public wallet traffic, or compatibility translation |
 | `zinder-query` | Canonical and wallet secondary generations, wallet-serving admission, native `WalletQuery` gRPC, transaction broadcast, and sparse tree-state fill | Either primary store, projection construction, compatibility translation, or mixed-generation responses |
 | `zinder-compat-lightwalletd` | Canonical and wallet secondary generations, wallet-serving admission, `CompactTxStreamer` translation, transaction broadcast, sparse tree-state fill | Either primary store, projection construction, or mixed-generation responses |
@@ -44,8 +44,9 @@ Source-node access is capability-specific:
 
 ## Storage ownership
 
-`zinder-ingest` opens canonical RocksDB as primary. `zinder-projector` opens a
-canonical secondary and wallet RocksDB as primary.
+`zinder-ingest` opens canonical RocksDB as primary, plus one in-process
+canonical secondary and the materialized-view store as primary.
+`zinder-projector` opens a canonical secondary and wallet RocksDB as primary.
 `zinder-query` and `zinder-compat-lightwalletd` each open generation-specific
 secondaries for both stores. Canonical and wallet paths are siblings, and every
 secondary generation has its own process-specific metadata path.

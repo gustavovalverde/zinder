@@ -242,6 +242,18 @@ pub fn resolve_canonical_reader_rocksdb_budget(
     resolve_rocksdb_resource_budget(section, defaults, "storage.canonical.rocksdb")
 }
 
+/// Merges materialized-view role overrides onto
+/// [`RocksDbResourceBudget::materialized_view_writer_defaults`].
+pub fn resolve_materialized_view_writer_rocksdb_budget(
+    section: RocksDbResourceBudgetSection,
+) -> Result<RocksDbResourceBudget, ConfigError> {
+    resolve_rocksdb_resource_budget(
+        section,
+        RocksDbResourceBudget::materialized_view_writer_defaults(),
+        "storage.materialized_views.rocksdb",
+    )
+}
+
 /// Merges materialized-view role overrides onto [`RocksDbResourceBudget::materialized_view_reader_defaults`].
 pub fn resolve_materialized_view_reader_rocksdb_budget(
     section: RocksDbResourceBudgetSection,
@@ -651,6 +663,35 @@ mod tests {
         assert_eq!(
             resolved.memtable_budget_bytes,
             static_defaults.memtable_budget_bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn materialized_view_writer_budget_resolution_falls_through_to_writer_defaults()
+    -> Result<(), ConfigError> {
+        let resolved = resolve_materialized_view_writer_rocksdb_budget(
+            RocksDbResourceBudgetSection::default(),
+        )?;
+        assert_eq!(
+            resolved,
+            RocksDbResourceBudget::materialized_view_writer_defaults()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn materialized_view_writer_budget_resolution_applies_overrides() -> Result<(), ConfigError> {
+        let resolved =
+            resolve_materialized_view_writer_rocksdb_budget(RocksDbResourceBudgetSection {
+                block_cache_bytes: Some(96 * 1024 * 1024),
+                ..RocksDbResourceBudgetSection::default()
+            })?;
+        let defaults = RocksDbResourceBudget::materialized_view_writer_defaults();
+        assert_eq!(resolved.block_cache_bytes, 96 * 1024 * 1024);
+        assert_eq!(
+            resolved.memtable_budget_bytes,
+            defaults.memtable_budget_bytes
         );
         Ok(())
     }

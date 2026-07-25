@@ -16,11 +16,21 @@ Those crates do not depend on `zinder-materialized-views`.
 
 ## Deployment status
 
-The materialized-view and explorer services compile in the workspace but are
-not part of the four-runtime release composition. The checked release topology
-does not start `zinder-explorer` or expose its native query service. The SDK's
-public Rust surface is a current code contract; it does not imply release-image
-or deployment support.
+`zinder-ingest` builds the materialized views. It opens one in-process
+canonical secondary at `<storage.path>.materialized-view-secondary`, hydrates
+block contexts from canonical replay rows, and writes the view store nested
+under the canonical path. The writer handle never serves these reads, so the
+canonical writer's cross-block read counters stay at zero.
+
+`zinder-explorer` reads those views as a RocksDB secondary. It is not part of
+the release composition: the checked release topology does not start it or
+expose its native query service. An operator who wants the explorer query
+surface runs it separately against the same storage path.
+
+A store built with `ingest.run_overrides.checkpoint_height` does not host
+materialized views. Cumulative address views resolve spends against the
+producing block, so a store whose first available height is above block 1
+would silently under-report. The tailer refuses such a store instead.
 
 ## Ownership
 
