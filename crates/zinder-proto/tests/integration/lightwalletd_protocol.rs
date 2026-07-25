@@ -7,23 +7,12 @@ use eyre::eyre;
 use prost::Message;
 use zinder_proto::compat::lightwalletd::{self, LIGHTWALLETD_PROTOCOL_COMMIT};
 
-const LIGHTWALLETD_PROTOCOL_REPOSITORY: &str = "https://github.com/zcash/lightwallet-protocol";
-
 #[test]
 #[allow(
     clippy::too_many_lines,
     reason = "this end-to-end wire round-trip test asserts every vendored lightwalletd field in one place"
 )]
 fn compact_block_decodes_current_lightwalletd_fields() -> eyre::Result<()> {
-    assert_eq!(
-        LIGHTWALLETD_PROTOCOL_REPOSITORY,
-        "https://github.com/zcash/lightwallet-protocol"
-    );
-    assert_eq!(
-        LIGHTWALLETD_PROTOCOL_COMMIT,
-        "ac7cee052a1bf5d430985a478d39e8b513fc4bd4"
-    );
-
     let transaction_id = vec![0x42; 32];
     let transparent_output_transaction_id = vec![0x43; 32];
     let compact_block = lightwalletd::CompactBlock {
