@@ -14,9 +14,6 @@
 //!   commits a [`ChainFixture`] before handing the store to tests.
 //! - [`WalletServingStoreFixture`] builds the production canonical and wallet
 //!   stores, then opens immutable secondaries at one admitted serving fence.
-//! - [`MockNodeSource`] implements [`zinder_source::NodeSource`]
-//!   against a [`ChainFixture`]. It supports tip mutation, error injection,
-//!   and configurable capabilities.
 //! - [`MockTransactionBroadcaster`] implements
 //!   [`zinder_source::TransactionBroadcaster`] with configurable per-call
 //!   outcomes and a recording mode that captures calls for later inspection.
@@ -46,7 +43,6 @@ pub mod live;
 pub mod log_capture;
 pub mod materialized_view_fixture;
 pub mod mock_mempool_source;
-pub mod mock_node_source;
 pub mod mock_transaction_broadcaster;
 pub mod network_upgrade_fixtures;
 pub mod store_fixture;
@@ -65,12 +61,11 @@ pub use json_rpc_test_server::{
 pub use log_capture::{CapturedEvent, LogCapture};
 pub use materialized_view_fixture::{
     MaterializedViewFixtureError, open_test_materialized_view_store_for_canonical,
-    seed_transparent_address_transaction_history, seed_transparent_outpoint_spends,
+    seed_transparent_outpoint_spends,
 };
 pub use mock_mempool_source::{
     MockMempoolSource, MockMempoolSourceClosed, MockMempoolSourceControl,
 };
-pub use mock_node_source::{MockNodeSource, NodeFailureScript};
 pub use mock_transaction_broadcaster::MockTransactionBroadcaster;
 pub use network_upgrade_fixtures::{
     local_network_from_activations, sample_regtest_upgrade_activations,
