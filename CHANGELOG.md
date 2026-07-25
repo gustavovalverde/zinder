@@ -41,9 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accept the compatibility image's declared native query dependency in release SBOM evidence. ([#41](https://github.com/gustavovalverde/zinder/pull/41))
 - Verify release archives and stable image promotion with compatible attestation identity selectors. ([#43](https://github.com/gustavovalverde/zinder/pull/43))
 - Check out the validated release commit before preparing draft GitHub Release assets. ([#45](https://github.com/gustavovalverde/zinder/pull/45))
+- Bind GitHub Release publication to the validated repository when the publication job runs without a checkout. ([#47](https://github.com/gustavovalverde/zinder/pull/47))
 
 
-## [0.5.0-rc.7] - 2026-07-24
+## [0.5.0-rc.8] - 2026-07-25
 
 ### Added
 
@@ -76,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accept the compatibility image's declared native query dependency in release SBOM evidence. ([#41](https://github.com/gustavovalverde/zinder/pull/41))
 - Verify release archives and stable image promotion with compatible attestation identity selectors. ([#43](https://github.com/gustavovalverde/zinder/pull/43))
 - Check out the validated release commit before preparing draft GitHub Release assets. ([#45](https://github.com/gustavovalverde/zinder/pull/45))
+- Bind GitHub Release publication to the validated repository when the publication job runs without a checkout. ([#47](https://github.com/gustavovalverde/zinder/pull/47))
 
 
 ## [0.4.0] - 2026-07-11
