@@ -266,36 +266,6 @@ pub fn split_unspent_outputs_stream(
     Ok((header, items))
 }
 
-/// Splits a `TransparentAddressTxIdsInRange` stream into the single leading
-/// `ChainView` header and the payload items that follow it.
-///
-/// Asserts the structural stream-header contract: the first message is the
-/// header, every later message is an item, and no second header appears.
-pub fn split_tx_ids_stream(
-    chunks: Vec<wallet::TransparentAddressTxIdsChunk>,
-) -> eyre::Result<(wallet::ChainView, Vec<wallet::TransparentAddressTxId>)> {
-    let mut header: Option<wallet::ChainView> = None;
-    let mut items = Vec::new();
-    for chunk in chunks {
-        match chunk
-            .body
-            .ok_or_else(|| eyre::eyre!("chunk carries no body"))?
-        {
-            wallet::transparent_address_tx_ids_chunk::Body::Header(chain_view) => {
-                assert!(header.is_none(), "stream sent more than one header");
-                assert!(items.is_empty(), "header must precede every item");
-                header = Some(chain_view);
-            }
-            wallet::transparent_address_tx_ids_chunk::Body::Item(entry) => {
-                assert!(header.is_some(), "item arrived before the header");
-                items.push(entry);
-            }
-        }
-    }
-    let header = header.ok_or_else(|| eyre::eyre!("stream emits exactly one header"))?;
-    Ok((header, items))
-}
-
 /// Builds a block hash whose 32 bytes repeat `seed` as four big-endian u32 chunks.
 #[must_use]
 pub fn block_hash_from_seed(seed: u32) -> BlockHash {

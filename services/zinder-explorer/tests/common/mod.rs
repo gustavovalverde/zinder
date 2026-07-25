@@ -147,58 +147,6 @@ pub(crate) async fn fetch_live_network_upgrade_activations(
     ))
 }
 
-/// Calls Zebra's regtest-only `generate` JSON-RPC to mine `block_count` empty
-/// blocks. Returns the list of newly mined block hashes.
-///
-/// Mirrors the helper in `services/zinder-ingest/tests/common/mod.rs` so the
-/// materialized-view mempool overlay live test can drive deterministic chain-tip
-/// changes without depending on a wallet-side broadcast cycle. Errors on
-/// non-regtest networks because Zebra rejects `generate` outside regtest.
-pub(crate) async fn regtest_generate_blocks(
-    env: &LiveTestEnv,
-    block_count: u32,
-) -> Result<Vec<String>> {
-    let body =
-        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"generate","params":[{block_count}]}}"#);
-    let output = tokio::process::Command::new("curl")
-        .arg("-s")
-        .args(["-X", "POST"])
-        .args(["-H", "content-type: application/json"])
-        .arg("-d")
-        .arg(&body)
-        .arg(env.target.json_rpc_addr.as_str())
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(eyre::eyre!(
-            "regtest generate({block_count}) curl exited with status {:?}: stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let body = String::from_utf8(output.stdout)?;
-    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
-        eyre::eyre!("regtest generate response is not JSON: {error}; body={body}")
-    })?;
-    if let Some(error_field) = parsed.get("error")
-        && !error_field.is_null()
-    {
-        return Err(eyre::eyre!(
-            "regtest generate({block_count}) RPC returned error: {error_field}"
-        ));
-    }
-    let result_field = parsed.get("result").ok_or_else(|| {
-        eyre::eyre!("regtest generate response missing result field; body={body}")
-    })?;
-    let block_hashes: Vec<String> =
-        serde_json::from_value(result_field.clone()).map_err(|error| {
-            eyre::eyre!(
-                "regtest generate result is not a list of block hashes: {error}; body={body}"
-            )
-        })?;
-    Ok(block_hashes)
-}
-
 type TestChainEventStream =
     Pin<Box<dyn Stream<Item = Result<wallet::ChainEventEnvelope, Status>> + Send>>;
 type TestMempoolEventStream =
