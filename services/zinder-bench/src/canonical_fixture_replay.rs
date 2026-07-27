@@ -233,6 +233,8 @@ pub struct CanonicalFixtureRocksDbReplayConfig {
     pub pipeline_limits: CanonicalPipelineLimits,
     /// Explicit bounded `RocksDB` writer and cold-reopen budget.
     pub resource_budget: RocksDbResourceBudget,
+    /// Immutable raw consensus-blob retention selected for this fresh store.
+    pub raw_blob_retention: RawBlobRetention,
     /// Retained shallow-reorg depth used to select the baseline settled tip.
     pub supported_reorg_depth: u32,
     /// Optional fixed delay applied once per outer fixture segment response.
@@ -455,7 +457,7 @@ fn admit_canonical_fixture_replay(
         &activations,
         history_predecessor,
         manifest.tip_id()?,
-        RawBlobRetention::Transactions,
+        config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.supported_reorg_depth)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
@@ -544,7 +546,7 @@ fn certify_reopened_canonical_fixture(
         &config.canonical_store_path,
         expected.activations,
         CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.supported_reorg_depth)?,
         config.resource_budget,
     )?;

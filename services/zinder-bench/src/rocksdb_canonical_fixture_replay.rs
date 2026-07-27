@@ -32,7 +32,7 @@ use zinder_source::{
     NodeAuth, ZebraIndexerBlockSource, ZebraIndexerBlockSourceOptions, ZebraIndexerSourceTarget,
     ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
-use zinder_store::{CanonicalStoreReadyEvidence, RocksDbResourceBudget};
+use zinder_store::{CanonicalStoreReadyEvidence, RawBlobRetention, RocksDbResourceBudget};
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
@@ -167,6 +167,7 @@ pub(crate) async fn run_rocksdb_canonical_fixture_replay(
         request_timeout: validated.request_timeout,
         pipeline_limits: validated.pipeline_limits,
         resource_budget,
+        raw_blob_retention: RawBlobRetention::Transactions,
         supported_reorg_depth: validated.supported_reorg_depth,
         source_segment_delay: validated.source_segment_delay,
     };

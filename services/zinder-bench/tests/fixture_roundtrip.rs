@@ -3,7 +3,9 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{fs::OpenOptions, io::Write, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    fs::OpenOptions, io::Write, num::NonZeroU32, process::Command, sync::Arc, time::Duration,
+};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
@@ -300,6 +302,7 @@ fn canonical_fixture_rocksdb_replay_config(
         request_timeout: construction.request_timeout,
         pipeline_limits: construction.pipeline_limits,
         resource_budget: RocksDbResourceBudget::for_local_tests(),
+        raw_blob_retention: RawBlobRetention::Transactions,
         supported_reorg_depth: 1,
         source_segment_delay: Duration::ZERO,
     }
@@ -400,6 +403,76 @@ fn assert_no_materialized_view_store(canonical_store_path: &std::path::Path) {
         !zinder_materialized_views::MaterializedViewStore::path_for_canonical(canonical_store_path)
             .exists(),
         "canonical fixture replay must not create a materialized-view store"
+    );
+}
+
+fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &FixtureManifest) {
+    assert_eq!(
+        report["contract_identity"],
+        "rocksdb-raw-blob-retention-comparison"
+    );
+    assert_eq!(report["report_format_version"], 1);
+    assert_eq!(
+        report["arm_execution_order"],
+        serde_json::json!(["transactions", "all"])
+    );
+    assert_eq!(report["transactions"]["raw_blob_retention"], "transactions");
+    assert_eq!(report["all"]["raw_blob_retention"], "all");
+    assert_eq!(
+        report["transactions"]["fixture_manifest_digest_sha256"],
+        report["all"]["fixture_manifest_digest_sha256"]
+    );
+    assert_eq!(
+        report["transactions"]["replay_plan_digest_sha256"],
+        report["all"]["replay_plan_digest_sha256"]
+    );
+    assert_eq!(
+        report["transactions"]["effective_limits"],
+        report["all"]["effective_limits"]
+    );
+    assert_eq!(
+        report["transactions"]["logical_replay_identity"],
+        report["all"]["logical_replay_identity"]
+    );
+    assert_eq!(
+        report["transactions"]["raw_blob_counts"]["transaction_blob_count"],
+        report["all"]["raw_blob_counts"]["transaction_blob_count"]
+    );
+    assert_eq!(
+        report["transactions"]["raw_blob_counts"]["block_blob_count"],
+        0
+    );
+    assert_eq!(
+        report["all"]["raw_blob_counts"]["block_blob_count"],
+        fixture.block_count
+    );
+    assert_eq!(
+        report["transactions"]["secondary_ready_matches_reopened_primary"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        report["all"]["secondary_ready_matches_reopened_primary"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        report["transactions"]["authenticated_replay_lifecycle_seconds"]
+            .as_f64()
+            .is_some_and(|seconds| seconds > 0.0)
+    );
+    assert!(
+        report["all"]["authenticated_replay_lifecycle_seconds"]
+            .as_f64()
+            .is_some_and(|seconds| seconds > 0.0)
+    );
+    assert!(
+        report["transactions"]["authenticated_replay_lifecycle_blocks_per_second"]
+            .as_f64()
+            .is_some_and(|blocks_per_second| blocks_per_second > 0.0)
+    );
+    assert!(
+        report["all"]["authenticated_replay_lifecycle_blocks_per_second"]
+            .as_f64()
+            .is_some_and(|blocks_per_second| blocks_per_second > 0.0)
     );
 }
 
@@ -563,6 +636,61 @@ async fn canonical_fixture_rocksdb_replay_publishes_and_cold_reopens_ready() -> 
     assert_canonical_fixture_load_evidence(&outcome, &fixture, &predecessor, &fixed_tip);
     assert_canonical_fixture_ready_evidence(&outcome, &fixture, &fixed_tip)?;
     assert_no_materialized_view_store(&canonical_store_path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_secondaries() -> Result<()>
+{
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (checkpoint_source, _, _) = fixture_construction_checkpoint_source(&fixture)?;
+    capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+    let output_directory = tempdir()?;
+    let transactions_canonical = output_directory.path().join("transactions-canonical");
+    let transactions_secondary = output_directory.path().join("transactions-secondary");
+    let all_canonical = output_directory.path().join("all-canonical");
+    let all_secondary = output_directory.path().join("all-secondary");
+    let report_path = output_directory.path().join("comparison.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+        .arg("rocksdb-raw-blob-retention-comparison")
+        .arg("--fixture")
+        .arg(fixture.directory.path())
+        .arg("--transactions-canonical-store")
+        .arg(&transactions_canonical)
+        .arg("--transactions-secondary-root")
+        .arg(&transactions_secondary)
+        .arg("--all-canonical-store")
+        .arg(&all_canonical)
+        .arg("--all-secondary-root")
+        .arg(&all_secondary)
+        .arg("--request-timeout-secs")
+        .arg("5")
+        .arg("--supported-reorg-depth")
+        .arg("1")
+        .arg("--report")
+        .arg(&report_path)
+        .output()?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "raw-blob retention comparison failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let report: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
+    assert_raw_blob_retention_comparison_report(&report, &fixture.manifest);
+    assert!(transactions_canonical.is_dir());
+    assert!(transactions_secondary.is_dir());
+    assert!(all_canonical.is_dir());
+    assert!(all_secondary.is_dir());
     Ok(())
 }
 

@@ -95,6 +95,33 @@ Zebra and is not live-source, advancing-tip, restart, reorg, canary, or
 production certification. Physical read I/O and Linux peak RSS still require a
 runner that can expose them.
 
+### Compare raw-blob retention costs
+
+Replay the same authenticated fixture first with transaction blobs and then
+with both transaction and block blobs:
+
+```bash
+zinder-bench rocksdb-raw-blob-retention-comparison \
+  --fixture ./fixtures/mainnet-1730000-1734999 \
+  --transactions-canonical-store ./stores/transactions-canonical \
+  --transactions-secondary-root ./stores/transactions-secondary \
+  --all-canonical-store ./stores/all-canonical \
+  --all-secondary-root ./stores/all-secondary \
+  --report ./reports/raw-blob-retention.json
+```
+
+All four store paths must be absent, have existing parents, and be pairwise
+disjoint from each other and the fixture. The command uses the same fixture,
+pipeline limits, reorg policy, wallet workload, writer budget, and reader
+budget for both arms. It fails instead of reporting if their authenticated
+fixture, replay plan, logical replay, fence, or effective-limit identities
+differ. The report records each retention contract, raw-blob counts, physical
+canonical bytes, replay throughput, and a fresh secondary READY-admission
+timing. `authenticated_replay_lifecycle_seconds` and its throughput field cover
+the complete authenticated replay lifecycle: load, publication, cold reopen,
+and full-scan certification. They are not isolated ingest timings, and the
+report records the fixed arm execution order so cache effects remain visible.
+
 ## 2. Snapshot the starting store
 
 The replay needs a canonical store already populated up to `from_height - 1`, so
