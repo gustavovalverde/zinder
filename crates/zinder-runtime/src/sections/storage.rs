@@ -11,7 +11,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use zinder_store::{RocksDbResourceBudget, RocksDbStatisticsLevel};
+use zinder_store::{RawBlobRetention, RocksDbResourceBudget, RocksDbStatisticsLevel};
 
 use crate::{
     ConfigError, canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
@@ -21,6 +21,8 @@ use crate::{
 const DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS: u64 = 4;
+const DEFAULT_CANONICAL_SECONDARY_RAW_BLOB_RETENTION: RawBlobRetention =
+    RawBlobRetention::Transactions;
 
 /// Raw role-scoped `rocksdb` sub-section.
 ///
@@ -142,6 +144,8 @@ pub struct CanonicalSecondaryStorageSection {
     /// Reader-local secondary metadata path; must be unique per reader
     /// process per ADR-0003.
     pub secondary_path: Option<PathBuf>,
+    /// Persisted raw-blob retention the canonical primary must attest.
+    pub raw_blob_policy: Option<RawBlobRetention>,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: Option<u64>,
     /// Maximum startup catchup duration in milliseconds before the reader
@@ -180,6 +184,8 @@ pub struct ResolvedCanonicalSecondaryStorage {
     pub path: PathBuf,
     /// Reader-local secondary metadata path.
     pub secondary_path: PathBuf,
+    /// Persisted raw-blob retention required during secondary admission.
+    pub expected_raw_blob_retention: RawBlobRetention,
     /// Catchup tick cadence.
     pub secondary_catchup_interval: Duration,
     /// Maximum startup catchup duration before serving with the opened secondary.
@@ -335,6 +341,9 @@ pub fn resolve_canonical_secondary_storage(
     let secondary_path = section
         .secondary_path
         .ok_or_else(|| ConfigError::missing_field("storage.secondary_path"))?;
+    let expected_raw_blob_retention = section
+        .raw_blob_policy
+        .unwrap_or(DEFAULT_CANONICAL_SECONDARY_RAW_BLOB_RETENTION);
     let catchup_ms = section
         .secondary_catchup_interval_ms
         .unwrap_or(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS);
@@ -359,6 +368,7 @@ pub fn resolve_canonical_secondary_storage(
     Ok(ResolvedCanonicalSecondaryStorage {
         path,
         secondary_path,
+        expected_raw_blob_retention,
         secondary_catchup_interval: Duration::from_millis(catchup_ms),
         initial_catchup_timeout: Duration::from_millis(initial_catchup_timeout_ms),
         secondary_replica_lag_threshold_chain_epochs,
@@ -471,6 +481,8 @@ pub struct CanonicalSecondaryStorageToml {
     pub path: String,
     /// Reader-local secondary metadata path.
     pub secondary_path: String,
+    /// Persisted raw-blob retention required from the canonical primary.
+    pub raw_blob_policy: RawBlobRetention,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: u64,
     /// Initial catchup timeout in milliseconds.
@@ -489,6 +501,7 @@ impl CanonicalSecondaryStorageToml {
         Self {
             path: resolved.path.display().to_string(),
             secondary_path: resolved.secondary_path.display().to_string(),
+            raw_blob_policy: resolved.expected_raw_blob_retention,
             secondary_catchup_interval_ms: duration_as_millis_u64(
                 resolved.secondary_catchup_interval,
             ),
@@ -580,6 +593,10 @@ mod tests {
         assert_eq!(
             resolved.secondary_path,
             PathBuf::from("/tmp/store-secondary")
+        );
+        assert_eq!(
+            resolved.expected_raw_blob_retention,
+            RawBlobRetention::Transactions
         );
         assert_eq!(
             resolved.secondary_catchup_interval,

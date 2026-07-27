@@ -799,9 +799,9 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
 /// `WalletQuery` endpoint. Callers preflight the deployment's advertised
 /// capabilities before depending on optional reads.
 ///
-/// Methods that require a live ingest-control/broadcast endpoint (broadcast,
-/// live-mempool reads, the chain-event stream, chain value-pools, the
-/// wallet-plane server descriptor) live on the separate
+/// Methods that require live endpoint-owned collaborators (broadcast,
+/// live-mempool reads, the chain-event stream, source-backed chain value-pools,
+/// and the wallet-plane server descriptor) live on the separate
 /// `EndpointBackedIndex` trait, which only the remote client
 /// implements. A caller that needs one of those methods adds an
 /// `EndpointBackedIndex` bound, so a handle without an endpoint fails to
@@ -977,8 +977,8 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// This is an optional protocol method. A serving implementation also
     /// requires retained block blobs (`raw_blob_policy = "all"`); heights with
     /// no retained blob return [`IndexerError::ArtifactUnavailable`]. Remote
-    /// callers must preflight `wallet.read.full_block_at_v1`. The released
-    /// exact-pair `zinder-query` profile does not advertise this capability.
+    /// callers must preflight `wallet.read.full_block_at_v1`; an admitted
+    /// wallet-serving endpoint advertises it only for `all` retention.
     ///
     /// # Examples
     ///
@@ -999,8 +999,8 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// This is an optional protocol method. A serving implementation also
     /// requires retained block blobs (`raw_blob_policy = "all"`); the stream
     /// errors on the first height with no retained blob. Remote callers must
-    /// preflight `wallet.read.full_block_range_v1`. The released exact-pair
-    /// `zinder-query` profile does not advertise this capability.
+    /// preflight `wallet.read.full_block_range_v1`; an admitted
+    /// wallet-serving endpoint advertises it only for `all` retention.
     ///
     /// # Examples
     ///
@@ -1054,6 +1054,12 @@ pub trait ChainIndex: Send + Sync + 'static {
     ) -> Result<TreeStateArtifact, IndexerError>;
 
     /// Reads subtree roots for a bounded range.
+    ///
+    /// `max_entries` must not exceed
+    /// [`MAX_SUBTREE_ROOTS_PER_REQUEST`](crate::MAX_SUBTREE_ROOTS_PER_REQUEST).
+    /// A remote endpoint reports larger requests as
+    /// [`ErrorReason::SubtreeRootRangeTooLarge`](crate::ErrorReason::SubtreeRootRangeTooLarge)
+    /// with [`RetryPolicy::ClientError`](crate::RetryPolicy::ClientError).
     ///
     /// # Examples
     ///
@@ -1187,8 +1193,9 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// requests above
     /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. This is an
     /// optional protocol method; remote callers must preflight
-    /// `wallet.read.transparent_outputs_by_outpoint_v1`. The released
-    /// exact-pair `zinder-query` profile does not advertise this capability.
+    /// `wallet.read.transparent_outputs_by_outpoint_v1`. The current
+    /// wallet-serving query does not advertise it until its admitted serving pair
+    /// resolver is implemented.
     ///
     /// # Examples
     ///
@@ -1216,8 +1223,9 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// canonical half of a getspentinfo-equivalent lookup; the unmined half is
     /// the endpoint-backed `transparent_mempool_spends_by_outpoint` method.
     /// This is an optional protocol method; remote callers must preflight
-    /// `wallet.read.transparent_spends_by_outpoint_v1`. The released exact-pair
-    /// `zinder-query` profile does not advertise this capability.
+    /// `wallet.read.transparent_spends_by_outpoint_v1`. The current
+    /// wallet-serving query does not advertise it until its admitted serving pair
+    /// resolver is implemented.
     ///
     /// # Examples
     ///
@@ -1247,8 +1255,9 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// canonical-only: a mempool-aware caller subtracts the spends returned by
     /// the endpoint-backed `transparent_mempool_spends_by_outpoint` method.
     /// This is an optional protocol method; remote callers must preflight
-    /// `wallet.read.transparent_unspent_outputs_by_outpoint_v1`. The released
-    /// exact-pair `zinder-query` profile does not advertise this capability.
+    /// `wallet.read.transparent_unspent_outputs_by_outpoint_v1`. The current
+    /// wallet-serving query does not advertise it until its admitted serving pair
+    /// resolver is implemented.
     ///
     /// # Examples
     ///
@@ -1287,15 +1296,15 @@ pub trait ChainIndex: Send + Sync + 'static {
     ) -> Result<TransparentUtxoSetSummaryView, IndexerError>;
 }
 
-/// Live ingest-control reads layered on top of [`ChainIndex`].
+/// Live endpoint-backed operations layered on top of [`ChainIndex`].
 ///
 /// Only [`crate::RemoteChainIndex`] implements this trait: every method needs a
-/// reachable ingest-control/broadcast endpoint that the canonical and materialized-view
-/// stores cannot stand in for. Broadcast forwards bytes to the upstream node;
-/// the mempool reads observe the writer's in-process mempool index; the
-/// chain-event stream and chain value-pools are produced by the writer at the
-/// settled tip; the wallet-plane server descriptor is the endpoint's own
-/// advertisement.
+/// live collaborator that the canonical and materialized-view stores cannot
+/// stand in for. Broadcast and chain value-pools use the query's admitted
+/// upstream source; the mempool reads observe the writer's in-process mempool
+/// index through its private control endpoint; the chain-event stream comes
+/// from the writer; and the wallet-plane server descriptor is the endpoint's
+/// own advertisement.
 ///
 /// A consumer that needs any of these methods bounds its handle as
 /// `T: ChainIndex + EndpointBackedIndex`, so a handle whose type does not

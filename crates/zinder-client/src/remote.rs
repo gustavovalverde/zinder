@@ -44,7 +44,6 @@ use zinder_proto::wire::{
 };
 
 use crate::error::ZINDER_ERROR_DOMAIN;
-use crate::server_info::optional_duration;
 use crate::{
     BlockId, Capability, CapabilityDescriptor, ChainEpochCommitted, ChainEvent, ChainEventCursor,
     ChainEventEnvelope, ChainEventStream, ChainEventStreamFamily, ChainIndex, ChainRangeReverted,
@@ -117,7 +116,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 /// Oldest native wallet contract revision this client can safely consume.
-pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 4;
+pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 5;
 
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.
@@ -1241,11 +1240,6 @@ fn server_info_from_message(
         build_git_commit: common.build_git_commit,
         schema_version: ArtifactSchemaVersion::new(schema_version),
         reorg_window_blocks: wallet_info.reorg_window_blocks,
-        chain_event_retention: optional_duration(wallet_info.chain_event_retention_seconds),
-        mempool_mined_retention: optional_duration(wallet_info.mempool_mined_retention_seconds),
-        mempool_invalidated_retention: optional_duration(
-            wallet_info.mempool_invalidated_retention_seconds,
-        ),
         node: wallet_info.node.map(|node| NodeServerInfo {
             version: node.version,
             capabilities: node.capabilities,
@@ -2798,13 +2792,13 @@ mod tests {
     }
 
     #[test]
-    fn contract_revision_four_is_the_minimum() {
+    fn contract_revision_five_is_the_minimum() {
         assert!(matches!(
-            ensure_supported_contract_revision(3),
+            ensure_supported_contract_revision(4),
             Err(IndexerError::FailedPrecondition { .. })
         ));
-        assert!(ensure_supported_contract_revision(4).is_ok());
         assert!(ensure_supported_contract_revision(5).is_ok());
+        assert!(ensure_supported_contract_revision(6).is_ok());
     }
 
     #[test]

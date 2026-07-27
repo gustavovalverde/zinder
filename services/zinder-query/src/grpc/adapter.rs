@@ -14,10 +14,12 @@ use zinder_core::{
     MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentOutPoint,
 };
-use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
-use zinder_proto::v1::{
-    ingest::{MempoolTransactionRequest, ingest_control_client::IngestControlClient},
-    wallet::{self, wallet_query_server},
+use zinder_proto::{
+    capabilities,
+    v1::{
+        ingest::{MempoolTransactionRequest, ingest_control_client::IngestControlClient},
+        wallet::{self, wallet_query_server},
+    },
 };
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 
@@ -34,17 +36,17 @@ use crate::{
 
 use super::chain_events::{decode_address_filter, spawn_filtered_stream};
 use super::native::{
-    ServerInfoSettings, address_lookup_to_script_hash, block_header_by_selector_response,
+    WalletEndpointMetadata, address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response, build_chain_view_message,
     build_compact_block_message, build_full_block_message, build_transparent_address_tx_ids_chunk,
     build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
-    build_transparent_unspent_outputs_header, build_wallet_server_info, compact_block_response,
-    full_block_response, latest_tree_state_checkpoint_response,
-    network_upgrade_activations_response, settled_tip_block_response, subtree_roots_response,
-    transaction_response, transparent_address_unspent_outputs_response,
-    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
-    transparent_unspent_outputs_by_outpoint_response, transparent_utxo_set_summary_response,
-    tree_state_at_response, visible_tip_block_response,
+    build_transparent_unspent_outputs_header, build_wallet_server_info,
+    chain_value_pools_at_tip_response, compact_block_response, full_block_response,
+    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
+    settled_tip_block_response, subtree_roots_response, transaction_response,
+    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
+    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
+    transparent_utxo_set_summary_response, tree_state_at_response, visible_tip_block_response,
 };
 use super::status_from_query_error;
 
@@ -69,7 +71,7 @@ const TRANSACTION_NOT_FOUND_REASON: &str =
 #[derive(Clone, Debug)]
 pub struct WalletQueryGrpcAdapter<QueryApi> {
     query_api: QueryApi,
-    server_info: ServerInfoSettings,
+    server_info: wallet::WalletServerInfo,
     ingest_control_proxy_endpoint: Option<String>,
     ingest_control_bearer_token: Option<BearerToken>,
     /// One cached HTTP/2 channel to the ingest-control writer, dialed lazily
@@ -79,11 +81,16 @@ pub struct WalletQueryGrpcAdapter<QueryApi> {
     ingest_control_channel: Arc<OnceCell<AuthenticatedChannel>>,
 }
 
-impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
+impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
     /// Creates a gRPC adapter over a wallet query API with the deployment's
     /// `ServerCapabilities` descriptor.
     #[must_use]
-    pub fn new(query_api: QueryApi, server_info: ServerInfoSettings) -> Self {
+    pub fn new(query_api: QueryApi, metadata: WalletEndpointMetadata) -> Self {
+        let server_info = build_wallet_server_info(
+            metadata,
+            query_api.native_endpoint_capabilities(),
+            query_api.upstream_node_capabilities(),
+        );
         Self {
             query_api,
             server_info,
@@ -102,9 +109,14 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     #[must_use]
     pub fn with_ingest_control_proxy(
         query_api: QueryApi,
-        server_info: ServerInfoSettings,
+        metadata: WalletEndpointMetadata,
         ingest_control_proxy_endpoint: String,
     ) -> Self {
+        let server_info = build_wallet_server_info(
+            metadata,
+            query_api.native_endpoint_capabilities(),
+            query_api.upstream_node_capabilities(),
+        );
         Self {
             query_api,
             server_info,
@@ -132,6 +144,20 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
         wallet_query_server::WalletQueryServer::new(self)
             .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES)
     }
+
+    fn require_endpoint_capability(&self, capability: &'static str) -> Result<(), Status> {
+        if self
+            .query_api
+            .native_endpoint_capabilities()
+            .contains(capability)
+        {
+            Ok(())
+        } else {
+            Err(status_from_query_error(
+                &crate::QueryError::EndpointCapabilityUnavailable { capability },
+            ))
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -150,6 +176,7 @@ where
         &self,
         request: Request<wallet::VisibleTipBlockRequest>,
     ) -> Result<Response<wallet::VisibleTipBlockResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1)?;
         visible_tip_block_response(
             &self.query_api,
             chain_epoch_id_from_request(request.into_inner().at_epoch_id),
@@ -163,6 +190,7 @@ where
         &self,
         request: Request<wallet::SettledTipBlockRequest>,
     ) -> Result<Response<wallet::SettledTipBlockResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_SETTLED_TIP_BLOCK_V1)?;
         settled_tip_block_response(
             &self.query_api,
             chain_epoch_id_from_request(request.into_inner().at_epoch_id),
@@ -176,6 +204,7 @@ where
         &self,
         request: Request<wallet::CompactBlockRequest>,
     ) -> Result<Response<wallet::CompactBlockResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_COMPACT_BLOCK_AT_V2)?;
         let request = request.into_inner();
         compact_block_response(
             &self.query_api,
@@ -191,6 +220,7 @@ where
         &self,
         request: Request<wallet::FullBlockRequest>,
     ) -> Result<Response<wallet::FullBlockResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_FULL_BLOCK_AT_V1)?;
         let request = request.into_inner();
         full_block_response(
             &self.query_api,
@@ -206,6 +236,7 @@ where
         &self,
         request: Request<wallet::BlockSelectorRequest>,
     ) -> Result<Response<wallet::BlockIdResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_BLOCK_ID_BY_SELECTOR_V1)?;
         let request = request.into_inner();
         let selector = block_selector_from_request(request.selector)?;
         let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
@@ -219,6 +250,7 @@ where
         &self,
         request: Request<wallet::BlockSelectorRequest>,
     ) -> Result<Response<wallet::BlockHeaderResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1)?;
         let request = request.into_inner();
         let selector = block_selector_from_request(request.selector)?;
         let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
@@ -232,6 +264,7 @@ where
         &self,
         request: Request<wallet::TransactionRequest>,
     ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_TRANSACTION_BY_ID_V2)?;
         let request = request.into_inner();
         let transaction_id = transaction_id_from_request(&request.transaction_id)?;
         let at_epoch_id = chain_epoch_id_from_request(request.at_epoch_id);
@@ -273,6 +306,7 @@ where
         &self,
         request: Request<wallet::CompactBlocksInRangeRequest>,
     ) -> Result<Response<Self::CompactBlocksInRangeStream>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V2)?;
         let request = request.into_inner();
         let block_range = BlockHeightRange::inclusive(
             BlockHeight::new(request.start_height),
@@ -304,6 +338,7 @@ where
         &self,
         request: Request<wallet::FullBlocksInRangeRequest>,
     ) -> Result<Response<Self::FullBlocksInRangeStream>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1)?;
         let request = request.into_inner();
         let block_range = BlockHeightRange::inclusive(
             BlockHeight::new(request.start_height),
@@ -333,6 +368,7 @@ where
         &self,
         request: Request<wallet::TreeStateAtHeightRequest>,
     ) -> Result<Response<wallet::TreeStateResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2)?;
         let request = request.into_inner();
         tree_state_at_response(
             &self.query_api,
@@ -348,6 +384,9 @@ where
         &self,
         request: Request<wallet::LatestTreeStateCheckpointRequest>,
     ) -> Result<Response<wallet::TreeStateResponse>, Status> {
+        self.require_endpoint_capability(
+            capabilities::WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
+        )?;
         latest_tree_state_checkpoint_response(
             &self.query_api,
             chain_epoch_id_from_request(request.into_inner().at_epoch_id),
@@ -361,8 +400,12 @@ where
         &self,
         request: Request<wallet::SubtreeRootsRequest>,
     ) -> Result<Response<wallet::SubtreeRootsResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1)?;
         let request = request.into_inner();
         let protocol = shielded_protocol_from_request(request.shielded_protocol)?;
+        if protocol == ShieldedProtocol::Ironwood {
+            self.require_endpoint_capability(capabilities::WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1)?;
+        }
         let max_entries = NonZeroU32::new(request.max_entries)
             .ok_or_else(|| Status::invalid_argument("max_entries must be non-zero"))?;
         let subtree_root_range = SubtreeRootRange::new(
@@ -382,6 +425,7 @@ where
         &self,
         request: Request<wallet::BroadcastTransactionRequest>,
     ) -> Result<Response<wallet::BroadcastTransactionResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_BROADCAST_TRANSACTION_V1)?;
         let raw_transaction = RawTransactionBytes::new(request.into_inner().raw_transaction);
 
         broadcast_transaction_response(&self.query_api, raw_transaction)
@@ -394,6 +438,7 @@ where
         &self,
         request: Request<wallet::ChainEventsRequest>,
     ) -> Result<Response<Self::ChainEventsStream>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_EVENTS_CHAIN_V1)?;
         let started_at = Instant::now();
         let outcome: Result<Response<ChainEventsStream>, Status> = async {
             let request = request.into_inner();
@@ -429,6 +474,7 @@ where
         &self,
         request: Request<wallet::MempoolSnapshotRequest>,
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_SNAPSHOT_MEMPOOL_V3)?;
         let started_at = Instant::now();
         let outcome = async {
             let mut client = self
@@ -448,6 +494,7 @@ where
         &self,
         request: Request<wallet::MempoolEventsRequest>,
     ) -> Result<Response<Self::MempoolEventsStream>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_EVENTS_MEMPOOL_V2)?;
         let started_at = Instant::now();
         let outcome: Result<Response<MempoolEventsStream>, Status> = async {
             let mut client = self
@@ -469,6 +516,9 @@ where
         &self,
         request: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
     ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
+        self.require_endpoint_capability(
+            capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
+        )?;
         let started_at = Instant::now();
         let outcome = async {
             let request = request.into_inner();
@@ -504,6 +554,9 @@ where
         &self,
         request: Request<wallet::TransparentMempoolSpendsByOutpointRequest>,
     ) -> Result<Response<wallet::TransparentMempoolSpendsByOutpointResponse>, Status> {
+        self.require_endpoint_capability(
+            capabilities::WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
+        )?;
         let started_at = Instant::now();
         let outcome = async {
             let mut client = self
@@ -527,6 +580,7 @@ where
         &self,
         request: Request<wallet::TransparentOutputsByOutpointRequest>,
     ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_TRANSPARENT_OUTPUTS_V1)?;
         let request = request.into_inner();
         reject_coinbase_sentinels(&request.outpoints)?;
         let outpoints = transparent_outpoints_from_request(request.outpoints)?;
@@ -541,6 +595,7 @@ where
         &self,
         request: Request<wallet::TransparentSpendsByOutpointRequest>,
     ) -> Result<Response<wallet::TransparentSpendsByOutpointResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1)?;
         let request = request.into_inner();
         reject_coinbase_sentinels(&request.outpoints)?;
         let outpoints = transparent_outpoints_from_request(request.outpoints)?;
@@ -555,6 +610,7 @@ where
         &self,
         request: Request<wallet::TransparentUnspentOutputsByOutpointRequest>,
     ) -> Result<Response<wallet::TransparentUnspentOutputsByOutpointResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1)?;
         let request = request.into_inner();
         reject_coinbase_sentinels(&request.outpoints)?;
         let outpoints = transparent_outpoints_from_request(request.outpoints)?;
@@ -569,6 +625,7 @@ where
         &self,
         request: Request<wallet::TransparentMempoolOutputsByOutpointRequest>,
     ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1)?;
         let started_at = Instant::now();
         let outcome = async {
             let request_inner = request.get_ref();
@@ -594,33 +651,22 @@ where
 
     async fn chain_value_pools_at_tip(
         &self,
-        request: Request<wallet::ChainValuePoolsAtTipRequest>,
+        _request: Request<wallet::ChainValuePoolsAtTipRequest>,
     ) -> Result<Response<wallet::ChainValuePoolsAtTipResponse>, Status> {
-        let started_at = Instant::now();
-        let outcome = async {
-            let mut client = self
-                .ingest_control_client(
-                    "ChainValuePoolsAtTip requires the ingest-control proxy; \
-                     configure the writer endpoint",
-                )
-                .await?;
-            let response = client.chain_value_pools_at_tip(request).await?;
-            if response.get_ref().source_tip.is_none() {
-                return Err(Status::data_loss(
-                    "ChainValuePoolsAtTipResponse.source_tip is missing",
-                ));
-            }
-            Ok(response)
-        }
-        .await;
-        record_proxy_outcome("chain_value_pools_at_tip", started_at, &outcome);
-        outcome
+        self.require_endpoint_capability(capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1)?;
+        chain_value_pools_at_tip_response(&self.query_api)
+            .await
+            .map(Response::new)
+            .map_err(|error| status_from_query_error(&error))
     }
 
     async fn transparent_address_unspent_outputs(
         &self,
         request: Request<wallet::TransparentAddressUnspentOutputsRequest>,
     ) -> Result<Response<Self::TransparentAddressUnspentOutputsStream>, Status> {
+        self.require_endpoint_capability(
+            capabilities::WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+        )?;
         let request = request.into_inner();
         let at_epoch_id = chain_epoch_id_from_request(request.at_epoch_id);
         let address_script_hash =
@@ -653,6 +699,7 @@ where
         &self,
         request: Request<wallet::TransparentAddressTxIdsInRangeRequest>,
     ) -> Result<Response<Self::TransparentAddressTxIdsInRangeStream>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_ADDRESS_TRANSPARENT_HISTORY_V1)?;
         let request = request.into_inner();
         let typed_request = transparent_address_tx_ids_in_range_request_from_message(
             request,
@@ -691,6 +738,7 @@ where
         &self,
         request: Request<wallet::TransparentAddressBalanceRequest>,
     ) -> Result<Response<wallet::TransparentAddressBalanceResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_ADDRESS_TRANSPARENT_BALANCE_V1)?;
         let started_at = Instant::now();
         let outcome = self.compute_transparent_address_balance(request).await;
         record_proxy_outcome("transparent_address_balance", started_at, &outcome);
@@ -701,10 +749,12 @@ where
         &self,
         request: Request<wallet::TransparentUtxoSetSummaryRequest>,
     ) -> Result<Response<wallet::TransparentUtxoSetSummaryResponse>, Status> {
+        self.require_endpoint_capability(
+            capabilities::WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
+        )?;
         transparent_utxo_set_summary_response(
             &self.query_api,
             chain_epoch_id_from_request(request.into_inner().at_epoch_id),
-            self.server_info.utxo_set_commitment_enabled,
         )
         .await
         .map(Response::new)
@@ -715,20 +765,8 @@ where
         &self,
         _request: Request<wallet::ServerInfoRequest>,
     ) -> Result<Response<wallet::ServerInfoResponse>, Status> {
-        let server_info = self.server_info.clone();
-        let mut wallet_info = build_wallet_server_info(&server_info);
-        let Some(common) = wallet_info.common.as_mut() else {
-            return Err(Status::internal(
-                "build_wallet_server_info must populate ops.ServerInfo",
-            ));
-        };
-        if self.ingest_control_proxy_endpoint.is_none() {
-            common
-                .capabilities
-                .retain(|advertised| advertised != WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1);
-        }
         Ok(Response::new(wallet::ServerInfoResponse {
-            info: Some(wallet_info),
+            info: Some(self.server_info.clone()),
         }))
     }
 
@@ -736,6 +774,7 @@ where
         &self,
         _request: Request<wallet::NetworkUpgradeActivationsRequest>,
     ) -> Result<Response<wallet::NetworkUpgradeActivationsResponse>, Status> {
+        self.require_endpoint_capability(capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1)?;
         network_upgrade_activations_response(&self.query_api)
             .await
             .map(Response::new)
@@ -779,12 +818,17 @@ fn clamp_max_entries(requested: NonZeroU32, cap: NonZeroU32) -> NonZeroU32 {
 
 impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     fn server_info_network(&self) -> Result<Network, Status> {
-        decode_zinder_native_chain_name(&self.server_info.network)
+        let network = self
+            .server_info
+            .common
+            .as_ref()
+            .map(|common| common.network.as_str())
+            .unwrap_or_default();
+        decode_zinder_native_chain_name(network)
             .ok()
             .ok_or_else(|| {
                 Status::internal(format!(
-                    "server network identifier {} is not recognized",
-                    self.server_info.network
+                    "server network identifier {network} is not recognized"
                 ))
             })
     }

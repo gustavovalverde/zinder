@@ -94,6 +94,9 @@ pub(crate) enum LightwalletdConfigError {
 
     #[error("gRPC reflection service build failed: {0}")]
     Reflection(#[from] tonic_reflection::server::Error),
+
+    #[error(transparent)]
+    Operations(#[from] zinder_runtime::OpsServerError),
 }
 
 /// Loads and validates lightwalletd compat configuration.

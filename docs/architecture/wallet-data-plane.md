@@ -78,9 +78,33 @@ A request pins a chain snapshot with `optional uint64 at_epoch_id`: absent resol
 
 ## Full Blocks
 
-Full-block-scanning wallets parse whole serialized blocks for inline transparent detection and shielded trial-decryption, so the native wallet protocol defines consensus-serialized block reads alongside the compact-block surface. The complete `WalletQuery` profile implements these reads: `FullBlock(height, at_epoch_id)` returns one serialized block, and `FullBlocksInRange(start, end, at_epoch_id)` streams them as `FullBlocksInRangeChunk` messages. The range mirrors `CompactBlocksInRange`: it pins one epoch for the whole stream and repeats the `ChainView` at field tag 1 on every chunk rather than emitting a one-shot header. It bounds size by the dedicated `max_full_block_range` (1000 blocks, one wallet initial-scan batch) before opening a reader. The stream is demand-driven: the range is walked in small epoch-pinned sub-reads and each block is forwarded as the client drains it, so per-stream memory tracks one sub-read plus the channel depth rather than the window width.
+Full-block-scanning wallets parse whole serialized blocks for inline transparent
+detection and shielded trial-decryption, so the native wallet protocol defines
+consensus-serialized block reads alongside the compact-block surface.
+`FullBlock(height, at_epoch_id)` returns one serialized block, and
+`FullBlocksInRange(start, end, at_epoch_id)` streams
+`FullBlocksInRangeChunk` messages. The admitted serving-pair query implements
+both operations directly over canonical `BlockBlobArtifact` rows.
 
-The complete profile serves the bytes from the `BlockBlobArtifact` the canonical reader resolves. Block blobs are not unconditionally present: ingest writes them only when `raw_blob_policy` is `all`. The default policy `none` and the `transactions` policy both skip block blobs, so a `FullBlock` read at any height returns `ArtifactUnavailable` (gRPC `NOT_FOUND`) under those policies. `FullBlocksInRange` delivers every retained block up to the first unavailable mid-range height, then terminates the stream with `ArtifactUnavailable` (gRPC `NOT_FOUND`); a sweep of the pinned epoch mid-stream terminates it with `CHAIN_EPOCH_PIN_UNAVAILABLE` the same way. In both cases the chunks already delivered remain valid: a caller treats any stream error as partial delivery of a prefix read under one consistent epoch. A complete-profile deployment that serves full blocks must set `storage.raw_blob_policy = "all"` (env `ZINDER_STORAGE__RAW_BLOB_POLICY=all`) before its first canonical commit, and advertises `wallet.read.full_block_at_v1` and `wallet.read.full_block_range_v1` only when the persisted store contract retains block blobs. Changing an existing store from another policy to `all` requires a rebuild; the handler never re-fetches an unretained block from the upstream node. The released exact-pair `WalletServingQuery` does not implement these reads, so `zinder-query` does not advertise either capability regardless of the retention policy.
+The range pins one admitted pair for the entire stream and repeats its
+`ChainView` at field tag 1 on every chunk. Pair rotation cannot change or close
+that in-flight read because the driver retains the pair's `Arc`; a later
+request using an expired epoch receives `CHAIN_EPOCH_PIN_UNAVAILABLE` and must
+reacquire its whole workflow snapshot. The request is bounded to 1,000 blocks.
+The driver walks it in 16-block multi-get sub-reads and forwards through a
+four-item channel as the client drains, so per-stream memory tracks one
+sub-read plus bounded channel depth rather than the whole window.
+
+Full-block support is derived from authenticated persisted retention, not a
+runtime profile. Ingest writes block blobs only when `storage.raw_blob_policy =
+"all"`, and query must declare the same value when admitting its canonical
+secondary. An admitted `All` endpoint advertises
+`wallet.read.full_block_at_v1` and `wallet.read.full_block_range_v1`; `None`
+and `Transactions` endpoints omit both, and direct calls fail with the precise
+missing-capability precondition. A missing blob inside an `All` store is an
+`ArtifactUnavailable` integrity or coverage outcome, not an invitation to
+fetch history from the upstream node. Changing a non-empty store to `All`
+requires a rebuilt store and blue-green cutover.
 
 Tree-state storage preserves upstream node JSON at canonical checkpoints and the
 latest committed tip. The native read surface is
@@ -140,6 +164,13 @@ header is read at request time from the typed `BlockHeaderArtifact`; raw block
 bytes are not part of the normal wallet read path. If repeated reads become
 the larger cost, the implementation should improve the typed header row rather
 than reintroducing raw-block parsing.
+
+The primary-store query implements both selector arms through the canonical
+hash index. The release serving-pair query currently resolves arbitrary
+heights but only the visible-tip hash because its narrow secondary-reader
+contract does not yet expose `BlockHashLookup`. The standalone `zinder-query`
+therefore omits both selector capability strings until that complete resolver
+is composed; partial method behavior is not advertised as support.
 
 `BlockSelector` is `#[non_exhaustive]`. Non-best-chain `(txid, block_hash)`
 lookup is a *separate method*, not a third selector arm. That form is a
@@ -381,14 +412,14 @@ chain epoch, so the stream is snapshot-consistent with the other canonical
 reads. The Rust `ChainIndex` trait carries the same surface:
 `transparent_address_unspent_outputs(query)` keyed by the typed
 `TransparentAddressScriptHash`, with `query.at_epoch_id:
-Option<ChainEpochId>` threading the pin. Capability
-`wallet.address.transparent_unspent_outputs_v1` is advertised on every
-deployment that can serve the read.
-
-Server streams hold the materialized unspent set for the stream lifetime,
-and a drained stream costs the client memory proportional to the address's
-unspent set; acceptable for wallet receivers and documented here for future
-consumers.
+Option<ChainEpochId>` threading the pin. The release `zinder-query` composition
+does not advertise `wallet.address.transparent_unspent_outputs_v1`: the current
+query contract materializes the complete set before the gRPC adapter starts
+streaming, so an address with many outputs can consume unbounded server memory.
+P2b must change the query/adapter boundary to read and emit bounded pages at one
+pinned epoch before admitting this capability. Until then, native requests fail
+the capability guard before reading storage. Compatibility runtimes own their
+separate lightwalletd admission and resource bounds.
 
 `TransparentAddressTxIdsInRange` streams `TransparentAddressTxIdsChunk`
 messages with the same one-shot header shape: one leading `ChainView` header
@@ -463,7 +494,7 @@ The full projection path is the canonical worked example in
 
 Transparent output resolution turns an `OutPoint` (a `(transaction_id, output_index)` pair) into the `TxOut` that funds the referenced input. Two paired RPCs cover both chain views:
 
-- `WalletQuery.TransparentOutputsByOutpoint(TransparentOutputsByOutpointRequest) returns (TransparentOutputsByOutpointResponse)` resolves outpoints against the canonical chain. Capability `wallet.read.transparent_outputs_by_outpoint_v1`. The complete-profile handler reads first-class `transparent_output` rows from `zinder-store`; pinned reads verify the row's producing-block identity against the requested epoch.
+- `WalletQuery.TransparentOutputsByOutpoint(TransparentOutputsByOutpointRequest) returns (TransparentOutputsByOutpointResponse)` resolves outpoints against the canonical chain. Capability `wallet.read.transparent_outputs_by_outpoint_v1`. The legacy primary-store library handler reads first-class `transparent_output` rows from `zinder-store`; pinned reads verify the row's producing-block identity against the requested epoch. The release serving-pair query omits the capability until it implements the same resolver.
 - `WalletQuery.TransparentMempoolOutputsByOutpoint(TransparentMempoolOutputsByOutpointRequest) returns (TransparentOutputsByOutpointResponse)` resolves outpoints against the writer's live mempool index, sharing the canonical surface's response shape so consumers decode both surfaces through one path. Capability `wallet.mempool.transparent_outputs_by_outpoint_v1`. The handler reads `MempoolEntry.transparent_outputs` directly through `MempoolIndex::transparent_outputs_by_outpoints`; no parsing at read time because the mempool ingest path pre-extracts transparent outputs at admission time. The wallet adapter proxies the call through the `IngestControl` private endpoint since secondary readers cannot observe live writer state.
 
 Every response binds to a `ChainEpoch` (canonical: the read's epoch; mempool: the writer's epoch visible at lookup time), then carries `repeated TransparentOutputEntry entries` in input order. Each entry has the request's `OutPoint` and an `optional TransparentOutput prevout`; absence means the canonical chain at the bound epoch (canonical) or the live mempool index (mempool) does not have the referenced output. The inner `TransparentOutput` carries `value_zat: uint64` and `script_pub_key: bytes`; identifying fields stay on the entry's `outpoint` so the inner payload carries no redundant fields. Duplicate request outpoints emit duplicate entries.
@@ -472,7 +503,7 @@ The shared `OutPoint` proto message is the canonical wire-level outpoint shape a
 
 Both methods cap the request at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024` outpoints. Requests above the cap are silently truncated to the first 1024 entries. The coinbase sentinel (`transaction_id == [0u8; 32] && output_index == 0xFFFFFFFF`) is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter; consumers filter coinbase inputs at the request boundary.
 
-The `ChainIndex` Rust API exposes `transparent_outputs_by_outpoint(outpoints, at_epoch_id)`, while `EndpointBackedIndex` exposes `transparent_mempool_outputs_by_outpoint(outpoints)` without an epoch pin. Both return `TransparentOutputsByOutpointResponse`, and `RemoteChainIndex` maps them to the native gRPC methods. The released exact-pair `WalletServingQuery` does not yet implement the canonical outpoint resolver, so `zinder-query` does not advertise that capability; consumers must preflight it instead of inferring support from the Rust method's presence.
+The `ChainIndex` Rust API exposes `transparent_outputs_by_outpoint(outpoints, at_epoch_id)`, while `EndpointBackedIndex` exposes `transparent_mempool_outputs_by_outpoint(outpoints)` without an epoch pin. Both return `TransparentOutputsByOutpointResponse`, and `RemoteChainIndex` maps them to the native gRPC methods. The released serving-pair `WalletServingQuery` does not yet implement the canonical outpoint resolver, so `zinder-query` does not advertise that capability; consumers must preflight it instead of inferring support from the Rust method's presence.
 
 The prevout-resolution surface is native-only. `CompactTxStreamer` has no prevout endpoint, and inventing a parallel surface is forbidden by [Service boundaries §Anti-Patterns](service-boundaries.md#anti-patterns).
 
@@ -480,30 +511,36 @@ The prevout-resolution surface is native-only. `CompactTxStreamer` has no prevou
 
 Reverse-spend resolution is the inverse of prevout resolution: given an `OutPoint`, it returns where that output was spent rather than the output itself. This is the getspentinfo-equivalent surface. Two RPCs cover the canonical and mempool chain views; a full getspentinfo composes both (this RPC for confirmed spends, the mempool RPC for unmined):
 
-- `WalletQuery.TransparentSpendsByOutpoint(TransparentSpendsByOutpointRequest) returns (TransparentSpendsByOutpointResponse)` resolves outpoints to their confirmed spend, arbitrarily far back: the answer is durable, not scoped to the reorg window. The complete profile advertises `wallet.read.transparent_spends_by_outpoint_v1` because its canonical spend-fact resolver is wired. That handler reads the `transparent_spend_fact` table through the epoch-bound `transparent_spend_facts_by_outpoints` reader; pinned reads (`at_epoch_id`) verify each spend's producing-block visibility against the requested epoch. Canonical misses are union-routed to the durable `transparent_outpoint_spend` materialized view per [ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md). That projection derives the spent outpoint and spender identity from the child transaction input plus its mined location, so a child retained above a checkpoint still records a spend whose parent output is below it. Parent-output hydration is not required. A projection hit is surfaced only when its spend settled at or below the pinned epoch's settled tip and its stored block hash still matches the retained canonical header at that height, so a row from a reorged-out branch never surfaces as the spender. If canonical retention has deleted spend facts above the projection's durable height, the read refuses with `MATERIALIZED_VIEW_UNAVAILABLE` instead of answering incompletely. If real deletion has occurred but the query handle has no materialized-view store, the same error prevents an ambiguous miss from becoming an absent spender. A store that never deleted a fact keeps the canonical-only absent semantics.
+- `WalletQuery.TransparentSpendsByOutpoint(TransparentSpendsByOutpointRequest) returns (TransparentSpendsByOutpointResponse)` resolves outpoints to their confirmed spend, arbitrarily far back: the answer is durable, not scoped to the reorg window. The legacy primary-store library handler reads the `transparent_spend_fact` table through the epoch-bound `transparent_spend_facts_by_outpoints` reader; pinned reads (`at_epoch_id`) verify each spend's producing-block visibility against the requested epoch. Canonical misses are union-routed to the durable `transparent_outpoint_spend` materialized view per [ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md). That projection derives the spent outpoint and spender identity from the child transaction input plus its mined location, so a child retained above a checkpoint still records a spend whose parent output is below it. Parent-output hydration is not required. A projection hit is surfaced only when its spend settled at or below the pinned epoch's settled tip and its stored block hash still matches the retained canonical header at that height, so a row from a reorged-out branch never surfaces as the spender. If canonical retention has deleted spend facts above the projection's durable height, the read refuses with `MATERIALIZED_VIEW_UNAVAILABLE` instead of answering incompletely. If real deletion has occurred but the query handle has no materialized-view store, the same error prevents an ambiguous miss from becoming an absent spender. A store that never deleted a fact keeps the canonical-only absent semantics. The release serving-pair query omits this capability until it composes the equivalent canonical-plus-projection resolver.
 - `WalletQuery.TransparentMempoolSpendsByOutpoint(TransparentMempoolSpendsByOutpointRequest) returns (TransparentMempoolSpendsByOutpointResponse)` resolves outpoints to their unmined spend in the writer's live mempool index. Capability `wallet.mempool.transparent_spends_by_outpoint_v1`.
 
 The canonical response binds to a `ChainEpoch`, then carries `repeated TransparentSpend spends`. Each `TransparentSpend` carries the request's `spent_outpoint`, the `spending_transaction_id` (RPC byte order), the `input_index` of the spend within the spending transaction, and a `BlockTip spending_block` (height plus RPC-form hash of the block that mined the spend). The spent output's value and script are intentionally omitted: a consumer wanting them already has `TransparentOutputsByOutpoint`. Outpoints with no spend visible at the bound epoch and no durably recorded spender produce no entry; consumers key results by `spent_outpoint`. Absence alone never proves that an arbitrary outpoint exists and is unspent: `TransparentUnspentOutputsByOutpoint` is the direct durable spentness authority per [ADR-0026](../adrs/0026-utxo-set-commitment.md). A consumer that already holds the canonical output fact, such as `ExplorerQuery.TransactionDetail`, may interpret a successful complete lookup's absent spender as unspent at that epoch. Duplicate request outpoints collapse to one entry. Coinbase inputs spend no prevout and never appear in the spend-fact index; the coinbase sentinel outpoint is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter. One request is capped at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024`, identical to the prevout surface; callers with larger known output sets must issue epoch-pinned chunks and verify the complete epoch identity across every response.
 
-The `ChainIndex` Rust API exposes `transparent_spends_by_outpoint(outpoints, at_epoch_id)`, returning `TransparentSpendsByOutpointResponse`; `RemoteChainIndex` calls the native gRPC method. The released exact-pair `WalletServingQuery` does not yet implement this canonical resolver, so `zinder-query` does not advertise the capability. The reverse-spend surface remains native-only for the same reason as prevout resolution.
+The `ChainIndex` Rust API exposes `transparent_spends_by_outpoint(outpoints, at_epoch_id)`, returning `TransparentSpendsByOutpointResponse`; `RemoteChainIndex` calls the native gRPC method. The released serving-pair `WalletServingQuery` does not yet implement this canonical resolver, so `zinder-query` does not advertise the capability. The reverse-spend surface remains native-only for the same reason as prevout resolution.
 
 ## Transparent Unspent-Output Probe
 
 The unspent-output probe is the gettxout-equivalent surface: given an `OutPoint`, it returns the referenced output only while that output is unspent on the canonical chain, and nothing if the output has been spent or never existed (null-if-spent). It composes the output resolver and the canonical reverse-spend reader on the server so a transparent-flow explorer issues one round-trip rather than an output lookup, a spend lookup, and a client-side join per outpoint.
 
-- `WalletQuery.TransparentUnspentOutputsByOutpoint(TransparentUnspentOutputsByOutpointRequest) returns (TransparentUnspentOutputsByOutpointResponse)`. The complete profile advertises `wallet.read.transparent_unspent_outputs_by_outpoint_v1` because both of its canonical output and spend-fact resolvers are wired.
+- `WalletQuery.TransparentUnspentOutputsByOutpoint(TransparentUnspentOutputsByOutpointRequest) returns (TransparentUnspentOutputsByOutpointResponse)`. The legacy primary-store library handler can serve this operation because both canonical output and spend-fact resolvers are wired. The release serving-pair query omits `wallet.read.transparent_unspent_outputs_by_outpoint_v1` until it composes those resolvers.
 
-The complete-profile handler opens one epoch-bound reader and reads both `transparent_outputs_by_outpoints` and `transparent_spend_facts_by_outpoints` at that single pinned epoch. An outpoint emits an entry only when the output is present and carries no canonical spend at the epoch; spent or never-existed outpoints emit no entry, so every entry's `output` is populated. The response binds to a `ChainEpoch` at field tag 1, then carries `repeated TransparentOutputEntry entries`, the same entry shape as `TransparentOutputsByOutpoint` so consumers share one decoder. Consumers key results by `outpoint`; duplicate request outpoints collapse to one entry. The coinbase sentinel outpoint is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter and the request is capped at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024`, identical to the prevout and reverse-spend surfaces.
+The primary-store handler opens one epoch-bound reader and reads both `transparent_outputs_by_outpoints` and `transparent_spend_facts_by_outpoints` at that single pinned epoch. An outpoint emits an entry only when the output is present and carries no canonical spend at the epoch; spent or never-existed outpoints emit no entry, so every entry's `output` is populated. The response binds to a `ChainEpoch` at field tag 1, then carries `repeated TransparentOutputEntry entries`, the same entry shape as `TransparentOutputsByOutpoint` so consumers share one decoder. Consumers key results by `outpoint`; duplicate request outpoints collapse to one entry. The coinbase sentinel outpoint is rejected with gRPC `INVALID_ARGUMENT` at the wallet adapter and the request is capped at `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST = 1024`, identical to the prevout and reverse-spend surfaces.
 
-The read is canonical-only. The mempool overlay is intentionally absent: a mempool-aware caller composes this canonical probe with `TransparentMempoolSpendsByOutpoint` and subtracts those unmined spends from the result. The `ChainIndex` Rust API exposes `transparent_unspent_outputs_by_outpoint(outpoints, at_epoch_id)`, returning `TransparentUnspentOutputsByOutpointResponse`; `RemoteChainIndex` calls the native gRPC method. The released exact-pair `WalletServingQuery` does not yet implement this probe, so `zinder-query` does not advertise the capability. The surface is native-only for the same reason as prevout resolution.
+The read is canonical-only. The mempool overlay is intentionally absent: a mempool-aware caller composes this canonical probe with `TransparentMempoolSpendsByOutpoint` and subtracts those unmined spends from the result. The `ChainIndex` Rust API exposes `transparent_unspent_outputs_by_outpoint(outpoints, at_epoch_id)`, returning `TransparentUnspentOutputsByOutpointResponse`; `RemoteChainIndex` calls the native gRPC method. The released serving-pair `WalletServingQuery` does not yet implement this probe, so `zinder-query` does not advertise the capability. The surface is native-only for the same reason as prevout resolution.
 
 ## Chain Value Pools
 
-The native surface is `WalletQuery.ChainValuePoolsAtTip(ChainValuePoolsAtTipRequest) returns (ChainValuePoolsAtTipResponse)`. Capability `wallet.read.chain_value_pools_at_tip_v1` is advertised when the query deployment can proxy to an ingest writer whose source probe reported `chain_value_pools`.
+The native schema contains `WalletQuery.ChainValuePoolsAtTip(ChainValuePoolsAtTipRequest) returns (ChainValuePoolsAtTipResponse)`, but the release composition does not advertise `wallet.read.chain_value_pools_at_tip_v1`.
 
-The response binds to the writer-visible `ChainEpoch`, carries `source_tip: BlockTip`, and preserves `repeated ChainValuePool pools` in upstream order. `source_tip` is the `blocks` plus `bestblockhash` pair returned by the same `getblockchaininfo` response as the pool totals. A caller accepting the snapshot as canonical compares both its height and hash with the intended canonical tip; height equality alone is not sufficient across a reorg. Each pool entry carries `id`, `monitored`, and optional `chain_value_zat`. The list-shaped contract is intentional: consumers can render known pools by id without forcing Zinder to drop or rename future consensus pools.
+The response binds to the query's admitted visible `ChainEpoch`, carries `source_tip: BlockTip`, and preserves `repeated ChainValuePool pools` in upstream order. `source_tip` is the `blocks` plus `bestblockhash` pair returned by the same `getblockchaininfo` response as the pool totals. A caller accepting the snapshot as canonical compares both its height and hash with the intended canonical tip; height equality alone is not sufficient across a reorg. Each pool entry carries `id`, `monitored`, and optional `chain_value_zat`. The list-shaped contract is intentional: consumers can render known pools by id without forcing Zinder to drop or rename future consensus pools.
 
-`zinder-query` does not open an upstream-node connection for this method. It proxies through `IngestControl.ChainValuePoolsAtTip`, because the ingest writer owns the source handle and the source capability snapshot. A `WalletQuery` adapter without an ingest-control proxy rejects the call with `UNAVAILABLE`; writers whose source lacks `chain_value_pools` reject with `FAILED_PRECONDITION`.
+OpenRPC method-name discovery does not prove that `getblockchaininfo` returns
+the required `valuePools` payload, and the current readiness loop does not
+retain a semantic value-pool probe. A later explorer slice may admit the method
+only after a successful startup value-pool read on the exact installed source
+and a matching retained readiness check. Until then, direct native calls fail
+with `FAILED_PRECONDITION` and `ENDPOINT_CAPABILITY_UNAVAILABLE` before node
+I/O.
 
 This live snapshot is a prerequisite fact, not a value-pool history or value-flow projection. Historical pool totals and per-period movements remain separate future consumers with independent coverage and replay semantics.
 
@@ -511,11 +548,14 @@ This live snapshot is a prerequisite fact, not a value-pool history or value-flo
 
 The native surface is `WalletQuery.TransparentAddressBalance(TransparentAddressBalanceRequest) returns (TransparentAddressBalanceResponse)`. The request carries `repeated AddressLookup addresses` and an `optional uint64 at_epoch_id`. The response carries the binding `chain_view` at field tag 1, then `confirmed_zat: uint64`, `unconfirmed_delta_zat: int64`, and `address_count: uint32`.
 
-The balance is served in the wallet plane (`zinder-query`) and advertises one capability: `wallet.address.transparent_balance_v1`, always on. The canonical unspent-output index it sums is present on every wallet-plane deployment, so the capability never gates on a separate plane. The handler sums the confirmed total in-process from the canonical unspent-output index (a saturating sum) pinned to `at_epoch_id`; absent, the read resolves against the visible tip. It then overlays the signed mempool delta by reading the live mempool through the colocated `IngestControl` endpoint: mempool outputs paid to the addresses are pending inflows, and mempool spends of the addresses' confirmed unspent set are pending outflows. `unconfirmed_delta_zat` is pending inflows minus pending outflows. When no ingest-control endpoint is wired, the delta is zero and the call still succeeds.
+The balance is served in the wallet plane (`zinder-query`) and advertises one capability: `wallet.address.transparent_balance_v1`, always on. The canonical unspent-output index it sums is present on every wallet-plane deployment, so the capability never gates on a separate plane. The release handler sums the confirmed total from the wallet projection (a saturating sum) pinned to `at_epoch_id`; absent, the read resolves against the visible tip. The release native composition does not admit an ingest-control mempool overlay, so `unconfirmed_delta_zat` is always zero. A later live-balance slice must admit a concrete authenticated provider and advertise its own live-state contract before a nonzero delta can be promised.
 
 The address list is capped at 256 per request (`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`), enforced in the wallet/native layer. An over-cap list is rejected with `INVALID_ARGUMENT` carrying `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`; an empty list is rejected with `INVALID_ARGUMENT`. The signed delta saturates to the `int64` range; `confirmed_zat` is a `uint64`.
 
-The mempool live state is not chain-epoch-pinnable. `at_epoch_id` pins only the canonical confirmed read; the mempool overlay always reads live state, and the response binds to the chain epoch the confirmed read answered against. Historical balance at an arbitrary height is out of scope.
+Mempool live state is not chain-epoch-pinnable. If a future native capability
+admits an overlay, `at_epoch_id` will pin only the canonical confirmed read and
+the response will remain bound to that epoch. Historical balance at an
+arbitrary height is out of scope.
 
 The lightwalletd compat shim answers `GetTaddressBalance` and `GetTaddressBalanceStream` by calling the wallet primitive and projecting it into one `int64 value_zat` (confirmed total minus pending outflows, saturating to zero, capped at `i64::MAX`); pending inflows are ignored because the legacy lightwalletd balance field is confirmed-shaped and carries no overlay slot. `GetTaddressBalanceStream` collects the streamed addresses and uses the same projection as the unary call; it exists only for the lightwalletd contract.
 
@@ -523,13 +563,13 @@ The `ChainIndex` Rust API exposes `transparent_address_balance(addresses)` retur
 
 ## Capability Discovery
 
-`WalletQuery.ServerInfo` returns a `ServerCapabilities` descriptor per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). Capability strings are exact-match; clients gate features on capability strings such as `wallet.events.chain_v1` rather than on Zinder version. The descriptor's `node` field is reserved for upstream-node capability snapshots; an adapter constructed without source-probe results leaves it empty.
+`WalletQuery.ServerInfo` returns a `ServerCapabilities` descriptor per [Public interfaces §Capability Discovery](public-interfaces.md#capability-discovery). Capability strings are exact-match; clients gate features on capability strings such as `wallet.events.chain_v1` rather than on Zinder version. The admitted query derives one immutable set from persisted storage evidence, implemented methods, and the exact probed providers installed in the composition. The native descriptor and operations endpoint share that exact immutable set without operator overrides or a copied support list. The descriptor's `node` field reports the upstream-node probe snapshot; an adapter constructed without source-probe results leaves it empty.
 
 ## Native Rust API
 
 Rust integrations can call the remote-first `zinder-client` surface per [Public interfaces §Rust API Shape](public-interfaces.md#rust-api-shape). The `ChainIndex` trait exposes immutable network metadata and canonical reads with typed Rust values (`BlockHeight`, `ChainEpoch`, `TxStatus`, and `IndexerError`); `RemoteChainIndex` also implements `EndpointBackedIndex` for broadcast, subscriptions, and live state. Zinder's serving runtimes compose service-internal reads through `WalletServingQuery` and an admitted `WalletServingReadPair`, while consumers with dependency or toolchain conflicts can generate stubs from the native `WalletQuery` protocol instead of linking the SDK.
 
-The `ChainIndex` trait does not duplicate the `WalletQueryApi` Rust trait inside `services/zinder-query`. They serve different consumer profiles: `WalletQueryApi` is the gRPC server's internal trait; `ChainIndex` is the public Rust API for in-process consumers. Both share types from `zinder-core`. A compatibility test asserts that every advertised `ServerCapabilities` capability string has a corresponding `ChainIndex` method.
+The `ChainIndex` trait does not duplicate the `WalletQueryApi` Rust trait inside `services/zinder-query`. They serve different boundaries: `WalletQueryApi` is the gRPC server's internal trait; `ChainIndex` is the public Rust API for consumers. Both share types from `zinder-core`. A compatibility test asserts that every advertised `ServerCapabilities` capability string has a corresponding `ChainIndex` method.
 
 ## Transaction Broadcast
 
@@ -642,7 +682,7 @@ The `ci-perf` profile runs deterministic regression checks from
 `services/zinder-query/tests/perf/perf_smoke.rs`. A 1,000-block compact range
 must complete within 2 seconds, a 1,000-block full-block stream within 5
 seconds, and a visible-tip read within 250 milliseconds. The full-block stream
-also caps its channel at 16 chunks, so peak buffering cannot scale with the
+also caps its channel at 4 chunks, so peak buffering cannot scale with the
 requested range. These are deliberately generous CI ceilings, not percentile
 claims about production hardware.
 
@@ -659,7 +699,14 @@ Every range or list endpoint defines:
 - Stable ordering.
 - The epoch or source timestamp that bounds the response.
 
-The native compact-block range API rejects requests above `max_compact_block_range` before opening a reader. Visible-tip block and tree-state reads use the same epoch-bound reader contract without upstream node repair. Batched storage reads are still bounded by the range limit; native gRPC streams one compact block per message instead of packing the whole range into a single response.
+The release native compact-block range API rejects requests above the fixed
+1,000-block `DEFAULT_MAX_COMPACT_BLOCK_RANGE` before opening a reader.
+Visible-tip reads use the epoch-bound pair directly. Tree-state reads first use
+the same pinned pair, then fill a missing exact-height checkpoint through the
+admitted upstream tree-state provider for the already-resolved canonical block.
+Batched storage reads remain bounded by the range limit; native gRPC streams
+one compact block per message instead of packing the whole range into a single
+response.
 
 The lightwalletd compatibility adapter must also keep unbounded upstream
 semantics bounded at Zinder's boundary. For example, `GetSubtreeRoots` treats

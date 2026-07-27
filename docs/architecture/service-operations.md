@@ -71,11 +71,29 @@ continuous following at an authenticated source position. An individually
 healthy canonical or wallet store is insufficient if their source identities
 do not agree.
 
+### Native wallet query
+
+Native wallet query is ready only when both of its independently retained
+inputs are healthy: the admitted canonical-and-wallet serving pair and the
+exact node source used by every advertised node-backed operation. Pair
+publication cannot erase a node failure, and node recovery cannot erase
+replica lag, writer-status failure, or pair-admission failure. Capability
+discovery remains immutable while either dependency is temporarily unhealthy.
+
+The node probe exercises `tip_id` and upstream synchronization health through
+the same shared source handle installed in the query. It does not repeat
+structural capability discovery. Any node-backed composition must admit
+`TipId` before binding so this liveness prerequisite cannot fail later as a
+configuration surprise. The serving-pair publisher and node-readiness probe
+are supervised with the gRPC server; an unexpected exit drains readiness and
+terminates the runtime.
+
 ### Lightwalletd compatibility
 
 Compatibility is ready only while `WalletServingPairPublisher` can reach writer
 status, catch canonical and wallet secondaries up, and publish a pair that
-passes exact-fence admission. Traffic uses a readiness interceptor, so a
+passes exact-fence admission, and while the admitted node source needed by its
+compatibility methods is healthy. Traffic uses a readiness interceptor, so a
 process that has drained readiness does not accept new gRPC requests.
 
 ## Startup and shutdown

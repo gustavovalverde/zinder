@@ -2,7 +2,6 @@
 
 use std::{num::NonZeroU32, pin::Pin, sync::Arc};
 
-use arc_swap::ArcSwap;
 use serde_json::Value;
 use tokio_stream::StreamExt as _;
 use tokio_stream::{self as stream};
@@ -28,7 +27,7 @@ use zinder_proto::compat::lightwalletd::{
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
     SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingReadPair,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingPairSlot,
     address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
@@ -93,7 +92,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     options: LightwalletdCompatibilityOptions,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
-    serving_pair_slot: Option<Arc<ArcSwap<WalletServingReadPair>>>,
+    serving_pair_slot: Option<WalletServingPairSlot>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
@@ -179,10 +178,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     /// startup snapshot, so its transparent-address claim cannot outlive a
     /// canonical/wallet pair generation.
     #[must_use]
-    pub fn with_serving_pair_slot(
-        mut self,
-        serving_pair_slot: Arc<ArcSwap<WalletServingReadPair>>,
-    ) -> Self {
+    pub fn with_serving_pair_slot(mut self, serving_pair_slot: WalletServingPairSlot) -> Self {
         self.serving_pair_slot = Some(serving_pair_slot);
         self
     }
@@ -818,7 +814,7 @@ where
             false
         } else if let Some(serving_pair_slot) = &self.serving_pair_slot {
             let source_position = serving_pair_slot
-                .load_full()
+                .capture()
                 .wallet_source()
                 .source_position();
             source_position.chain_epoch_id == visible_tip_block.chain_epoch.id

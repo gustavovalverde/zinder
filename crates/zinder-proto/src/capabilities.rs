@@ -72,16 +72,20 @@ pub const WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1: &str = "wallet.read.subtree_roo
 pub const WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1: &str = "wallet.read.subtree_roots_ironwood_v1";
 /// Capability advertised for `WalletQuery.Transaction`.
 ///
-/// Covers the typed transaction-status response. The RPC always works; the
-/// optional `raw_transaction_bytes` field on the mined arm is gated
-/// separately by [`WALLET_READ_TRANSACTION_BYTES_V1`].
+/// Covers the complete typed transaction-status response. A composition
+/// advertises it only when its admitted canonical and live providers can
+/// distinguish every supported status. The optional `raw_transaction_bytes`
+/// field on the mined arm is gated separately by
+/// [`WALLET_READ_TRANSACTION_BYTES_V1`].
 pub const WALLET_READ_TRANSACTION_BY_ID_V2: &str = "wallet.read.transaction_by_id_v2";
 /// Field capability gating `raw_transaction_bytes` on the mined arm of
 /// `WalletQuery.Transaction`.
 ///
-/// Advertised when the store retains transaction blobs (ingest
-/// `raw_blob_policy` in `{transactions, all}`). When absent the field is
-/// `None`; clients branch on presence rather than empty-vs-populated bytes.
+/// A composition may advertise this only together with
+/// [`WALLET_READ_TRANSACTION_BY_ID_V2`] and when its admitted store retains
+/// transaction blobs (ingest `raw_blob_policy` in `{transactions, all}`).
+/// When absent the field is `None`; clients branch on presence rather than
+/// empty-vs-populated bytes.
 pub const WALLET_READ_TRANSACTION_BYTES_V1: &str = "wallet.read.transaction_bytes_v1";
 /// Capability advertised for `WalletQuery.ServerInfo`.
 pub const WALLET_READ_SERVER_INFO_V2: &str = "wallet.read.server_info_v2";
@@ -118,17 +122,16 @@ pub const WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1: &str = "wallet.read.chain_val
 /// Capability advertised for `WalletQuery.TransparentUtxoSetSummary`.
 ///
 /// The count and total value are folded in-process from the canonical
-/// current-UTXO projection at the settled tip. Always advertised: the
-/// projection the scan reads is present on every wallet-plane deployment. The
-/// serialized-set hash and byte size of `gettxoutsetinfo` are not reported;
-/// both depend on a UTXO-set serialization ordering Zinder does not define.
+/// current-UTXO projection at the settled tip. A composition advertises this
+/// only when that projection and the bounded summary implementation are
+/// concretely admitted. The release serving-pair query currently omits it.
 pub const WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1: &str =
     "wallet.read.transparent_utxo_set_summary_v1";
 /// Field capability gating `commitment` on `TransparentUtxoSetSummaryResponse`.
 ///
-/// Operator opt-in: the `LtHash16` commitment is folded inside the summary scan
-/// and has real per-output CPU cost, so it is advertised only when the operator
-/// enables it. When absent the field is `None`; clients branch on presence.
+/// The `LtHash16` commitment has real per-output CPU cost. No current production
+/// composition admits this field, and a manual operator support flag is not
+/// valid admission evidence. When absent the field is `None`.
 pub const WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1: &str =
     "wallet.read.transparent_utxo_set_commitment_v1";
 /// Capability advertised for `WalletQuery.BroadcastTransaction`.
@@ -155,11 +158,10 @@ pub const WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
 pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transparent_history_v1";
 /// Capability advertised for `WalletQuery.TransparentAddressBalance`.
 ///
-/// The confirmed total is summed in-process from the canonical
-/// unspent-output index; the signed `unconfirmed_delta_zat` overlays the live
-/// mempool when an ingest-control endpoint is wired and is zero otherwise.
-/// Always advertised: the canonical unspent index the confirmed sum reads is
-/// present on every wallet-plane deployment.
+/// The confirmed total is summed in-process from the wallet projection's
+/// unspent-output index. A native runtime advertises this only when that
+/// concrete projection is admitted; compatibility adapters own their
+/// independent support decision.
 pub const WALLET_ADDRESS_TRANSPARENT_BALANCE_V1: &str = "wallet.address.transparent_balance_v1";
 /// Capability advertised for `ExplorerQuery.ServerInfo`.
 pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
@@ -588,8 +590,9 @@ pub enum AdvertisePolicy {
     /// Wallet: requires a store that retains transaction blobs
     /// (ingest `raw_blob_policy` in `{transactions, all}`).
     RequiresTransactionBlobs,
-    /// Wallet: requires operator opt-in to the transparent
-    /// UTXO-set commitment fold.
+    /// Wallet: requires an admitted transparent UTXO-set commitment fold.
+    ///
+    /// No release composition currently satisfies this policy.
     RequiresUtxoSetCommitment,
     /// Wallet: requires an available transparent-address history projection.
     RequiresTransparentAddressHistory,

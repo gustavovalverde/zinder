@@ -15,7 +15,7 @@ use zinder_core::{
 use zinder_proto::v1::wallet::{
     self, AddressLookup, address_lookup, wallet_query_server::WalletQuery as WalletQueryService,
 };
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_store::PrimaryChainStore;
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
@@ -70,7 +70,7 @@ async fn transparent_address_unspent_outputs_streams_complete_set() -> eyre::Res
     let stored_utxos = commit_unspent_outputs(&store, ChainEpochId::new(1), 1, 3)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let (header, outputs) = drain_unspent_outputs(&grpc_adapter, 0, None).await?;
 
@@ -96,7 +96,7 @@ async fn transparent_address_unspent_outputs_streams_across_multiple_internal_pa
     let stored_utxos = commit_unspent_outputs(&store, ChainEpochId::new(1), 1, 1001)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let (_header, outputs) = drain_unspent_outputs(&grpc_adapter, 0, None).await?;
 
@@ -116,7 +116,7 @@ async fn transparent_address_unspent_outputs_honors_start_height_floor() -> eyre
     let stored_utxos = commit_unspent_outputs(&store, ChainEpochId::new(1), 1, 3)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let (_at_header, at_mined_height) = drain_unspent_outputs(&grpc_adapter, 1, None).await?;
     assert_eq!(at_mined_height.len(), stored_utxos.len());
@@ -138,7 +138,7 @@ async fn transparent_address_unspent_outputs_rejects_invalid_address_selector() 
     let _ = commit_unspent_outputs(&store, ChainEpochId::new(1), 1, 1)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let status = match WalletQueryService::transparent_address_unspent_outputs(
         &grpc_adapter,
@@ -179,7 +179,7 @@ async fn transparent_address_unspent_outputs_pinned_to_a_past_epoch_diverges_fro
     commit_address_output_then_spend(&store, funding_epoch)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let (live_header, live_outputs) = drain_unspent_outputs(&grpc_adapter, 0, None).await?;
     assert!(

@@ -466,7 +466,7 @@ The explorer may parse transaction bytes through `zinder-source` and poll an opt
 3. The fact lands in `SourceBlock`, a typed `Source*` value, a source-backed control primitive, or a new canonical artifact family per [Extending artifacts](extending-artifacts.md).
 4. The explorer consumer subscribes to the new event or artifact, or composes through the new `WalletQuery` primitive when the fact is intentionally live-source-backed.
 
-Chain value pools (the `ValuePoolSummary` view) is the first source-boundary extension that stays live-source-backed. `zinder-source` parses `getblockchaininfo.valuePools` together with that response's `blocks` and `bestblockhash`, `IngestControl` owns the writer-side source handle, `WalletQuery.ChainValuePoolsAtTip` proxies the hash-bound snapshot through that control plane, and `ExplorerQuery.ValuePoolSummary` wraps the wallet response in `ExplorerFreshness`.
+Chain value pools (the `ValuePoolSummary` view) is the first source-boundary extension that stays live-source-backed. `zinder-source` parses `getblockchaininfo.valuePools` together with that response's `blocks` and `bestblockhash`; the admitted `WalletQuery` owns the same probed source handle that justified its capability claim and uses it to serve the hash-bound snapshot; and `ExplorerQuery.ValuePoolSummary` wraps the wallet response in `ExplorerFreshness`.
 
 Final note-commitment roots use the durable variant of this pattern.
 `zinder-source` parses the post-block Sapling, Orchard, and Ironwood roots from

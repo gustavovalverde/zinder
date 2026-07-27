@@ -1,20 +1,23 @@
 //! Zinder native wallet-query gRPC server entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{future::Future, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_query::{
-    ServerInfoSettings, WalletCapabilityProfile, WalletQueryGrpcAdapter, WalletServingPairConfig,
-    WalletServingPairPublisher, WalletServingQuery, wallet_capability_strings,
+    WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairConfig,
+    WalletServingPairPublisher, WalletServingQuery, WalletServingReadiness,
+    spawn_wallet_node_readiness_probe,
 };
 use zinder_runtime::{
-    Readiness, RuntimeService, StartupPhase, TrafficReadinessInterceptor,
-    cancel_on_terminating_signal, install_tracing_subscriber, spawn_ops_endpoint_for,
+    OpsEndpointHandle, OpsServerError, Readiness, RuntimeService, StartupPhase,
+    TrafficReadinessInterceptor, cancel_on_terminating_signal, install_tracing_subscriber,
+    spawn_ops_endpoint_for,
 };
-use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
-use zinder_store::RawBlobRetention;
+use zinder_source::{
+    DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+};
 
 mod config;
 
@@ -40,6 +43,12 @@ struct Cli {
     /// Root containing this process's canonical secondary generations.
     #[arg(long = "canonical-secondary-root")]
     canonical_secondary_root: Option<PathBuf>,
+    /// Canonical raw-blob retention expected from the writer.
+    #[arg(
+        long = "raw-blob-policy",
+        value_parser = ["none", "transactions", "all"]
+    )]
+    raw_blob_policy: Option<String>,
     /// Wallet primary path replicated only through an immutable secondary.
     #[arg(long = "wallet-primary-path")]
     wallet_primary_path: Option<PathBuf>,
@@ -115,29 +124,8 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     };
 
     let readiness = Readiness::default();
-    readiness.set(zinder_runtime::ReadinessState::starting());
+    let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
     let start_api_phase = StartupPhase::StartApi.start();
-    let server_info = ServerInfoSettings {
-        network: encode_zinder_native_chain_name(query_config.network).to_owned(),
-        service_version: env!("CARGO_PKG_VERSION").to_owned(),
-        schema_version: u32::from(zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value()),
-        reorg_window_blocks: query_config.canonical_reorg_policy.reorg_window_blocks(),
-        transaction_broadcast_enabled: true,
-        chain_events_enabled: true,
-        transparent_address_history_available: false,
-        capability_profile: WalletCapabilityProfile::ExactPair,
-        ..ServerInfoSettings::default()
-    };
-    let advertised_capabilities = wallet_capability_strings(&server_info);
-    let ops_handle = spawn_ops_endpoint_for(
-        RuntimeService::Query,
-        query_config.ops_listen_addr,
-        env!("CARGO_PKG_VERSION"),
-        encode_zinder_native_chain_name(query_config.network),
-        readiness.clone(),
-        advertised_capabilities.clone(),
-    );
-
     let connect_node_phase = StartupPhase::ConnectNode.start();
     let source = ZebraJsonRpcSource::with_options(
         query_config.node.network,
@@ -149,13 +137,16 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             broadcast_timeout: query_config.node.broadcast_timeout,
         },
     )
-    .map_err(|error| QueryConfigError::Source(Box::new(error)))?;
-    let network_upgrade_activations = Arc::new(
-        source
-            .discover_network_upgrade_activations("zinder-query")
-            .await
-            .map_err(|error| QueryConfigError::Source(Box::new(error)))?,
-    );
+    .map_err(|error| QueryConfigError::Source(Box::new(error)))?
+    .with_health_config(query_config.node.health.clone());
+    source
+        .probe_capabilities()
+        .await
+        .map_err(|error| QueryConfigError::Source(Box::new(error)))?;
+    let network_upgrade_activations = source
+        .discover_network_upgrade_activations("zinder-query")
+        .await
+        .map_err(|error| QueryConfigError::Source(Box::new(error)))?;
     connect_node_phase.complete();
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
@@ -167,8 +158,8 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             wallet_secondary_root: query_config.wallet_secondary_root.clone(),
             network: query_config.network,
             network_upgrade_activations: Arc::clone(&network_upgrade_activations),
+            expected_raw_blob_retention: query_config.storage.expected_raw_blob_retention,
             canonical_reorg_policy: query_config.canonical_reorg_policy,
-            expected_raw_blob_retention: RawBlobRetention::Transactions,
             canonical_resource_budget: query_config.storage.canonical_rocksdb_budget,
             wallet_resource_budget: query_config.wallet_rocksdb_budget,
             catchup_interval: query_config.storage.secondary_catchup_interval,
@@ -178,39 +169,60 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
                 .storage
                 .secondary_replica_lag_threshold_chain_epochs,
         },
-        readiness.clone(),
+        serving_readiness.clone(),
         &query_config.ingest_control_addr,
         query_config.ingest_control_bearer_token.as_ref(),
     )
     .await?;
     let visible_height = pair_slot
-        .load_full()
+        .capture()
         .canonical_fence()
         .visible_tip()
         .height
         .value();
     open_storage_phase.complete();
 
-    let query = WalletServingQuery::from_serving_pair_slot(
+    let query = WalletServingQuery::from_probed_node_source(
         pair_slot,
         source.clone(),
         Arc::clone(&network_upgrade_activations),
+    )?;
+    let endpoint_metadata = WalletEndpointMetadata {
+        network: encode_zinder_native_chain_name(query_config.network).to_owned(),
+        service_version: env!("CARGO_PKG_VERSION").to_owned(),
+        schema_version: u32::from(zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value()),
+        reorg_window_blocks: query_config.canonical_reorg_policy.reorg_window_blocks(),
+        materialized_view_preset: Some(zinder_materialized_views::MaterializedViewPreset::Wallet),
+        ..WalletEndpointMetadata::default()
+    };
+    let native_endpoint_capabilities = query.native_endpoint_capabilities().clone();
+    let advertised_capabilities = native_endpoint_capabilities.shared_identifiers();
+    let ops_handle = spawn_ops_endpoint_for(
+        RuntimeService::Query,
+        query_config.ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(query_config.network),
+        readiness.clone(),
+        advertised_capabilities,
     )
-    .with_tree_state_upstream(Arc::new(source));
-    let mut grpc_adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
-        query,
-        server_info,
-        query_config.ingest_control_addr.clone(),
-    );
-    if let Some(token) = query_config.ingest_control_bearer_token.clone() {
-        grpc_adapter = grpc_adapter.with_ingest_control_bearer_token(token);
-    }
+    .await?;
+    let grpc_adapter = WalletQueryGrpcAdapter::new(query, endpoint_metadata);
 
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)
         .build_v1()?;
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
+    let node_readiness_handle = spawn_wallet_node_readiness_probe(
+        source,
+        &native_endpoint_capabilities,
+        serving_readiness.clone(),
+        query_config.node.health.as_ref().map_or_else(
+            || std::time::Duration::from_millis(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS),
+            |health| health.poll_interval,
+        ),
+        cancel.clone(),
+    )?;
     let publisher_handle = pair_publisher.spawn(cancel.clone());
     let traffic_readiness = TrafficReadinessInterceptor::new(readiness.clone());
     let reflection_readiness = TrafficReadinessInterceptor::new(readiness.clone());
@@ -233,24 +245,195 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     );
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    let server_result = tonic::transport::Server::builder()
+    let server = tonic::transport::Server::builder()
         .add_service(grpc_service)
         .add_service(reflection_service)
-        .serve_with_shutdown(query_config.listen_addr, cancel.clone().cancelled_owned())
-        .await;
+        .serve_with_shutdown(query_config.listen_addr, cancel.clone().cancelled_owned());
+    supervise_query_runtime(
+        server,
+        cancel,
+        &serving_readiness,
+        QueryBackgroundTasks {
+            serving_pair_publisher: publisher_handle,
+            node_readiness_probe: node_readiness_handle,
+            operations: ops_handle,
+        },
+    )
+    .await
+}
+
+struct QueryBackgroundTasks {
+    serving_pair_publisher: tokio::task::JoinHandle<()>,
+    node_readiness_probe: tokio::task::JoinHandle<()>,
+    operations: Option<OpsEndpointHandle>,
+}
+
+enum QueryRuntimeExit {
+    ShutdownRequested,
+    GrpcServer(Result<(), tonic::transport::Error>),
+    ServingPairPublisher(Result<(), tokio::task::JoinError>),
+    NodeReadinessProbe(Result<(), tokio::task::JoinError>),
+    Operations(Result<(), OpsServerError>),
+}
+
+async fn supervise_query_runtime<Server>(
+    server: Server,
+    cancel: CancellationToken,
+    readiness: &WalletServingReadiness,
+    background_tasks: QueryBackgroundTasks,
+) -> Result<(), QueryConfigError>
+where
+    Server: Future<Output = Result<(), tonic::transport::Error>>,
+{
+    let QueryBackgroundTasks {
+        mut serving_pair_publisher,
+        mut node_readiness_probe,
+        mut operations,
+    } = background_tasks;
+    tokio::pin!(server);
+    let exit = tokio::select! {
+        biased;
+        () = cancel.cancelled() => QueryRuntimeExit::ShutdownRequested,
+        server_outcome = &mut server => QueryRuntimeExit::GrpcServer(server_outcome),
+        publisher_outcome = &mut serving_pair_publisher => {
+            QueryRuntimeExit::ServingPairPublisher(publisher_outcome)
+        }
+        node_probe_outcome = &mut node_readiness_probe => {
+            QueryRuntimeExit::NodeReadinessProbe(node_probe_outcome)
+        }
+        operations_outcome = wait_for_operations_exit(&mut operations) => {
+            QueryRuntimeExit::Operations(operations_outcome)
+        }
+    };
+
+    readiness.publish_shutting_down();
     cancel.cancel();
-    if let Some(handle) = ops_handle {
-        handle.shutdown().await;
+    let operations_shutdown = shutdown_operations(&mut operations).await;
+
+    match exit {
+        QueryRuntimeExit::ShutdownRequested => {
+            let server_result = server.await;
+            require_clean_task_shutdown("serving-pair publisher", serving_pair_publisher.await)?;
+            require_clean_task_shutdown("node-readiness probe", node_readiness_probe.await)?;
+            operations_shutdown?;
+            server_result.map_err(QueryConfigError::Transport)
+        }
+        QueryRuntimeExit::GrpcServer(server_result) => {
+            require_clean_task_shutdown("serving-pair publisher", serving_pair_publisher.await)?;
+            require_clean_task_shutdown("node-readiness probe", node_readiness_probe.await)?;
+            operations_shutdown?;
+            server_result.map_err(QueryConfigError::Transport)?;
+            Err(QueryConfigError::GrpcServerStopped)
+        }
+        QueryRuntimeExit::ServingPairPublisher(task_result) => {
+            let task_error = unexpected_task_exit("serving-pair publisher", task_result);
+            drain_server_after_runtime_failure(server.await);
+            drain_task_after_runtime_failure("node-readiness probe", node_readiness_probe.await);
+            drain_operations_after_runtime_failure(operations_shutdown);
+            Err(task_error)
+        }
+        QueryRuntimeExit::NodeReadinessProbe(task_result) => {
+            let task_error = unexpected_task_exit("node-readiness probe", task_result);
+            drain_server_after_runtime_failure(server.await);
+            drain_task_after_runtime_failure(
+                "serving-pair publisher",
+                serving_pair_publisher.await,
+            );
+            drain_operations_after_runtime_failure(operations_shutdown);
+            Err(task_error)
+        }
+        QueryRuntimeExit::Operations(operations_result) => {
+            let task_error = match operations_result {
+                Ok(()) => QueryConfigError::RuntimeTaskStopped {
+                    task: "operations endpoint",
+                },
+                Err(error) => QueryConfigError::Operations(error),
+            };
+            drain_server_after_runtime_failure(server.await);
+            drain_task_after_runtime_failure(
+                "serving-pair publisher",
+                serving_pair_publisher.await,
+            );
+            drain_task_after_runtime_failure("node-readiness probe", node_readiness_probe.await);
+            drain_operations_after_runtime_failure(operations_shutdown);
+            Err(task_error)
+        }
     }
-    if let Err(join_error) = publisher_handle.await {
+}
+
+async fn wait_for_operations_exit(
+    operations: &mut Option<OpsEndpointHandle>,
+) -> Result<(), OpsServerError> {
+    match operations {
+        Some(handle) => handle.wait().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn shutdown_operations(
+    operations: &mut Option<OpsEndpointHandle>,
+) -> Result<(), QueryConfigError> {
+    match operations.take() {
+        Some(handle) => handle
+            .shutdown()
+            .await
+            .map_err(QueryConfigError::Operations),
+        None => Ok(()),
+    }
+}
+
+fn require_clean_task_shutdown(
+    task: &'static str,
+    join_outcome: Result<(), tokio::task::JoinError>,
+) -> Result<(), QueryConfigError> {
+    join_outcome.map_err(|source| QueryConfigError::RuntimeTaskJoin { task, source })
+}
+
+fn unexpected_task_exit(
+    task: &'static str,
+    join_outcome: Result<(), tokio::task::JoinError>,
+) -> QueryConfigError {
+    match join_outcome {
+        Ok(()) => QueryConfigError::RuntimeTaskStopped { task },
+        Err(source) => QueryConfigError::RuntimeTaskJoin { task, source },
+    }
+}
+
+fn drain_server_after_runtime_failure(server_outcome: Result<(), tonic::transport::Error>) {
+    if let Err(error) = server_outcome {
         tracing::warn!(
             target: "zinder::query",
-            event = "wallet_serving_pair_publisher_join_failed",
-            error = %join_error,
-            "wallet-serving pair publisher task did not exit cleanly"
+            event = "query_server_drain_failed",
+            error = %error,
+            "native query gRPC server failed while draining after a runtime task failure"
         );
     }
-    server_result.map_err(QueryConfigError::Transport)
+}
+
+fn drain_task_after_runtime_failure(
+    task: &'static str,
+    join_outcome: Result<(), tokio::task::JoinError>,
+) {
+    if let Err(error) = join_outcome {
+        tracing::warn!(
+            target: "zinder::query",
+            event = "query_runtime_task_drain_failed",
+            task,
+            error = %error,
+            "wallet query runtime task failed while draining after another runtime failure"
+        );
+    }
+}
+
+fn drain_operations_after_runtime_failure(operations_outcome: Result<(), QueryConfigError>) {
+    if let Err(error) = operations_outcome {
+        tracing::warn!(
+            target: "zinder::query",
+            event = "query_operations_drain_failed",
+            error = %error,
+            "operations endpoint failed while draining after another runtime failure"
+        );
+    }
 }
 
 fn emit_runtime_error(error: &QueryConfigError) -> ExitCode {
@@ -269,6 +452,7 @@ impl From<Cli> for QueryConfigOverrides {
             network: cli.network,
             canonical_primary_path: cli.canonical_primary_path,
             canonical_secondary_root: cli.canonical_secondary_root,
+            raw_blob_policy: cli.raw_blob_policy,
             wallet_primary_path: cli.wallet_primary_path,
             wallet_secondary_root: cli.wallet_secondary_root,
             ingest_control_addr: cli.ingest_control_addr,
@@ -278,5 +462,137 @@ impl From<Cli> for QueryConfigOverrides {
             node_json_rpc_addr: cli.node_json_rpc_addr,
             reorg_window_blocks: cli.reorg_window_blocks,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+
+    use super::*;
+    use zinder_runtime::{ReadinessCause, ReadinessState};
+
+    #[tokio::test]
+    async fn serving_pair_publisher_exit_drains_the_runtime() {
+        let runtime_readiness = Readiness::default();
+        let serving_readiness =
+            WalletServingReadiness::without_node_source(runtime_readiness.clone());
+        let cancel = CancellationToken::new();
+        let publisher = tokio::spawn(async {});
+        let node_cancel = cancel.clone();
+        let node_probe = tokio::spawn(async move {
+            node_cancel.cancelled().await;
+        });
+        let server_cancel = cancel.clone();
+        let server = async move {
+            server_cancel.cancelled().await;
+            Ok(())
+        };
+
+        let runtime_outcome = supervise_query_runtime(
+            server,
+            cancel,
+            &serving_readiness,
+            QueryBackgroundTasks {
+                serving_pair_publisher: publisher,
+                node_readiness_probe: node_probe,
+                operations: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            runtime_outcome,
+            Err(QueryConfigError::RuntimeTaskStopped {
+                task: "serving-pair publisher"
+            })
+        ));
+        assert!(matches!(
+            runtime_readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_drains_all_runtime_tasks_cleanly() {
+        let runtime_readiness = Readiness::new(ReadinessState::ready(Some(1)));
+        let serving_readiness =
+            WalletServingReadiness::without_node_source(runtime_readiness.clone());
+        let cancel = CancellationToken::new();
+        let publisher_cancel = cancel.clone();
+        let publisher = tokio::spawn(async move {
+            publisher_cancel.cancelled().await;
+        });
+        let node_cancel = cancel.clone();
+        let node_probe = tokio::spawn(async move {
+            node_cancel.cancelled().await;
+        });
+        let server_cancel = cancel.clone();
+        let server = async move {
+            server_cancel.cancelled().await;
+            Ok(())
+        };
+        cancel.cancel();
+
+        let runtime_outcome = supervise_query_runtime(
+            server,
+            cancel,
+            &serving_readiness,
+            QueryBackgroundTasks {
+                serving_pair_publisher: publisher,
+                node_readiness_probe: node_probe,
+                operations: None,
+            },
+        )
+        .await;
+
+        assert!(runtime_outcome.is_ok());
+        assert!(matches!(
+            runtime_readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
+    }
+
+    #[tokio::test]
+    async fn node_probe_join_failure_is_a_typed_runtime_failure() {
+        let runtime_readiness = Readiness::default();
+        let serving_readiness =
+            WalletServingReadiness::without_node_source(runtime_readiness.clone());
+        let cancel = CancellationToken::new();
+        let publisher_cancel = cancel.clone();
+        let publisher = tokio::spawn(async move {
+            publisher_cancel.cancelled().await;
+        });
+        let node_probe = tokio::spawn(future::pending::<()>());
+        node_probe.abort();
+        let server_cancel = cancel.clone();
+        let server = async move {
+            server_cancel.cancelled().await;
+            Ok(())
+        };
+
+        let runtime_outcome = supervise_query_runtime(
+            server,
+            cancel,
+            &serving_readiness,
+            QueryBackgroundTasks {
+                serving_pair_publisher: publisher,
+                node_readiness_probe: node_probe,
+                operations: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            runtime_outcome,
+            Err(QueryConfigError::RuntimeTaskJoin {
+                task: "node-readiness probe",
+                ..
+            })
+        ));
+        assert!(matches!(
+            runtime_readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
     }
 }

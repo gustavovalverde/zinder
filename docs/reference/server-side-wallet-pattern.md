@@ -95,7 +95,7 @@ The structure is "snapshot once, subscribe forever, re-derive on hint" (see [Cha
 `zinder-client` splits the chain-index contract in two so the compiler tells you which calls a handle can serve:
 
 - `ChainIndex` carries immutable network metadata plus canonical and wallet-projection reads. The public `RemoteChainIndex` implements this contract as a `WalletQuery` gRPC client.
-- `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
+- `EndpointBackedIndex` carries operations that need live endpoint-owned collaborators: transaction broadcast and chain value-pools use the query's admitted upstream source; the chain-event stream and live-mempool snapshot/events/overlays use the writer control boundary; and the wallet-plane server descriptor describes the endpoint itself. Only `RemoteChainIndex` implements it.
 
 A function that broadcasts or subscribes to chain events bounds its handle `T: ChainIndex + EndpointBackedIndex`; a function that only reads canonical state bounds it `T: ChainIndex`.
 

@@ -12,11 +12,12 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection,
-    NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml, ProjectorControlSection,
-    ProjectorControlToml, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, SecuritySection,
-    SecurityToml, StorageRoleSection, guard_optional_serving_bind, require_field,
-    resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
-    resolve_ingest_control_reader, resolve_ops_listen_addr, resolve_projector_control,
+    NetworkSection, NetworkToml, NodeToml, OpsSection, OpsServerError, OpsToml,
+    ProjectorControlSection, ProjectorControlToml, RocksDbResourceBudgetSection,
+    RocksDbResourceBudgetToml, SecuritySection, SecurityToml, StorageRoleSection,
+    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
+    resolve_canonical_reader_rocksdb_budget, resolve_ingest_control_reader,
+    resolve_ops_listen_addr, resolve_projector_control,
     resolve_wallet_projection_writer_rocksdb_budget,
 };
 use zinder_source::{NodeSection, NodeTarget};
@@ -112,6 +113,9 @@ pub(crate) struct ProjectorConfigOverrides {
 pub(crate) enum ProjectorError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+
+    #[error(transparent)]
+    OpsServer(#[from] OpsServerError),
 
     #[error("node source initialization failed: {0}")]
     NodeConfig(#[from] zinder_source::NodeConfigError),

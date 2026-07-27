@@ -47,6 +47,7 @@ pub(super) struct QueryConfigOverrides {
     pub(super) network: Option<String>,
     pub(super) canonical_primary_path: Option<PathBuf>,
     pub(super) canonical_secondary_root: Option<PathBuf>,
+    pub(super) raw_blob_policy: Option<String>,
     pub(super) wallet_primary_path: Option<PathBuf>,
     pub(super) wallet_secondary_root: Option<PathBuf>,
     pub(super) ingest_control_addr: Option<String>,
@@ -66,6 +67,8 @@ pub(super) enum QueryConfigError {
     CanonicalStoreBuildPlan(#[from] CanonicalStoreBuildPlanError),
     #[error(transparent)]
     WalletServingPair(#[from] zinder_query::WalletServingPairError),
+    #[error(transparent)]
+    WalletQuery(#[from] zinder_query::QueryError),
     #[error("node source initialization failed: {0}")]
     Source(Box<zinder_source::SourceError>),
     #[error("gRPC transport failed: {0}")]
@@ -74,6 +77,18 @@ pub(super) enum QueryConfigError {
     BearerToken(#[from] BearerTokenError),
     #[error("gRPC reflection service build failed: {0}")]
     Reflection(#[from] tonic_reflection::server::Error),
+    #[error(transparent)]
+    Operations(#[from] zinder_runtime::OpsServerError),
+    #[error("wallet query {task} stopped before runtime shutdown")]
+    RuntimeTaskStopped { task: &'static str },
+    #[error("wallet query {task} task failed: {source}")]
+    RuntimeTaskJoin {
+        task: &'static str,
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    #[error("wallet query gRPC server stopped before runtime shutdown")]
+    GrpcServerStopped,
 }
 
 pub(super) fn load_query_config(
@@ -90,6 +105,7 @@ pub(super) fn load_query_config(
         .with_override_if("network.name", overrides.network)?
         .with_override_path_if("storage.path", overrides.canonical_primary_path)?
         .with_override_path_if("storage.secondary_path", overrides.canonical_secondary_root)?
+        .with_override_if("storage.raw_blob_policy", overrides.raw_blob_policy)?
         .with_override_path_if("wallet.path", overrides.wallet_primary_path)?
         .with_override_path_if("wallet.secondary_path", overrides.wallet_secondary_root)?
         .with_override_if("ingest_control.addr", overrides.ingest_control_addr)?

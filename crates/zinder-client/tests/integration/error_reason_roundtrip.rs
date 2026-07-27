@@ -6,8 +6,9 @@
 
 use tonic::Status;
 use tonic_types::StatusExt;
-use zinder_client::{ErrorReason, IndexerError, RetryPolicy};
+use zinder_client::{ErrorReason, IndexerError, MAX_SUBTREE_ROOTS_PER_REQUEST, RetryPolicy};
 use zinder_core::BlockHeight;
+use zinder_proto::capabilities::WALLET_READ_FULL_BLOCK_AT_V1;
 use zinder_proto::v1::ops::ErrorReason as WireErrorReason;
 use zinder_query::{QueryError, status_from_query_error};
 
@@ -28,7 +29,7 @@ fn query_error_status_carries_error_info() {
 
 #[test]
 fn generic_remote_status_preserves_exact_reason_on_client() {
-    let status = status_from_query_error(&QueryError::CompactBlockRangeTooLarge {
+    let status = status_from_query_error(&QueryError::BlockRangeTooLarge {
         requested: 4_096,
         maximum: 1_000,
     });
@@ -37,17 +38,70 @@ fn generic_remote_status_preserves_exact_reason_on_client() {
     let Some(error_info) = details.error_info() else {
         unreachable!("status must carry an ErrorInfo detail")
     };
-    assert_eq!(error_info.reason, "COMPACT_BLOCK_RANGE_TOO_LARGE");
+    assert_eq!(error_info.reason, "BLOCK_RANGE_TOO_LARGE");
 
     // Round-trip the status through the public-vocabulary compatibility
     // mapper and confirm the exact reason survives a shared gRPC code.
     let client_error: IndexerError = into_client_error(&status);
     assert!(matches!(client_error, IndexerError::RemoteFailure { .. }));
+    assert_eq!(client_error.reason(), Some(ErrorReason::BlockRangeTooLarge));
+    assert_eq!(client_error.retry_policy(), RetryPolicy::ClientError);
+}
+
+#[test]
+fn subtree_root_range_limit_round_trips_as_client_error() {
+    let status = status_from_query_error(&QueryError::SubtreeRootRangeTooLarge {
+        requested: MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1),
+        maximum: MAX_SUBTREE_ROOTS_PER_REQUEST,
+    });
+    let details = status.get_error_details();
+    let violation = details
+        .bad_request()
+        .and_then(|bad_request| bad_request.field_violations.first());
+
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(matches!(
+        violation,
+        Some(violation)
+            if violation.field == "max_entries"
+                && violation.description.contains("maximum is 1024")
+    ));
+
+    let client_error = into_client_error(&status);
     assert_eq!(
         client_error.reason(),
-        Some(ErrorReason::CompactBlockRangeTooLarge)
+        Some(ErrorReason::SubtreeRootRangeTooLarge)
     );
     assert_eq!(client_error.retry_policy(), RetryPolicy::ClientError);
+}
+
+#[test]
+fn unavailable_endpoint_capability_requires_operator_action() {
+    let status = status_from_query_error(&QueryError::EndpointCapabilityUnavailable {
+        capability: WALLET_READ_FULL_BLOCK_AT_V1,
+    });
+    let details = status.get_error_details();
+    let violation = details
+        .precondition_failure()
+        .and_then(|failure| failure.violations.first());
+
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(matches!(
+        violation,
+        Some(violation)
+            if violation.r#type == "ENDPOINT_CAPABILITY_UNAVAILABLE"
+                && violation.subject == WALLET_READ_FULL_BLOCK_AT_V1
+    ));
+
+    let client_error = into_client_error(&status);
+    assert_eq!(
+        client_error.reason(),
+        Some(ErrorReason::EndpointCapabilityUnavailable)
+    );
+    assert_eq!(
+        client_error.retry_policy(),
+        RetryPolicy::OperatorActionRequired
+    );
 }
 
 #[test]
@@ -88,7 +142,8 @@ fn every_error_reason_round_trips_through_proto_str_name() {
     let reasons = [
         WireErrorReason::Unspecified,
         WireErrorReason::InvalidBlockRange,
-        WireErrorReason::CompactBlockRangeTooLarge,
+        WireErrorReason::BlockRangeTooLarge,
+        WireErrorReason::SubtreeRootRangeTooLarge,
         WireErrorReason::ChainEventCursorInvalid,
         WireErrorReason::AddressOutputCursorInvalid,
         WireErrorReason::TransparentHistoryCursorInvalid,
@@ -124,6 +179,7 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         WireErrorReason::UnsupportedWalletEncoding,
         WireErrorReason::EntropyUnavailable,
         WireErrorReason::MaterializedViewUnavailable,
+        WireErrorReason::EndpointCapabilityUnavailable,
         WireErrorReason::NodeCapabilityMissing,
         WireErrorReason::NoVisibleChainEpoch,
         WireErrorReason::ExplorerInternal,

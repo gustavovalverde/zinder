@@ -293,8 +293,10 @@ impl ReadinessCause {
 /// `tonic_types::ErrorDetails` shapes (`ResourceInfo`, `PreconditionFailure`,
 /// `BadRequest`).
 ///
-/// New reasons are additive only and must reserve a new scalar code;
-/// existing reasons' semantics are stable within a major version.
+/// Additive reasons reserve a new scalar code. Renaming, removing, or changing
+/// an existing reason's semantics is a breaking native-contract change: bump
+/// `WalletServerInfo.contract_revision`, reserve any removed name and scalar,
+/// and cut controlled consumers over with the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ErrorReason {
@@ -302,7 +304,7 @@ pub enum ErrorReason {
     Unspecified = 0,
     /// INVALID_ARGUMENT family.
     InvalidBlockRange = 1,
-    CompactBlockRangeTooLarge = 2,
+    BlockRangeTooLarge = 2,
     ChainEventCursorInvalid = 3,
     AddressOutputCursorInvalid = 4,
     TransparentHistoryCursorInvalid = 5,
@@ -314,6 +316,7 @@ pub enum ErrorReason {
     TransparentBalanceAddressCountExceeded = 43,
     SnapshotPageCursorInvalid = 44,
     BroadcastTransactionTooLarge = 46,
+    SubtreeRootRangeTooLarge = 49,
     /// FAILED_PRECONDITION family.
     BroadcastDisabled = 11,
     ChainEventCursorExpired = 12,
@@ -347,6 +350,7 @@ pub enum ErrorReason {
     MaterializedViewUnavailable = 34,
     NodeCapabilityMissing = 36,
     ExplorerPreconditionUnsatisfied = 40,
+    EndpointCapabilityUnavailable = 48,
     /// UNAVAILABLE family.
     NoVisibleChainEpoch = 38,
     /// UNIMPLEMENTED family.
@@ -370,7 +374,7 @@ impl ErrorReason {
         match self {
             Self::Unspecified => "ERROR_REASON_UNSPECIFIED",
             Self::InvalidBlockRange => "INVALID_BLOCK_RANGE",
-            Self::CompactBlockRangeTooLarge => "COMPACT_BLOCK_RANGE_TOO_LARGE",
+            Self::BlockRangeTooLarge => "BLOCK_RANGE_TOO_LARGE",
             Self::ChainEventCursorInvalid => "CHAIN_EVENT_CURSOR_INVALID",
             Self::AddressOutputCursorInvalid => "ADDRESS_OUTPUT_CURSOR_INVALID",
             Self::TransparentHistoryCursorInvalid => "TRANSPARENT_HISTORY_CURSOR_INVALID",
@@ -384,6 +388,7 @@ impl ErrorReason {
             }
             Self::SnapshotPageCursorInvalid => "SNAPSHOT_PAGE_CURSOR_INVALID",
             Self::BroadcastTransactionTooLarge => "BROADCAST_TRANSACTION_TOO_LARGE",
+            Self::SubtreeRootRangeTooLarge => "SUBTREE_ROOT_RANGE_TOO_LARGE",
             Self::BroadcastDisabled => "BROADCAST_DISABLED",
             Self::ChainEventCursorExpired => "CHAIN_EVENT_CURSOR_EXPIRED",
             Self::MempoolEventCursorExpired => "MEMPOOL_EVENT_CURSOR_EXPIRED",
@@ -411,6 +416,7 @@ impl ErrorReason {
             Self::MaterializedViewUnavailable => "MATERIALIZED_VIEW_UNAVAILABLE",
             Self::NodeCapabilityMissing => "NODE_CAPABILITY_MISSING",
             Self::ExplorerPreconditionUnsatisfied => "EXPLORER_PRECONDITION_UNSATISFIED",
+            Self::EndpointCapabilityUnavailable => "ENDPOINT_CAPABILITY_UNAVAILABLE",
             Self::NoVisibleChainEpoch => "NO_VISIBLE_CHAIN_EPOCH",
             Self::ExplorerMethodDisabled => "EXPLORER_METHOD_DISABLED",
             Self::DependencyNotConfigured => "DEPENDENCY_NOT_CONFIGURED",
@@ -422,7 +428,7 @@ impl ErrorReason {
         match value {
             "ERROR_REASON_UNSPECIFIED" => Some(Self::Unspecified),
             "INVALID_BLOCK_RANGE" => Some(Self::InvalidBlockRange),
-            "COMPACT_BLOCK_RANGE_TOO_LARGE" => Some(Self::CompactBlockRangeTooLarge),
+            "BLOCK_RANGE_TOO_LARGE" => Some(Self::BlockRangeTooLarge),
             "CHAIN_EVENT_CURSOR_INVALID" => Some(Self::ChainEventCursorInvalid),
             "ADDRESS_OUTPUT_CURSOR_INVALID" => Some(Self::AddressOutputCursorInvalid),
             "TRANSPARENT_HISTORY_CURSOR_INVALID" => {
@@ -438,6 +444,7 @@ impl ErrorReason {
             }
             "SNAPSHOT_PAGE_CURSOR_INVALID" => Some(Self::SnapshotPageCursorInvalid),
             "BROADCAST_TRANSACTION_TOO_LARGE" => Some(Self::BroadcastTransactionTooLarge),
+            "SUBTREE_ROOT_RANGE_TOO_LARGE" => Some(Self::SubtreeRootRangeTooLarge),
             "BROADCAST_DISABLED" => Some(Self::BroadcastDisabled),
             "CHAIN_EVENT_CURSOR_EXPIRED" => Some(Self::ChainEventCursorExpired),
             "MEMPOOL_EVENT_CURSOR_EXPIRED" => Some(Self::MempoolEventCursorExpired),
@@ -466,6 +473,9 @@ impl ErrorReason {
             "NODE_CAPABILITY_MISSING" => Some(Self::NodeCapabilityMissing),
             "EXPLORER_PRECONDITION_UNSATISFIED" => {
                 Some(Self::ExplorerPreconditionUnsatisfied)
+            }
+            "ENDPOINT_CAPABILITY_UNAVAILABLE" => {
+                Some(Self::EndpointCapabilityUnavailable)
             }
             "NO_VISIBLE_CHAIN_EPOCH" => Some(Self::NoVisibleChainEpoch),
             "EXPLORER_METHOD_DISABLED" => Some(Self::ExplorerMethodDisabled),

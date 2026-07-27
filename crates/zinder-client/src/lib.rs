@@ -46,14 +46,14 @@ pub use zinder_core::{
     BlockSelector, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
     BroadcastQueued, BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainEpoch,
     ChainEpochId, ChainValuePool, ChainValuePools, ChainValuePoolsAtTip, CompactBlockArtifact,
-    ConsensusBranchId, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, MempoolEntry, MempoolEvictionReason,
-    MinedTransaction, MinedTransactionChainContext, Network, NetworkUpgradeActivation,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentUnspentOutput, TransparentUtxoSetCommitment, TreeStateArtifact, TxStatus,
-    UtxoSetCommitmentScheme,
+    ConsensusBranchId, MAX_SUBTREE_ROOTS_PER_REQUEST, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST,
+    MempoolEntry, MempoolEvictionReason, MinedTransaction, MinedTransactionChainContext, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
+    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentMempoolOutput, TransparentMempoolOutputsRequest, TransparentMempoolSpend,
+    TransparentOutPoint, TransparentUnspentOutput, TransparentUtxoSetCommitment, TreeStateArtifact,
+    TxStatus, UtxoSetCommitmentScheme,
 };
 /// The server-side wallet recipe, compiled as a doctest so its worked skeleton
 /// cannot drift from the real `connect` and stream API.

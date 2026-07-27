@@ -64,7 +64,23 @@ fn print_config_uses_native_ports_and_dedicated_secondary_roots() -> eyre::Resul
         "secondary_path = \"{}\"",
         temporary.path().join("wallet-secondary").display()
     )));
+    assert!(stdout.contains("raw_blob_policy = \"transactions\""));
     assert!(!stdout.contains("9101"));
+    Ok(())
+}
+
+#[test]
+fn print_config_exposes_the_full_block_retention_contract() -> eyre::Result<()> {
+    let temporary = TempDir::new()?;
+    let mut command = query_command(&temporary, &temporary.path().join("canonical-secondary"));
+    command.args(["--raw-blob-policy", "all"]);
+    let output = command.output()?;
+    assert!(
+        output.status.success(),
+        "print-config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8(output.stdout)?.contains("raw_blob_policy = \"all\""));
     Ok(())
 }
 

@@ -14,9 +14,10 @@ use tonic::{Code, Request, Response, Status, transport::Server};
 use tonic_types::StatusExt;
 use zinder_core::wire::encode_rpc_transaction_id_hex;
 use zinder_core::{
-    ChainEpoch, ChainTipMetadata, CompactBlockArtifact, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootHash, SubtreeRootIndex, TransactionId, TransparentAddressScriptHash,
-    TransparentOutPoint, TransparentOutputArtifact, TreeStateArtifact, UnixTimestampMillis,
+    ChainEpoch, ChainTipMetadata, CompactBlockArtifact, MAX_SUBTREE_ROOTS_PER_REQUEST,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionId,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputArtifact,
+    TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_proto::capabilities::{WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1};
 use zinder_proto::v1::{
@@ -26,7 +27,9 @@ use zinder_proto::v1::{
     },
     wallet::{self, wallet_query_server::WalletQuery as WalletQueryService},
 };
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter, WalletQueryOptions};
+use zinder_query::{
+    WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter, WalletQueryOptions,
+};
 use zinder_store::{
     ChainEpochArtifacts, EventStreamStartPosition, PrimaryChainStore, StreamCursorTokenV1,
     chain_view_message, event_stream_start_message,
@@ -48,7 +51,7 @@ async fn native_grpc_service_returns_wallet_reads_from_stored_artifacts() -> eyr
     let stored_artifacts = commit_wallet_artifacts(&store)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let grpc_responses = read_wallet_grpc_responses(&grpc_adapter).await?;
 
     assert_wallet_grpc_response_epochs(&grpc_responses, stored_artifacts.chain_epoch.id.value());
@@ -69,10 +72,6 @@ async fn native_grpc_service_returns_wallet_reads_from_stored_artifacts() -> eyr
             .as_ref()
             .ok_or_else(|| eyre!("missing compact block"))?,
         &zinder_proto::wire::compact_block_message(&stored_artifacts.compact_block)
-    );
-    assert_eq!(
-        grpc_responses.explicit_tree_state.payload_bytes,
-        stored_artifacts.tree_state.payload_bytes
     );
     assert_eq!(
         grpc_responses.latest_tree_state_checkpoint.payload_bytes,
@@ -112,7 +111,7 @@ async fn native_grpc_service_checks_range_limit_before_opening_reader() -> eyre:
             ..WalletQueryOptions::default()
         },
     );
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let status = match WalletQueryService::compact_blocks_in_range(
         &grpc_adapter,
@@ -134,6 +133,53 @@ async fn native_grpc_service_checks_range_limit_before_opening_reader() -> eyre:
 }
 
 #[tokio::test]
+async fn native_grpc_service_rejects_oversized_subtree_root_range() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
+    let requested = MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1);
+
+    let status = match WalletQueryService::subtree_roots(
+        &grpc_adapter,
+        Request::new(wallet::SubtreeRootsRequest {
+            shielded_protocol: wallet::ShieldedProtocol::Sapling as i32,
+            start_index: 0,
+            max_entries: requested,
+            at_epoch_id: None,
+        }),
+    )
+    .await
+    {
+        Ok(response) => {
+            return Err(eyre!("expected subtree-root range error, got {response:?}"));
+        }
+        Err(status) => status,
+    };
+    let details = status.get_error_details();
+    let reason = details
+        .error_info()
+        .map(|error_info| error_info.reason.as_str());
+    let violation = details
+        .bad_request()
+        .and_then(|bad_request| bad_request.field_violations.first());
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(reason, Some("SUBTREE_ROOT_RANGE_TOO_LARGE"));
+    assert!(matches!(
+        violation,
+        Some(violation)
+            if violation.field == "max_entries"
+                && violation.description.contains("maximum is 1024")
+    ));
+    assert!(status.message().contains("maximum 1024"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
@@ -146,7 +192,7 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
     )?)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let tree_state_status = match WalletQueryService::tree_state_at_height(
         &grpc_adapter,
@@ -175,7 +221,7 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
         Err(status) => status,
     };
 
-    assert_eq!(tree_state_status.code(), Code::NotFound);
+    assert_eq!(tree_state_status.code(), Code::FailedPrecondition);
     assert_eq!(subtree_roots_status.code(), Code::NotFound);
 
     Ok(())
@@ -188,7 +234,7 @@ async fn native_grpc_service_returns_not_found_when_transaction_missing() -> eyr
     commit_wallet_artifacts(&store)?;
     let requested_transaction_id = TransactionId::from_bytes([0x45; 32]);
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let status = match WalletQueryService::transaction(
         &grpc_adapter,
@@ -214,43 +260,12 @@ async fn native_grpc_service_returns_not_found_when_transaction_missing() -> eyr
 }
 
 #[tokio::test]
-async fn native_grpc_service_broadcasts_raw_transactions() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let transaction_id = TransactionId::from_bytes([0x9a; 32]);
-    let broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        broadcaster.clone(),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
-
-    let response = WalletQueryService::broadcast_transaction(
-        &grpc_adapter,
-        Request::new(wallet::BroadcastTransactionRequest {
-            raw_transaction: vec![0x01, 0x02],
-        }),
-    )
-    .await?
-    .into_inner();
-
-    assert!(matches!(
-        response.outcome,
-        Some(wallet::broadcast_transaction_response::Outcome::Accepted(accepted))
-            if accepted.transaction_id == encode_rpc_transaction_id_hex(transaction_id)
-    ));
-    assert_eq!(broadcaster.call_count(), 1);
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn native_grpc_service_streams_chain_events_from_the_store() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let stored_artifacts = commit_wallet_artifacts(&store)?;
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let mut event_stream = WalletQueryService::chain_events(
         &grpc_adapter,
@@ -296,7 +311,7 @@ async fn native_grpc_service_rejects_unset_event_stream_start() -> eyre::Result<
     let store = store_fixture.chain_store().clone();
     commit_wallet_artifacts(&store)?;
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     for start in [None, Some(wallet::EventStreamStart { position: None })] {
         let status = match WalletQueryService::chain_events(
@@ -328,7 +343,7 @@ async fn native_grpc_service_live_tail_delivers_only_post_subscribe_events() -> 
         (),
         Arc::new(sample_regtest_upgrade_activations()),
     );
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let mut event_stream = WalletQueryService::chain_events(
         &grpc_adapter,
@@ -394,7 +409,7 @@ async fn native_grpc_service_expires_pruned_chain_event_cursors() -> eyre::Resul
     store.prune_chain_events_before(UnixTimestampMillis::new(1_774_668_300_003))?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let mut event_stream = WalletQueryService::chain_events(
         &grpc_adapter,
         Request::new(wallet::ChainEventsRequest {
@@ -458,7 +473,7 @@ async fn native_grpc_service_honors_request_epoch_pin() -> eyre::Result<()> {
     ))?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let response = WalletQueryService::visible_tip_block(
         &grpc_adapter,
         Request::new(wallet::VisibleTipBlockRequest {
@@ -520,7 +535,7 @@ async fn native_grpc_service_resolves_unpinned_mempool_transactions() -> eyre::R
     );
     let grpc_adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
         wallet_query,
-        ServerInfoSettings::default(),
+        WalletEndpointMetadata::default(),
         format!("http://{ingest_control_addr}"),
     );
 
@@ -574,7 +589,7 @@ async fn native_grpc_service_combines_confirmed_balance_with_pending_transparent
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
         wallet_query,
-        ServerInfoSettings::default(),
+        WalletEndpointMetadata::default(),
         format!("http://{ingest_control_addr}"),
     );
 
@@ -692,7 +707,7 @@ fn configured_mempool_balance_ingest_control(
 }
 
 #[tokio::test]
-async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::Result<()> {
+async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let read_only_query = WalletQuery::new(
         store_fixture.chain_store().clone(),
@@ -700,7 +715,7 @@ async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::
         Arc::new(sample_regtest_upgrade_activations()),
     );
     let read_only_adapter =
-        WalletQueryGrpcAdapter::new(read_only_query, ServerInfoSettings::default());
+        WalletQueryGrpcAdapter::new(read_only_query, WalletEndpointMetadata::default());
     let read_only_info = WalletQueryService::server_info(
         &read_only_adapter,
         Request::new(wallet::ServerInfoRequest {}),
@@ -722,13 +737,8 @@ async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::
         broadcaster,
         Arc::new(sample_regtest_upgrade_activations()),
     );
-    let broadcast_adapter = WalletQueryGrpcAdapter::new(
-        broadcast_query,
-        ServerInfoSettings {
-            transaction_broadcast_enabled: true,
-            ..ServerInfoSettings::default()
-        },
-    );
+    let broadcast_adapter =
+        WalletQueryGrpcAdapter::new(broadcast_query, WalletEndpointMetadata::default());
     let broadcast_info = WalletQueryService::server_info(
         &broadcast_adapter,
         Request::new(wallet::ServerInfoRequest {}),
@@ -738,7 +748,7 @@ async fn native_grpc_service_advertises_only_configured_capabilities() -> eyre::
     .info
     .ok_or_else(|| eyre!("missing broadcast info"))?;
 
-    assert!(has_capability(
+    assert!(!has_capability(
         &broadcast_info,
         WALLET_BROADCAST_TRANSACTION_V1
     ));
@@ -756,7 +766,6 @@ struct StoredWalletArtifacts {
 struct WalletGrpcResponses {
     visible_tip_block: wallet::VisibleTipBlockResponse,
     compact_block_range: Vec<wallet::CompactBlocksInRangeChunk>,
-    explicit_tree_state: wallet::TreeStateResponse,
     latest_tree_state_checkpoint: wallet::TreeStateResponse,
     subtree_roots: wallet::SubtreeRootsResponse,
     network_upgrade_activations: wallet::NetworkUpgradeActivationsResponse,
@@ -821,15 +830,6 @@ async fn read_wallet_grpc_responses(
     while let Some(compact_block_chunk) = compact_block_stream.next().await {
         compact_block_range.push(compact_block_chunk?);
     }
-    let explicit_tree_state = WalletQueryService::tree_state_at_height(
-        grpc_adapter,
-        Request::new(wallet::TreeStateAtHeightRequest {
-            height: 1,
-            at_epoch_id: None,
-        }),
-    )
-    .await?
-    .into_inner();
     let latest_tree_state_checkpoint = WalletQueryService::latest_tree_state_checkpoint(
         grpc_adapter,
         Request::new(wallet::LatestTreeStateCheckpointRequest { at_epoch_id: None }),
@@ -857,7 +857,6 @@ async fn read_wallet_grpc_responses(
     Ok(WalletGrpcResponses {
         visible_tip_block,
         compact_block_range,
-        explicit_tree_state,
         latest_tree_state_checkpoint,
         subtree_roots,
         network_upgrade_activations,
@@ -872,10 +871,6 @@ fn assert_wallet_grpc_response_epochs(responses: &WalletGrpcResponses, chain_epo
     for compact_block_chunk in &responses.compact_block_range {
         assert_eq!(response_chain_epoch_id(compact_block_chunk), chain_epoch_id);
     }
-    assert_eq!(
-        response_chain_epoch_id(&responses.explicit_tree_state),
-        chain_epoch_id
-    );
     assert_eq!(
         response_chain_epoch_id(&responses.latest_tree_state_checkpoint),
         chain_epoch_id

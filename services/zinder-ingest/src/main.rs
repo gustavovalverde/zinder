@@ -28,7 +28,7 @@ use zinder_ingest::{
 };
 use zinder_materialized_views::MaterializedViewPreset;
 use zinder_runtime::{
-    OpsEndpointHandle, Readiness, ReadinessState, RuntimeService, StartupPhase,
+    OpsEndpointHandle, OpsServerError, Readiness, ReadinessState, RuntimeService, StartupPhase,
     cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
     spawn_ops_endpoint_for,
 };
@@ -294,10 +294,11 @@ async fn run_ingest(
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(command_config.runtime_config.node.network),
         readiness.clone(),
-        zinder_proto::capabilities::always_on_capability_strings(
+        Arc::from(zinder_proto::capabilities::always_on_capability_strings(
             zinder_proto::capabilities::CapabilitySurface::Ingest,
-        ),
-    );
+        )),
+    )
+    .await?;
 
     let connect_node_phase = StartupPhase::ConnectNode.start();
     let source = zebra_json_rpc_source_for_target(
@@ -380,7 +381,6 @@ async fn run_ingest(
         shutdown_ops_endpoint(ops_handle),
     )
     .await
-    .map_err(IngestConfigError::from)
 }
 
 type CanonicalControlServer = JoinHandle<Result<(), tonic::transport::Error>>;
@@ -563,10 +563,10 @@ async fn coordinate_canonical_writer_lifecycle<DrainWorkers, ShutdownOps>(
     readiness: &Readiness,
     drain_workers: DrainWorkers,
     shutdown_ops: ShutdownOps,
-) -> Result<(), zinder_ingest::CanonicalWriterError>
+) -> Result<(), IngestConfigError>
 where
     DrainWorkers: std::future::Future<Output = ()>,
-    ShutdownOps: std::future::Future<Output = ()>,
+    ShutdownOps: std::future::Future<Output = Result<(), OpsServerError>>,
 {
     drain_workers.await;
     match writer_result {
@@ -592,12 +592,25 @@ where
                 "canonical writer parked with readiness drained for operator review"
             );
             termination.cancelled().await;
-            shutdown_ops.await;
+            shutdown_ops.await?;
             Ok(())
         }
         outcome => {
-            shutdown_ops.await;
-            outcome
+            let ops_outcome = shutdown_ops.await;
+            match outcome {
+                Err(error) => {
+                    if let Err(ops_error) = ops_outcome {
+                        tracing::warn!(
+                            target: "zinder::ingest",
+                            event = "ops_endpoint_shutdown_failed",
+                            error = %ops_error,
+                            "operational endpoint shutdown also failed"
+                        );
+                    }
+                    Err(IngestConfigError::from(error))
+                }
+                Ok(()) => ops_outcome.map_err(IngestConfigError::from),
+            }
         }
     }
 }
@@ -653,9 +666,12 @@ async fn await_worker_task(worker: &'static str, handle: JoinHandle<()>) {
     }
 }
 
-async fn shutdown_ops_endpoint(ops_handle: Option<OpsEndpointHandle>) {
-    if let Some(handle) = ops_handle {
-        handle.shutdown().await;
+async fn shutdown_ops_endpoint(
+    ops_handle: Option<OpsEndpointHandle>,
+) -> Result<(), OpsServerError> {
+    match ops_handle {
+        Some(handle) => handle.shutdown().await,
+        None => Ok(()),
     }
 }
 
@@ -1250,6 +1266,29 @@ mod tests {
         supervise_canonical_writer,
     };
 
+    fn reorg_window_exceeded_writer_result() -> Result<(), zinder_ingest::CanonicalWriterError> {
+        Err(zinder_ingest::CanonicalWriterError::Follow(
+            zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(Box::new(
+                zinder_ingest::CanonicalReorgWindowExceeded {
+                    local_tip: zinder_core::BlockId::new(
+                        zinder_core::BlockHeight::new(4),
+                        zinder_core::BlockHash::from_bytes([4; 32]),
+                    ),
+                    source_tip: zinder_core::BlockId::new(
+                        zinder_core::BlockHeight::new(4),
+                        zinder_core::BlockHash::from_bytes([5; 32]),
+                    ),
+                    settled_tip: zinder_core::BlockId::new(
+                        zinder_core::BlockHeight::new(2),
+                        zinder_core::BlockHash::from_bytes([2; 32]),
+                    ),
+                    required_depth: 3,
+                    configured_window_blocks: 2,
+                },
+            )),
+        ))
+    }
+
     #[tokio::test]
     async fn writer_reorg_window_exceeded_drains_workers_then_parks_ops_until_termination()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1269,28 +1308,10 @@ mod tests {
             let ops_shutdown = Arc::clone(&ops_shutdown);
             async move {
                 ops_shutdown.store(true, Ordering::SeqCst);
+                Ok(())
             }
         };
-        let writer_result = Err(zinder_ingest::CanonicalWriterError::Follow(
-            zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(Box::new(
-                zinder_ingest::CanonicalReorgWindowExceeded {
-                    local_tip: zinder_core::BlockId::new(
-                        zinder_core::BlockHeight::new(4),
-                        zinder_core::BlockHash::from_bytes([4; 32]),
-                    ),
-                    source_tip: zinder_core::BlockId::new(
-                        zinder_core::BlockHeight::new(4),
-                        zinder_core::BlockHash::from_bytes([5; 32]),
-                    ),
-                    settled_tip: zinder_core::BlockId::new(
-                        zinder_core::BlockHeight::new(2),
-                        zinder_core::BlockHash::from_bytes([2; 32]),
-                    ),
-                    required_depth: 3,
-                    configured_window_blocks: 2,
-                },
-            )),
-        ));
+        let writer_result = reorg_window_exceeded_writer_result();
         let mut lifecycle = Box::pin(coordinate_canonical_writer_lifecycle(
             writer_result,
             &termination,
@@ -1312,16 +1333,17 @@ mod tests {
             } => {}
         }
 
+        let readiness_report = readiness.report();
         assert!(matches!(
-            readiness.report().cause,
+            readiness_report.cause,
             zinder_runtime::ReadinessCause::ReorgWindowExceeded {
                 depth: 3,
                 configured: 2,
             }
         ));
-        assert_eq!(readiness.report().current_height, Some(4));
+        assert_eq!(readiness_report.current_height, Some(4));
         assert_eq!(
-            readiness.report().phase,
+            readiness_report.phase,
             Some(zinder_runtime::IngestPhase::FollowingTip)
         );
         assert!(!ops_shutdown.load(Ordering::SeqCst));
@@ -1355,6 +1377,7 @@ mod tests {
             let ops_shutdown = Arc::clone(&ops_shutdown);
             async move {
                 ops_shutdown.store(true, Ordering::SeqCst);
+                Ok(())
             }
         };
         let writer_result = Err(zinder_ingest::CanonicalWriterError::ControlServer {
@@ -1378,12 +1401,45 @@ mod tests {
 
         assert!(matches!(
             error,
-            zinder_ingest::CanonicalWriterError::ControlServer { reason }
+            crate::config::IngestConfigError::CanonicalWriter(
+                zinder_ingest::CanonicalWriterError::ControlServer { reason }
+            )
                 if reason == "test control server stopped"
         ));
         assert!(workers_drained.load(Ordering::SeqCst));
         assert!(ops_shutdown.load(Ordering::SeqCst));
         assert!(!termination.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_writer_propagates_ops_shutdown_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let readiness = zinder_runtime::Readiness::default();
+        let termination = CancellationToken::new();
+        let shutdown_ops = async {
+            Err(zinder_runtime::OpsServerError::Transport {
+                source: std::io::Error::other("synthetic ops shutdown failure"),
+            })
+        };
+
+        let error = coordinate_canonical_writer_lifecycle(
+            Ok(()),
+            &termination,
+            &readiness,
+            async {},
+            shutdown_ops,
+        )
+        .await
+        .err()
+        .ok_or("operational endpoint shutdown failure must propagate")?;
+
+        assert!(matches!(
+            error,
+            crate::config::IngestConfigError::OpsServer(
+                zinder_runtime::OpsServerError::Transport { .. }
+            )
+        ));
         Ok(())
     }
 

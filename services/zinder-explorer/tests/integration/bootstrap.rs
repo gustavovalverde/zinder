@@ -45,7 +45,7 @@ use zinder_proto::v1::explorer::{
 };
 use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
@@ -1461,7 +1461,7 @@ async fn spawn_wallet_query_server(
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(adapter.into_server())

@@ -5,7 +5,6 @@
 
 use std::{num::NonZeroU16, sync::Arc};
 
-use arc_swap::ArcSwap;
 use tokio_stream::StreamExt as _;
 use tonic::{Code, Request};
 use zebra_chain::{
@@ -13,18 +12,19 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
-    BlockHeaderArtifact, BlockHeight, BlockHeightRange, CommitmentTreeCheckpoint,
-    CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
-    TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentUnspentOutput,
+    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
+    TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::{
-    CanonicalReader, WalletProjectionReader, WalletServingQuery, WalletServingReadPair,
+    CanonicalReader, WalletProjectionReader, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_store::{
     CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
+    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, WalletServingStoreFixture,
@@ -52,7 +52,9 @@ async fn production_pair_serves_transparent_utxo_contract_and_support_signal() -
     let other_first_id = TransactionId::from_bytes([0x30; 32]);
     let other_second_id = TransactionId::from_bytes([0x40; 32]);
     let at_floor_transaction_bytes = b"production-utxo-round-trip".to_vec();
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(2);
     let block_one = chain
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre::eyre!("UTXO fixture must include block 1"))?
@@ -195,7 +197,9 @@ async fn production_pair_drains_both_transparent_history_rpcs_across_native_page
     let address_text = address.to_string();
     let script = address.script().as_raw_bytes().to_vec();
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(2);
     let block_one = chain
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre::eyre!("history fixture must include block 1"))?
@@ -278,7 +282,9 @@ async fn production_pair_seeks_transparent_address_ranges_past_a_large_prefix() 
     let address_text = address.to_string();
     let script = address.script().as_raw_bytes().to_vec();
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(2);
     let block_one = chain
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre::eyre!("history fixture must include block 1"))?
@@ -379,7 +385,9 @@ async fn production_history_maps_a_missing_canonical_blob_to_not_found() -> eyre
     let script = address.script().as_raw_bytes().to_vec();
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
     let transaction_id = TransactionId::from_bytes([0x32; 32]);
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(1);
     let block = chain
         .block_at(BlockHeight::new(1))
         .ok_or_else(|| eyre::eyre!("missing-blob fixture must include block 1"))?
@@ -450,7 +458,7 @@ fn build_wallet_serving_adapter_from_readers(
     activations: Arc<zinder_core::NetworkUpgradeActivations>,
 ) -> eyre::Result<WalletServingAdapter> {
     let serving_pair = Arc::new(WalletServingReadPair::new(canonical_reader, wallet_reader)?);
-    let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
+    let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let query = WalletServingQuery::from_serving_pair_slot(
         serving_pair_slot.clone(),
         MockTransactionBroadcaster::broadcast_disabled(),
@@ -524,6 +532,10 @@ struct MissingTransactionBlobCanonicalReader {
 }
 
 impl CanonicalReader for MissingTransactionBlobCanonicalReader {
+    fn raw_blob_retention(&self) -> RawBlobRetention {
+        self.canonical_reader.raw_blob_retention()
+    }
+
     fn network(&self) -> Network {
         self.canonical_reader.network()
     }
@@ -562,6 +574,20 @@ impl CanonicalReader for MissingTransactionBlobCanonicalReader {
         range: BlockHeightRange,
     ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
         self.canonical_reader.compact_blocks_in_range(range)
+    }
+
+    fn block_blob_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError> {
+        self.canonical_reader.block_blob_at(height)
+    }
+
+    fn block_blobs_in_range(
+        &self,
+        range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError> {
+        self.canonical_reader.block_blobs_in_range(range)
     }
 
     fn transaction_location(

@@ -1,6 +1,8 @@
 //! Zinder wallet projector release binary.
 
-use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    net::SocketAddr, num::NonZeroU32, path::PathBuf, process::ExitCode, sync::Arc, time::Duration,
+};
 
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -171,18 +173,22 @@ async fn run_projector(cli: Cli) -> Result<(), ProjectorError> {
     let config_path = cli.config_path.clone();
     let config = config::load_projector_config(config_path, cli.into())?;
     let readiness = Readiness::default();
-    let ops_handle = config.ops_listen_addr.map(|listen_addr| {
-        spawn_ops_endpoint(
-            listen_addr,
-            OpsServer {
-                service_name: PROJECTOR_SERVICE_NAME,
-                service_version: env!("CARGO_PKG_VERSION"),
-                network_name: encode_zinder_native_chain_name(config.network),
-                advertised_capabilities: Vec::new(),
-            },
-            readiness.clone(),
-        )
-    });
+    let ops_handle = match config.ops_listen_addr {
+        Some(listen_addr) => Some(
+            spawn_ops_endpoint(
+                listen_addr,
+                OpsServer {
+                    service_name: PROJECTOR_SERVICE_NAME,
+                    service_version: env!("CARGO_PKG_VERSION"),
+                    network_name: encode_zinder_native_chain_name(config.network),
+                    advertised_capabilities: Arc::from([]),
+                },
+                readiness.clone(),
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let cancel = CancellationToken::new();
     let _signal = cancel_on_terminating_signal(cancel.clone());
 
@@ -192,10 +198,24 @@ async fn run_projector(cli: Cli) -> Result<(), ProjectorError> {
         zinder_runtime::ReadinessCause::ShuttingDown,
     ));
     cancel.cancel();
-    if let Some(ops_handle) = ops_handle {
-        ops_handle.shutdown().await;
+    let ops_outcome = match ops_handle {
+        Some(ops_handle) => ops_handle.shutdown().await,
+        None => Ok(()),
+    };
+    match projector_outcome {
+        Err(error) => {
+            if let Err(ops_error) = ops_outcome {
+                tracing::warn!(
+                    target: "zinder::projector",
+                    event = "ops_endpoint_shutdown_failed",
+                    error = %ops_error,
+                    "operational endpoint shutdown also failed"
+                );
+            }
+            Err(error)
+        }
+        Ok(()) => ops_outcome.map_err(ProjectorError::from),
     }
-    projector_outcome
 }
 
 #[allow(

@@ -313,7 +313,8 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         ErrorReason::ChainEpochPinUnavailable => RetryPolicy::RefreshChainEpoch,
         ErrorReason::ChainEventCursorExpired => RetryPolicy::RestartFromEarliestRetained,
         ErrorReason::InvalidBlockRange
-        | ErrorReason::CompactBlockRangeTooLarge
+        | ErrorReason::BlockRangeTooLarge
+        | ErrorReason::SubtreeRootRangeTooLarge
         | ErrorReason::ChainEventCursorInvalid
         | ErrorReason::AddressOutputCursorInvalid
         | ErrorReason::TransparentHistoryCursorInvalid
@@ -338,6 +339,7 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::EntropyUnavailable
         | ErrorReason::ExplorerInternal
         | ErrorReason::MaterializedViewUnavailable
+        | ErrorReason::EndpointCapabilityUnavailable
         | ErrorReason::NodeCapabilityMissing
         | ErrorReason::ExplorerPreconditionUnsatisfied
         | ErrorReason::ExplorerMethodDisabled
@@ -423,6 +425,22 @@ mod tests {
         let error = IndexerError::from_status(status);
 
         assert_eq!(error.reason(), Some(ErrorReason::InvalidAddress));
+        assert_eq!(error.retry_policy(), RetryPolicy::ClientError);
+        assert!(matches!(error, IndexerError::RemoteFailure { .. }));
+    }
+
+    #[test]
+    fn subtree_root_range_limit_is_a_client_error() {
+        let status = zinder_query::status_from_query_error(
+            &zinder_query::QueryError::SubtreeRootRangeTooLarge {
+                requested: zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1),
+                maximum: zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST,
+            },
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(error.reason(), Some(ErrorReason::SubtreeRootRangeTooLarge));
         assert_eq!(error.retry_policy(), RetryPolicy::ClientError);
         assert!(matches!(error, IndexerError::RemoteFailure { .. }));
     }

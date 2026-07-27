@@ -11,7 +11,6 @@ use std::{
     task::{Context, Poll},
 };
 
-use arc_swap::ArcSwap;
 use eyre::eyre;
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
@@ -23,15 +22,13 @@ use tonic::{
     transport::Server,
 };
 use zinder_client::{
-    BlockHeight, BlockHeightRange, Capability, CapabilityDescriptor, ChainEvent, ChainIndex,
-    ConsensusBranchId, EndpointBackedIndex, EventStreamStart, IndexerError, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, RemoteChainIndex,
-    RemoteOpenOptions, RetryPolicy, TransactionBroadcastOutcome, TransactionId,
+    BlockHeight, BlockHeightRange, ChainEvent, ChainIndex, ConsensusBranchId, EndpointBackedIndex,
+    EventStreamStart, Network, NetworkUpgradeActivation, RemoteChainIndex, RemoteOpenOptions,
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    ServerInfoSettings, WalletCapabilityProfile, WalletQuery, WalletQueryGrpcAdapter,
-    WalletServingQuery, WalletServingReadPair,
+    WalletEndpointMetadata, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_testkit::{
     ChainFixture, MockTransactionBroadcaster, StoreFixture, WalletServingStoreFixture,
@@ -43,20 +40,12 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
     let store_fixture =
         StoreFixture::with_chain_committed(&chain_fixture, zinder_client::ChainEpochId::new(1))?;
-    let transaction_id = TransactionId::from_bytes([0x66; 32]);
-    let broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),
-        broadcaster,
+        MockTransactionBroadcaster::broadcast_disabled(),
         Arc::new(sample_regtest_upgrade_activations()),
     );
-    let grpc_adapter = WalletQueryGrpcAdapter::new(
-        wallet_query,
-        ServerInfoSettings {
-            transaction_broadcast_enabled: true,
-            ..ServerInfoSettings::default()
-        },
-    );
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let endpoint = spawn_wallet_query(grpc_adapter).await?;
     let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
         endpoint,
@@ -79,9 +68,6 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
         compact_block_result?;
         compact_block_count += 1;
     }
-    let broadcast_outcome = chain_index
-        .broadcast_transaction(RawTransactionBytes::new([0x01, 0x02]))
-        .await?;
     let mut events = chain_index
         .chain_events(EventStreamStart::EarliestRetained)
         .await?;
@@ -91,14 +77,9 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
 
     assert_eq!(server_info.network, Network::ZcashRegtest);
     assert_eq!(server_info.service_name, "zinder-query");
-    assert!(server_info.supports(Capability::Broadcast));
     assert_eq!(current_epoch.visible_tip_height, BlockHeight::new(2));
     assert_eq!(compact_block.height(), BlockHeight::new(1));
     assert_eq!(compact_block_count, 2);
-    assert_eq!(
-        broadcast_outcome,
-        TransactionBroadcastOutcome::Accepted(zinder_client::BroadcastAccepted { transaction_id })
-    );
     assert!(matches!(
         first_event.event,
         ChainEvent::ChainCommitted { committed }
@@ -121,15 +102,12 @@ async fn remote_chain_index_returns_typed_network_upgrade_activations() -> eyre:
         Arc::new(canonical_reader),
         Arc::new(wallet_reader),
     )?);
-    let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
+    let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let wallet_query =
         WalletServingQuery::from_serving_pair_slot(serving_pair_slot, (), activations);
     let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
         wallet_query,
-        ServerInfoSettings {
-            capability_profile: WalletCapabilityProfile::ExactPair,
-            ..ServerInfoSettings::default()
-        },
+        WalletEndpointMetadata::default(),
     ))
     .await?;
     let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
@@ -153,89 +131,6 @@ async fn remote_chain_index_returns_typed_network_upgrade_activations() -> eyre:
         name: "Overwinter".to_owned(),
     };
     assert_eq!(first, &expected_first);
-    Ok(())
-}
-
-#[tokio::test]
-async fn remote_chain_index_maps_released_serving_query_stale_pin_to_refresh() -> eyre::Result<()> {
-    let mut delayed_activations = sample_regtest_upgrade_activations().activations().to_vec();
-    for activation in &mut delayed_activations {
-        if matches!(activation.name.as_str(), "Sapling" | "NU5" | "NU6.3") {
-            activation.activation_height = BlockHeight::new(100);
-        }
-    }
-    let activations = Arc::new(NetworkUpgradeActivations::new(
-        Network::ZcashRegtest,
-        delayed_activations,
-    )?);
-    let initial_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let replacement_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let mut initial_store =
-        WalletServingStoreFixture::from_chain(&initial_chain, activations.as_ref())?;
-    let (initial_canonical, initial_wallet) = initial_store.take_readers()?;
-    let initial_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(initial_canonical),
-        Arc::new(initial_wallet),
-    )?);
-    let initial_epoch_id = initial_pair.canonical_fence().chain_epoch_id();
-    let serving_slot = Arc::new(ArcSwap::from(initial_pair));
-    let query = WalletServingQuery::from_serving_pair_slot(
-        Arc::clone(&serving_slot),
-        (),
-        Arc::clone(&activations),
-    );
-    let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
-        query,
-        ServerInfoSettings::default(),
-    ))
-    .await?;
-    let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
-        endpoint,
-        network: Network::ZcashRegtest,
-    })?;
-
-    let snapshot = chain_index.snapshot().await?;
-    assert_eq!(snapshot.chain_epoch().id, initial_epoch_id);
-    let initial_tip = snapshot.visible_tip_block().await?;
-
-    let mut replacement_store = WalletServingStoreFixture::from_chain_after_live_append(
-        &replacement_chain,
-        activations.as_ref(),
-    )?;
-    let (replacement_canonical, replacement_wallet) = replacement_store.take_readers()?;
-    let replacement_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(replacement_canonical),
-        Arc::new(replacement_wallet),
-    )?);
-    let replacement_epoch_id = replacement_pair.canonical_fence().chain_epoch_id();
-    assert!(replacement_epoch_id.value() > initial_epoch_id.value());
-    serving_slot.store(replacement_pair);
-    assert_eq!(chain_index.current_epoch().await?.id, replacement_epoch_id);
-
-    let stale_read = snapshot.visible_tip_block().await;
-    let Err(error) = stale_read else {
-        return Err(eyre!(
-            "the released serving query served a stale snapshot after pair publication"
-        ));
-    };
-
-    assert!(matches!(error, IndexerError::ChainEpochPinUnavailable));
-    assert_eq!(error.retry_policy(), RetryPolicy::RefreshChainEpoch);
-    let stale_artifact_read = snapshot.compact_block_at(initial_tip.height).await;
-    let Err(artifact_error) = stale_artifact_read else {
-        return Err(eyre!(
-            "the released serving query served a stale snapshot artifact"
-        ));
-    };
-    assert!(matches!(
-        artifact_error,
-        IndexerError::ChainEpochPinUnavailable
-    ));
-    assert_eq!(
-        artifact_error.retry_policy(),
-        RetryPolicy::RefreshChainEpoch
-    );
-    assert_ne!(chain_index.visible_tip_block(None).await?, initial_tip);
     Ok(())
 }
 
@@ -437,6 +332,7 @@ async fn spawn_wallet_query<QueryApi>(
     grpc_adapter: WalletQueryGrpcAdapter<QueryApi>,
 ) -> eyre::Result<String>
 where
+    QueryApi: WalletQueryApi,
     WalletQueryGrpcAdapter<QueryApi>: zinder_proto::v1::wallet::wallet_query_server::WalletQuery,
 {
     let listener = TcpListener::bind("127.0.0.1:0").await?;

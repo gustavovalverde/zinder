@@ -34,7 +34,7 @@ use zinder_ingest::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
+    WalletEndpointMetadata, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
     latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
     visible_tip_block_response,
 };
@@ -445,7 +445,7 @@ async fn assert_native_wallet_grpc_responses(
     activations: &Arc<NetworkUpgradeActivations>,
 ) -> Result<()> {
     let wallet_query = WalletQuery::new(store.clone(), (), Arc::clone(activations));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let visible_tip_block = WalletQueryService::visible_tip_block(
         &grpc_adapter,

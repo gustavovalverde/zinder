@@ -72,7 +72,8 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         ErrorReason::Unspecified => ReasonPolicy::new(Code::Internal, NonRetryable),
 
         ErrorReason::InvalidBlockRange
-        | ErrorReason::CompactBlockRangeTooLarge
+        | ErrorReason::BlockRangeTooLarge
+        | ErrorReason::SubtreeRootRangeTooLarge
         | ErrorReason::ChainEventCursorInvalid
         | ErrorReason::AddressOutputCursorInvalid
         | ErrorReason::TransparentHistoryCursorInvalid
@@ -98,6 +99,7 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::ChainEpochConflict
         | ErrorReason::ChainEpochNetworkMismatch
         | ErrorReason::MaterializedViewUnavailable
+        | ErrorReason::EndpointCapabilityUnavailable
         | ErrorReason::DependencyNotConfigured
         | ErrorReason::NodeCapabilityMissing
         | ErrorReason::ExplorerPreconditionUnsatisfied => {

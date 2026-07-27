@@ -41,7 +41,7 @@ use zinder_proto::v1::{
     },
     wallet,
 };
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::LiveTestEnv;
@@ -215,9 +215,11 @@ pub(crate) async fn serve_wallet_query_grpc(
 ) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
     let server_info = options
         .network
-        .map_or_else(ServerInfoSettings::default, |network| ServerInfoSettings {
-            network: encode_zinder_native_chain_name(network).to_owned(),
-            ..ServerInfoSettings::default()
+        .map_or_else(WalletEndpointMetadata::default, |network| {
+            WalletEndpointMetadata {
+                network: encode_zinder_native_chain_name(network).to_owned(),
+                ..WalletEndpointMetadata::default()
+            }
         });
     let adapter = match options.ingest_control_endpoint {
         Some(endpoint) => {

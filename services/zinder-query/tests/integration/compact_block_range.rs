@@ -12,19 +12,21 @@ use prost::Message;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainTipMetadata, CompactBlockArtifact,
-    CompactChainMetadata, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    SubtreeRootRange, TreeStateArtifact,
+    CompactChainMetadata, MAX_SUBTREE_ROOTS_PER_REQUEST, Network, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TreeStateArtifact,
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    ArtifactKey, QueryError, WalletQuery, WalletQueryApi, WalletQueryOptions,
+    ArtifactKey, DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, WalletQuery, WalletQueryApi,
+    WalletQueryOptions, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
     latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
     visible_tip_block_response,
 };
 use zinder_source::{SourceError, SourceTreeState, TreeStateUpstream};
-use zinder_store::{ArtifactFamily, ChainEpochArtifacts};
+use zinder_store::{ArtifactFamily, ChainEpochArtifacts, RawBlobRetention};
 use zinder_testkit::{
-    StoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
+    ChainFixture, StoreFixture, WalletServingStoreFixture, encode_fixture_block_replay,
+    sample_regtest_upgrade_activations,
 };
 
 use crate::common::{
@@ -441,6 +443,79 @@ async fn sparse_tree_state_uses_canonical_identity_and_time_with_frontier_only_p
 }
 
 #[tokio::test]
+async fn generic_query_rejects_oversized_subtree_root_range_before_storage() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let requested = MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1);
+    let max_entries = NonZeroU32::new(requested).ok_or_else(|| eyre!("invalid max entries"))?;
+
+    let query_outcome = wallet_query
+        .subtree_roots(
+            SubtreeRootRange::new(
+                ShieldedProtocol::Sapling,
+                SubtreeRootIndex::new(0),
+                max_entries,
+            ),
+            None,
+        )
+        .await;
+
+    assert!(matches!(
+        query_outcome,
+        Err(QueryError::SubtreeRootRangeTooLarge {
+            requested: actual,
+            maximum,
+        }) if actual == requested && maximum == MAX_SUBTREE_ROOTS_PER_REQUEST
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn serving_query_rejects_oversized_subtree_root_range() -> eyre::Result<()> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(1);
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical),
+        Arc::new(wallet),
+    )?);
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(pair),
+        (),
+        activations,
+    );
+    let requested = MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1);
+    let max_entries = NonZeroU32::new(requested).ok_or_else(|| eyre!("invalid max entries"))?;
+
+    let query_outcome = wallet_query
+        .subtree_roots(
+            SubtreeRootRange::new(
+                ShieldedProtocol::Sapling,
+                SubtreeRootIndex::new(0),
+                max_entries,
+            ),
+            None,
+        )
+        .await;
+
+    assert!(matches!(
+        query_outcome,
+        Err(QueryError::SubtreeRootRangeTooLarge {
+            requested: actual,
+            maximum,
+        }) if actual == requested && maximum == MAX_SUBTREE_ROOTS_PER_REQUEST
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
@@ -461,7 +536,8 @@ async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> 
         SubtreeRootRange::new(
             ShieldedProtocol::Sapling,
             SubtreeRootIndex::new(0),
-            NonZeroU32::new(8).ok_or_else(|| eyre!("invalid max entries"))?,
+            NonZeroU32::new(MAX_SUBTREE_ROOTS_PER_REQUEST)
+                .ok_or_else(|| eyre!("invalid max entries"))?,
         ),
         None,
     )
@@ -745,11 +821,47 @@ async fn compact_block_range_rejects_ranges_above_configured_limit() -> eyre::Re
         Err(error) => error,
     };
 
-    assert!(matches!(
-        error,
-        QueryError::CompactBlockRangeTooLarge { .. }
-    ));
+    assert!(matches!(error, QueryError::BlockRangeTooLarge { .. }));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn serving_pair_compact_range_enforces_the_release_limit_before_storage() -> eyre::Result<()>
+{
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(1);
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical),
+        Arc::new(wallet),
+    )?);
+    let query = WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(pair),
+        (),
+        activations,
+    );
+    let requested = DEFAULT_MAX_COMPACT_BLOCK_RANGE.get().saturating_add(1);
+    let requested_count = usize::try_from(requested)?;
+    let maximum_count = usize::try_from(DEFAULT_MAX_COMPACT_BLOCK_RANGE.get())?;
+
+    let outcome = query
+        .compact_blocks_in_range(
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(requested)),
+            None,
+        )
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(QueryError::BlockRangeTooLarge {
+            requested: actual,
+            maximum,
+        }) if actual == requested_count && maximum == maximum_count
+    ));
     Ok(())
 }
 

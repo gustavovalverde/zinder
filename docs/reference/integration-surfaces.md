@@ -21,7 +21,7 @@ The wallet codebases below demonstrate integration seams and method demand; they
 
 | Wallet codebase | Existing seam | Zinder methods or method families | Integration shape |
 | --- | --- | --- | --- |
-| [ZODL](https://github.com/zodl-inc/zodl-android) | Zcash Android SDK `LightWalletEndpoint` | `GetLightdInfo`, `GetLatestBlock`, `GetBlockRange`, `GetTreeState`, `GetSubtreeRoots`, `GetTransaction`, `GetAddressUtxosStream`, `GetTaddressTxids`, `SendTransaction`, `GetMempoolTx`, and `GetMempoolStream` | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; no native Zinder adapter is required. |
+| [ZODL](https://github.com/zodl-inc/zodl-android) | Zcash Android SDK `LightWalletEndpoint` | `GetLightdInfo`, `GetLatestBlock`, `GetBlockRange`, `GetTreeState`, `GetSubtreeRoots`, `GetTransaction`, `GetAddressUtxosStream`, `GetTaddressTxids`, `SendTransaction`, and `GetMempoolStream` | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; no native Zinder adapter is required. |
 | [Vizor](https://github.com/chainapsis/vizor-wallet) | librustzcash `lightwalletd-tonic` client with a configurable endpoint | `GetLightdInfo`, latest block and block ranges, tree state, subtree roots, transaction lookup, transparent receiver discovery, `SendTransaction`, and mempool methods through librustzcash's sync engine | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; public deployments also need trusted TLS in front of Zinder. |
 | [Zallet](https://github.com/zcash/zallet) | Backend-neutral `Chain` and snapshot-scoped `ChainView` traits | `ServerInfo`, `VisibleTipBlock`, `FullBlocksInRange`, block headers, `SubtreeRoots`, `Transaction`, transparent output and spend lookups, `ChainEvents`, `MempoolSnapshot`, `MempoolEvents`, and `BroadcastTransaction` | Implement a new native `WalletQuery` adapter behind the existing traits. This mapping does not claim that Zallet integration exists on Zinder `main`. |
 | [Zally](https://github.com/gustavovalverde/zally) | `ChainSource` for reads and events, plus `Submitter` for broadcast | `SettledTipBlock`, `VisibleTipBlock`, `CompactBlocksInRange`, `TreeState`, `SubtreeRoots`, `Transaction`, `TransparentAddressUnspentOutputs`, `ChainEvents`, and `BroadcastTransaction` | Map the traits to public `RemoteChainIndex` and `EndpointBackedIndex`. |
@@ -67,11 +67,23 @@ Public deployments terminate TLS, authentication, rate limiting, and quota contr
 The contract is split across two async traits so the compiler expresses which calls a handle can serve:
 
 - `ChainIndex` carries immutable network metadata plus canonical and wallet-projection reads. `RemoteChainIndex` implements the typed client contract; consumers preflight advertised capabilities before relying on optional reads.
-- `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
+- `EndpointBackedIndex` carries operations that need live endpoint-owned
+  collaborators: transaction broadcast and chain value-pools require an
+  admitted upstream source; the chain-event stream and live-mempool
+  snapshot/events/overlays require the writer control boundary; and the
+  wallet-plane server descriptor describes the endpoint itself. Only
+  `RemoteChainIndex` implements it. The release query currently omits the
+  chain-value-pools capability because method discovery alone does not prove
+  the required payload or retained liveness semantics.
 
 A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
 
-The public traits and protocol include full-block and transparent-outpoint methods for consumer compatibility, but the released exact-pair `WalletServingQuery` returns `Unavailable` for those reads and `zinder-query` does not advertise their capabilities. Method presence is not a deployment support claim.
+The public traits and protocol include optional full-block and
+transparent-outpoint methods. The admitted wallet-serving query advertises
+full-block reads only when authenticated canonical retention is `all`.
+Transparent-outpoint reads remain omitted until their concrete serving-pair
+resolvers are implemented. Method presence is not a deployment support claim;
+consumers must preflight exact capability strings.
 
 Capture calls `current_epoch` once. A remote serving pair that has advanced
 returns `IndexerError::ChainEpochPinUnavailable`; its
@@ -141,7 +153,15 @@ At connect time, call `ServerInfo` and check:
 2. `contract_revision` meets the consumer's minimum.
 3. Every capability the consumer requires is present in `capabilities`.
 
-One caveat: the wallet-plane mempool capabilities (`wallet.snapshot.mempool_v3`, `wallet.events.mempool_v2`, the `wallet.mempool.*` reads) are always-on and advertised whether or not the deployment wires the ingest-control proxy that feeds them. Snapshot and point reads return `UNAVAILABLE` unless the mempool source tip exactly matches the canonical visible tip. Native `MempoolEvents` remains a tip-agnostic durable lifecycle stream; consumers combine it with `ChainEvents` when they need a tip-coherent view. `wallet.events.chain_v1` is gated on the deployment actually serving the chain-event stream, so a consumer that needs live-plane data probes that capability or issues a live call (for example `MempoolSnapshot`) and handles the failure.
+The release `zinder-query` composition does not admit an ingest-control
+mempool provider, so it omits `wallet.snapshot.mempool_v3`,
+`wallet.events.mempool_v2`, and the `wallet.mempool.*` capabilities. Calling
+one of those native methods directly fails with
+`ENDPOINT_CAPABILITY_UNAVAILABLE` before dialing a configured endpoint.
+Adding the live native mempool surface requires authenticated provider
+admission, readiness integration, and current-consumer certification; a URL
+alone is not evidence of support. `wallet.events.chain_v1` is independently
+derived from the admitted serving pair.
 
 ## Server-side wallets
 

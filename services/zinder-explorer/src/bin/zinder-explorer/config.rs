@@ -7,10 +7,10 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
-    OpsSection, OpsToml, ResolvedSecondaryStorage, RuntimeService, SecondaryStorageSection,
-    SecondaryStorageToml, SecuritySection, SecurityToml, guard_optional_serving_bind,
-    guard_serving_bind, load_bearer_token, parse_socket_addr, require_field,
-    resolve_allow_public_bind, resolve_ops_listen_addr, resolve_secondary_storage,
+    OpsSection, OpsServerError, OpsToml, ResolvedSecondaryStorage, RuntimeService,
+    SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
+    guard_optional_serving_bind, guard_serving_bind, load_bearer_token, parse_socket_addr,
+    require_field, resolve_allow_public_bind, resolve_ops_listen_addr, resolve_secondary_storage,
 };
 use zinder_source::{NodeSection, NodeTarget};
 
@@ -53,6 +53,9 @@ pub(crate) struct ExplorerConfigOverrides {
 pub(crate) enum ExplorerConfigError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+
+    #[error(transparent)]
+    OpsServer(#[from] OpsServerError),
 
     #[error(transparent)]
     Store(#[from] zinder_explorer::MaterializedViewStoreError),

@@ -4,9 +4,9 @@
 //! depends on. Parity here means "Zinder serves the consumer-expected shape",
 //! not byte-equivalence with every implementation detail of another indexer.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -14,14 +14,19 @@ use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
 use zinder_client::{
-    BlockHeight, Network, NetworkUpgradeActivations, RemoteChainIndex, RemoteOpenOptions,
-    TransactionId, TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
+    BlockHeight, BlockId, Network, NetworkUpgradeActivations, RawTransactionBytes,
+    RemoteChainIndex, RemoteOpenOptions, TransactionBroadcastOutcome, TransactionId,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd;
 use zinder_query::{
-    CanonicalReader, ServerInfoSettings, WalletCapabilityProfile, WalletProjectionReader,
-    WalletQueryGrpcAdapter, WalletServingQuery, WalletServingReadPair,
+    CanonicalReader, WalletEndpointMetadata, WalletProjectionReader, WalletQueryGrpcAdapter,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+};
+use zinder_source::{
+    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceTreeState,
+    TransactionBroadcaster, TreeStateUpstream,
 };
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{
@@ -44,6 +49,93 @@ struct TransparentAddressServingFixture {
     script_pub_key: Vec<u8>,
     value_zat: i64,
     raw_transaction_bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct ParityNodeSource {
+    capabilities: NodeCapabilities,
+    tip: BlockId,
+    block_time_seconds_by_id: Arc<HashMap<BlockId, u32>>,
+}
+
+impl ParityNodeSource {
+    fn from_chain(chain_fixture: &ChainFixture) -> eyre::Result<Self> {
+        let tip_block = chain_fixture
+            .blocks()
+            .last()
+            .ok_or_else(|| eyre::eyre!("parity node source requires a non-empty chain"))?;
+        let block_time_seconds_by_id = chain_fixture
+            .blocks()
+            .iter()
+            .map(|block| {
+                (
+                    BlockId::new(block.height, block.hash),
+                    block.block_time_seconds,
+                )
+            })
+            .collect();
+
+        Ok(Self {
+            capabilities: NodeCapabilities::new([
+                NodeCapability::TipId,
+                NodeCapability::TreeState,
+                NodeCapability::OpenRpcDiscovery,
+            ])?,
+            tip: BlockId::new(tip_block.height, tip_block.hash),
+            block_time_seconds_by_id: Arc::new(block_time_seconds_by_id),
+        })
+    }
+}
+
+#[async_trait]
+impl NodeSource for ParityNodeSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        self.capabilities
+    }
+
+    async fn fetch_block_at(&self, _height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        Err(SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::BestChainBlocks,
+        })
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        Ok(self.tip)
+    }
+}
+
+#[async_trait]
+impl TreeStateUpstream for ParityNodeSource {
+    async fn fetch_tree_state_for_block(
+        &self,
+        block_id: BlockId,
+    ) -> Result<SourceTreeState, SourceError> {
+        let block_time_seconds = self
+            .block_time_seconds_by_id
+            .get(&block_id)
+            .copied()
+            .ok_or_else(|| SourceError::NodeUnavailable {
+                reason: format!(
+                    "parity fixture has no canonical block at height {}",
+                    block_id.height.value()
+                ),
+            })?;
+        Ok(SourceTreeState::new(
+            block_id,
+            block_time_seconds,
+            PARITY_TREE_STATE_PAYLOAD,
+        ))
+    }
+}
+
+#[async_trait]
+impl TransactionBroadcaster for ParityNodeSource {
+    async fn broadcast_transaction(
+        &self,
+        _raw_transaction: RawTransactionBytes,
+    ) -> Result<TransactionBroadcastOutcome, SourceError> {
+        Err(SourceError::TransactionBroadcastDisabled)
+    }
 }
 
 mod explorers;
@@ -115,9 +207,9 @@ fn build_transparent_address_adapter(
         Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
         Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
     )?);
-    let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
+    let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let query = WalletServingQuery::from_serving_pair_slot(
-        Arc::clone(&serving_pair_slot),
+        serving_pair_slot.clone(),
         MockTransactionBroadcaster::broadcast_disabled(),
         Arc::clone(&fixture.activations),
     );
@@ -147,6 +239,7 @@ fn address_history_filter(address: String) -> lightwalletd::TransparentAddressBl
 
 async fn open_remote_chain_index(chain_fixture: &ChainFixture) -> eyre::Result<RemoteChainIndex> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
+    let node_source = ParityNodeSource::from_chain(chain_fixture)?;
     let mut store_fixture =
         WalletServingStoreFixture::from_chain(chain_fixture, activations.as_ref())?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
@@ -154,21 +247,10 @@ async fn open_remote_chain_index(chain_fixture: &ChainFixture) -> eyre::Result<R
         Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
         Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
     )?);
-    let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
-    let wallet_query = WalletServingQuery::from_serving_pair_slot(
-        serving_pair_slot,
-        MockTransactionBroadcaster::broadcast_disabled(),
-        activations,
-    );
-    let adapter = WalletQueryGrpcAdapter::new(
-        wallet_query,
-        ServerInfoSettings {
-            capability_profile: WalletCapabilityProfile::ExactPair,
-            transaction_blobs_retained: true,
-            transparent_address_history_available: true,
-            ..ServerInfoSettings::default()
-        },
-    );
+    let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
+    let wallet_query =
+        WalletServingQuery::from_probed_node_source(serving_pair_slot, node_source, activations)?;
+    let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let incoming = TcpListenerStream::new(listener);

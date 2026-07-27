@@ -625,6 +625,14 @@ impl<Inner> EpochPinRecorder<Inner> {
 
 #[async_trait]
 impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
+    fn native_endpoint_capabilities(&self) -> &zinder_query::NativeWalletEndpointCapabilities {
+        self.inner.native_endpoint_capabilities()
+    }
+
+    fn upstream_node_capabilities(&self) -> Option<&zinder_query::UpstreamNodeCapabilities> {
+        self.inner.upstream_node_capabilities()
+    }
+
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
         self.inner.network_upgrade_activations().await
     }
@@ -806,12 +814,9 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     async fn transparent_utxo_set_summary(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-        commitment_enabled: bool,
     ) -> Result<TransparentUtxoSetSummary, QueryError> {
         self.record(at_epoch_id);
-        self.inner
-            .transparent_utxo_set_summary(at_epoch_id, commitment_enabled)
-            .await
+        self.inner.transparent_utxo_set_summary(at_epoch_id).await
     }
 
     async fn tree_state_at(

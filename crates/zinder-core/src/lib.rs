@@ -89,8 +89,8 @@ pub use network_upgrade_activations::{
     UnsupportedNetworkUpgradeActivationsFingerprintVersion,
 };
 pub use subtree_root::{
-    SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    SubtreeRootRange, SubtreeRootRangeIter,
+    MAX_SUBTREE_ROOTS_PER_REQUEST, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, SubtreeRootRangeIter,
 };
 pub use transaction::{
     AuthDigest, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,

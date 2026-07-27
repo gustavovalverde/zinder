@@ -11,6 +11,12 @@ use crate::{BlockHash, BlockHeight};
 /// depth. A height-16 subtree contains 2^16 leaves.
 pub const SUBTREE_LEAF_COUNT: u32 = 1 << 16;
 
+/// Maximum number of subtree roots returned by one wallet query request.
+///
+/// The bound prevents one request from forcing an unbounded storage scan and
+/// response allocation.
+pub const MAX_SUBTREE_ROOTS_PER_REQUEST: u32 = 1_024;
+
 /// Shielded note commitment protocol.
 ///
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -99,11 +105,17 @@ pub struct SubtreeRootRange {
     /// First requested subtree-root index.
     pub start_index: SubtreeRootIndex,
     /// Maximum number of subtree roots to return.
+    ///
+    /// Wallet query boundaries reject values above
+    /// [`MAX_SUBTREE_ROOTS_PER_REQUEST`] before reading storage.
     pub max_entries: NonZeroU32,
 }
 
 impl SubtreeRootRange {
     /// Creates a bounded subtree-root range.
+    ///
+    /// This domain constructor does not apply a consumer-specific limit.
+    /// Wallet query boundaries enforce [`MAX_SUBTREE_ROOTS_PER_REQUEST`].
     #[must_use]
     pub const fn new(
         protocol: ShieldedProtocol,

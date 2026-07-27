@@ -53,6 +53,7 @@ impl WalletServingStoreFixture {
             "chain fixture and network-upgrade activations must use the same network"
         );
         let canonical_chain_fixture = chain_fixture.clone().with_canonical_genesis_parent();
+        let raw_blob_retention = canonical_chain_fixture.raw_blob_retention();
         let tip_block = canonical_chain_fixture
             .blocks()
             .last()
@@ -67,7 +68,7 @@ impl WalletServingStoreFixture {
             network_upgrade_activations,
             tip_block.block_time_seconds.saturating_sub(1),
             tip,
-            RawBlobRetention::Transactions,
+            raw_blob_retention,
             reorg_policy,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
@@ -112,7 +113,7 @@ impl WalletServingStoreFixture {
             temporary_directory.path().join("canonical-secondary"),
             network_upgrade_activations,
             CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            raw_blob_retention,
             reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -159,6 +160,7 @@ impl WalletServingStoreFixture {
             "wallet-serving live-append fixture requires at least two blocks"
         );
         let baseline_chain = baseline_fixture.with_canonical_genesis_parent();
+        let raw_blob_retention = baseline_chain.raw_blob_retention();
         let baseline_tip = baseline_chain
             .blocks()
             .last()
@@ -173,7 +175,7 @@ impl WalletServingStoreFixture {
             network_upgrade_activations,
             baseline_tip.block_time_seconds.saturating_sub(1),
             baseline_tip_id,
-            RawBlobRetention::Transactions,
+            raw_blob_retention,
             reorg_policy,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
@@ -236,7 +238,7 @@ impl WalletServingStoreFixture {
             temporary_directory.path().join("canonical-secondary"),
             network_upgrade_activations,
             CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            raw_blob_retention,
             reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -281,6 +283,11 @@ fn canonical_build_blocks(chain_fixture: &ChainFixture) -> eyre::Result<Vec<Cano
     let tip_height = chain_fixture
         .tip_height()
         .ok_or_else(|| eyre!("wallet-serving fixture requires a tip"))?;
+    let build_inputs = CanonicalBlockBuildInputs {
+        transaction_rows: &transaction_rows,
+        tip_height,
+        raw_blob_retention: chain_fixture.raw_blob_retention(),
+    };
     let mut build_blocks = Vec::with_capacity(chain_fixture.block_count());
 
     for ((fixture_block, replay_envelope), compact_block) in chain_fixture
@@ -293,20 +300,24 @@ fn canonical_build_blocks(chain_fixture: &ChainFixture) -> eyre::Result<Vec<Cano
             fixture_block,
             replay_envelope,
             compact_block,
-            &transaction_rows,
-            tip_height,
+            &build_inputs,
         )?);
     }
 
     Ok(build_blocks)
 }
 
+struct CanonicalBlockBuildInputs<'a> {
+    transaction_rows: &'a [FixtureTransactionRows],
+    tip_height: BlockHeight,
+    raw_blob_retention: RawBlobRetention,
+}
+
 fn canonical_build_block(
     fixture_block: &FixtureBlock,
     replay_envelope: CanonicalBlockReplayEnvelope,
     compact_block: zinder_core::CompactBlockArtifact,
-    transaction_rows: &[FixtureTransactionRows],
-    tip_height: BlockHeight,
+    build_inputs: &CanonicalBlockBuildInputs<'_>,
 ) -> eyre::Result<CanonicalBuildBlock> {
     let facts = decode_canonical_block_replay(replay_envelope.as_bytes())
         .wrap_err_with(|| {
@@ -327,7 +338,8 @@ fn canonical_build_block(
         "wallet-serving fixture currently requires empty commitment-tree frontiers"
     );
 
-    let mut block_transaction_rows = transaction_rows
+    let mut block_transaction_rows = build_inputs
+        .transaction_rows
         .iter()
         .filter(|rows| {
             rows.location.block_height == fixture_block.height
@@ -335,18 +347,22 @@ fn canonical_build_block(
         })
         .collect::<Vec<_>>();
     block_transaction_rows.sort_by_key(|rows| rows.location.tx_index_in_block);
-    let transaction_blobs = block_transaction_rows
-        .into_iter()
-        .map(|rows| {
-            rows.blob.clone().ok_or_else(|| {
-                eyre!(
-                    "production canonical fixture transaction {:?} has no raw blob",
-                    rows.location.transaction_id
-                )
+    let transaction_blobs = if build_inputs.raw_blob_retention.retains_transaction_blobs() {
+        block_transaction_rows
+            .into_iter()
+            .map(|rows| {
+                rows.blob.clone().ok_or_else(|| {
+                    eyre!(
+                        "production canonical fixture transaction {:?} has no raw blob",
+                        rows.location.transaction_id
+                    )
+                })
             })
-        })
-        .collect::<eyre::Result<Vec<_>>>()?;
-    let checkpoint_required = fixture_block.height == tip_height
+            .collect::<eyre::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let checkpoint_required = fixture_block.height == build_inputs.tip_height
         || fixture_block
             .height
             .value()
@@ -367,6 +383,9 @@ fn canonical_build_block(
         tree_state_checkpoint,
         block_final_note_commitment_roots: None,
         transaction_blobs,
-        block_blob: None,
+        block_blob: build_inputs
+            .raw_blob_retention
+            .retains_block_blobs()
+            .then(|| fixture_block.block_blob_artifact()),
     })
 }
