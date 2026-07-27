@@ -346,6 +346,12 @@ fn transaction_identifiers(
     }
 }
 
+/// Derives both witnessed digests from one librustzcash transaction parse.
+///
+/// Zebra's current `WtxId::from(&Transaction)` path converts the transaction
+/// separately for its transaction ID and authorizing digest. This source hot
+/// path keeps the same librustzcash release line as Zebra but performs that
+/// conversion once. Prefer a one-pass Zebra API when upstream exposes one.
 fn witnessed_transaction_identifiers(
     transaction: &ZebraTransaction,
     raw_transaction_bytes: &[u8],

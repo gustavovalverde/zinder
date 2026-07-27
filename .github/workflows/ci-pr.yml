@@ -142,6 +142,9 @@ jobs:
       - name: Verify PostgreSQL protocol patch
         run: scripts/check-postgres-protocol-patch.sh
 
+      - name: Verify Zcash upstream alignment
+        run: scripts/check-zcash-upstream-alignment.sh
+
       - name: Verify release identity policy
         run: scripts/test-release-tag.sh
 
@@ -332,6 +335,24 @@ jobs:
               > "${tempdir}/${proto}.upstream"
             diff -u "${tempdir}/${proto}.local" "${tempdir}/${proto}.upstream"
           done
+
+      - name: Verify Zebra indexer protocol pin
+        run: |
+          set -euo pipefail
+          upstream_commit="$(cat crates/zinder-proto/proto/external/zebra/COMMIT)"
+          upstream_url="https://raw.githubusercontent.com/ZcashFoundation/zebra/${upstream_commit}/zebra-rpc/proto/indexer.proto"
+          tempdir="$(mktemp -d)"
+          trap 'rm -rf "${tempdir}"' EXIT
+
+          perl -pe 's/[ \t]+$//' \
+            crates/zinder-proto/proto/external/zebra/indexer.proto \
+            > "${tempdir}/indexer.proto.local"
+          curl -fsSL "$upstream_url" \
+            | perl -pe 's/[ \t]+$//' \
+            > "${tempdir}/indexer.proto.upstream"
+          diff -u \
+            "${tempdir}/indexer.proto.local" \
+            "${tempdir}/indexer.proto.upstream"
 
   coverage:
     name: coverage
