@@ -42,6 +42,10 @@ services:
   zinder-ingest:
     image: ${ZINDER_INGEST_IMAGE:-zinder-ingest:local}
     mem_limit: ${ZINDER_INGEST_MEMORY_LIMIT:-14g}
+    ulimits:
+      nofile:
+        soft: ${ZINDER_INGEST_NOFILE_SOFT_LIMIT:-65536}
+        hard: ${ZINDER_INGEST_NOFILE_HARD_LIMIT:-65536}
     build:
       context: ..
       dockerfile: deploy/Dockerfile

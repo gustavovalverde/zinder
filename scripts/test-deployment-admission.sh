@@ -97,6 +97,10 @@ jq -e '
   .services["zinder-explorer"].build.target == "zinder-explorer"
   and .services["zinder-explorer"].command == ["--config", "/etc/zinder/config.toml"]
   and .services["zinder-explorer"].network_mode == "service:zinder-ingest"
+  and .services["zinder-ingest"].ulimits.nofile.soft == 65536
+  and .services["zinder-ingest"].ulimits.nofile.hard == 65536
+  and .services["zinder-explorer"].ulimits.nofile.soft == 65536
+  and .services["zinder-explorer"].ulimits.nofile.hard == 65536
   and .services["zinder-explorer"].depends_on["zinder-query"].condition == "service_healthy"
   and .services["zinder-explorer"].healthcheck.test == [
     "CMD",
