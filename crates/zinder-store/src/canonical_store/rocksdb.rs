@@ -184,8 +184,9 @@ impl RocksDbCanonicalStore {
     ///
     /// Admission validates the complete column-family set, singleton control
     /// key, identity, schema, exact network-upgrade activation table, workload,
-    /// canonical reorg policy, source range, and readiness evidence before
-    /// opening a writer that cannot create data families.
+    /// raw-blob retention, canonical reorg policy, source range, construction
+    /// manifest identity, and readiness evidence before opening a writer that
+    /// cannot create data families.
     #[allow(
         clippy::too_many_arguments,
         reason = "primary admission keeps the filesystem identity and every immutable canonical contract explicit"
@@ -594,7 +595,7 @@ pub(super) fn admit_existing_store(
         })?;
     let control = validate_open_store_control(&db, path, expectation)?;
     if let CanonicalStoreBuildState::Ready(ready) = control.build_state {
-        validate_ready_construction_manifest(path, &ready)?;
+        validate_ready_construction_manifest(path, &ready, control.workload, &control.build_plan)?;
     }
     validate_mempool_lifecycle_admission(&db, control.network, control.cursor_auth_key)?;
     let database_identity = db.get_db_identity().map_err(|source| {

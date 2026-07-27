@@ -18,6 +18,7 @@ use super::{
     CanonicalSequenceCheckpoint, CanonicalStoreBuildState, CanonicalStoreError,
     CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
     block_replay::{CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at},
+    construction_manifest::validate_ready_construction_manifest,
     event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
     live_commit::event_fence_from_ready,
     mempool_lifecycle::validate_mempool_lifecycle_admission,
@@ -74,7 +75,10 @@ pub struct RocksDbCanonicalSecondary {
 }
 
 impl RocksDbCanonicalSecondary {
-    /// Opens one admitted secondary and catches it up to the primary's current state.
+    /// Opens one exactly admitted secondary and catches it up to the primary's current state.
+    ///
+    /// The expected raw-blob retention is an immutable store identity, not a
+    /// request to infer coverage from currently present rows.
     #[allow(
         clippy::too_many_arguments,
         reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
@@ -134,6 +138,12 @@ impl RocksDbCanonicalSecondary {
         let CanonicalStoreBuildState::Ready(ready_evidence) = opened_control.build_state else {
             return Err(CanonicalStoreError::StoreNotReady { path: primary_path });
         };
+        validate_ready_construction_manifest(
+            &primary_path,
+            &ready_evidence,
+            opened_control.workload,
+            &opened_control.build_plan,
+        )?;
         validate_ready_publication(
             &bounded_open.db,
             &opened_control.build_plan,

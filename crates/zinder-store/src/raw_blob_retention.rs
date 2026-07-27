@@ -21,6 +21,17 @@ pub enum RawBlobRetention {
 }
 
 impl RawBlobRetention {
+    /// Decodes the exact persisted configuration spelling.
+    #[must_use]
+    pub fn from_kebab_case(encoded: &str) -> Option<Self> {
+        match encoded {
+            "none" => Some(Self::None),
+            "transactions" => Some(Self::Transactions),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
     /// Returns the configuration spelling for this retention contract.
     #[must_use]
     pub const fn as_kebab_case(self) -> &'static str {
@@ -66,7 +77,12 @@ mod tests {
                 serde_json::from_str::<RawBlobRetention>(encoded)?,
                 retention
             );
+            assert_eq!(
+                RawBlobRetention::from_kebab_case(retention.as_kebab_case()),
+                Some(retention)
+            );
         }
+        assert_eq!(RawBlobRetention::from_kebab_case("transaction"), None);
         Ok(())
     }
 }

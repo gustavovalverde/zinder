@@ -230,6 +230,7 @@ async fn run_owned_projector(
         &config.canonical_secondary_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        config.expected_canonical_raw_blob_retention,
         reorg_policy,
         config.canonical_rocksdb_budget,
     )?;
@@ -1961,7 +1962,8 @@ mod tests {
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventHistoryRequest,
         CanonicalLiveAppend, CanonicalLiveReplacement, CanonicalReorgPolicy,
         CanonicalReplacementBlock, CanonicalStoreBuildPlan, CanonicalStoreWorkload,
-        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+        RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+        RocksDbResourceBudget,
     };
 
     #[test]
@@ -1984,8 +1986,13 @@ mod tests {
             block_one.facts.block_header.height,
             block_one.facts.block_header.block_hash,
         );
-        let build_plan =
-            CanonicalStoreBuildPlan::complete(&activations, 0, block_one_id, reorg_policy)?;
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            block_one_id,
+            RawBlobRetention::Transactions,
+            reorg_policy,
+        )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             &canonical_path,
             CanonicalStoreWorkload::Wallet,
@@ -2061,6 +2068,7 @@ mod tests {
             temporary.path().join("canonical-secondary"),
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;

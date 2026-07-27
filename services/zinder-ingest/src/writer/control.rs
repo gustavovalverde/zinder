@@ -1302,6 +1302,7 @@ fn checkpoint_build_plan_message(
                 }),
         }),
         build_tip: Some(checkpoint_block_id_message(build_plan.build_tip())),
+        raw_blob_retention: build_plan.raw_blob_retention().as_kebab_case().to_owned(),
     }
 }
 
@@ -1787,6 +1788,7 @@ pub(crate) mod test_support {
             .build_plan
             .ok_or("checkpoint response omitted build-plan identity")?;
         assert_eq!(build_plan.activation_fingerprint_version, 1);
+        assert_eq!(build_plan.raw_blob_retention, "transactions");
         assert_eq!(build_plan.reorg_window_blocks, 1);
         assert_eq!(
             build_plan

@@ -12,7 +12,7 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, ChainTipMetadata,
     CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactBlockArtifact, SerializedBytesDigest,
-    TransactionBlobArtifact,
+    TransactionBlobArtifact, TransactionLocation,
 };
 use zinder_rocksdb_bulk_load::{
     FixedRecordSorter, OrderedSstWriter, SstFileEvidence, SstFileSet, fixed_record_capacity,
@@ -446,18 +446,31 @@ fn write_build_block(
     let block_hash_record = encode_block_hash_location(facts.block_header.block_hash, height);
     block_hash_sorter.push(block_hash_record)?;
 
-    for (transaction_index, transaction_blob) in transaction_blobs.into_iter().enumerate() {
+    for (transaction_index, transaction) in facts.transactions.iter().enumerate() {
         let transaction_index = u32::try_from(transaction_index).map_err(|_| {
             CanonicalStoreError::block_load_sequence(format!(
                 "block {} transaction count exceeds u32::MAX",
                 height.value()
             ))
         })?;
+        let location_record = encode_transaction_location(TransactionLocation::new(
+            transaction.public_facts.transaction_id,
+            height,
+            facts.block_header.block_hash,
+            transaction_index,
+        ));
+        transaction_location_sorter.push(location_record)?;
+    }
+
+    for (transaction_index, transaction_blob) in transaction_blobs.into_iter().enumerate() {
+        let transaction_index = u32::try_from(transaction_index).map_err(|_| {
+            CanonicalStoreError::block_load_sequence(format!(
+                "block {} transaction blob count exceeds u32::MAX",
+                height.value()
+            ))
+        })?;
         let transaction_key = encode_transaction_position(height, transaction_index);
         transaction_blob_writer.put(&transaction_key, &transaction_blob.raw_transaction_bytes)?;
-
-        let location_record = encode_transaction_location(transaction_blob.location);
-        transaction_location_sorter.push(location_record)?;
     }
 
     if let Some(block_blob) = block_blob {
@@ -1164,6 +1177,10 @@ impl BlockSequenceRow {
                 CanonicalStoreError::block_load_sequence("transaction blob count exceeds u64::MAX")
             })?;
         let mut transaction_location_logical_bytes = 0;
+        for _ in &block.facts.transactions {
+            transaction_location_logical_bytes =
+                checked_add_row_bytes(transaction_location_logical_bytes, 32, 40)?;
+        }
         let mut transaction_blob_logical_bytes = 0;
         for transaction_blob in &block.transaction_blobs {
             transaction_blob_logical_bytes = checked_add_row_bytes(
@@ -1171,8 +1188,6 @@ impl BlockSequenceRow {
                 8,
                 transaction_blob.raw_transaction_bytes.len(),
             )?;
-            transaction_location_logical_bytes =
-                checked_add_row_bytes(transaction_location_logical_bytes, 32, 40)?;
         }
         let block_blob_logical_bytes = block.block_blob.as_ref().map_or(Ok(0), |block_blob| {
             checked_row_bytes(4, block_blob.raw_block_bytes.len())
@@ -1442,7 +1457,7 @@ impl BlockSequence {
             block_hash_index_count: self.block_count,
             block_replay_count: self.block_count,
             compact_block_count: self.block_count,
-            transaction_location_count: self.transaction_blob_count,
+            transaction_location_count: self.transaction_count,
             transaction_blob_count: self.transaction_blob_count,
             block_blob_count: self.block_blob_count,
             tree_state_checkpoint_count: self

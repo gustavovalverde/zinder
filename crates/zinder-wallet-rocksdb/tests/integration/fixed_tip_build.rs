@@ -22,8 +22,9 @@ use zinder_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
     CanonicalBuildBlock, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_STORE_IDENTITY, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
@@ -296,6 +297,7 @@ fn owner_checkpoints_are_cold_admitted_and_remain_exact_after_sources_advance()
         &canonical_checkpoint_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -531,6 +533,7 @@ fn closed_canonical_primary_secondary_build_matches_primary_oracle()
         temporary.path().join("canonical-secondary"),
         &inactive_upgrade_activations()?,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1172,6 +1175,7 @@ fn build_ready_canonical_store(
         &inactive_upgrade_activations()?,
         0,
         tip,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
@@ -1211,6 +1215,7 @@ fn build_ready_checkpointed_canonical_store(
         &inactive_upgrade_activations()?,
         checkpoint,
         tip,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
@@ -1248,6 +1253,7 @@ fn open_incremental_secondary(
         temporary.path().join(secondary_name),
         activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)

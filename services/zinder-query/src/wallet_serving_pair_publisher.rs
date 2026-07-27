@@ -30,8 +30,8 @@ use zinder_runtime::{
     ReadinessState, connect_zinder_grpc,
 };
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
+    RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
@@ -56,6 +56,8 @@ pub struct WalletServingPairConfig {
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     /// Canonical replacement-depth identity expected from the writer.
     pub canonical_reorg_policy: CanonicalReorgPolicy,
+    /// Immutable raw-blob retention identity expected from the canonical writer.
+    pub expected_raw_blob_retention: RawBlobRetention,
     /// `RocksDB` budget for each canonical secondary generation.
     pub canonical_resource_budget: RocksDbResourceBudget,
     /// `RocksDB` budget for each wallet secondary generation.
@@ -270,6 +272,7 @@ impl WalletServingPairPublisher {
         let wallet_secondary_path = secondary_generation.wallet_secondary_path.clone();
         let network_upgrade_activations = Arc::clone(&self.config.network_upgrade_activations);
         let canonical_reorg_policy = self.config.canonical_reorg_policy;
+        let expected_raw_blob_retention = self.config.expected_raw_blob_retention;
         let canonical_resource_budget = self.config.canonical_resource_budget;
         let wallet_resource_budget = self.config.wallet_resource_budget;
         let network = self.config.network;
@@ -291,6 +294,7 @@ impl WalletServingPairPublisher {
                 canonical_secondary_path,
                 network_upgrade_activations.as_ref(),
                 CanonicalStoreWorkload::Wallet,
+                expected_raw_blob_retention,
                 canonical_reorg_policy,
                 canonical_resource_budget,
             )?;
@@ -805,8 +809,9 @@ mod tests {
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
         CanonicalStoreBuildPlan, CanonicalStoreWorkload, EventStreamStartPosition,
-        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
-        RocksDbResourceBudget, StreamCursorTokenV1, event_stream_start_message,
+        RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+        RocksDbCanonicalStore, RocksDbResourceBudget, StreamCursorTokenV1,
+        event_stream_start_message,
     };
     use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionSourcePosition};
     use zinder_wallet_rocksdb::{
@@ -1227,6 +1232,7 @@ mod tests {
                 .join("wallet-reconcile-canonical-secondary"),
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1392,6 +1398,7 @@ mod tests {
             network: Network::ZcashRegtest,
             network_upgrade_activations,
             canonical_reorg_policy: CanonicalReorgPolicy::new(100)?,
+            expected_raw_blob_retention: RawBlobRetention::Transactions,
             canonical_resource_budget: RocksDbResourceBudget::for_local_tests(),
             wallet_resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
@@ -1416,6 +1423,7 @@ mod tests {
                 activations,
                 0,
                 tip,
+                RawBlobRetention::Transactions,
                 CanonicalReorgPolicy::new(100)?,
             )?,
             RocksDbResourceBudget::for_local_tests(),

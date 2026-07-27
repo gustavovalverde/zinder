@@ -207,7 +207,8 @@ Production wallet recovery is one coherent state-bundle operation:
 
 1. coordinate canonical and wallet owners through their private control APIs;
 2. capture physical checkpoints and owner admission evidence;
-3. bind both checkpoints to one canonical event fence and wallet digest;
+3. bind both checkpoints to one canonical event fence, wallet digest, and the
+   canonical build plan including raw-blob retention;
 4. restore into fresh paths;
 5. cold-admit each checkpoint under bounded resources; and
 6. start ingest, projector, native query, then compatibility and require normal
@@ -216,6 +217,10 @@ Production wallet recovery is one coherent state-bundle operation:
 An independently timed copy of the canonical and wallet directories is not a
 coherent backup. Physical checkpoint success also does not prove query serving,
 continuous following, reorg recovery, or client compatibility.
+
+State-bundle manifest format 2 carries the checkpoint build plan's exact
+raw-blob retention. Missing or unknown retention values fail admission instead
+of being inferred from workload or available rows.
 
 ## Deployment support
 

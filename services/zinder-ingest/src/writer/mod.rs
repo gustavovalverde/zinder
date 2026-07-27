@@ -554,7 +554,7 @@ fn install_staged_store(
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, path::PathBuf, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
     use tempfile::tempdir;
@@ -565,10 +565,11 @@ mod tests {
     use zinder_testkit::sample_regtest_upgrade_activations;
 
     use super::{
-        CanonicalWriterError, discard_unpublished_block_load_staging,
+        CanonicalWriterConfig, CanonicalWriterError, discard_unpublished_block_load_staging,
         remove_empty_construction_staging, remove_unpublished_staging, resolve_build_plan,
         validate_first_available_height,
     };
+    use crate::{CanonicalConstructionConfig, CanonicalFollowConfig};
 
     #[derive(Clone)]
     struct GenesisSource;
@@ -631,12 +632,32 @@ mod tests {
     #[tokio::test]
     async fn genesis_predecessor_selects_complete_history_without_genesis_artifact()
     -> Result<(), Box<dyn Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let config = CanonicalWriterConfig {
+            storage_path: PathBuf::new(),
+            resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            construction: CanonicalConstructionConfig::for_local_tests(
+                Duration::from_secs(1),
+                Arc::new(activations.clone()),
+            ),
+            checkpoint_height: Some(BlockHeight::new(0)),
+            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            reorg_window_blocks: 100,
+            follow: CanonicalFollowConfig {
+                request_timeout: Duration::from_secs(1),
+                poll_interval: Duration::from_millis(1),
+                lag_threshold_blocks: 0,
+                target_height: None,
+                event_retention_window: None,
+                event_retention_check_interval: Duration::from_secs(1),
+                mempool_ready_gate: None,
+            },
+        };
         let plan = resolve_build_plan(
             &GenesisSource,
-            &sample_regtest_upgrade_activations(),
-            Some(BlockHeight::new(0)),
+            &activations,
+            &config,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
-            100,
         )
         .await?;
 

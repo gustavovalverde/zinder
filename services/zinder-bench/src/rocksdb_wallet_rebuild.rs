@@ -8,7 +8,8 @@ use zinder_bench::BenchError;
 use zinder_core::wire::decode_zinder_native_chain_name;
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, build_wallet_from_canonical};
 
@@ -106,6 +107,7 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
         &args.canonical_store,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(args.supported_reorg_depth)?,
         RocksDbResourceBudget::canonical_reader_defaults(),
     )?;

@@ -34,8 +34,8 @@ use zinder_source::{
     SourceChainSegmentLimits, SourceError,
 };
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
+    RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
 
@@ -625,6 +625,7 @@ async fn canonical_fixture_rocksdb_replay_leaves_a_mismatched_tip_checkpoint_unp
         &canonical_store_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -710,6 +711,7 @@ async fn canonical_fixture_rocksdb_replay_leaves_manifest_digest_drift_unpublish
         &canonical_store_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )

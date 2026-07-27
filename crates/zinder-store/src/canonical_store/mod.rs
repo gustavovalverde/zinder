@@ -25,6 +25,7 @@ mod wallet_events;
 
 use std::{io, num::NonZeroU32, path::PathBuf};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
@@ -392,7 +393,8 @@ pub enum CanonicalStoreBuildError<SourceError> {
 /// selected workload fixes which optional explorer source artifacts must be
 /// complete. Raw block and transaction retention is an independent persisted
 /// [`RawBlobRetention`] contract.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CanonicalStoreWorkload {
     /// Wallet APIs, including typed tree-state checkpoints and continuous
     /// subtree roots.

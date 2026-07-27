@@ -14,6 +14,7 @@ use zinder_runtime::{
     cancel_on_terminating_signal, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_store::RawBlobRetention;
 
 mod config;
 
@@ -167,6 +168,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             network: query_config.network,
             network_upgrade_activations: Arc::clone(&network_upgrade_activations),
             canonical_reorg_policy: query_config.canonical_reorg_policy,
+            expected_raw_blob_retention: RawBlobRetention::Transactions,
             canonical_resource_budget: query_config.storage.canonical_rocksdb_budget,
             wallet_resource_budget: query_config.wallet_rocksdb_budget,
             catchup_interval: query_config.storage.secondary_catchup_interval,

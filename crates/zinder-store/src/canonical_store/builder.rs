@@ -912,6 +912,22 @@ mod tests {
         .err()
         .ok_or("READY admission must reject a tampered construction manifest")?;
         assert!(tampered.to_string().contains("construction manifest"));
+        let secondary_tampered = RocksDbCanonicalSecondary::open_ready(
+            &store_path,
+            temporary.path().join("canonical-secondary"),
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("secondary admission must reject a tampered construction manifest")?;
+        assert!(
+            secondary_tampered
+                .to_string()
+                .contains("construction manifest")
+        );
         assert_ne!(binding, [0; 32]);
         Ok(())
     }
@@ -2154,6 +2170,47 @@ mod tests {
         assert_eq!(evidence.transaction_location_count, 1);
         assert_eq!(evidence.transaction_blob_count, 1);
         assert_eq!(evidence.block_blob_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn no_blob_bulk_load_counts_semantic_locations_independently_from_optional_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            RawBlobRetention::None,
+            CanonicalReorgPolicy::new(100)?,
+        )?;
+        let mut store = RocksDbCanonicalBuilder::create_fresh(
+            &store_path,
+            CanonicalStoreWorkload::Wallet,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let mut block = canonical_build_block_with_raw_blobs(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        block.transaction_blobs.clear();
+        block.block_blob = None;
+        add_tree_state_checkpoint(&mut block)?;
+
+        let evidence = store.bulk_load_blocks([Ok::<_, std::io::Error>(block)])?;
+
+        assert_eq!(evidence.transaction_count, 1);
+        assert_eq!(evidence.transaction_location_count, 1);
+        assert_eq!(evidence.transaction_blob_count, 0);
+        assert_eq!(evidence.block_blob_count, 0);
+        assert_eq!(evidence.transaction_location_logical_bytes, 32 + 40);
+        assert_eq!(evidence.transaction_blob_logical_bytes, 0);
+        assert_eq!(evidence.block_blob_logical_bytes, 0);
         Ok(())
     }
 

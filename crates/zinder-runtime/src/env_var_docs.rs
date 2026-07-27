@@ -849,7 +849,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_STORAGE__RAW_BLOB_POLICY",
         toml_path: "storage.raw_blob_policy",
-        used_by: &["zinder-ingest"],
+        used_by: &["zinder-ingest", "zinder-projector"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Immutable raw-blob retention contract: `none`, `transactions`, or `all`. \
@@ -858,6 +858,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Wallet-serving coverage defaults to `transactions` and rejects `none`, because \
                       native and lightwalletd-compatible transaction and transparent-history methods \
                       require retained bytes. \
+                      The projector must configure the exact writer retention identity before opening \
+                      its canonical secondary. \
                       The first canonical commit fixes historical coverage; changing a non-empty store \
                       requires a rebuild.",
     },

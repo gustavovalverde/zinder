@@ -54,6 +54,16 @@ fn maximum_depth_replacement_is_atomic_archived_and_reopenable_then_appends()
     let old_fence = store.event_fence();
     let old_three_location = transaction_location(BlockHeight::new(3), [3; 32], 103);
     let old_four_location = transaction_location(BlockHeight::new(4), [4; 32], 104);
+    assert_eq!(
+        store.transaction_location(old_three_location.transaction_id)?,
+        Some(old_three_location)
+    );
+    assert_eq!(
+        store
+            .transaction_blob(old_three_location)?
+            .map(|blob| blob.raw_transaction_bytes),
+        Some(vec![103])
+    );
     let replacement_three = replacement_block(BlockHeight::new(3), [33; 32], [2; 32], 203)?;
 
     let (next, outcome) = store.commit_live_replacement(
@@ -205,6 +215,17 @@ fn all_retention_keeps_block_blobs_across_append_replacement_secondary_and_reope
         BlockHeight::new(1),
         RawBlobRetention::All,
     )?;
+    let initial_transaction_location = transaction_location(BlockHeight::new(1), [1; 32], 101);
+    assert_eq!(
+        store.transaction_location(initial_transaction_location.transaction_id)?,
+        Some(initial_transaction_location)
+    );
+    assert_eq!(
+        store
+            .transaction_blob(initial_transaction_location)?
+            .map(|blob| blob.raw_transaction_bytes),
+        Some(vec![101])
+    );
     let settled_tip = store.append_anchor()?.settled_tip();
     let append = replacement_block_with_retention(
         BlockHeight::new(3),
@@ -290,6 +311,141 @@ fn all_retention_keeps_block_blobs_across_append_replacement_secondary_and_reope
             .raw_block_bytes,
         vec![233]
     );
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end proof keeps no-blob construction, reopen, append, replacement, stale deletion, and secondary catch-up together"
+)]
+fn no_blob_retention_preserves_transaction_locations_across_the_complete_store_lifecycle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut store = published_store_with_retention(
+        &store_path,
+        2,
+        BlockHeight::new(2),
+        BlockHeight::new(1),
+        RawBlobRetention::None,
+    )?;
+    let initial_location = transaction_location(BlockHeight::new(1), [1; 32], 101);
+    assert_eq!(
+        store.transaction_location(initial_location.transaction_id)?,
+        Some(initial_location)
+    );
+    assert_eq!(store.transaction_blob(initial_location)?, None);
+    assert_eq!(store.block_blob_at(BlockHeight::new(1))?, None);
+    drop(store);
+
+    store = open_store_with_retention(&store_path, &activations, 2, RawBlobRetention::None)?;
+    assert_eq!(
+        store.transaction_location(initial_location.transaction_id)?,
+        Some(initial_location)
+    );
+    assert_eq!(store.transaction_blob(initial_location)?, None);
+
+    let secondary_path = temporary.path().join("secondary");
+    let mut secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        &secondary_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::None,
+        CanonicalReorgPolicy::new(2)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(
+        secondary.transaction_location(initial_location.transaction_id)?,
+        Some(initial_location)
+    );
+    assert_eq!(secondary.transaction_blob(initial_location)?, None);
+
+    let appended_location = transaction_location(BlockHeight::new(3), [3; 32], 203);
+    let append = replacement_block_with_retention(
+        BlockHeight::new(3),
+        [3; 32],
+        [2; 32],
+        203,
+        RawBlobRetention::None,
+    )?;
+    let append_fence = store.event_fence();
+    let settled_tip = store.append_anchor()?.settled_tip();
+    let (next, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            append_fence,
+            append,
+            Vec::new(),
+            settled_tip,
+            UnixTimestampMillis::new(1_750_000_000_002),
+        ),
+        &activations,
+    )?;
+    store = next;
+    assert_eq!(
+        store.transaction_location(appended_location.transaction_id)?,
+        Some(appended_location)
+    );
+    assert_eq!(store.transaction_blob(appended_location)?, None);
+    secondary.try_catch_up()?;
+    assert_eq!(
+        secondary.transaction_location(appended_location.transaction_id)?,
+        Some(appended_location)
+    );
+    assert_eq!(secondary.transaction_blob(appended_location)?, None);
+
+    let replacement_location = transaction_location(BlockHeight::new(3), [33; 32], 233);
+    let replacement = replacement_block_with_retention(
+        BlockHeight::new(3),
+        [33; 32],
+        [2; 32],
+        233,
+        RawBlobRetention::None,
+    )?;
+    let replacement_fence = store.event_fence();
+    let (next, _) = store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            replacement_fence,
+            vec![CanonicalReplacementBlock::new(replacement, Vec::new())],
+            UnixTimestampMillis::new(1_750_000_000_003),
+        ),
+        &activations,
+    )?;
+    store = next;
+    assert_eq!(
+        store.transaction_location(appended_location.transaction_id)?,
+        None
+    );
+    assert_eq!(
+        store.transaction_location(replacement_location.transaction_id)?,
+        Some(replacement_location)
+    );
+    assert_eq!(store.transaction_blob(replacement_location)?, None);
+    secondary.try_catch_up()?;
+    assert_eq!(
+        secondary.transaction_location(appended_location.transaction_id)?,
+        None
+    );
+    assert_eq!(
+        secondary.transaction_location(replacement_location.transaction_id)?,
+        Some(replacement_location)
+    );
+    assert_eq!(secondary.transaction_blob(replacement_location)?, None);
+    drop(secondary);
+    drop(store);
+
+    let reopened = open_store_with_retention(&store_path, &activations, 2, RawBlobRetention::None)?;
+    assert_eq!(
+        reopened.transaction_location(appended_location.transaction_id)?,
+        None
+    );
+    assert_eq!(
+        reopened.transaction_location(replacement_location.transaction_id)?,
+        Some(replacement_location)
+    );
+    assert_eq!(reopened.transaction_blob(replacement_location)?, None);
     Ok(())
 }
 

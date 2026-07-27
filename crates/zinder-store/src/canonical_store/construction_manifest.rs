@@ -197,6 +197,39 @@ impl CanonicalConstructionManifestDraft {
 pub(super) fn read_construction_manifest_binding(
     store_path: &Path,
 ) -> Result<CanonicalConstructionManifestBinding, CanonicalStoreError> {
+    let (manifest, bytes) = read_construction_manifest(store_path)?;
+    Ok(CanonicalConstructionManifestBinding {
+        version: manifest.format_version,
+        sha256: manifest_digest(&bytes),
+    })
+}
+
+pub(super) fn validate_ready_construction_manifest(
+    store_path: &Path,
+    ready: &CanonicalStoreReadyEvidence,
+    workload: CanonicalStoreWorkload,
+    build_plan: &CanonicalStoreBuildPlan,
+) -> Result<(), CanonicalStoreError> {
+    let (manifest, bytes) = read_construction_manifest(store_path)?;
+    let binding = CanonicalConstructionManifestBinding {
+        version: manifest.format_version,
+        sha256: manifest_digest(&bytes),
+    };
+    if binding.version != ready.construction_manifest_version
+        || binding.sha256 != ready.construction_manifest_sha256
+    {
+        return Err(CanonicalStoreError::admission(
+            store_path,
+            "construction manifest version or digest differs from READY",
+        ));
+    }
+    validate_manifest_control_identity(store_path, &manifest, workload, build_plan)?;
+    Ok(())
+}
+
+fn read_construction_manifest(
+    store_path: &Path,
+) -> Result<(PersistedConstructionManifest, Vec<u8>), CanonicalStoreError> {
     let path = manifest_path(store_path);
     let bytes = read_manifest_bytes(&path)?;
     let manifest: PersistedConstructionManifest =
@@ -207,23 +240,37 @@ pub(super) fn read_construction_manifest_binding(
             ))
         })?;
     manifest.validate()?;
-    Ok(CanonicalConstructionManifestBinding {
-        version: manifest.format_version,
-        sha256: manifest_digest(&bytes),
-    })
+    Ok((manifest, bytes))
 }
 
-pub(super) fn validate_ready_construction_manifest(
+fn validate_manifest_control_identity(
     store_path: &Path,
-    ready: &CanonicalStoreReadyEvidence,
+    manifest: &PersistedConstructionManifest,
+    workload: CanonicalStoreWorkload,
+    build_plan: &CanonicalStoreBuildPlan,
 ) -> Result<(), CanonicalStoreError> {
-    let binding = read_construction_manifest_binding(store_path)?;
-    if binding.version != ready.construction_manifest_version
-        || binding.sha256 != ready.construction_manifest_sha256
+    validate_manifest_control_parts(
+        store_path,
+        manifest.workload,
+        &manifest.build_plan,
+        workload,
+        build_plan,
+    )
+}
+
+fn validate_manifest_control_parts(
+    store_path: &Path,
+    manifest_workload: CanonicalStoreWorkload,
+    manifest_build_plan: &PersistedBuildPlan,
+    control_workload: CanonicalStoreWorkload,
+    control_build_plan: &CanonicalStoreBuildPlan,
+) -> Result<(), CanonicalStoreError> {
+    if manifest_workload != control_workload
+        || *manifest_build_plan != PersistedBuildPlan::from_plan(control_build_plan)
     {
         return Err(CanonicalStoreError::admission(
             store_path,
-            "construction manifest version or digest differs from READY",
+            "construction manifest workload or build plan differs from store control",
         ));
     }
     Ok(())
@@ -390,7 +437,7 @@ fn manifest_digest(bytes: &[u8]) -> [u8; 32] {
 struct PersistedConstructionManifest {
     format_version: u16,
     evidence_provenance: String,
-    workload: String,
+    workload: CanonicalStoreWorkload,
     build_plan: PersistedBuildPlan,
     source_tip_checkpoint: PersistedCheckpoint,
     block_evidence: PersistedBlockEvidence,
@@ -411,7 +458,7 @@ impl PersistedConstructionManifest {
         let manifest = Self {
             format_version: CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
             evidence_provenance: draft.evidence_provenance.as_str().to_owned(),
-            workload: draft.workload.as_str().to_owned(),
+            workload: draft.workload,
             build_plan: PersistedBuildPlan::from_plan(&draft.build_plan),
             source_tip_checkpoint: PersistedCheckpoint::from_checkpoint(&draft.source_checkpoint),
             block_evidence,
@@ -448,11 +495,6 @@ impl PersistedConstructionManifest {
                 "construction manifest has an unknown proof provenance",
             ));
         }
-        if self.workload != "wallet" && self.workload != "explorer" {
-            return Err(CanonicalStoreError::publication(
-                "construction manifest has an unknown workload",
-            ));
-        }
         self.build_plan.validate()?;
         self.source_tip_checkpoint.validate()?;
         if self.source_tip_checkpoint.block_id != self.build_plan.build_tip
@@ -486,13 +528,13 @@ impl PersistedConstructionManifest {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedBuildPlan {
     network_id: u32,
     network_upgrade_activations_fingerprint_version: u16,
     network_upgrade_activations_fingerprint: [u8; 32],
-    raw_blob_retention: String,
+    raw_blob_retention: crate::RawBlobRetention,
     reorg_window_blocks: u32,
     first_available_height: u32,
     history_predecessor: PersistedCheckpoint,
@@ -511,7 +553,7 @@ impl PersistedBuildPlan {
             network_upgrade_activations_fingerprint: plan
                 .network_upgrade_activations_fingerprint()
                 .as_bytes(),
-            raw_blob_retention: plan.raw_blob_retention().as_kebab_case().to_owned(),
+            raw_blob_retention: plan.raw_blob_retention(),
             reorg_window_blocks: plan.reorg_policy().reorg_window_blocks(),
             first_available_height: plan.history_bounds().first_available_height().value(),
             history_predecessor: PersistedCheckpoint::from_checkpoint(plan.history_predecessor()),
@@ -523,10 +565,7 @@ impl PersistedBuildPlan {
     }
 
     fn validate(&self) -> Result<(), CanonicalStoreError> {
-        if !matches!(
-            self.raw_blob_retention.as_str(),
-            "none" | "transactions" | "all"
-        ) || self.reorg_window_blocks == 0
+        if self.reorg_window_blocks == 0
             || self.history_predecessor.block_id.height.saturating_add(1)
                 != self.first_available_height
             || self.first_available_height > self.build_tip.height
@@ -548,7 +587,7 @@ impl PersistedBuildPlan {
                 .to_le_bytes(),
         );
         digest.update(self.network_upgrade_activations_fingerprint);
-        digest.update(self.raw_blob_retention.as_bytes());
+        digest.update(self.raw_blob_retention.as_kebab_case().as_bytes());
         digest.update([0]);
         digest.update(self.reorg_window_blocks.to_le_bytes());
         digest.update(self.first_available_height.to_le_bytes());
@@ -559,7 +598,7 @@ impl PersistedBuildPlan {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedCheckpoint {
     block_id: PersistedBlockId,
@@ -622,7 +661,7 @@ impl PersistedCheckpoint {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedFrontier {
     protocol: u8,
@@ -665,7 +704,7 @@ impl PersistedFrontier {
     }
 }
 
-#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedBlockId {
     height: u32,
@@ -962,15 +1001,13 @@ fn validate_persisted_source_evidence(
                         )
                     })
             })?;
-    let expected_transaction_blob_count = if matches!(
-        build_plan.raw_blob_retention.as_str(),
-        "transactions" | "all"
-    ) {
-        block_evidence.transaction_count
-    } else {
-        0
-    };
-    let expected_block_blob_count = if build_plan.raw_blob_retention == "all" {
+    let expected_transaction_blob_count =
+        if build_plan.raw_blob_retention.retains_transaction_blobs() {
+            block_evidence.transaction_count
+        } else {
+            0
+        };
+    let expected_block_blob_count = if build_plan.raw_blob_retention.retains_block_blobs() {
         block_evidence.block_count
     } else {
         0
@@ -979,7 +1016,7 @@ fn validate_persisted_source_evidence(
         || header.row_count != block_evidence.block_count
         || block_hash.row_count != block_evidence.block_count
         || compact.row_count != block_evidence.block_count
-        || transaction_location.row_count != expected_transaction_blob_count
+        || transaction_location.row_count != block_evidence.transaction_count
         || transaction_blob.row_count != expected_transaction_blob_count
         || block_blob.row_count != expected_block_blob_count
         || staged_logical_bytes != block_evidence.logical_bytes
@@ -1209,6 +1246,7 @@ fn update_length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use zinder_core::{BlockHash, BlockHeight};
 
     #[test]
     fn manifest_digest_is_domain_separated_and_stable() {
@@ -1244,5 +1282,71 @@ mod tests {
 
         assert!(error.to_string().contains("unknown field"));
         Ok(())
+    }
+
+    #[test]
+    fn manifest_and_control_reject_raw_blob_retention_tampering_in_both_directions_without_rewrite()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let transactions_plan = test_build_plan(crate::RawBlobRetention::Transactions)?;
+        let all_plan = test_build_plan(crate::RawBlobRetention::All)?;
+        let persisted_transactions = PersistedBuildPlan::from_plan(&transactions_plan);
+        let persisted_all = PersistedBuildPlan::from_plan(&all_plan);
+        let original_transactions = persisted_transactions.clone();
+        let original_all = persisted_all.clone();
+
+        for (manifest_plan, control_plan) in [
+            (&persisted_transactions, &all_plan),
+            (&persisted_all, &transactions_plan),
+        ] {
+            let error = validate_manifest_control_parts(
+                temporary.path(),
+                CanonicalStoreWorkload::Wallet,
+                manifest_plan,
+                CanonicalStoreWorkload::Wallet,
+                control_plan,
+            )
+            .err()
+            .ok_or("manifest/control raw-blob retention mismatch must fail closed")?;
+            assert!(error.to_string().contains("differs from store control"));
+        }
+
+        assert_eq!(persisted_transactions, original_transactions);
+        assert_eq!(persisted_all, original_all);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_and_control_compare_typed_workload_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let build_plan = test_build_plan(crate::RawBlobRetention::Transactions)?;
+        let persisted_plan = PersistedBuildPlan::from_plan(&build_plan);
+
+        assert!(
+            validate_manifest_control_parts(
+                temporary.path(),
+                CanonicalStoreWorkload::Explorer,
+                &persisted_plan,
+                CanonicalStoreWorkload::Wallet,
+                &build_plan,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn test_build_plan(
+        raw_blob_retention: crate::RawBlobRetention,
+    ) -> Result<CanonicalStoreBuildPlan, Box<dyn std::error::Error>> {
+        let activations =
+            super::super::test_network_upgrade_activations(zinder_core::Network::ZcashTestnet)?;
+        Ok(CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            raw_blob_retention,
+            super::super::CanonicalReorgPolicy::new(100)?,
+        )?)
     }
 }

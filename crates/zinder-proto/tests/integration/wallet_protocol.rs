@@ -682,6 +682,22 @@ fn writer_status_response_round_trips_through_prost() -> eyre::Result<()> {
 }
 
 #[test]
+fn checkpoint_build_plan_raw_blob_retention_round_trips_through_prost() -> eyre::Result<()> {
+    let build_plan = ingest::CanonicalOwnerCheckpointBuildPlanEvidence {
+        activation_fingerprint_version: 1,
+        activation_fingerprint: vec![0x11; 32],
+        reorg_window_blocks: 100,
+        history_preceding_checkpoint: None,
+        history_predecessor: None,
+        build_tip: None,
+        raw_blob_retention: "all".to_owned(),
+    };
+
+    assert_eq!(round_trip(&build_plan)?.raw_blob_retention, "all");
+    Ok(())
+}
+
+#[test]
 fn writer_phase_enum_round_trips_each_variant() -> eyre::Result<()> {
     for phase in [
         ingest::WriterPhase::Unspecified,

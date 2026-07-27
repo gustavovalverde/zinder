@@ -230,6 +230,9 @@ pub struct CanonicalOwnerCheckpointBuildPlanEvidence {
     >,
     #[prost(message, optional, tag = "6")]
     pub build_tip: ::core::option::Option<CanonicalCheckpointBlockId>,
+    /// Exact persisted raw-blob retention: none, transactions, or all.
+    #[prost(string, tag = "7")]
+    pub raw_blob_retention: ::prost::alloc::string::String,
 }
 /// Complete READY evidence cold-read from one owner-created canonical
 /// checkpoint. This is intentionally evidence, not a filesystem handle or

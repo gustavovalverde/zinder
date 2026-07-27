@@ -9,7 +9,7 @@ use zinder_core::{
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend, CanonicalReorgPolicy,
-    CanonicalStoreBuildPlan, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
+    CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
     RocksDbCanonicalSecondary, RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE,
 };
 use zinder_wallet_rocksdb::{
@@ -67,6 +67,7 @@ impl WalletServingStoreFixture {
             network_upgrade_activations,
             tip_block.block_time_seconds.saturating_sub(1),
             tip,
+            RawBlobRetention::Transactions,
             reorg_policy,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
@@ -111,6 +112,7 @@ impl WalletServingStoreFixture {
             temporary_directory.path().join("canonical-secondary"),
             network_upgrade_activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -171,6 +173,7 @@ impl WalletServingStoreFixture {
             network_upgrade_activations,
             baseline_tip.block_time_seconds.saturating_sub(1),
             baseline_tip_id,
+            RawBlobRetention::Transactions,
             reorg_policy,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
@@ -233,6 +236,7 @@ impl WalletServingStoreFixture {
             temporary_directory.path().join("canonical-secondary"),
             network_upgrade_activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;
