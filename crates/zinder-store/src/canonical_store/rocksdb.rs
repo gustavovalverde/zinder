@@ -11,7 +11,7 @@ use zinder_core::{
 };
 
 use crate::{
-    BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
+    BoundedRocksDbOpen, RawBlobRetention, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
     build_block_based_table_factory, open_bounded_rocksdb,
 };
 
@@ -106,6 +106,7 @@ pub(super) struct CanonicalStoreAdmissionExpectation {
     network: Network,
     activations_fingerprint: NetworkUpgradeActivationsFingerprint,
     workload: CanonicalStoreWorkload,
+    raw_blob_retention: RawBlobRetention,
     reorg_policy: super::CanonicalReorgPolicy,
 }
 
@@ -113,6 +114,7 @@ impl CanonicalStoreAdmissionExpectation {
     pub(super) fn from_activations(
         activations: &NetworkUpgradeActivations,
         workload: CanonicalStoreWorkload,
+        raw_blob_retention: RawBlobRetention,
         reorg_policy: super::CanonicalReorgPolicy,
     ) -> Self {
         Self {
@@ -120,6 +122,7 @@ impl CanonicalStoreAdmissionExpectation {
             activations_fingerprint: activations
                 .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
             workload,
+            raw_blob_retention,
             reorg_policy,
         }
     }
@@ -132,6 +135,7 @@ impl CanonicalStoreAdmissionExpectation {
             network: build_plan.network(),
             activations_fingerprint: build_plan.network_upgrade_activations_fingerprint(),
             workload,
+            raw_blob_retention: build_plan.raw_blob_retention(),
             reorg_policy: build_plan.reorg_policy(),
         }
     }
@@ -182,10 +186,15 @@ impl RocksDbCanonicalStore {
     /// key, identity, schema, exact network-upgrade activation table, workload,
     /// canonical reorg policy, source range, and readiness evidence before
     /// opening a writer that cannot create data families.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "primary admission keeps the filesystem identity and every immutable canonical contract explicit"
+    )]
     pub fn open_ready(
         path: impl AsRef<Path>,
         expected_network_upgrade_activations: &NetworkUpgradeActivations,
         expected_workload: CanonicalStoreWorkload,
+        expected_raw_blob_retention: RawBlobRetention,
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
@@ -193,6 +202,7 @@ impl RocksDbCanonicalStore {
         let expectation = CanonicalStoreAdmissionExpectation::from_activations(
             expected_network_upgrade_activations,
             expected_workload,
+            expected_raw_blob_retention,
             expected_reorg_policy,
         );
         Self::open_ready_with_expectation(path, expectation, resource_budget)
@@ -411,6 +421,12 @@ impl RocksDbCanonicalStore {
     #[must_use]
     pub const fn workload(&self) -> CanonicalStoreWorkload {
         self.workload
+    }
+
+    /// Returns the immutable raw-blob retention persisted by the store.
+    #[must_use]
+    pub const fn raw_blob_retention(&self) -> RawBlobRetention {
+        self.build_plan.raw_blob_retention()
     }
 
     /// Returns the immutable maximum supported canonical replacement depth.
@@ -669,6 +685,16 @@ pub(super) fn validate_open_store_control(
             ),
         ));
     }
+    if persisted.build_plan.raw_blob_retention() != expectation.raw_blob_retention {
+        return Err(CanonicalStoreError::admission(
+            path,
+            format!(
+                "persisted raw blob retention {} does not equal requested raw blob retention {}; rebuild the canonical store to change retention",
+                persisted.build_plan.raw_blob_retention(),
+                expectation.raw_blob_retention
+            ),
+        ));
+    }
     if persisted.build_plan.reorg_policy() != expectation.reorg_policy {
         return Err(CanonicalStoreError::admission(
             path,
@@ -731,6 +757,7 @@ mod tests {
             &path,
             &testnet_activations,
             CanonicalStoreWorkload::Explorer,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -745,6 +772,7 @@ mod tests {
             &path,
             &mainnet_activations,
             CanonicalStoreWorkload::Explorer,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -760,6 +788,7 @@ mod tests {
             &path,
             &testnet_activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -803,6 +832,7 @@ mod tests {
             &path,
             &shifted_activations,
             CanonicalStoreWorkload::Explorer,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -831,6 +861,7 @@ mod tests {
             &path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Explorer,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -877,6 +908,7 @@ mod tests {
             &path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Explorer,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -885,7 +917,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("schema version 1 does not equal required version 6"),
+                .contains("schema version 1 does not equal required version 7"),
             "{error}"
         );
         assert_eq!(read_control(&path)?, control);
@@ -915,6 +947,7 @@ mod tests {
             &path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Explorer,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -939,7 +972,7 @@ mod tests {
     #[test]
     fn contract_identity_and_schema_are_exact() {
         assert_eq!(CANONICAL_STORE_IDENTITY, "canonical");
-        assert_eq!(CANONICAL_STORE_SCHEMA_VERSION, 6);
+        assert_eq!(CANONICAL_STORE_SCHEMA_VERSION, 7);
     }
 
     fn read_control(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -956,6 +989,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
         )?)
     }

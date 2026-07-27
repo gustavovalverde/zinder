@@ -15,15 +15,23 @@ use zinder_runtime::{IngestPhase, Readiness, ReadinessState};
 use zinder_source::{NodeSource, SourceError};
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreBuildPlanError, CanonicalStoreError, CanonicalStoreWorkload,
+    CanonicalStoreBuildPlanError, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
     RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 
 use crate::{
     CanonicalConstructionConfig, CanonicalConstructionError, CanonicalControlCommand,
-    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, follow_canonical_tip,
-    follow_canonical_tip_with_control, load_fresh_canonical,
+    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, RawBlobPolicy,
+    follow_canonical_tip, follow_canonical_tip_with_control, load_fresh_canonical,
 };
+
+pub(super) const fn raw_blob_policy_for_retention(retention: RawBlobRetention) -> RawBlobPolicy {
+    match retention {
+        RawBlobRetention::None => RawBlobPolicy::None,
+        RawBlobRetention::Transactions => RawBlobPolicy::Transactions,
+        RawBlobRetention::All => RawBlobPolicy::All,
+    }
+}
 
 /// Complete concrete configuration for the first `RocksDB` single-host writer.
 #[derive(Clone, Debug)]
@@ -36,6 +44,8 @@ pub struct CanonicalWriterConfig {
     pub construction: CanonicalConstructionConfig,
     /// Optional authenticated predecessor for a checkpointed build.
     pub checkpoint_height: Option<BlockHeight>,
+    /// Immutable raw-byte retention contract for fresh construction and reopen.
+    pub raw_blob_retention: RawBlobRetention,
     /// Maximum depth used to select the baseline settled tip.
     pub reorg_window_blocks: u32,
     /// Continuous follower policy.
@@ -215,6 +225,7 @@ fn open_existing_store(
         &config.storage_path,
         network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
     )?;
@@ -247,6 +258,7 @@ fn recover_staged_store(
         staging_path,
         network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
     ) {
@@ -258,6 +270,7 @@ fn recover_staged_store(
                 &config.storage_path,
                 network_upgrade_activations,
                 CanonicalStoreWorkload::Wallet,
+                config.raw_blob_retention,
                 CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
                 config.resource_budget,
             )?;
@@ -387,6 +400,7 @@ where
         &config.storage_path,
         network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
     )?;
@@ -451,14 +465,8 @@ where
         }
         _ => source_tip,
     };
-    let build_plan = resolve_build_plan(
-        source,
-        network_upgrade_activations,
-        config.checkpoint_height,
-        fixed_tip,
-        config.reorg_window_blocks,
-    )
-    .await?;
+    let build_plan =
+        resolve_build_plan(source, network_upgrade_activations, config, fixed_tip).await?;
     let first_retained_height = build_plan.history_bounds().first_available_height();
     let settled_height = BlockHeight::new(
         fixed_tip
@@ -479,14 +487,13 @@ where
 async fn resolve_build_plan<Source>(
     source: &Source,
     network_upgrade_activations: &NetworkUpgradeActivations,
-    checkpoint_height: Option<BlockHeight>,
+    config: &CanonicalWriterConfig,
     fixed_tip: BlockId,
-    reorg_window_blocks: u32,
 ) -> Result<CanonicalStoreBuildPlan, CanonicalWriterError>
 where
     Source: NodeSource,
 {
-    if let Some(checkpoint_height) = checkpoint_height {
+    if let Some(checkpoint_height) = config.checkpoint_height {
         if fixed_tip.height <= checkpoint_height {
             return Err(CanonicalWriterError::CheckpointNotBehindSource {
                 checkpoint_height,
@@ -501,7 +508,8 @@ where
                 network_upgrade_activations,
                 checkpoint,
                 fixed_tip,
-                CanonicalReorgPolicy::new(reorg_window_blocks)?,
+                config.raw_blob_retention,
+                CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
             )
             .map_err(CanonicalWriterError::from);
         }
@@ -512,7 +520,8 @@ where
         network_upgrade_activations,
         genesis.block_time_seconds,
         fixed_tip,
-        CanonicalReorgPolicy::new(reorg_window_blocks)?,
+        config.raw_blob_retention,
+        CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
     )
     .map_err(CanonicalWriterError::from)
 }

@@ -27,16 +27,16 @@ use super::{
 
 /// Fixed sidecar name copied with every owner-created canonical checkpoint.
 pub(super) const CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME: &str =
-    "canonical-construction-manifest.v2.json";
+    "canonical-construction-manifest.v3.json";
 /// Exact immutable construction-manifest format accepted by this release.
-pub const CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION: u16 = 2;
+pub const CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION: u16 = 3;
 const MAX_CONSTRUCTION_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const CONSTRUCTION_MANIFEST_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.file.v2\0";
+    b"zinder.canonical.construction-manifest.file.v3\0";
 const CONSTRUCTION_BUILD_PLAN_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.build-plan.v2\0";
+    b"zinder.canonical.construction-manifest.build-plan.v3\0";
 const CONSTRUCTION_CHECKPOINT_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.checkpoint.v2\0";
+    b"zinder.canonical.construction-manifest.checkpoint.v3\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CanonicalConstructionProofProvenance {
@@ -477,6 +477,7 @@ impl PersistedConstructionManifest {
         validate_persisted_sst_coverage(&self.family_evidence, &self.staged_ssts)?;
         validate_persisted_source_evidence(
             &self.family_evidence,
+            &self.build_plan,
             &self.block_evidence,
             &self.subtree_evidence,
         )?;
@@ -491,6 +492,7 @@ struct PersistedBuildPlan {
     network_id: u32,
     network_upgrade_activations_fingerprint_version: u16,
     network_upgrade_activations_fingerprint: [u8; 32],
+    raw_blob_retention: String,
     reorg_window_blocks: u32,
     first_available_height: u32,
     history_predecessor: PersistedCheckpoint,
@@ -509,6 +511,7 @@ impl PersistedBuildPlan {
             network_upgrade_activations_fingerprint: plan
                 .network_upgrade_activations_fingerprint()
                 .as_bytes(),
+            raw_blob_retention: plan.raw_blob_retention().as_kebab_case().to_owned(),
             reorg_window_blocks: plan.reorg_policy().reorg_window_blocks(),
             first_available_height: plan.history_bounds().first_available_height().value(),
             history_predecessor: PersistedCheckpoint::from_checkpoint(plan.history_predecessor()),
@@ -520,7 +523,10 @@ impl PersistedBuildPlan {
     }
 
     fn validate(&self) -> Result<(), CanonicalStoreError> {
-        if self.reorg_window_blocks == 0
+        if !matches!(
+            self.raw_blob_retention.as_str(),
+            "none" | "transactions" | "all"
+        ) || self.reorg_window_blocks == 0
             || self.history_predecessor.block_id.height.saturating_add(1)
                 != self.first_available_height
             || self.first_available_height > self.build_tip.height
@@ -542,6 +548,8 @@ impl PersistedBuildPlan {
                 .to_le_bytes(),
         );
         digest.update(self.network_upgrade_activations_fingerprint);
+        digest.update(self.raw_blob_retention.as_bytes());
+        digest.update([0]);
         digest.update(self.reorg_window_blocks.to_le_bytes());
         digest.update(self.first_available_height.to_le_bytes());
         digest.update(self.history_predecessor.digest_sha256);
@@ -915,12 +923,13 @@ fn validate_persisted_sst_coverage(
 
 fn validate_persisted_source_evidence(
     families: &[PersistedFamilyEvidence],
+    build_plan: &PersistedBuildPlan,
     block_evidence: &PersistedBlockEvidence,
     subtree_evidence: &PersistedSubtreeEvidence,
 ) -> Result<(), CanonicalStoreError> {
     use super::rocksdb::{
-        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
+        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
+        COMPACT_BLOCK_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
         TRANSACTION_LOCATION_COLUMN_FAMILY,
     };
 
@@ -939,6 +948,7 @@ fn validate_persisted_source_evidence(
     let compact = require(COMPACT_BLOCK_COLUMN_FAMILY)?;
     let transaction_location = require(TRANSACTION_LOCATION_COLUMN_FAMILY)?;
     let transaction_blob = require(TRANSACTION_BLOB_COLUMN_FAMILY)?;
+    let block_blob = require(BLOCK_BLOB_COLUMN_FAMILY)?;
     let subtree = require(SUBTREE_ROOT_COLUMN_FAMILY)?;
     let staged_logical_bytes =
         canonical_staged_sst_families()
@@ -952,12 +962,26 @@ fn validate_persisted_source_evidence(
                         )
                     })
             })?;
+    let expected_transaction_blob_count = if matches!(
+        build_plan.raw_blob_retention.as_str(),
+        "transactions" | "all"
+    ) {
+        block_evidence.transaction_count
+    } else {
+        0
+    };
+    let expected_block_blob_count = if build_plan.raw_blob_retention == "all" {
+        block_evidence.block_count
+    } else {
+        0
+    };
     if replay.row_count != block_evidence.block_count
         || header.row_count != block_evidence.block_count
         || block_hash.row_count != block_evidence.block_count
         || compact.row_count != block_evidence.block_count
-        || transaction_location.row_count != block_evidence.transaction_count
-        || transaction_blob.row_count != block_evidence.transaction_count
+        || transaction_location.row_count != expected_transaction_blob_count
+        || transaction_blob.row_count != expected_transaction_blob_count
+        || block_blob.row_count != expected_block_blob_count
         || staged_logical_bytes != block_evidence.logical_bytes
         || subtree.row_count != subtree_evidence.subtree_root_count
         || subtree.logical_bytes != subtree_evidence.subtree_root_logical_bytes

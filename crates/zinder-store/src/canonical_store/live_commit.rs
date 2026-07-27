@@ -266,7 +266,11 @@ impl PreparedLiveAppendCommit {
                 "expected canonical event fence is stale",
             ));
         }
-        validate_live_block(store.workload, &append.block)?;
+        validate_live_block(
+            store.workload,
+            store.build_plan.raw_blob_retention(),
+            &append.block,
+        )?;
         let visible_tip = validate_live_block_extension(&store.ready_evidence, &append.block)?;
         validate_live_checkpoint_transition(&anchor, &append.block, network_upgrade_activations)?;
         let tip_metadata = append.block.tip_metadata;

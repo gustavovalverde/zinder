@@ -9,7 +9,8 @@ use zinder_core::{
 };
 
 use crate::{
-    BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget, open_bounded_rocksdb,
+    BoundedRocksDbOpen, RawBlobRetention, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
+    open_bounded_rocksdb,
 };
 
 use super::{
@@ -83,6 +84,7 @@ impl RocksDbCanonicalSecondary {
         secondary_path: impl AsRef<Path>,
         expected_network_upgrade_activations: &NetworkUpgradeActivations,
         expected_workload: CanonicalStoreWorkload,
+        expected_raw_blob_retention: RawBlobRetention,
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
@@ -98,6 +100,7 @@ impl RocksDbCanonicalSecondary {
         let expectation = CanonicalStoreAdmissionExpectation::from_activations(
             expected_network_upgrade_activations,
             expected_workload,
+            expected_raw_blob_retention,
             expected_reorg_policy,
         );
         require_exact_primary_column_family_metadata(&primary_path)?;
@@ -237,6 +240,12 @@ impl RocksDbCanonicalSecondary {
     #[must_use]
     pub const fn workload(&self) -> CanonicalStoreWorkload {
         self.workload
+    }
+
+    /// Returns the immutable raw-blob retention authenticated at admission.
+    #[must_use]
+    pub const fn raw_blob_retention(&self) -> RawBlobRetention {
+        self.build_plan.raw_blob_retention()
     }
 
     /// Returns the immutable retained canonical range.

@@ -18,6 +18,8 @@ use zinder_rocksdb_bulk_load::{
     FixedRecordSorter, OrderedSstWriter, SstFileEvidence, SstFileSet, fixed_record_capacity,
 };
 
+use crate::RawBlobRetention;
+
 use self::codec::{BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN};
 
 pub(super) use self::codec::{
@@ -830,18 +832,30 @@ pub(super) fn validate_build_block(
     build_plan: &CanonicalStoreBuildPlan,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
-    validate_block(workload, block, build_plan.build_tip().height)
+    validate_block(
+        workload,
+        build_plan.raw_blob_retention(),
+        block,
+        build_plan.build_tip().height,
+    )
 }
 
 pub(super) fn validate_live_block(
     workload: CanonicalStoreWorkload,
+    raw_blob_retention: RawBlobRetention,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
-    validate_block(workload, block, block.facts.block_header.height)
+    validate_block(
+        workload,
+        raw_blob_retention,
+        block,
+        block.facts.block_header.height,
+    )
 }
 
 fn validate_block(
     workload: CanonicalStoreWorkload,
+    raw_blob_retention: RawBlobRetention,
     block: &CanonicalBuildBlock,
     transition_tip_height: BlockHeight,
 ) -> Result<(), CanonicalStoreError> {
@@ -876,8 +890,8 @@ fn validate_block(
         )));
     }
     validate_compact_block_payload(block)?;
-    validate_transaction_blobs(block)?;
-    validate_block_blob(workload, block)?;
+    validate_transaction_blobs(raw_blob_retention, block)?;
+    validate_block_blob(raw_blob_retention, block)?;
     validate_tree_state_checkpoint(transition_tip_height, block)?;
     validate_block_final_note_commitment_roots(workload, block)
 }
@@ -924,13 +938,22 @@ pub(super) fn validate_compact_block_payload(
     Ok(())
 }
 
-fn validate_transaction_blobs(block: &CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
+fn validate_transaction_blobs(
+    raw_blob_retention: RawBlobRetention,
+    block: &CanonicalBuildBlock,
+) -> Result<(), CanonicalStoreError> {
     let height = block.facts.block_header.height;
-    if block.transaction_blobs.len() != block.facts.transactions.len() {
+    let expected_blob_count = if raw_blob_retention.retains_transaction_blobs() {
+        block.facts.transactions.len()
+    } else {
+        0
+    };
+    if block.transaction_blobs.len() != expected_blob_count {
         return Err(CanonicalStoreError::block_load_sequence(format!(
-            "block {} has {} facts but {} raw transaction blobs",
+            "block {} requires {} raw transaction blobs under {} retention but contains {}",
             height.value(),
-            block.facts.transactions.len(),
+            expected_blob_count,
+            raw_blob_retention,
             block.transaction_blobs.len()
         )));
     }
@@ -971,44 +994,46 @@ fn validate_transaction_blobs(block: &CanonicalBuildBlock) -> Result<(), Canonic
 }
 
 fn validate_block_blob(
-    workload: CanonicalStoreWorkload,
+    raw_blob_retention: RawBlobRetention,
     block: &CanonicalBuildBlock,
 ) -> Result<(), CanonicalStoreError> {
     let header = &block.facts.block_header;
     let height = header.height;
-    match (workload, &block.block_blob) {
-        (CanonicalStoreWorkload::Wallet, Some(_)) => {
+    match (raw_blob_retention.retains_block_blobs(), &block.block_blob) {
+        (false, Some(_)) => {
             return Err(CanonicalStoreError::block_load_sequence(format!(
-                "wallet block {} unexpectedly contains an explorer raw block",
-                height.value()
+                "block {} unexpectedly contains a raw block under {} retention",
+                height.value(),
+                raw_blob_retention
             )));
         }
-        (CanonicalStoreWorkload::Explorer, None) => {
+        (true, None) => {
             return Err(CanonicalStoreError::block_load_sequence(format!(
-                "explorer block {} is missing its raw block",
-                height.value()
+                "block {} is missing its raw block under {} retention",
+                height.value(),
+                raw_blob_retention
             )));
         }
-        (CanonicalStoreWorkload::Explorer, Some(blob))
+        (true, Some(blob))
             if blob.height != height
                 || blob.block_hash != header.block_hash
                 || blob.parent_hash != header.parent_hash =>
         {
             return Err(CanonicalStoreError::block_load_sequence(format!(
-                "explorer block {} raw block identity does not match its canonical facts",
+                "block {} raw block identity does not match its canonical facts",
                 height.value()
             )));
         }
-        (CanonicalStoreWorkload::Explorer, Some(blob))
+        (true, Some(blob))
             if SerializedBytesDigest::from_serialized_bytes(&blob.raw_block_bytes)
                 != block.facts.serialized_bytes_digest =>
         {
             return Err(CanonicalStoreError::block_load_sequence(format!(
-                "explorer block {} raw bytes do not match canonical facts",
+                "block {} raw bytes do not match canonical facts",
                 height.value()
             )));
         }
-        (CanonicalStoreWorkload::Wallet, None) | (CanonicalStoreWorkload::Explorer, Some(_)) => {}
+        (false, None) | (true, Some(_)) => {}
     }
     Ok(())
 }
@@ -1089,6 +1114,7 @@ struct BlockSequence {
     tip_metadata: ChainTipMetadata,
     block_count: u64,
     transaction_count: u64,
+    transaction_blob_count: u64,
     block_blob_count: u64,
     tree_state_checkpoint_count: u64,
     block_final_note_commitment_roots_count: u64,
@@ -1106,6 +1132,7 @@ struct BlockSequenceRow {
     parent_hash: BlockHash,
     tip_metadata: ChainTipMetadata,
     transaction_count: u64,
+    transaction_blob_count: u64,
     has_block_blob: bool,
     has_tree_state_checkpoint: bool,
     has_block_final_note_commitment_roots: bool,
@@ -1132,6 +1159,10 @@ impl BlockSequenceRow {
         let transaction_count = u64::try_from(block.facts.transactions.len()).map_err(|_| {
             CanonicalStoreError::block_load_sequence("transaction count exceeds u64::MAX")
         })?;
+        let transaction_blob_count =
+            u64::try_from(block.transaction_blobs.len()).map_err(|_| {
+                CanonicalStoreError::block_load_sequence("transaction blob count exceeds u64::MAX")
+            })?;
         let mut transaction_location_logical_bytes = 0;
         let mut transaction_blob_logical_bytes = 0;
         for transaction_blob in &block.transaction_blobs {
@@ -1172,6 +1203,7 @@ impl BlockSequenceRow {
             parent_hash: block.facts.block_header.parent_hash,
             tip_metadata: block.tip_metadata,
             transaction_count,
+            transaction_blob_count,
             has_block_blob: block.block_blob.is_some(),
             has_tree_state_checkpoint: block.tree_state_checkpoint.is_some(),
             has_block_final_note_commitment_roots: block
@@ -1266,6 +1298,7 @@ impl BlockSequence {
             tip_metadata: row.tip_metadata,
             block_count: 1,
             transaction_count: row.transaction_count,
+            transaction_blob_count: row.transaction_blob_count,
             block_blob_count: u64::from(row.has_block_blob),
             tree_state_checkpoint_count: u64::from(row.has_tree_state_checkpoint),
             block_final_note_commitment_roots_count: u64::from(
@@ -1310,11 +1343,40 @@ impl BlockSequence {
         self.block_count = self.block_count.checked_add(1).ok_or_else(|| {
             CanonicalStoreError::block_load_sequence("block count exceeds u64::MAX")
         })?;
+        self.append_family_counts(&row)?;
+        self.family_logical_bytes = self
+            .family_logical_bytes
+            .checked_add(row.family_logical_bytes)?;
+        self.logical_replay_bytes = self
+            .logical_replay_bytes
+            .checked_add(row.replay_value_bytes)
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence("replay bytes exceed u64::MAX")
+            })?;
+        self.sequence_digest
+            .try_append(row.facts_digest)
+            .map_err(|_| {
+                CanonicalStoreError::block_load_sequence("block sequence count exceeds u64::MAX")
+            })?;
+        self.tip_height = row.height;
+        self.tip_hash = row.block_hash;
+        self.tip_metadata = row.tip_metadata;
+        self.retain_checkpoint();
+        Ok(())
+    }
+
+    fn append_family_counts(&mut self, row: &BlockSequenceRow) -> Result<(), CanonicalStoreError> {
         self.transaction_count = self
             .transaction_count
             .checked_add(row.transaction_count)
             .ok_or_else(|| {
                 CanonicalStoreError::block_load_sequence("transaction count exceeds u64::MAX")
+            })?;
+        self.transaction_blob_count = self
+            .transaction_blob_count
+            .checked_add(row.transaction_blob_count)
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence("transaction blob count exceeds u64::MAX")
             })?;
         self.block_blob_count = self
             .block_blob_count
@@ -1338,24 +1400,6 @@ impl BlockSequence {
                     "block final note-commitment roots count exceeds u64::MAX",
                 )
             })?;
-        self.family_logical_bytes = self
-            .family_logical_bytes
-            .checked_add(row.family_logical_bytes)?;
-        self.logical_replay_bytes = self
-            .logical_replay_bytes
-            .checked_add(row.replay_value_bytes)
-            .ok_or_else(|| {
-                CanonicalStoreError::block_load_sequence("replay bytes exceed u64::MAX")
-            })?;
-        self.sequence_digest
-            .try_append(row.facts_digest)
-            .map_err(|_| {
-                CanonicalStoreError::block_load_sequence("block sequence count exceeds u64::MAX")
-            })?;
-        self.tip_height = row.height;
-        self.tip_hash = row.block_hash;
-        self.tip_metadata = row.tip_metadata;
-        self.retain_checkpoint();
         Ok(())
     }
 
@@ -1398,8 +1442,8 @@ impl BlockSequence {
             block_hash_index_count: self.block_count,
             block_replay_count: self.block_count,
             compact_block_count: self.block_count,
-            transaction_location_count: self.transaction_count,
-            transaction_blob_count: self.transaction_count,
+            transaction_location_count: self.transaction_blob_count,
+            transaction_blob_count: self.transaction_blob_count,
             block_blob_count: self.block_blob_count,
             tree_state_checkpoint_count: self
                 .tree_state_checkpoint_count

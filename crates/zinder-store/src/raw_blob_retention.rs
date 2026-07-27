@@ -2,13 +2,15 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Raw-blob retention fixed by the primary writer after the first canonical commit.
 ///
 /// Readers use this persisted value for capability discovery. Changing it on a
 /// non-empty store would make that capability lie about historical coverage,
 /// so opening with a different value fails closed and requires a rebuild.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RawBlobRetention {
     /// Neither block nor transaction blobs are retained.
     None,
@@ -45,5 +47,26 @@ impl RawBlobRetention {
 impl fmt::Display for RawBlobRetention {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_kebab_case())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RawBlobRetention;
+
+    #[test]
+    fn serde_round_trips_exact_configuration_spellings() -> Result<(), Box<dyn std::error::Error>> {
+        for (retention, encoded) in [
+            (RawBlobRetention::None, "\"none\""),
+            (RawBlobRetention::Transactions, "\"transactions\""),
+            (RawBlobRetention::All, "\"all\""),
+        ] {
+            assert_eq!(serde_json::to_string(&retention)?, encoded);
+            assert_eq!(
+                serde_json::from_str::<RawBlobRetention>(encoded)?,
+                retention
+            );
+        }
+        Ok(())
     }
 }

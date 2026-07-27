@@ -2106,6 +2106,7 @@ pub(crate) mod test_support {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2257,6 +2258,7 @@ pub(crate) mod test_support {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2286,6 +2288,7 @@ pub(crate) mod test_support {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2336,6 +2339,7 @@ pub(crate) mod test_support {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2684,8 +2688,13 @@ pub(crate) mod test_support {
     ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
         let activations = fixture_activations()?;
         let tip = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32]));
-        let plan =
-            CanonicalStoreBuildPlan::complete(&activations, 0, tip, CanonicalReorgPolicy::new(1)?)?;
+        let plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            tip,
+            zinder_store::RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(1)?,
+        )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
             CanonicalStoreWorkload::Wallet,

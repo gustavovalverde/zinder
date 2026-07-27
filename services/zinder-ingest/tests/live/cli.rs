@@ -214,6 +214,7 @@ fn open_wallet_canonical_store(
         storage_path,
         activations,
         CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::canonical_writer_defaults(),
     )?)

@@ -246,6 +246,7 @@ async fn run_probe(
         &runtime_config.storage_path,
         &activations,
         zinder_store::CanonicalStoreWorkload::Wallet,
+        runtime_config.raw_blob_policy.to_retention(),
         zinder_store::CanonicalReorgPolicy::new(runtime_config.reorg_window_blocks)
             .map_err(zinder_ingest::CanonicalWriterError::from)?,
         runtime_config.canonical_rocksdb_budget,
@@ -680,6 +681,7 @@ struct MaterializedViewPlaneSpec {
     canonical_rocksdb_budget: RocksDbResourceBudget,
     materialized_view_rocksdb_budget: RocksDbResourceBudget,
     activations: Arc<NetworkUpgradeActivations>,
+    raw_blob_retention: zinder_store::RawBlobRetention,
     reorg_policy: CanonicalReorgPolicy,
     chain_event_retention_window: Option<Duration>,
     cursor_at_risk_warning: Duration,
@@ -696,6 +698,7 @@ fn materialized_view_plane_spec(
         canonical_rocksdb_budget: runtime_config.canonical_rocksdb_budget,
         materialized_view_rocksdb_budget: runtime_config.materialized_view_rocksdb_budget,
         activations,
+        raw_blob_retention: runtime_config.raw_blob_policy.to_retention(),
         reorg_policy: CanonicalReorgPolicy::new(runtime_config.reorg_window_blocks)
             .map_err(zinder_ingest::CanonicalWriterError::from)?,
         chain_event_retention_window: command_config.retention.chain_event_window(),
@@ -813,6 +816,7 @@ async fn open_canonical_secondary_when_published(
             &spec.secondary_path,
             &spec.activations,
             CanonicalStoreWorkload::Wallet,
+            spec.raw_blob_retention,
             spec.reorg_policy,
             spec.canonical_rocksdb_budget,
         ) {
@@ -861,6 +865,7 @@ fn canonical_writer_config(
             .runtime_config
             .run_overrides
             .checkpoint_height,
+        raw_blob_retention: command_config.runtime_config.raw_blob_policy.to_retention(),
         reorg_window_blocks: command_config.runtime_config.reorg_window_blocks,
         follow: CanonicalFollowConfig {
             request_timeout: command_config.runtime_config.node.request_timeout,
@@ -886,6 +891,7 @@ fn log_canonical_writer_start(
         json_rpc_addr = command_config.runtime_config.node.json_rpc_addr.as_str(),
         workload = "wallet",
         schema_version = zinder_store::CANONICAL_STORE_SCHEMA_VERSION,
+        raw_blob_retention = %writer_config.raw_blob_retention,
         reorg_window_blocks = writer_config.reorg_window_blocks,
         checkpoint_height = ?writer_config.checkpoint_height.map(BlockHeight::value),
         target_height = ?writer_config.follow.target_height.map(BlockHeight::value),

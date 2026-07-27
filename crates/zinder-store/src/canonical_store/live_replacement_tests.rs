@@ -32,7 +32,8 @@ use super::{
 };
 use crate::{
     ChainEpochCommitted, ChainEvent, ChainEventHistoryRequest, ChainEventStreamFamily,
-    ChainRangeReverted, EventStreamStartPosition, RocksDbResourceBudget, StreamCursorTokenV1,
+    ChainRangeReverted, EventStreamStartPosition, RawBlobRetention, RocksDbResourceBudget,
+    StreamCursorTokenV1,
     format::{ChainEventCursorAnchor, ChainEventLocator},
 };
 
@@ -184,6 +185,111 @@ fn maximum_depth_replacement_is_atomic_archived_and_reopenable_then_appends()
         BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([44; 32]))
     );
     assert_eq!(store.displaced_block_count()?, 2);
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end proof keeps append, replacement, secondary catch-up, and cold reopen together"
+)]
+fn all_retention_keeps_block_blobs_across_append_replacement_secondary_and_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut store = published_store_with_retention(
+        &store_path,
+        2,
+        BlockHeight::new(2),
+        BlockHeight::new(1),
+        RawBlobRetention::All,
+    )?;
+    let settled_tip = store.append_anchor()?.settled_tip();
+    let append = replacement_block_with_retention(
+        BlockHeight::new(3),
+        [3; 32],
+        [2; 32],
+        203,
+        RawBlobRetention::All,
+    )?;
+    let append_fence = store.event_fence();
+    let (next, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            append_fence,
+            append,
+            Vec::new(),
+            settled_tip,
+            UnixTimestampMillis::new(1_750_000_000_002),
+        ),
+        &activations,
+    )?;
+    store = next;
+    assert_eq!(
+        store
+            .block_blob_at(BlockHeight::new(3))?
+            .ok_or("appended block blob must be retained")?
+            .raw_block_bytes,
+        vec![203]
+    );
+
+    let mut secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::All,
+        CanonicalReorgPolicy::new(2)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let replacement = replacement_block_with_retention(
+        BlockHeight::new(3),
+        [33; 32],
+        [2; 32],
+        233,
+        RawBlobRetention::All,
+    )?;
+    let replacement_fence = store.event_fence();
+    let (next, _) = store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            replacement_fence,
+            vec![CanonicalReplacementBlock::new(replacement, Vec::new())],
+            UnixTimestampMillis::new(1_750_000_000_003),
+        ),
+        &activations,
+    )?;
+    store = next;
+    assert_eq!(
+        store
+            .block_blobs_in_range(BlockHeightRange::inclusive(
+                BlockHeight::new(1),
+                BlockHeight::new(3),
+            ))?
+            .into_iter()
+            .map(|blob| blob.map(|blob| blob.raw_block_bytes))
+            .collect::<Vec<_>>(),
+        vec![Some(vec![101]), Some(vec![102]), Some(vec![233])]
+    );
+    secondary.try_catch_up()?;
+    assert_eq!(
+        secondary
+            .block_blob_at(BlockHeight::new(3))?
+            .ok_or("secondary replacement block blob must be retained")?
+            .raw_block_bytes,
+        vec![233]
+    );
+    drop(secondary);
+    drop(store);
+
+    let reopened = open_store_with_retention(&store_path, &activations, 2, RawBlobRetention::All)?;
+    assert_eq!(reopened.raw_blob_retention(), RawBlobRetention::All);
+    assert_eq!(
+        reopened
+            .block_blob_at(BlockHeight::new(3))?
+            .ok_or("reopened replacement block blob must be retained")?
+            .raw_block_bytes,
+        vec![233]
+    );
     Ok(())
 }
 
@@ -475,6 +581,7 @@ fn retained_events_resume_exactly_and_leases_bound_pruning()
         &store_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -507,6 +614,7 @@ fn secondary_wallet_events_reconstruct_historical_branches_across_multiple_reorg
         &secondary_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(32)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -954,6 +1062,7 @@ fn secondary_point_reads_agree_with_the_bounded_replay_range_scan()
         &secondary_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1114,12 +1223,29 @@ fn published_store(
     build_tip_height: BlockHeight,
     settled_height: BlockHeight,
 ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    published_store_with_retention(
+        path,
+        reorg_window,
+        build_tip_height,
+        settled_height,
+        RawBlobRetention::Transactions,
+    )
+}
+
+fn published_store_with_retention(
+    path: &Path,
+    reorg_window: u32,
+    build_tip_height: BlockHeight,
+    settled_height: BlockHeight,
+    raw_blob_retention: RawBlobRetention,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
     let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
     let tip_byte = u8::try_from(build_tip_height.value())?;
     let build_plan = CanonicalStoreBuildPlan::complete(
         &activations,
         0,
         BlockId::new(build_tip_height, BlockHash::from_bytes([tip_byte; 32])),
+        raw_blob_retention,
         CanonicalReorgPolicy::new(reorg_window)?,
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
@@ -1138,6 +1264,7 @@ fn published_store(
             [u8::try_from(height.value() - 1)?; 32]
         };
         let mut block = canonical_block(height, [hash_byte; 32], parent_hash, 100 + hash_byte);
+        apply_raw_blob_retention(&mut block, raw_blob_retention, 100 + hash_byte);
         if height == build_tip_height {
             add_checkpoint(&mut block)?;
         }
@@ -1164,10 +1291,25 @@ fn open_store(
     activations: &zinder_core::NetworkUpgradeActivations,
     reorg_window: u32,
 ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    open_store_with_retention(
+        path,
+        activations,
+        reorg_window,
+        RawBlobRetention::Transactions,
+    )
+}
+
+fn open_store_with_retention(
+    path: &Path,
+    activations: &zinder_core::NetworkUpgradeActivations,
+    reorg_window: u32,
+    raw_blob_retention: RawBlobRetention,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
     Ok(RocksDbCanonicalStore::open_ready(
         path,
         activations,
         CanonicalStoreWorkload::Wallet,
+        raw_blob_retention,
         CanonicalReorgPolicy::new(reorg_window)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)
@@ -1179,7 +1321,24 @@ fn replacement_block(
     parent_hash: [u8; 32],
     transaction_tag: u8,
 ) -> Result<CanonicalBuildBlock, Box<dyn std::error::Error>> {
+    replacement_block_with_retention(
+        height,
+        block_hash,
+        parent_hash,
+        transaction_tag,
+        RawBlobRetention::Transactions,
+    )
+}
+
+fn replacement_block_with_retention(
+    height: BlockHeight,
+    block_hash: [u8; 32],
+    parent_hash: [u8; 32],
+    transaction_tag: u8,
+    raw_blob_retention: RawBlobRetention,
+) -> Result<CanonicalBuildBlock, Box<dyn std::error::Error>> {
     let mut block = canonical_block(height, block_hash, parent_hash, transaction_tag);
+    apply_raw_blob_retention(&mut block, raw_blob_retention, transaction_tag);
     add_checkpoint(&mut block)?;
     Ok(block)
 }
@@ -1287,6 +1446,33 @@ fn canonical_block(
         )],
         block_blob: None,
         facts,
+    }
+}
+
+fn apply_raw_blob_retention(
+    block: &mut CanonicalBuildBlock,
+    raw_blob_retention: RawBlobRetention,
+    block_tag: u8,
+) {
+    match raw_blob_retention {
+        RawBlobRetention::None => block.transaction_blobs.clear(),
+        RawBlobRetention::Transactions => {}
+        RawBlobRetention::All => {
+            let raw_block_bytes = vec![block_tag];
+            block.facts.serialized_bytes_digest =
+                SerializedBytesDigest::from_serialized_bytes(&raw_block_bytes);
+            block.block_blob = Some(zinder_core::BlockBlobArtifact::new(
+                block.facts.block_header.height,
+                block.facts.block_header.block_hash,
+                block.facts.block_header.parent_hash,
+                raw_block_bytes,
+            ));
+            block.replay_envelope = encode_canonical_block_replay(
+                &block.facts,
+                CanonicalBlockReplayFormatVersion::V1,
+                CanonicalBlockFactsDigestVersion::V1,
+            );
+        }
     }
 }
 
