@@ -1,13 +1,13 @@
-//! Zinder capability strings and the single declarative advertisement table.
+//! Zinder capability strings and registry metadata.
 //!
 //! Every served RPC on `WalletQuery`, `ExplorerQuery`, and `IngestControl`
 //! has one row in [`CAPABILITIES`]. Each row binds a capability string to its
 //! surface, the fully qualified proto method it gates, and a declarative
-//! [`AdvertisePolicy`]. The three `ServerInfo` builders fold over this table,
-//! filtering by surface and evaluating the policy against their own context;
-//! the `capability-table-vs-descriptor` CI guard cross-checks the table
-//! against the compiled `FileDescriptorSet`. The full protocol contract is in
-//! [Public interfaces §Capability
+//! [`AdvertisePolicy`]. The registry defines vocabulary, stable ordering, and
+//! descriptive requirements; it does not discover the capabilities of a
+//! composed wallet runtime. The `capability-table-vs-descriptor` CI guard
+//! cross-checks the table against the compiled `FileDescriptorSet`. The full
+//! protocol contract is in [Public interfaces §Capability
 //! Discovery](../../docs/architecture/public-interfaces.md#capability-discovery).
 //!
 //! Capability naming follows `domain.subdomain.capability_name_v{N}`.
@@ -44,19 +44,17 @@ pub const WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2: &str = "wallet.read.compact_blo
 ///
 /// The serialized block bytes are present only when the writer deployment
 /// retains block blobs (ingest `raw_blob_policy` is `all`). Reads for
-/// unretained heights return `ArtifactUnavailable` (gRPC `NOT_FOUND`). The
-/// complete wallet-query profile advertises this capability only when
-/// block-blob retention is enabled. The released exact-pair `zinder-query`
-/// profile does not implement or advertise it.
+/// unretained heights return `ArtifactUnavailable` (gRPC `NOT_FOUND`). A
+/// wallet composition claims this capability only when its admitted read path
+/// retains and serves block blobs.
 pub const WALLET_READ_FULL_BLOCK_AT_V1: &str = "wallet.read.full_block_at_v1";
 /// Capability advertised for `WalletQuery.FullBlocksInRange`.
 ///
 /// Same block-blob retention requirement as
 /// [`WALLET_READ_FULL_BLOCK_AT_V1`]: the stream yields serialized blocks only
-/// when the writer deployment sets `raw_blob_policy = "all"`. The complete
-/// wallet-query profile advertises this capability only for such deployments;
-/// the released exact-pair `zinder-query` profile does not implement or
-/// advertise it.
+/// when the writer deployment sets `raw_blob_policy = "all"`. A wallet
+/// composition claims this capability only when its admitted range-read path
+/// retains and serves block blobs.
 pub const WALLET_READ_FULL_BLOCK_RANGE_V1: &str = "wallet.read.full_block_range_v1";
 /// Capability advertised for `WalletQuery.TreeStateAtHeight`.
 pub const WALLET_READ_TREE_STATE_AT_HEIGHT_V2: &str = "wallet.read.tree_state_at_height_v2";
@@ -92,25 +90,23 @@ pub const WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1: &str =
     "wallet.read.network_upgrade_activations_v1";
 /// Capability advertised for `WalletQuery.TransparentOutputsByOutpoint`.
 ///
-/// The complete wallet-query profile implements and advertises the canonical
-/// output resolver. The released exact-pair `zinder-query` profile does not.
+/// A wallet composition claims this capability only when its admitted query
+/// implements the canonical output resolver.
 pub const WALLET_READ_TRANSPARENT_OUTPUTS_V1: &str =
     "wallet.read.transparent_outputs_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.TransparentSpendsByOutpoint`.
 ///
-/// The complete wallet-query profile implements the canonical (confirmed)
-/// reverse-spend resolver over the canonical spend-fact index and advertises
-/// this capability. The released exact-pair `zinder-query` profile does not
-/// implement or advertise it. The unmined half is
+/// A wallet composition claims this capability only when its admitted query
+/// implements the canonical (confirmed) reverse-spend resolver over the
+/// canonical spend-fact index. The unmined half is
 /// [`WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1`].
 pub const WALLET_READ_TRANSPARENT_SPENDS_V1: &str = "wallet.read.transparent_spends_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.TransparentUnspentOutputsByOutpoint`.
 ///
-/// The complete wallet-query profile implements this canonical single-outpoint
-/// unspent probe (gettxout-equivalent) over the canonical output and spend-fact
-/// indexes and advertises the capability. The released exact-pair
-/// `zinder-query` profile does not implement or advertise it. Mempool-aware
-/// unspent-ness composes with
+/// A wallet composition claims this capability only when its admitted query
+/// implements the canonical single-outpoint unspent probe
+/// (gettxout-equivalent) over the canonical output and spend-fact indexes.
+/// Mempool-aware unspent-ness composes with
 /// [`WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1`].
 pub const WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
     "wallet.read.transparent_unspent_outputs_by_outpoint_v1";
@@ -539,27 +535,25 @@ pub enum CapabilitySurface {
     Ingest,
 }
 
-/// Declarative gate a `ServerInfo` builder evaluates before advertising a
-/// capability.
+/// Declarative runtime requirement associated with a capability.
 ///
-/// Each variant names a deployment precondition that a single surface's
-/// builder resolves against its own runtime context after filtering for the
-/// selected implementation profile. A variant never appears on a
-/// [`CapabilitySpec`] whose surface cannot evaluate it.
+/// Each variant classifies evidence an owning runtime may require before it
+/// advertises a capability. The registry records this metadata but does not
+/// derive wallet runtime support from it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AdvertisePolicy {
-    /// No additional deployment gate after implementation-profile filtering.
+    /// No additional deployment requirement.
     AlwaysOn,
-    /// Wallet: advertised when a transaction broadcaster is configured.
+    /// Wallet: requires a configured transaction broadcaster.
     RequiresBroadcaster,
-    /// Wallet: advertised when the chain-event stream is served.
+    /// Wallet: requires a served chain-event stream.
     RequiresChainEvents,
     /// Advertised when the upstream node reports chain value-pool totals.
     ///
-    /// Wallet resolves this against the configured proxy flag; Ingest
-    /// resolves it against the source handle's
-    /// `NodeCapability::ChainValuePools`.
+    /// Ingest resolves this against the source handle's
+    /// `NodeCapability::ChainValuePools`; wallet compositions require the
+    /// corresponding admitted upstream read path.
     RequiresChainValuePools,
     /// Explorer: advertised when a `WalletQuery` endpoint is wired.
     RequiresWalletQuery,
@@ -588,53 +582,22 @@ pub enum AdvertisePolicy {
     /// Explorer: advertised when transaction history has verified full
     /// coverage through its typed projection position and wallet-query is online.
     RequiresCompleteTransactionHistory,
-    /// Wallet: a supported implementation advertises when the store retains
-    /// full block blobs (ingest `raw_blob_policy = all`).
+    /// Wallet: requires a store that retains full block blobs (ingest
+    /// `raw_blob_policy = all`).
     RequiresBlockBlobs,
-    /// Wallet: advertised when the store retains transaction blobs
+    /// Wallet: requires a store that retains transaction blobs
     /// (ingest `raw_blob_policy` in `{transactions, all}`).
     RequiresTransactionBlobs,
-    /// Wallet: advertised when the operator opted into the transparent
+    /// Wallet: requires operator opt-in to the transparent
     /// UTXO-set commitment fold.
     RequiresUtxoSetCommitment,
-    /// Wallet: advertised when transparent-address history projection is available.
+    /// Wallet: requires an available transparent-address history projection.
     RequiresTransparentAddressHistory,
-    /// Wallet: advertised when durable transparent-spend projection is available.
+    /// Wallet: requires an available durable transparent-spend projection.
     RequiresTransparentOutpointSpend,
 }
 
 impl AdvertisePolicy {
-    /// Resolves a `WalletQuery` capability against `zinder-query` settings.
-    ///
-    /// Wallet capabilities use only the always-on, broadcaster, chain-event,
-    /// chain-value-pool, and blob-retention gates; the explorer-only variants
-    /// never appear on a [`CapabilitySurface::Wallet`] spec and resolve to
-    /// `false`.
-    #[must_use]
-    pub fn wallet_satisfied(self, inputs: WalletAdvertiseInputs) -> bool {
-        match self {
-            Self::AlwaysOn => true,
-            Self::RequiresBroadcaster => inputs.broadcaster_enabled,
-            Self::RequiresChainEvents => inputs.chain_events_enabled,
-            Self::RequiresChainValuePools => inputs.chain_value_pools_enabled,
-            Self::RequiresBlockBlobs => inputs.block_blobs_retained,
-            Self::RequiresTransactionBlobs => inputs.transaction_blobs_retained,
-            Self::RequiresUtxoSetCommitment => inputs.utxo_set_commitment_enabled,
-            Self::RequiresTransparentAddressHistory => inputs.transparent_address_history_available,
-            Self::RequiresTransparentOutpointSpend => inputs.transparent_outpoint_spend_available,
-            Self::RequiresWalletQuery
-            | Self::RequiresCanonicalStore
-            | Self::RequiresMaterializedViewStore
-            | Self::RequiresWalletQueryAndCanonicalStore
-            | Self::RequiresMaterializedViewStoreAndWalletQuery
-            | Self::RequiresMaterializedViewStoreAndCanonicalStore
-            | Self::RequiresMaterializedViewStoreWalletQueryAndCanonicalStore
-            | Self::RequiresPrevoutResolution
-            | Self::RequiresTransactionHistory
-            | Self::RequiresCompleteTransactionHistory => false,
-        }
-    }
-
     /// Resolves an `ExplorerQuery` capability against the adapter's readiness.
     ///
     /// `prevout_resolution_online` is expected to already fold in the
@@ -708,35 +671,6 @@ impl AdvertisePolicy {
     }
 }
 
-/// Inputs the wallet plane resolves an [`AdvertisePolicy`] against.
-///
-/// Each field mirrors a gate the `WalletQuery` `ServerInfo` builder already
-/// tracks. The query plane constructs this directly per request, so it is not
-/// `#[non_exhaustive]`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "Each bool is an independent wallet advertisement gate, not a state machine."
-)]
-pub struct WalletAdvertiseInputs {
-    /// A transaction broadcaster is configured.
-    pub broadcaster_enabled: bool,
-    /// The chain-event stream is served.
-    pub chain_events_enabled: bool,
-    /// The upstream node reports chain value-pool totals.
-    pub chain_value_pools_enabled: bool,
-    /// The store retains full block blobs.
-    pub block_blobs_retained: bool,
-    /// The store retains transaction blobs.
-    pub transaction_blobs_retained: bool,
-    /// The operator opted into the transparent UTXO-set commitment fold.
-    pub utxo_set_commitment_enabled: bool,
-    /// Transparent-address history projection is configured and schema-compatible.
-    pub transparent_address_history_available: bool,
-    /// Durable transparent-outpoint-spend projection is configured and schema-compatible.
-    pub transparent_outpoint_spend_available: bool,
-}
-
 /// Readiness inputs the explorer plane resolves an [`AdvertisePolicy`] against.
 ///
 /// Each field mirrors an online/offline gate the `ExplorerQuery` adapter
@@ -781,7 +715,7 @@ pub struct CapabilitySpec {
     /// The fully qualified proto method the capability gates, or `None` for a
     /// field-level capability that rides on another RPC.
     pub method: Option<&'static str>,
-    /// The precondition the owning surface evaluates before advertising.
+    /// Declarative runtime-requirement metadata for the capability.
     pub policy: AdvertisePolicy,
 }
 
@@ -805,9 +739,10 @@ impl CapabilitySpec {
 ///
 /// Every served RPC on the three planes has a row here, plus the field-level
 /// capabilities (`explorer.transaction.fees_v1`, `ingest.writer.phase_v1`)
-/// that ride on an existing RPC. The `ServerInfo` builders fold over this
-/// table filtered by surface; the CI drift guard cross-checks it against the
-/// compiled `FileDescriptorSet`.
+/// that ride on an existing RPC. A row's presence does not prove runtime
+/// availability. Owning runtimes advertise only capabilities proven by their
+/// admitted composition. The CI drift guard cross-checks this vocabulary
+/// against the compiled `FileDescriptorSet`.
 pub const CAPABILITIES: &[CapabilitySpec] = &[
     CapabilitySpec::new(
         WALLET_READ_VISIBLE_TIP_BLOCK_V1,
@@ -1347,9 +1282,8 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
 
 /// Returns the capability rows owned by `surface`, in table order.
 ///
-/// `ServerInfo` builders filter the single [`CAPABILITIES`] table by their own
-/// surface, then evaluate each row's [`AdvertisePolicy`] against their runtime
-/// context.
+/// This registry query preserves vocabulary order and does not evaluate
+/// [`AdvertisePolicy`] or discover runtime support.
 pub fn capabilities_for_surface(
     surface: CapabilitySurface,
 ) -> impl Iterator<Item = &'static CapabilitySpec> {
@@ -1360,9 +1294,8 @@ pub fn capabilities_for_surface(
 
 /// Returns the always-on capability strings for `surface`.
 ///
-/// The readiness-gated ops endpoint advertises this subset: it spawns before
-/// the source and store readiness gates resolve, so it can only honestly claim
-/// the capabilities every deployment of the surface serves unconditionally.
+/// This is a classification query over registry metadata, not evidence that a
+/// particular runtime composed or admitted the corresponding methods.
 #[must_use]
 pub fn always_on_capability_strings(surface: CapabilitySurface) -> Vec<&'static str> {
     capabilities_for_surface(surface)
