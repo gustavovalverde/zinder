@@ -2,8 +2,13 @@
 
 use zinder_client::{Capability, CapabilityDescriptor, ErrorReason, ServerInfo};
 use zinder_proto::capabilities::{
+    WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1, WALLET_EVENTS_CHAIN_V1,
+    WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2, WALLET_READ_COMPACT_BLOCK_RANGE_V2,
     WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
-    WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+    WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1, WALLET_READ_SERVER_INFO_V2,
+    WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
+    WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
+    WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
 };
 
 #[test]
@@ -15,6 +20,46 @@ fn wallet_capabilities_use_client_owned_exact_match_vocabulary() {
             Capability::NetworkUpgradeActivations,
             WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
         ),
+    ] {
+        assert_eq!(capability.as_str(), expected);
+    }
+}
+
+#[test]
+fn wallet_sync_capabilities_use_client_owned_exact_match_vocabulary() {
+    for (capability, expected) in [
+        (Capability::ServerInfo, WALLET_READ_SERVER_INFO_V2),
+        (
+            Capability::VisibleTipBlock,
+            WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+        ),
+        (
+            Capability::SettledTipBlock,
+            WALLET_READ_SETTLED_TIP_BLOCK_V1,
+        ),
+        (
+            Capability::CompactBlockRange,
+            WALLET_READ_COMPACT_BLOCK_RANGE_V2,
+        ),
+        (
+            Capability::CompactBlockIronwood,
+            WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
+        ),
+        (Capability::TreeState, WALLET_READ_TREE_STATE_AT_HEIGHT_V2),
+        (
+            Capability::SubtreeRoots,
+            WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
+        ),
+        (
+            Capability::SubtreeRootsIronwood,
+            WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
+        ),
+        (Capability::Transaction, WALLET_READ_TRANSACTION_BY_ID_V2),
+        (
+            Capability::TransparentAddressUnspentOutputs,
+            WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+        ),
+        (Capability::ChainEvents, WALLET_EVENTS_CHAIN_V1),
     ] {
         assert_eq!(capability.as_str(), expected);
     }

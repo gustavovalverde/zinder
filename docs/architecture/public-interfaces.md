@@ -152,8 +152,10 @@ database engine, raw-byte retention policy, or release topology.
 - Transport metadata and errors cross the SDK boundary as client-owned
   `ServerInfo`, `Capability`, `CapabilityDescriptor`, and `ErrorReason` types.
   Unknown wire capability and reason strings remain available through typed
-  `Unknown(String)` variants; generated protobuf types are not public SDK
-  vocabulary.
+  `Unknown(String)` variants. Every wallet operation that an external client
+  preflights has a client-owned `Capability` variant, so consumers do not
+  import protocol constants or copy wire strings. Generated protobuf types are
+  not public SDK vocabulary.
 - Public traits describe consumer capabilities. Concrete RocksDB types remain
   at composition roots and storage adapters.
 

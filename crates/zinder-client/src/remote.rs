@@ -1411,12 +1411,14 @@ mod server_info_conversion_tests {
             .ok_or_else(|| IndexerError::malformed("info.common", "test field is missing"))?;
         common.capabilities = vec![
             Capability::FullBlock.as_str().to_owned(),
+            Capability::VisibleTipBlock.as_str().to_owned(),
             "wallet.read.future_v7".to_owned(),
         ];
 
         let server_info = server_info_from_message(Network::ZcashRegtest, message)?;
 
         assert!(server_info.supports(Capability::FullBlock));
+        assert!(server_info.supports(Capability::VisibleTipBlock));
         assert!(server_info.has("wallet.read.future_v7"));
         assert!(
             server_info
