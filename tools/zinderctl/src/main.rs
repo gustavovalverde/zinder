@@ -9,7 +9,9 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use eyre::Result;
-use zinder_runtime::{host_cpu_meets_compiled_baseline, install_tracing_subscriber};
+use zinder_runtime::{
+    BUILD_GIT_COMMIT, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
+};
 
 mod migration;
 mod migration_archive;
@@ -43,6 +45,11 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     install_tracing_subscriber();
+    tracing::debug!(
+        version = env!("CARGO_PKG_VERSION"),
+        build_git_commit = BUILD_GIT_COMMIT,
+        "zinderctl build identity"
+    );
     if !host_cpu_meets_compiled_baseline() {
         return ExitCode::FAILURE;
     }
