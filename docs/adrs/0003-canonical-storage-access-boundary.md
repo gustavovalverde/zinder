@@ -48,6 +48,9 @@ missing canonical artifacts directly from the node.
 - Multi-artifact responses have one explicit chain identity.
 - One process owns every RocksDB write path.
 - Reader freshness is observable and can participate in readiness.
-- Each reader process needs a unique secondary metadata directory.
+- Each reader needs a unique secondary metadata directory. A writer process may
+  host reader-plane secondaries of the store it writes, as `zinder-ingest` does
+  for materialized-view hydration, because the linear ownership rule binds the
+  primary handle rather than the process.
 - Long-lived readers require explicit retention contracts for epochs and events
   they may still reference.

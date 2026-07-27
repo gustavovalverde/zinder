@@ -627,6 +627,20 @@ pub(super) fn fixture_ironwood_source_block() -> Result<SourceBlock, Box<dyn Err
     )
 }
 
+pub(super) fn fixture_sapling_source_block() -> Result<SourceBlock, Box<dyn Error>> {
+    fixture_source_block_from(
+        Network::ZcashTestnet,
+        include_str!("../fixtures/zcash-testnet-sapling-block-1842432.json"),
+    )
+}
+
+pub(super) fn fixture_orchard_source_block() -> Result<SourceBlock, Box<dyn Error>> {
+    fixture_source_block_from(
+        Network::ZcashTestnet,
+        include_str!("../fixtures/zcash-testnet-orchard-block-1842462.json"),
+    )
+}
+
 fn fixture_source_block_from(
     network: Network,
     fixture_json: &str,

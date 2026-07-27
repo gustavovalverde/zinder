@@ -6,7 +6,6 @@
 //! parallel test-only namespace.
 
 mod balance_federation;
-mod fee_summary_federation;
 mod mempool_federation;
 mod search_federation;
 mod transaction_detail_federation;

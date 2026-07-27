@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use rust_rocksdb::{DB, DEFAULT_COLUMN_FAMILY_NAME, Options};
 use zinder_core::{
-    BlockHeightRange, CanonicalHistoryBounds, Network, NetworkUpgradeActivations,
-    NetworkUpgradeActivationsFingerprint,
+    BlockHeight, BlockHeightRange, CanonicalBlockFacts, CanonicalHistoryBounds, Network,
+    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
 };
 
 use crate::{
@@ -16,7 +16,7 @@ use super::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalRetainedEvent,
     CanonicalSequenceCheckpoint, CanonicalStoreBuildState, CanonicalStoreError,
     CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
-    block_replay::{CanonicalReplayRangeScan, CanonicalReplayScan},
+    block_replay::{CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at},
     event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
     live_commit::event_fence_from_ready,
     mempool_lifecycle::validate_mempool_lifecycle_admission,
@@ -285,6 +285,18 @@ impl RocksDbCanonicalSecondary {
         range: BlockHeightRange,
     ) -> Result<CanonicalReplayRangeScan<'_>, CanonicalStoreError> {
         CanonicalReplayRangeScan::new(&self.bounded_open.db, &self.ready_evidence, range)
+    }
+
+    /// Reads one retained block's canonical facts by height.
+    ///
+    /// Heights outside the admitted retained range return `None`. A missing row
+    /// inside that range is a canonical replay-sequence error: READY admission
+    /// proves the retained range is contiguous.
+    pub fn block_replay_facts_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<CanonicalBlockFacts>, CanonicalStoreError> {
+        read_replay_facts_at(&self.bounded_open.db, &self.ready_evidence, height)
     }
 
     /// Reads retained canonical events from this secondary's admitted READY fence.

@@ -75,8 +75,9 @@ pub use sections::{
     resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
     resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_reader,
     resolve_ingest_control_writer, resolve_materialized_view_reader_rocksdb_budget,
-    resolve_ops_listen_addr, resolve_projector_control, resolve_retention,
-    resolve_secondary_storage, resolve_wallet_projection_reader_rocksdb_budget,
+    resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr,
+    resolve_projector_control, resolve_retention, resolve_secondary_storage,
+    resolve_wallet_projection_reader_rocksdb_budget,
     resolve_wallet_projection_writer_rocksdb_budget,
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};

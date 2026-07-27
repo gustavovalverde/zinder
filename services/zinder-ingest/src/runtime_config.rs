@@ -114,6 +114,9 @@ pub struct IngestRuntimeConfig {
     pub storage_path: PathBuf,
     /// Bounded `RocksDB` resource budget for the canonical store.
     pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
+    /// Bounded `RocksDB` resource budget for the materialized-view store the
+    /// in-process tailer writes.
+    pub materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// Optional raw-byte blob write policy for canonical ingest.
     pub raw_blob_policy: RawBlobPolicy,
     /// Reorg-window invariant. Bulk catch-up never advances the settled tip inside
@@ -196,12 +199,26 @@ pub struct MaterializedViewReplayConfig {
     pub memory_resume_ratio: f64,
     /// Smallest effective replay batch while memory pressure is degraded.
     pub min_replay_batch_blocks: NonZeroU32,
-    /// Residual materialized-view lag, in blocks, at which startup catch-up stops
-    /// replaying synchronously and hands the remainder to the always-on
-    /// tailer. Startup returns once the materialized-view plane is within this many
-    /// blocks of the canonical tip, letting the API and ops surfaces come up
-    /// while the tailer drains the rest.
-    pub startup_handoff_lag_blocks: u64,
+}
+
+impl MaterializedViewReplayConfig {
+    /// Replay limits the always-on materialized-view tailer runs with.
+    pub const DEFAULT: Self = Self {
+        replay_batch_blocks: nonzero_u32(100),
+        replay_policy: MaterializedViewReplayPolicy::DEFAULT,
+        memory_budget_bytes: None,
+        memory_degrade_ratio: 0.90,
+        memory_pause_ratio: 0.99,
+        memory_resume_ratio: 0.80,
+        min_replay_batch_blocks: nonzero_u32(10),
+    };
+}
+
+pub(crate) const fn nonzero_u32(candidate: u32) -> NonZeroU32 {
+    match NonZeroU32::new(candidate) {
+        Some(nonzero) => nonzero,
+        None => NonZeroU32::MIN,
+    }
 }
 
 /// Runtime policy for replaying retained chain events into materialized-view consumers.
@@ -302,10 +319,19 @@ pub(crate) async fn wait_until_historical_work_or_cancelled(
         if gate.is_open() {
             return false;
         }
-        tokio::select! {
-            () = cancel.cancelled() => return true,
-            () = tokio::time::sleep(BACKGROUND_WORK_PHASE_POLL_INTERVAL) => {}
+        if sleep_or_cancel(BACKGROUND_WORK_PHASE_POLL_INTERVAL, cancel).await {
+            return true;
         }
+    }
+}
+
+/// Sleeps for `duration` unless cancellation arrives first.
+///
+/// Returns `true` when the caller was cancelled and should stop.
+pub(crate) async fn sleep_or_cancel(duration: Duration, cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        () = cancel.cancelled() => true,
+        () = tokio::time::sleep(duration) => false,
     }
 }
 

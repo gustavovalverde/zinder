@@ -775,60 +775,61 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES",
         toml_path: "storage.materialized_views.rocksdb.block_cache_bytes",
-        used_by: &["zinder-explorer"],
+        used_by: &["zinder-ingest", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Materialized-view store RocksDB block cache budget in bytes. Defaults to \
-                      67108864.",
+                      268435456 for writers and 67108864 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WAL_BYTES",
         toml_path: "storage.materialized_views.rocksdb.max_wal_bytes",
-        used_by: &["zinder-explorer"],
+        used_by: &["zinder-ingest", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Materialized-view store RocksDB live WAL ceiling in bytes. Defaults to \
-                      16777216.",
+                      268435456 for writers and 16777216 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES",
         toml_path: "storage.materialized_views.rocksdb.max_open_files",
-        used_by: &["zinder-explorer"],
+        used_by: &["zinder-ingest", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Materialized-view store RocksDB open SST file cap. Defaults to 64.",
+        description: "Materialized-view store RocksDB open SST file cap. Defaults to 512 for \
+                      writers and 64 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__WRITE_BUFFER_BYTES",
         toml_path: "storage.materialized_views.rocksdb.write_buffer_bytes",
-        used_by: &["zinder-explorer"],
+        used_by: &["zinder-ingest", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Materialized-view store per-column-family RocksDB write buffer size. \
-                      Defaults to 4194304.",
+                      Defaults to 16777216 for writers and 4194304 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WRITE_BUFFER_COUNT",
         toml_path: "storage.materialized_views.rocksdb.max_write_buffer_count",
-        used_by: &["zinder-explorer"],
+        used_by: &["zinder-ingest", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Materialized-view store per-column-family mutable plus immutable RocksDB write \
-                      buffer count. Defaults to 2.",
+                      buffer count. Defaults to 4 for writers and 2 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES",
         toml_path: "storage.materialized_views.rocksdb.memtable_budget_bytes",
-        used_by: &["zinder-explorer"],
+        used_by: &["zinder-ingest", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Materialized-view store total RocksDB memtable budget across column families. \
-                      Defaults to 16777216.",
+                      Defaults to 536870912 for writers and 16777216 for readers.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__STATISTICS_LEVEL",
         toml_path: "storage.materialized_views.rocksdb.statistics_level",
-        used_by: &["zinder-explorer"],
+        used_by: &["zinder-ingest", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Materialized-view store RocksDB statistics collection gate: `off`, `tickers`, or `full`. \

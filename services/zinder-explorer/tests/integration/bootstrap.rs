@@ -6,7 +6,7 @@
 //! Smoke test that boots an `ExplorerQueryGrpcAdapter` against an in-process
 //! tonic server and verifies `ServerInfo` returns the expected capability set.
 
-use std::{net::SocketAddr, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
@@ -1216,7 +1216,7 @@ async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
     seed_recorded_chain_reorg(&store_fixture)?;
 
     let seeded_materialized_view_store =
-        seeded_reorg_history_materialized_view_store(&store_fixture).await?;
+        seeded_reorg_history_materialized_view_store(&store_fixture)?;
     let (mut client, explorer_handle) = spawn_explorer_query_server_with_materialized_view_store(
         seeded_materialized_view_store.secondary_store,
     )
@@ -1283,20 +1283,15 @@ fn seed_recorded_chain_reorg(store_fixture: &StoreFixture) -> Result<()> {
     Ok(())
 }
 
-async fn seeded_reorg_history_materialized_view_store(
+fn seeded_reorg_history_materialized_view_store(
     store_fixture: &StoreFixture,
 ) -> Result<SeededMaterializedViewStore> {
-    let primary_materialized_view_store =
-        zinder_ingest::open_primary_materialized_view_store_for_canonical(
-            store_fixture.tempdir_path(),
-            zinder_store::RocksDbResourceBudget::for_local_tests(),
-        )?;
-    zinder_ingest::catch_up_materialized_view_store_to_canonical(
-        store_fixture.chain_store(),
-        &primary_materialized_view_store,
-        test_materialized_view_config(),
-    )
-    .await?;
+    let primary_materialized_view_store = zinder_ingest::open_primary_materialized_view_store(
+        store_fixture.tempdir_path(),
+        zinder_materialized_views::MaterializedViewPreset::Explorer,
+        zinder_store::RocksDbResourceBudget::for_local_tests(),
+    )?;
+    record_reorg_incidents(store_fixture, &primary_materialized_view_store)?;
     let reorg_cursor = primary_materialized_view_store
         .get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
         .ok_or_else(|| eyre!("reorg incidents cursor missing after materialized-view replay"))?;
@@ -1516,17 +1511,36 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
     })
 }
 
-fn test_materialized_view_config() -> zinder_ingest::MaterializedViewReplayConfig {
-    zinder_ingest::MaterializedViewReplayConfig {
-        replay_batch_blocks: NonZeroU32::new(100).unwrap_or(NonZeroU32::MIN),
-        replay_policy: zinder_ingest::MaterializedViewReplayPolicy::CanonicalFirst,
-        memory_budget_bytes: None,
-        memory_degrade_ratio: 0.85,
-        memory_pause_ratio: 0.95,
-        memory_resume_ratio: 0.75,
-        min_replay_batch_blocks: NonZeroU32::new(10).unwrap_or(NonZeroU32::MIN),
-        startup_handoff_lag_blocks: 1_000,
+/// Replays the fixture's retained chain events into the reorg-incident log.
+fn record_reorg_incidents(
+    store_fixture: &StoreFixture,
+    materialized_view_store: &MaterializedViewStore,
+) -> Result<()> {
+    let blocks = std::collections::HashMap::new();
+    for envelope in store_fixture.chain_store().chain_event_history(
+        zinder_store::ChainEventHistoryRequest::with_default_limit(None),
+    )? {
+        let mut reorg_incidents = zinder_materialized_views::ReorgIncidentsConsumer::new();
+        let mut block_consumers: [&mut dyn zinder_materialized_views::BlockKeyedConsumer; 0] = [];
+        let mut event_consumers: [&mut dyn zinder_materialized_views::MaterializedViewConsumer; 1] =
+            [&mut reorg_incidents];
+        materialized_view_store.write_chain_event_chunk_with_event_consumers(
+            zinder_materialized_views::ChainEventDispatchConsumers {
+                block_consumers: &mut block_consumers,
+                event_consumers: &mut event_consumers,
+            },
+            zinder_materialized_views::ChainEventDispatchInputs {
+                chain_epoch: envelope.chain_epoch,
+                chain_event: &envelope.event,
+                chain_cursor: envelope.cursor.as_bytes(),
+                event_sequence: envelope.event_sequence,
+                settled_tip_height: envelope.settled_tip_height,
+            },
+            &blocks,
+            true,
+        )?;
     }
+    Ok(())
 }
 
 fn seed_block_summary(

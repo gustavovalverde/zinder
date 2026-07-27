@@ -28,7 +28,7 @@ use zinder_runtime::{
     StorageRoleSection, StorageRoleToml, duration_as_millis_u64, guard_optional_serving_bind,
     require_field, resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
     resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer,
-    resolve_ops_listen_addr, resolve_retention,
+    resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr, resolve_retention,
 };
 use zinder_source::{
     DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
@@ -423,6 +423,7 @@ struct IngestPrimaryStorageSection {
     path: Option<PathBuf>,
     secondary_path: Option<PathBuf>,
     canonical: StorageRoleSection,
+    materialized_views: StorageRoleSection,
     raw_blob_policy: Option<RawBlobPolicy>,
 }
 
@@ -565,6 +566,8 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     let storage_path = require_field(config.storage.path, "storage.path")?;
     let canonical_rocksdb_budget =
         resolve_canonical_writer_rocksdb_budget(config.storage.canonical.rocksdb)?;
+    let materialized_view_rocksdb_budget =
+        resolve_materialized_view_writer_rocksdb_budget(config.storage.materialized_views.rocksdb)?;
 
     let reorg_window_blocks = require_field(
         config.ingest.reorg_window_blocks,
@@ -776,6 +779,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         node_source,
         storage_path,
         canonical_rocksdb_budget,
+        materialized_view_rocksdb_budget,
         raw_blob_policy,
         reorg_window_blocks,
         phase_classification: PhaseClassificationConfig {
@@ -900,8 +904,11 @@ impl RedactedIngestConfigToml {
             node: NodeToml::from_node_target(&runtime_config.node),
             storage: IngestStorageToml {
                 path: runtime_config.storage_path.display().to_string(),
-                canonical: StorageRoleToml::from_resolved(runtime_config.canonical_rocksdb_budget),
                 raw_blob_policy: runtime_config.raw_blob_policy,
+                canonical: StorageRoleToml::from_resolved(runtime_config.canonical_rocksdb_budget),
+                materialized_views: StorageRoleToml::from_resolved(
+                    runtime_config.materialized_view_rocksdb_budget,
+                ),
             },
             ingest: IngestToml {
                 source: node_source_name(runtime_config.node_source),
@@ -1046,8 +1053,9 @@ struct IngestMempoolToml {
 #[derive(Serialize)]
 struct IngestStorageToml {
     path: String,
-    canonical: StorageRoleToml,
     raw_blob_policy: RawBlobPolicy,
+    canonical: StorageRoleToml,
+    materialized_views: StorageRoleToml,
 }
 
 #[derive(Serialize)]

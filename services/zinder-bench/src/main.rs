@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use zinder_bench::{
     BenchError,
     canonical_fixture_replay::capture_canonical_fixture_replay_plan,
@@ -20,13 +20,12 @@ use zinder_bench::{
     capture::{CaptureConfig, capture_fixed_range},
     fixture::FixtureManifest,
     recorder::install_recorder,
-    replay::{MaterializedViewReplayScope, ReplayConfig, replay_fixture},
+    replay::{ReplayConfig, replay_fixture},
     report::{AcceptanceThresholds, BenchmarkReport, FixtureCachePolicy},
 };
 use zinder_core::{
     BlockHeight, Network, UnixTimestampMillis, wire::decode_zinder_native_chain_name,
 };
-use zinder_materialized_views::MaterializedViewPreset;
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
 #[path = "canonical_replay_storage/command.rs"]
@@ -210,20 +209,6 @@ struct CanonicalStoreRangeReplayArgs {
     /// Optional canonical block-cache override in bytes.
     #[arg(long = "block-cache-bytes")]
     block_cache_bytes: Option<u64>,
-    /// Materialized-view preset to replay after canonical ingest. `explorer` is a
-    /// diagnostic replay, not materialized-view-readiness certification. Omit for a
-    /// canonical-only run.
-    #[arg(long = "materialized-view-preset")]
-    materialized_view_preset: Option<CliMaterializedViewPreset>,
-    /// Materialized-view history to replay. Fixed-range seeds fresh materialized-view
-    /// cursors at the cloned canonical tip; retained-history rebuilds all
-    /// retained events.
-    #[arg(
-        long = "materialized-view-replay-scope",
-        value_enum,
-        default_value_t = CliMaterializedViewReplayScope::FixedRange
-    )]
-    materialized_view_replay_scope: CliMaterializedViewReplayScope,
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -257,37 +242,6 @@ struct CanonicalStoreRangeReplayArgs {
     /// Maximum accepted canonical fixture replay time, in seconds.
     #[arg(long = "canonical-fixture-replay-hard-limit-secs")]
     canonical_fixture_replay_hard_limit_secs: Option<f64>,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum CliMaterializedViewPreset {
-    Wallet,
-    Explorer,
-}
-
-impl From<CliMaterializedViewPreset> for MaterializedViewPreset {
-    fn from(preset: CliMaterializedViewPreset) -> Self {
-        match preset {
-            CliMaterializedViewPreset::Wallet => Self::Wallet,
-            CliMaterializedViewPreset::Explorer => Self::Explorer,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum CliMaterializedViewReplayScope {
-    #[default]
-    FixedRange,
-    RetainedHistory,
-}
-
-impl From<CliMaterializedViewReplayScope> for MaterializedViewReplayScope {
-    fn from(scope: CliMaterializedViewReplayScope) -> Self {
-        match scope {
-            CliMaterializedViewReplayScope::FixedRange => Self::FixedRange,
-            CliMaterializedViewReplayScope::RetainedHistory => Self::RetainedHistory,
-        }
-    }
 }
 
 #[tokio::main]
@@ -478,10 +432,6 @@ async fn run_canonical_store_range_replay(
             .transpose()?,
         source_segment_delay_millis: args.source_segment_delay_millis,
         canonical_block_cache_bytes: args.block_cache_bytes,
-        materialized_view_preset: args
-            .materialized_view_preset
-            .map(MaterializedViewPreset::from),
-        materialized_view_replay_scope: args.materialized_view_replay_scope.into(),
         software_revision: args.software_revision,
         trial_id: args.trial_id,
         fixture_cache_policy: args.fixture_cache_policy,

@@ -6,7 +6,7 @@ use std::{
 
 use rust_rocksdb::{BoundColumnFamily, DB, DBRawIteratorWithThreadMode, ReadOptions};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockHeightRangeIter, BlockId,
+    BlockHash, BlockHeight, BlockHeightRange, BlockHeightRangeIter, BlockId, CanonicalBlockFacts,
     CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     CanonicalBlockReplayFormatVersion, ValidatedCanonicalBlockReplay,
@@ -483,6 +483,19 @@ pub(super) fn resume_persisted_sequence_checkpoint(
         digest_builder.finish(),
         logical_replay_bytes,
     ))
+}
+
+pub(super) fn read_replay_facts_at(
+    db: &DB,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+    height: BlockHeight,
+) -> Result<Option<CanonicalBlockFacts>, CanonicalStoreError> {
+    if height < ready_evidence.first_retained_block.height
+        || height > ready_evidence.visible_tip.height
+    {
+        return Ok(None);
+    }
+    Ok(Some(read_persisted_replay(db, height)?.replay.into_facts()))
 }
 
 pub(super) struct PersistedReplayStep {

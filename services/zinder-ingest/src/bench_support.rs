@@ -2,10 +2,9 @@
 //!
 //! The `zinder-bench` crate replays the real bulk-catchup pipeline over
 //! captured source payloads and a cloned canonical store. Everything the
-//! replay drives (`run_bulk_catchup_with_store`, `catch_up_materialized_view_store_to_canonical`,
-//! `open_primary_materialized_view_store_for_canonical`) is already part of the crate's
-//! public surface; this module adds only the one thing the harness cannot
-//! assemble on its own: a [`BulkCatchupRunConfig`] filled with
+//! replay drives (`run_bulk_catchup_with_store`) is already part of the
+//! crate's public surface; this module adds only the one thing the harness
+//! cannot assemble on its own: a [`BulkCatchupRunConfig`] filled with
 //! resource-resolved bulk-catchup defaults so the benchmark varies only the
 //! knobs under measurement (prepare concurrency, cache size, range).
 //!
@@ -28,8 +27,7 @@ use zinder_store::RocksDbResourceBudget;
 use crate::{
     BulkCatchupRunConfig, CanonicalPipelineLimits,
     DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
-    DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE, MaterializedViewReplayConfig,
-    MaterializedViewReplayPolicy, NodeSourceKind, RawBlobPolicy,
+    DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE, NodeSourceKind, RawBlobPolicy,
 };
 
 /// Maximum blocks committed in one bulk-catchup epoch.
@@ -44,19 +42,6 @@ pub const BENCH_FLUSH_INTERVAL_EPOCHS: u32 = 5;
 pub const BENCH_NODE_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Maximum response body size applied to the placeholder node target.
 pub const BENCH_MAX_RESPONSE_BYTES: u64 = 384 * 1024 * 1024;
-/// Materialized-view replay batch size used when the harness drives materialized-view replay.
-pub const BENCH_MATERIALIZED_VIEW_REPLAY_BATCH_BLOCKS: u32 = 100;
-/// Smallest materialized-view replay batch under memory pressure.
-pub const BENCH_MATERIALIZED_VIEW_MIN_REPLAY_BATCH_BLOCKS: u32 = 10;
-/// Memory ratio at which materialized-view replay starts shrinking its batch.
-pub const BENCH_MATERIALIZED_VIEW_MEMORY_DEGRADE_RATIO: f64 = 0.90;
-/// Memory ratio at which materialized-view replay pauses.
-pub const BENCH_MATERIALIZED_VIEW_MEMORY_PAUSE_RATIO: f64 = 0.99;
-/// Memory ratio below which materialized-view replay resumes normal batching.
-pub const BENCH_MATERIALIZED_VIEW_MEMORY_RESUME_RATIO: f64 = 0.80;
-/// Residual materialized-view lag at which startup hands replay to the tailer;
-/// inert here because the harness always drains materialized-view replay to completion.
-pub const BENCH_MATERIALIZED_VIEW_STARTUP_HANDOFF_LAG_BLOCKS: u64 = 1_000;
 
 const BENCH_PLACEHOLDER_JSON_RPC_ADDR: &str = "http://127.0.0.1:0";
 
@@ -156,25 +141,6 @@ pub fn bench_bulk_catchup_run_config(params: BenchBulkCatchupParams) -> BulkCatc
         upstream_tip_hint: Some(params.to_height),
         allow_reorg_window_settlement: true,
         checkpoint: None,
-    }
-}
-
-/// Returns the materialized-view replay configuration the harness drives for canonical fixture replay.
-///
-/// `CanonicalFirst` matches the default indexing posture; the harness runs the
-/// catch-up to completion regardless, so the policy only shapes memory-pressure
-/// throttling during the run.
-#[must_use]
-pub fn bench_materialized_view_config() -> MaterializedViewReplayConfig {
-    MaterializedViewReplayConfig {
-        replay_batch_blocks: nz32(BENCH_MATERIALIZED_VIEW_REPLAY_BATCH_BLOCKS),
-        replay_policy: MaterializedViewReplayPolicy::CanonicalFirst,
-        memory_budget_bytes: None,
-        memory_degrade_ratio: BENCH_MATERIALIZED_VIEW_MEMORY_DEGRADE_RATIO,
-        memory_pause_ratio: BENCH_MATERIALIZED_VIEW_MEMORY_PAUSE_RATIO,
-        memory_resume_ratio: BENCH_MATERIALIZED_VIEW_MEMORY_RESUME_RATIO,
-        min_replay_batch_blocks: nz32(BENCH_MATERIALIZED_VIEW_MIN_REPLAY_BATCH_BLOCKS),
-        startup_handoff_lag_blocks: BENCH_MATERIALIZED_VIEW_STARTUP_HANDOFF_LAG_BLOCKS,
     }
 }
 

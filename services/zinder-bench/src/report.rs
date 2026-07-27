@@ -56,9 +56,6 @@ const READ_DURATION_SUM: &str = "zinder_store_read_duration_seconds_sum";
 const MULTI_GET_KEYS_TOTAL: &str = "zinder_store_multi_get_keys_total";
 const MULTI_GET_RESOLVED_TOTAL: &str = "zinder_store_multi_get_resolved_total";
 const ROCKSDB_TICKER: &str = "zinder_store_rocksdb_ticker";
-const ROCKSDB_COMPACT_READ_BYTES: &str = "rocksdb.compact.read.bytes";
-const ROCKSDB_COMPACT_WRITE_BYTES: &str = "rocksdb.compact.write.bytes";
-const MATERIALIZED_VIEW_STORE_METRIC_ROLE: &str = "materialized_view_primary";
 const COMMIT_DURATION_COUNT: &str = "zinder_ingest_commit_duration_seconds_count";
 const COMMIT_FALLBACK_CALLER: &str = "commit_fallback";
 const SOURCE_REQUEST_TOTAL: &str = "zinder_ingest_source_request_total";
@@ -183,11 +180,6 @@ pub struct CanonicalStoreRangeReplayMeasurements {
     pub source_segment_delay_millis: u64,
     /// Effective canonical writer schema, resource, and durability settings.
     pub canonical_writer: CanonicalStoreRangeReplayWriterSettings,
-    /// Materialized-view preset replayed after canonical ingest, or `None` for a
-    /// canonical-only run.
-    pub materialized_view_preset: Option<&'static str>,
-    /// Materialized-view history scope, or `None` for a canonical-only run.
-    pub materialized_view_replay_scope: Option<&'static str>,
     /// Wall-clock seconds spent in the canonical replay call.
     pub wall_clock_seconds: f64,
     /// Logical canonical position and checkpoint identity before replay.
@@ -197,18 +189,6 @@ pub struct CanonicalStoreRangeReplayMeasurements {
     /// Store tip hash after replay, in the same internal byte order as
     /// [`FixtureSummary::tip_hash_hex`].
     pub tip_hash_after_hex: Option<String>,
-    /// Wall-clock seconds spent constructing materialized views, when driven.
-    pub materialized_view_build_wall_clock_seconds: Option<f64>,
-    /// Total rows across the selected consumers' owned column families.
-    pub materialized_view_row_count: Option<u64>,
-    /// Whether every selected materialized-view cursor equals the canonical event tip.
-    pub materialized_view_event_cursor_at_tip: Option<bool>,
-    /// Final on-disk bytes under the materialized-view store directory.
-    pub materialized_view_store_bytes: Option<u64>,
-    /// Seconds required to close and reopen the populated materialized-view store.
-    pub materialized_view_store_reopen_seconds: Option<f64>,
-    /// Serialized bytes submitted in successful materialized-view write batches.
-    pub materialized_view_logical_write_bytes: Option<u64>,
     /// Peak resident-set-size reading.
     pub peak_rss: PeakRss,
     /// Storage implementation measured by this run.
@@ -246,8 +226,6 @@ pub struct StorageCandidateIdentity {
     pub canonical_engine: &'static str,
     /// Canonical logical model exercised by this candidate.
     pub canonical_model: &'static str,
-    /// Engine used for current diagnostic materialized views, when driven.
-    pub diagnostic_materialized_view_engine: Option<&'static str>,
     /// Deployment/storage topology used by the candidate.
     pub topology: &'static str,
 }
@@ -260,18 +238,7 @@ impl StorageCandidateIdentity {
             id: "rocksdb-canonical-store-range-replay",
             canonical_engine: "rocksdb",
             canonical_model: "canonical-store",
-            diagnostic_materialized_view_engine: None,
             topology: "rocksdb-single-host",
-        }
-    }
-
-    /// Identifies the single-host canonical store plus the current diagnostic
-    /// materialized-view store.
-    #[must_use]
-    pub const fn rocksdb_canonical_store_range_replay_with_diagnostic_materialized_view() -> Self {
-        Self {
-            diagnostic_materialized_view_engine: Some("rocksdb"),
-            ..Self::rocksdb_canonical_store_range_replay()
         }
     }
 
@@ -282,7 +249,6 @@ impl StorageCandidateIdentity {
             id: "rocksdb-canonical-replay-storage",
             canonical_engine: "rocksdb",
             canonical_model: "block-granular-canonical-replays",
-            diagnostic_materialized_view_engine: None,
             topology: "rocksdb-single-host",
         }
     }
@@ -294,7 +260,6 @@ impl StorageCandidateIdentity {
             id: "postgres-canonical-replay-storage",
             canonical_engine: "postgres",
             canonical_model: "block-granular-canonical-replays",
-            diagnostic_materialized_view_engine: None,
             topology: "postgres-scale-out",
         }
     }
@@ -306,7 +271,6 @@ impl StorageCandidateIdentity {
             id: "rocksdb-storage-lifecycle",
             canonical_engine: "rocksdb",
             canonical_model: "canonical-replay-storage",
-            diagnostic_materialized_view_engine: None,
             topology: "rocksdb-single-host",
         }
     }
@@ -318,7 +282,6 @@ impl StorageCandidateIdentity {
             id: "rocksdb-canonical-fixture-replay",
             canonical_engine: "rocksdb",
             canonical_model: "canonical-replay-storage",
-            diagnostic_materialized_view_engine: None,
             topology: "rocksdb-single-host",
         }
     }
@@ -651,11 +614,6 @@ pub struct CanonicalStoreRangeReplaySummary {
     pub source_segment_delay_millis: u64,
     /// Effective canonical writer schema, resource, and durability settings.
     pub canonical_writer: CanonicalStoreRangeReplayWriterSettings,
-    /// Materialized-view preset replayed after canonical ingest, or `None` for a
-    /// canonical-only run.
-    pub materialized_view_preset: Option<&'static str>,
-    /// Materialized-view history scope, or `None` for a canonical-only run.
-    pub materialized_view_replay_scope: Option<&'static str>,
     /// Wall-clock seconds spent in the canonical replay call.
     pub wall_clock_seconds: f64,
     /// Logical canonical position and checkpoint identity before replay.
@@ -676,20 +634,6 @@ pub struct CanonicalStoreRangeReplaySummary {
     /// Source request, response, and adaptive-prefetch attribution, when the
     /// in-process metrics recorder observed completed segment requests.
     pub source_fetch_attribution: Option<SourceFetchAttributionSummary>,
-    /// Wall-clock seconds spent constructing materialized views, when driven.
-    pub materialized_view_build_wall_clock_seconds: Option<f64>,
-    /// Total rows across the selected consumers' owned column families.
-    pub materialized_view_row_count: Option<u64>,
-    /// Whether every selected materialized-view cursor equals the canonical event tip.
-    pub materialized_view_event_cursor_at_tip: Option<bool>,
-    /// Final on-disk bytes under the materialized-view store directory.
-    pub materialized_view_store_bytes: Option<u64>,
-    /// Serialized bytes submitted in successful materialized-view write batches.
-    pub materialized_view_logical_write_bytes: Option<u64>,
-    /// Bytes read plus written by materialized-view store compactions.
-    pub materialized_view_compaction_bytes: Option<u64>,
-    /// Seconds required to close and reopen the populated materialized-view store.
-    pub materialized_view_store_reopen_seconds: Option<f64>,
     /// Peak resident-set-size reading.
     pub peak_rss: PeakRss,
 }
@@ -2211,7 +2155,7 @@ pub fn build_canonical_store_range_replay_report(
     let samples = exposition.map(parse_prometheus_samples).unwrap_or_default();
     let store_reads = aggregate_store_reads(&samples);
     let rocksdb_tickers = aggregate_tickers(&samples);
-    let replay = build_replay_summary(measurements, &samples, &store_reads, &rocksdb_tickers);
+    let replay = build_replay_summary(measurements, &samples, &store_reads);
     CanonicalStoreRangeReplayReport {
         contract_identity: REPORT_CONTRACT_IDENTITY.to_owned(),
         report_format_version: REPORT_FORMAT_VERSION,
@@ -2449,21 +2393,7 @@ fn build_replay_summary(
     measurements: &CanonicalStoreRangeReplayMeasurements,
     samples: &[MetricSample],
     store_reads: &[CallerReadStat],
-    rocksdb_tickers: &[TickerStat],
 ) -> CanonicalStoreRangeReplaySummary {
-    let materialized_view_compaction_bytes = measurements.materialized_view_preset.and_then(|_| {
-        ticker_reading(
-            rocksdb_tickers,
-            ROCKSDB_COMPACT_READ_BYTES,
-            MATERIALIZED_VIEW_STORE_METRIC_ROLE,
-        )
-        .zip(ticker_reading(
-            rocksdb_tickers,
-            ROCKSDB_COMPACT_WRITE_BYTES,
-            MATERIALIZED_VIEW_STORE_METRIC_ROLE,
-        ))
-        .map(|(read_bytes, write_bytes)| read_bytes.saturating_add(write_bytes))
-    });
     let epochs_committed = samples
         .iter()
         .any(|sample| sample.name == COMMIT_DURATION_COUNT)
@@ -2500,8 +2430,6 @@ fn build_replay_summary(
         block_prepare_memory_watermark_bytes: measurements.block_prepare_memory_watermark_bytes,
         source_segment_delay_millis: measurements.source_segment_delay_millis,
         canonical_writer: measurements.canonical_writer,
-        materialized_view_preset: measurements.materialized_view_preset,
-        materialized_view_replay_scope: measurements.materialized_view_replay_scope,
         wall_clock_seconds: measurements.wall_clock_seconds,
         starting_canonical_state: measurements.starting_canonical_state.clone(),
         tip_height_after: measurements.tip_height_after,
@@ -2514,14 +2442,6 @@ fn build_replay_summary(
             samples,
             measurements.wall_clock_seconds,
         ),
-        materialized_view_build_wall_clock_seconds: measurements
-            .materialized_view_build_wall_clock_seconds,
-        materialized_view_row_count: measurements.materialized_view_row_count,
-        materialized_view_event_cursor_at_tip: measurements.materialized_view_event_cursor_at_tip,
-        materialized_view_store_bytes: measurements.materialized_view_store_bytes,
-        materialized_view_logical_write_bytes: measurements.materialized_view_logical_write_bytes,
-        materialized_view_compaction_bytes,
-        materialized_view_store_reopen_seconds: measurements.materialized_view_store_reopen_seconds,
         peak_rss: measurements.peak_rss,
     }
 }
@@ -2722,13 +2642,6 @@ pub fn summarize_rocksdb_storage_lifecycle_acceptance(
             wallet_thresholds,
         ),
     }
-}
-
-fn ticker_reading(tickers: &[TickerStat], ticker: &str, store_role: &str) -> Option<u64> {
-    tickers
-        .iter()
-        .find(|stat| stat.ticker == ticker && stat.store_role == store_role)
-        .map(|stat| round_to_u64(stat.reading))
 }
 
 fn blocks_committed(before: Option<u32>, after: Option<u32>) -> u64 {
@@ -3382,10 +3295,6 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
         );
         assert_eq!(report.storage_candidate.canonical_engine, "rocksdb");
         assert_eq!(report.storage_candidate.canonical_model, "canonical-store");
-        assert_eq!(
-            report.storage_candidate.diagnostic_materialized_view_engine,
-            None
-        );
         assert_eq!(report.storage_candidate.topology, "rocksdb-single-host");
         assert_eq!(
             report.provenance.software_revision.as_deref(),
@@ -3490,36 +3399,6 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
         assert!(AcceptanceThresholds::try_from_seconds(2.0, 1.0).is_err());
         assert!(AcceptanceThresholds::try_from_seconds(f64::NAN, 1.0).is_err());
         assert!(AcceptanceThresholds::try_from_seconds(1.0, f64::INFINITY).is_err());
-    }
-
-    #[test]
-    fn diagnostic_materialized_view_presets_do_not_claim_wallet_build_acceptance()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for materialized_view_preset in ["wallet", "explorer"] {
-            let mut measurements = canonical_measurements();
-            measurements.materialized_view_preset = Some(materialized_view_preset);
-            measurements.materialized_view_replay_scope = Some("retained-history");
-            measurements.materialized_view_build_wall_clock_seconds = Some(5.0);
-            measurements.storage_candidate =
-                StorageCandidateIdentity::rocksdb_canonical_store_range_replay_with_diagnostic_materialized_view();
-
-            let report =
-                build_canonical_store_range_replay_report(fixture_summary(), &measurements, None);
-            let report_json = serde_json::to_value(&report)?;
-
-            assert!(report_json.get("lifecycle").is_none());
-            assert!(report_json["acceptance"].get("wallet_build").is_none());
-            assert!(
-                report_json["acceptance"]
-                    .get("wallet_build_lifecycle")
-                    .is_none()
-            );
-            assert_eq!(
-                report.storage_candidate.diagnostic_materialized_view_engine,
-                Some("rocksdb")
-            );
-        }
-        Ok(())
     }
 
     #[test]
@@ -3827,8 +3706,6 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
                     statistics_level: "tickers",
                 },
             },
-            materialized_view_preset: None,
-            materialized_view_replay_scope: None,
             wall_clock_seconds: 12.5,
             starting_canonical_state: StartingCanonicalState {
                 kind: StartingCanonicalStateKind::Checkpoint,
@@ -3840,12 +3717,6 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
             },
             tip_height_after: Some(20),
             tip_hash_after_hex: Some("abcd".to_owned()),
-            materialized_view_build_wall_clock_seconds: None,
-            materialized_view_row_count: None,
-            materialized_view_event_cursor_at_tip: None,
-            materialized_view_store_bytes: None,
-            materialized_view_store_reopen_seconds: None,
-            materialized_view_logical_write_bytes: None,
             peak_rss: crate::rss::PeakRss {
                 bytes: None,
                 source: PEAK_RSS_SOURCE_UNAVAILABLE,

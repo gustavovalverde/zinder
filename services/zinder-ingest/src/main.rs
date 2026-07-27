@@ -1,8 +1,11 @@
 //! Zinder ingestion command-line entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{
+    ffi::OsString, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration,
+};
 
 use clap::{Parser, Subcommand};
+use parking_lot::RwLock;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
@@ -10,12 +13,20 @@ use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_ingest::{
     CanonicalCheckpointStagingRoot, CanonicalConstructionConfig, CanonicalControlCommand,
     CanonicalControlGrpcAdapter, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
-    CanonicalRunOverrides, CanonicalWriterConfig, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-    IngestError, LiveMempoolOwner, MempoolIngestSettings, NodeSourceKind,
+    CanonicalRunOverrides, CanonicalWriterConfig, ConventionalFeeDistributionBackfillConfig,
+    ConventionalFeeDistributionBackfillContext, DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
+    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, HistoricalWorkGate, IngestError, LiveMempoolOwner,
+    MaterializedViewReplayConfig, MaterializedViewTailer, MempoolIngestSettings, NodeSourceKind,
+    TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
     canonical_control_channel, classify_phase, mempool_ready_channel,
-    run_canonical_writer_with_control, run_live_mempool_owner, run_mempool_retention,
-    spawn_runtime_memory_metrics_task, spawn_upstream_health_probe_task,
+    open_primary_materialized_view_store, run_canonical_writer_with_control,
+    run_live_mempool_owner, run_mempool_retention, seed_backfill_owned_consumer_cursors,
+    spawn_conventional_fee_distribution_backfill_task,
+    spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
+    spawn_runtime_memory_metrics_task, spawn_transaction_component_backfill_task,
+    spawn_upstream_health_probe_task,
 };
+use zinder_materialized_views::MaterializedViewPreset;
 use zinder_runtime::{
     OpsEndpointHandle, Readiness, ReadinessState, RuntimeService, StartupPhase,
     cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
@@ -27,7 +38,10 @@ use zinder_source::{
     ZebraIndexerMempoolSourceOptions, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
     ZebraJsonRpcSourceOptions,
 };
-use zinder_store::{ChainStoreOptions, MempoolEventRetentionConfig, SecondaryChainStore};
+use zinder_store::{
+    CanonicalReorgPolicy, CanonicalStoreWorkload, ChainStoreOptions, MempoolEventRetentionConfig,
+    RocksDbCanonicalSecondary, RocksDbResourceBudget, SecondaryChainStore,
+};
 
 use crate::config::{
     CanonicalReplayVerificationConfigOverrides, IngestCommandConfig, IngestConfigError,
@@ -45,6 +59,17 @@ const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::TreeState,
     NodeCapability::SubtreeRoots,
 ];
+
+/// Suffix of the reader-local metadata directory the in-process canonical
+/// secondary owns, as ADR-0003 requires of every reader.
+const MATERIALIZED_VIEW_SECONDARY_PATH_SUFFIX: &str = ".materialized-view-secondary";
+
+/// Delay between attempts to open the canonical secondary while the writer is
+/// still constructing or publishing its primary.
+const CANONICAL_SECONDARY_OPEN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Cadence at which the replay budget sampler refreshes its gauges.
+const MATERIALIZED_VIEW_REPLAY_BUDGET_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(name = "zinder-ingest")]
@@ -293,16 +318,32 @@ async fn run_ingest(
     let termination = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(termination.clone());
     let worker_cancel = termination.child_token();
-    let upstream_health_probe_handle = spawn_upstream_health_probe_for(
-        &command_config.runtime_config.node,
-        &source,
-        readiness.clone(),
-        worker_cancel.clone(),
-    );
-    let memory_metrics_handle = spawn_runtime_memory_metrics_task(
-        DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-        worker_cancel.clone(),
-    );
+    let materialized_view_plane =
+        materialized_view_plane_spec(&command_config, Arc::clone(&network_upgrade_activations))?;
+    let worker_tasks = IngestWorkerTaskHandles {
+        upstream_health_probe: spawn_upstream_health_probe_for(
+            &command_config.runtime_config.node,
+            &source,
+            readiness.clone(),
+            worker_cancel.clone(),
+        ),
+        memory_metrics: spawn_runtime_memory_metrics_task(
+            DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
+            worker_cancel.clone(),
+        ),
+        materialized_view_plane: tokio::spawn(run_materialized_view_plane(
+            materialized_view_plane,
+            HistoricalWorkGate::new(readiness.clone()),
+            worker_cancel.clone(),
+        )),
+        replay_budget_metrics: spawn_materialized_view_replay_budget_metrics_task(
+            MaterializedViewReplayConfig::DEFAULT,
+            DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
+            MATERIALIZED_VIEW_REPLAY_BUDGET_SAMPLE_INTERVAL,
+            readiness.clone(),
+            worker_cancel.clone(),
+        ),
+    };
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
 
@@ -334,12 +375,7 @@ async fn run_ingest(
         writer_result,
         &termination,
         &readiness,
-        shutdown_ingest_worker_tasks(
-            &worker_cancel,
-            canonical_control_tasks,
-            memory_metrics_handle,
-            upstream_health_probe_handle,
-        ),
+        shutdown_ingest_worker_tasks(&worker_cancel, canonical_control_tasks, worker_tasks),
         shutdown_ops_endpoint(ops_handle),
     )
     .await
@@ -565,52 +601,53 @@ where
     }
 }
 
+/// Background tasks the ingest runtime drains before the ops endpoint closes.
+struct IngestWorkerTaskHandles {
+    memory_metrics: JoinHandle<()>,
+    upstream_health_probe: Option<JoinHandle<()>>,
+    materialized_view_plane: JoinHandle<()>,
+    replay_budget_metrics: JoinHandle<()>,
+}
+
 async fn shutdown_ingest_worker_tasks(
     cancel: &CancellationToken,
     mut control_tasks: CanonicalControlTasks,
-    memory_metrics_handle: JoinHandle<()>,
-    upstream_health_probe_handle: Option<JoinHandle<()>>,
+    worker_tasks: IngestWorkerTaskHandles,
 ) {
     cancel.cancel();
     if !control_tasks.server_completed {
         await_canonical_control_server_shutdown(control_tasks.server.take()).await;
     }
-    if let Some(mempool_owner_task) = control_tasks.mempool_owner.take()
-        && let Err(join_error) = mempool_owner_task.await
-    {
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "mempool_owner_join_failed",
-            error = %join_error,
-            "live mempool owner did not shut down cleanly"
-        );
+    if let Some(mempool_owner_task) = control_tasks.mempool_owner.take() {
+        await_worker_task("mempool_owner", mempool_owner_task).await;
     }
-    if let Some(mempool_retention_task) = control_tasks.mempool_retention.take()
-        && let Err(join_error) = mempool_retention_task.await
-    {
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "mempool_retention_join_failed",
-            error = %join_error,
-            "mempool retention task did not shut down cleanly"
-        );
+    if let Some(mempool_retention_task) = control_tasks.mempool_retention.take() {
+        await_worker_task("mempool_retention", mempool_retention_task).await;
     }
-    if let Err(join_error) = memory_metrics_handle.await {
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "runtime_memory_metrics_join_failed",
-            error = %join_error,
-            "runtime memory metrics task failed during shutdown"
-        );
+    await_worker_task("runtime_memory_metrics", worker_tasks.memory_metrics).await;
+    if let Some(upstream_health_probe) = worker_tasks.upstream_health_probe {
+        await_worker_task("upstream_health_probe", upstream_health_probe).await;
     }
-    if let Some(upstream_health_probe_handle) = upstream_health_probe_handle
-        && let Err(join_error) = upstream_health_probe_handle.await
-    {
+    await_worker_task(
+        "materialized_view_plane",
+        worker_tasks.materialized_view_plane,
+    )
+    .await;
+    await_worker_task(
+        "materialized_view_replay_budget_metrics",
+        worker_tasks.replay_budget_metrics,
+    )
+    .await;
+}
+
+async fn await_worker_task(worker: &'static str, handle: JoinHandle<()>) {
+    if let Err(join_error) = handle.await {
         tracing::warn!(
             target: "zinder::ingest",
-            event = "upstream_health_probe_join_failed",
+            event = "ingest_worker_join_failed",
+            worker,
             error = %join_error,
-            "upstream health probe did not shut down cleanly"
+            "ingest worker task did not shut down cleanly"
         );
     }
 }
@@ -632,6 +669,179 @@ async fn await_canonical_control_server_shutdown(server: Option<CanonicalControl
             error = %join_error,
             "canonical control server did not shut down cleanly"
         );
+    }
+}
+
+/// Everything the in-process materialized-view plane needs to open its own
+/// storage handles once the canonical writer has published a READY primary.
+struct MaterializedViewPlaneSpec {
+    storage_path: PathBuf,
+    secondary_path: PathBuf,
+    canonical_rocksdb_budget: RocksDbResourceBudget,
+    materialized_view_rocksdb_budget: RocksDbResourceBudget,
+    activations: Arc<NetworkUpgradeActivations>,
+    reorg_policy: CanonicalReorgPolicy,
+    chain_event_retention_window: Option<Duration>,
+    cursor_at_risk_warning: Duration,
+}
+
+fn materialized_view_plane_spec(
+    command_config: &IngestCommandConfig,
+    activations: Arc<NetworkUpgradeActivations>,
+) -> Result<MaterializedViewPlaneSpec, IngestConfigError> {
+    let runtime_config = &command_config.runtime_config;
+    Ok(MaterializedViewPlaneSpec {
+        secondary_path: materialized_view_secondary_path(&runtime_config.storage_path),
+        storage_path: runtime_config.storage_path.clone(),
+        canonical_rocksdb_budget: runtime_config.canonical_rocksdb_budget,
+        materialized_view_rocksdb_budget: runtime_config.materialized_view_rocksdb_budget,
+        activations,
+        reorg_policy: CanonicalReorgPolicy::new(runtime_config.reorg_window_blocks)
+            .map_err(zinder_ingest::CanonicalWriterError::from)?,
+        chain_event_retention_window: command_config.retention.chain_event_window(),
+        cursor_at_risk_warning: command_config.retention.cursor_at_risk_warning(),
+    })
+}
+
+fn materialized_view_secondary_path(storage_path: &std::path::Path) -> PathBuf {
+    let mut secondary_path = OsString::from(storage_path.as_os_str());
+    secondary_path.push(MATERIALIZED_VIEW_SECONDARY_PATH_SUFFIX);
+    PathBuf::from(secondary_path)
+}
+
+/// Builds and follows the explorer materialized views from canonical storage.
+///
+/// The canonical primary may not exist yet: a fresh deployment publishes it
+/// only after the writer finishes construction. The view store nests inside the
+/// canonical directory, so it is opened strictly after a successful secondary
+/// open; creating it earlier would make the canonical path exist and route the
+/// writer's fresh construction into a reopen it cannot satisfy.
+async fn run_materialized_view_plane(
+    spec: MaterializedViewPlaneSpec,
+    historical_work_gate: HistoricalWorkGate,
+    cancel: CancellationToken,
+) {
+    let Some(canonical) = open_canonical_secondary_when_published(&spec, &cancel).await else {
+        return;
+    };
+    let materialized_view_store = match open_primary_materialized_view_store(
+        &spec.storage_path,
+        MaterializedViewPreset::Explorer,
+        spec.materialized_view_rocksdb_budget,
+    ) {
+        Ok(materialized_view_store) => materialized_view_store,
+        Err(error) => {
+            tracing::error!(
+                target: "zinder::ingest",
+                event = "materialized_view_store_open_failed",
+                error = %error,
+                "failed to open the materialized-view store; explorer views stay dark"
+            );
+            return;
+        }
+    };
+    if let Err(error) = seed_backfill_owned_consumer_cursors(
+        &canonical,
+        &spec.activations,
+        &materialized_view_store,
+    ) {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "materialized_view_backfill_cursor_seed_failed",
+            error = %error,
+            "failed to seed backfill-owned consumer cursors; those consumers replay retained history instead"
+        );
+    }
+    let canonical = Arc::new(RwLock::new(canonical));
+    let tailer = spawn_materialized_view_tailer_task(
+        MaterializedViewTailer {
+            canonical: Arc::clone(&canonical),
+            materialized_view_store: materialized_view_store.clone(),
+            config: MaterializedViewReplayConfig::DEFAULT,
+            activations: Arc::clone(&spec.activations),
+            reorg_window_blocks: spec.reorg_policy.reorg_window_blocks(),
+            chain_event_retention_window: spec.chain_event_retention_window,
+            cursor_at_risk_warning: spec.cursor_at_risk_warning,
+        },
+        DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
+        historical_work_gate.clone(),
+        cancel.clone(),
+    );
+    let conventional_fee_distribution_backfill = spawn_conventional_fee_distribution_backfill_task(
+        ConventionalFeeDistributionBackfillConfig::DEFAULT,
+        ConventionalFeeDistributionBackfillContext::new(
+            Arc::clone(&canonical),
+            Arc::clone(&spec.activations),
+            materialized_view_store.clone(),
+        ),
+        historical_work_gate.clone(),
+        cancel.clone(),
+    );
+    let transaction_component_backfill = spawn_transaction_component_backfill_task(
+        TransactionComponentBackfillConfig::DEFAULT,
+        TransactionComponentBackfillContext::new(
+            canonical,
+            spec.activations,
+            materialized_view_store,
+        ),
+        historical_work_gate,
+        cancel,
+    );
+    await_worker_task("materialized_view_tailer", tailer).await;
+    await_worker_task(
+        "conventional_fee_distribution_backfill",
+        conventional_fee_distribution_backfill,
+    )
+    .await;
+    await_worker_task(
+        "transaction_component_backfill",
+        transaction_component_backfill,
+    )
+    .await;
+}
+
+/// Retries the canonical secondary open until the writer publishes a READY
+/// primary or the runtime is cancelled.
+async fn open_canonical_secondary_when_published(
+    spec: &MaterializedViewPlaneSpec,
+    cancel: &CancellationToken,
+) -> Option<RocksDbCanonicalSecondary> {
+    let mut waiting_logged = false;
+    loop {
+        match RocksDbCanonicalSecondary::open_ready(
+            &spec.storage_path,
+            &spec.secondary_path,
+            &spec.activations,
+            CanonicalStoreWorkload::Wallet,
+            spec.reorg_policy,
+            spec.canonical_rocksdb_budget,
+        ) {
+            Ok(canonical) => {
+                tracing::info!(
+                    target: "zinder::ingest",
+                    event = "materialized_view_canonical_secondary_opened",
+                    storage_path = %spec.storage_path.display(),
+                    secondary_path = %spec.secondary_path.display(),
+                    "materialized-view plane opened its canonical secondary"
+                );
+                return Some(canonical);
+            }
+            Err(error) if !waiting_logged => {
+                waiting_logged = true;
+                tracing::info!(
+                    target: "zinder::ingest",
+                    event = "materialized_view_canonical_secondary_unavailable",
+                    error = %error,
+                    retry_interval_seconds = CANONICAL_SECONDARY_OPEN_RETRY_INTERVAL.as_secs(),
+                    "waiting for the canonical writer to publish a ready store before building materialized views"
+                );
+            }
+            Err(_) => {}
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return None,
+            () = tokio::time::sleep(CANONICAL_SECONDARY_OPEN_RETRY_INTERVAL) => {}
+        }
     }
 }
 
