@@ -6,16 +6,12 @@
 //! classifier in `zinder-core` is exercised by unit tests; this file
 //! covers the federated handler in `services/zinder-explorer/src/grpc/search.rs`.
 
-use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
 
 use eyre::{Result, eyre};
 use tempfile::{TempDir, tempdir};
-use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto as _;
@@ -30,15 +26,15 @@ use zinder_proto::v1::explorer::{
     NotPubliclyIndexableReason, SearchRequest, SearchResponse,
     explorer_query_server::ExplorerQuery as ExplorerQueryService, search_candidate,
 };
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::WalletQuery;
 use zinder_source::{NodeSource as _, SourceBlock};
 use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
-    zebra_source_from_bulk_catchup,
+    WalletQueryServerOptions, fetch_live_network_upgrade_activations, fetch_live_tip_height,
+    live_bulk_catchup_run_config, serve_wallet_query_grpc, zebra_source_from_bulk_catchup,
 };
 
 const BACKFILL_DEPTH_BLOCKS: u32 = 50;
@@ -305,8 +301,14 @@ impl SearchFixture {
             (),
             Arc::new(sample_regtest_upgrade_activations()),
         );
-        let (wallet_grpc_addr, wallet_server_handle) =
-            serve_wallet_query_grpc(wallet_query).await?;
+        let (wallet_grpc_addr, wallet_server_handle) = serve_wallet_query_grpc(
+            wallet_query,
+            WalletQueryServerOptions {
+                network: None,
+                ingest_control_endpoint: None,
+            },
+        )
+        .await?;
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
 
         let explorer_adapter =
@@ -419,30 +421,4 @@ fn sample_tip(block: &SourceBlock) -> Result<SampleBlock> {
         block_hash: block.hash,
         coinbase_transaction_id: TransactionId::from_bytes(coinbase.hash().0),
     })
-}
-
-async fn serve_wallet_query_grpc(
-    wallet_query: WalletQuery<PrimaryChainStore>,
-) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    await_grpc_endpoint(addr).await?;
-    Ok((addr, handle))
-}
-
-async fn await_grpc_endpoint(addr: SocketAddr) -> Result<()> {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    Err(eyre!("gRPC endpoint {addr} did not become reachable"))
 }

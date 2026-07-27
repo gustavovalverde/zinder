@@ -274,7 +274,7 @@ from `getrawmempool` without a corresponding block commit, it emits
 prove one. Silently dropping a txid would make the mempool cache insert-only and
 break rebroadcast and pending-transaction views.
 
-Mempool retention is two-tier (60 minutes mined / 24 hours invalidated by default, both configurable). Expired cursors return `MempoolCursorExpired` with `oldest_retained_sequence` in `PreconditionFailure` detail.
+Mempool retention is two-tier (60 minutes mined / 24 hours invalidated by default, both configurable). Expired cursors return `MempoolEventCursorExpired` with `oldest_retained_sequence` in `PreconditionFailure` detail.
 
 ### Mempool Point Lookups
 

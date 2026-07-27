@@ -20,18 +20,13 @@
 //!
 //! Mainnet is opt-in via `require_live_for([Network::ZcashMainnet])`.
 
-use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
 
 use eyre::{Result, eyre};
 use tempfile::{TempDir, tempdir};
-use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
-use tonic::transport::Channel;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto;
 use zinder_core::wire::{encode_rpc_transaction_id_hex, encode_zinder_native_chain_name};
@@ -43,15 +38,15 @@ use zinder_proto::v1::explorer::{
     explorer_query_server::ExplorerQuery as ExplorerQueryService,
 };
 use zinder_proto::v1::wallet::transaction_location;
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::WalletQuery;
 use zinder_source::{NodeSource as _, SourceBlock};
 use zinder_store::{ChainStoreOptions, PrimaryChainStore, SecondaryChainStore};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
-    zebra_source_from_bulk_catchup,
+    WalletQueryServerOptions, fetch_live_network_upgrade_activations, fetch_live_tip_height,
+    live_bulk_catchup_run_config, serve_wallet_query_grpc, zebra_source_from_bulk_catchup,
 };
 
 /// Number of blocks below the tip to bulk catch up.
@@ -185,8 +180,14 @@ impl TransactionDetailFixture {
             Arc::new(sample_regtest_upgrade_activations()),
         );
 
-        let (wallet_grpc_addr, wallet_server_handle) =
-            serve_wallet_query_grpc(wallet_query).await?;
+        let (wallet_grpc_addr, wallet_server_handle) = serve_wallet_query_grpc(
+            wallet_query,
+            WalletQueryServerOptions {
+                network: None,
+                ingest_control_endpoint: None,
+            },
+        )
+        .await?;
         let canonical_secondary = SecondaryChainStore::open(
             tempdir.path().join("zinder-store"),
             tempdir.path().join("zinder-store-secondary-explorer"),
@@ -226,37 +227,6 @@ impl TransactionDetailFixture {
         self.wallet_server_handle.abort();
         let _ = (&mut self.wallet_server_handle).await;
     }
-}
-
-async fn serve_wallet_query_grpc(
-    wallet_query: WalletQuery<PrimaryChainStore>,
-) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    await_grpc_endpoint(addr).await?;
-    Ok((addr, handle))
-}
-
-async fn await_grpc_endpoint(addr: SocketAddr) -> Result<()> {
-    let endpoint = format!("http://{addr}");
-    for _ in 0..20 {
-        if Channel::from_shared(endpoint.clone())?
-            .connect()
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    Err(eyre!("gRPC endpoint at {addr} never accepted connections"))
 }
 
 #[derive(Clone, Debug)]

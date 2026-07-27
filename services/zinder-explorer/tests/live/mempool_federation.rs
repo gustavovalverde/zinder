@@ -7,21 +7,15 @@
 //! testnet/mainnet), and assert the wire shape, freshness envelope, and
 //! pagination contract.
 
-use std::net::SocketAddr;
-use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
 
 use eyre::{Result, eyre};
-use tempfile::{TempDir, tempdir};
-use tokio::net::TcpListener;
+use tempfile::TempDir;
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
+use zinder_core::Network;
 use zinder_core::wire::encode_zinder_native_chain_name;
-use zinder_core::{BlockHeight, Network};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
-use zinder_ingest::run_bulk_catchup;
 use zinder_proto::capabilities::{
     EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MEMPOOL_SUMMARY_V1,
 };
@@ -30,17 +24,14 @@ use zinder_proto::v1::explorer::{
     MempoolSnapshotResponse, MempoolSummaryRequest, MempoolSummaryResponse,
     explorer_query_server::ExplorerQuery as ExplorerQueryService,
 };
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_store::PrimaryChainStore;
+use zinder_query::WalletQuery;
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
-    serve_test_ingest_control, zebra_source_from_bulk_catchup,
+    WalletQueryServerOptions, bulk_catchup_store, serve_test_ingest_control,
+    serve_wallet_query_grpc,
 };
-
-const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
@@ -130,15 +121,21 @@ struct MempoolFixture {
 impl MempoolFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
-        let (store_tempdir, store) = bulk_catchup_store(env).await?;
+        let (store_tempdir, store, _) = bulk_catchup_store(env).await?;
         let wallet_query = WalletQuery::new(
             store.clone(),
             (),
             Arc::new(sample_regtest_upgrade_activations()),
         );
         let (ingest_control_addr, ingest_control_handle) = serve_test_ingest_control(None).await?;
-        let (wallet_grpc_addr, wallet_server_handle) =
-            serve_wallet_query_grpc(wallet_query, format!("http://{ingest_control_addr}")).await?;
+        let (wallet_grpc_addr, wallet_server_handle) = serve_wallet_query_grpc(
+            wallet_query,
+            WalletQueryServerOptions {
+                network: None,
+                ingest_control_endpoint: Some(format!("http://{ingest_control_addr}")),
+            },
+        )
+        .await?;
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
 
         let explorer_adapter =
@@ -272,73 +269,4 @@ fn assert_snapshot_freshness(response: &MempoolSnapshotResponse) -> Result<()> {
     assert!(response.entries.len() <= usize::from(256_u16));
     assert!(summary.transaction_count >= u32::try_from(response.entries.len())?);
     Ok(())
-}
-
-async fn bulk_catchup_store(env: &LiveTestEnv) -> Result<(TempDir, PrimaryChainStore)> {
-    let tip_height = fetch_live_tip_height(env).await?;
-    if tip_height.value() <= BACKFILL_DEPTH_BLOCKS {
-        return Err(eyre!(
-            "tip height {} is at or below the minimum {BACKFILL_DEPTH_BLOCKS}",
-            tip_height.value(),
-        ));
-    }
-    let checkpoint_height = BlockHeight::new(tip_height.value() - BACKFILL_DEPTH_BLOCKS - 1);
-    let from_height = BlockHeight::new(checkpoint_height.value() + 1);
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zinder-store");
-    let activations = fetch_live_network_upgrade_activations(env).await?;
-    let mut bulk_catchup_config = live_bulk_catchup_run_config(
-        env,
-        &storage_path,
-        from_height,
-        tip_height,
-        NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
-        true,
-        activations,
-    );
-    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    let checkpoint = source
-        .fetch_chain_checkpoint(
-            checkpoint_height,
-            &bulk_catchup_config.network_upgrade_activations,
-        )
-        .await?;
-    bulk_catchup_config.checkpoint = Some(checkpoint);
-    run_bulk_catchup(&bulk_catchup_config, &source)
-        .await?
-        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
-    let store =
-        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
-    Ok((tempdir, store))
-}
-
-async fn serve_wallet_query_grpc(
-    wallet_query: WalletQuery<PrimaryChainStore>,
-    ingest_control_endpoint: String,
-) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
-        wallet_query,
-        ServerInfoSettings::default(),
-        ingest_control_endpoint,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    await_grpc_endpoint(addr).await?;
-    Ok((addr, handle))
-}
-
-async fn await_grpc_endpoint(addr: SocketAddr) -> Result<()> {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    Err(eyre!("gRPC endpoint {addr} did not become reachable"))
 }

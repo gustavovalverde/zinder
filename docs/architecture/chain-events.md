@@ -128,8 +128,8 @@ Rules:
 
 `StreamCursorTokenV1`'s `flags` byte carries a family code in the lower nibble (per [Chain events §Cursor varieties](chain-events.md#cursor-varieties)). Two `ChainEvents` family codes are active:
 
-- **`0x0` `ChainEventVisible`** — receives every `ChainCommitted` and `ChainReorged` envelope. Default for wallet consumers; clients must handle reorgs.
-- **`0x1` `ChainEventSettled`** — receives only non-reorg commits whose full range is at or below the settled tip. A `Settled` cursor cannot be reorged out below the settled tip by definition, so a locator miss is an expiry, not a synthesized reorg. Default for explorer and analytics consumers; trades latency for absence of reorg events. Bootstrap uses `WalletQuery.ChainEvents` with `family = Settled` and `start = earliest_retained` ([ADR-0027](../adrs/0027-event-stream-start-positions.md)).
+- **`0x0` `CHAIN_EVENT_STREAM_FAMILY_VISIBLE`** — receives every `ChainCommitted` and `ChainReorged` envelope. Default for wallet consumers; clients must handle reorgs.
+- **`0x1` `CHAIN_EVENT_STREAM_FAMILY_SETTLED`** — receives only non-reorg commits whose full range is at or below the settled tip. A `Settled` cursor cannot be reorged out below the settled tip by definition, so a locator miss is an expiry, not a synthesized reorg. Default for explorer and analytics consumers; trades latency for absence of reorg events. Bootstrap uses `WalletQuery.ChainEvents` with `family = Settled` and `start = earliest_retained` ([ADR-0027](../adrs/0027-event-stream-start-positions.md)).
 
 Only the active `ChainEvents` family codes are defined here.
 

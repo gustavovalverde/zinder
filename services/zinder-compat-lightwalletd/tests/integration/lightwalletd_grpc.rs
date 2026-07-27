@@ -42,8 +42,8 @@ use zinder_query::{
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEventStreamFamily,
-    ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention, ReorgWindowChange,
-    StreamCursorTokenV1,
+    ChainEventStreamResume, EventStreamStartPosition, PrimaryChainStore, RawBlobRetention,
+    ReorgWindowChange, StreamCursorTokenV1,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, StoreFixture,
@@ -63,14 +63,7 @@ const DEFAULT_TREE_STATE_PAYLOAD: &[u8] =
 )]
 async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let visible_tip_block = adapter
         .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
@@ -175,15 +168,7 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
 async fn lightd_info_refuses_transparent_support_without_projection_readiness() -> eyre::Result<()>
 {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    )
-    .with_transparent_address_support();
+    let adapter = acceptance_adapter(&store_fixture).with_transparent_address_support();
 
     let lightd_info = adapter
         .get_lightd_info(Request::new(lightwalletd::Empty {}))
@@ -197,14 +182,7 @@ async fn lightd_info_refuses_transparent_support_without_projection_readiness() 
 #[tokio::test]
 async fn get_block_returns_lightwalletd_error_codes_for_invalid_selectors() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .get_block(Request::new(lightwalletd::BlockId {
@@ -260,14 +238,7 @@ async fn get_block_returns_lightwalletd_error_codes_for_invalid_selectors() -> e
 #[tokio::test]
 async fn get_block_nullifiers_reports_future_height_like_lightwalletd() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .get_block_nullifiers(Request::new(lightwalletd::BlockId {
@@ -288,14 +259,7 @@ async fn get_block_nullifiers_reports_future_height_like_lightwalletd() -> eyre:
 #[tokio::test]
 async fn get_block_range_methods_report_future_height_like_lightwalletd() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let request = || lightwalletd::BlockRange {
         start: Some(lightwalletd::BlockId {
@@ -328,14 +292,7 @@ async fn get_block_range_methods_report_future_height_like_lightwalletd() -> eyr
 #[tokio::test]
 async fn get_block_range_methods_serve_genesis_when_artifacts_are_retained() -> eyre::Result<()> {
     let store_fixture = genesis_store_fixture()?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let request = || lightwalletd::BlockRange {
         start: Some(lightwalletd::BlockId {
@@ -375,14 +332,7 @@ async fn get_block_range_methods_serve_genesis_when_artifacts_are_retained() -> 
 #[tokio::test]
 async fn get_block_range_rejects_malformed_requests_before_streaming() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let Err(status) = adapter
         .get_block_range(Request::new(lightwalletd::BlockRange {
@@ -464,14 +414,7 @@ async fn get_block_range_rejects_malformed_requests_before_streaming() -> eyre::
 async fn block_nullifiers_omit_commitment_tree_sizes_and_redact_non_nullifier_fields()
 -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let single = adapter
         .get_block_nullifiers(Request::new(lightwalletd::BlockId {
@@ -584,14 +527,7 @@ fn assert_nullifiers_only_redaction(block: &lightwalletd::CompactBlock) -> eyre:
 #[tokio::test]
 async fn get_subtree_roots_serves_ironwood() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let stream = adapter
         .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
@@ -613,14 +549,7 @@ async fn get_subtree_roots_serves_ironwood() -> eyre::Result<()> {
 #[tokio::test]
 async fn get_subtree_roots_serves_non_empty_orchard_and_ironwood() -> eyre::Result<()> {
     let (store_fixture, completing_block_hash) = subtree_root_store_fixture()?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let orchard_stream = adapter
         .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
@@ -1003,14 +932,7 @@ async fn get_transaction_by_hash_pins_every_read_to_one_epoch() -> eyre::Result<
 async fn tree_state_returns_not_found_for_non_checkpoint_height() -> eyre::Result<()> {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -1030,14 +952,7 @@ async fn tree_state_returns_not_found_for_non_checkpoint_height() -> eyre::Resul
 #[tokio::test]
 async fn tree_state_reports_future_height_like_lightwalletd() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -1062,14 +977,7 @@ async fn tree_state_reports_future_height_like_lightwalletd() -> eyre::Result<()
 )]
 async fn retained_history_floor_unavailable_artifacts_return_not_found() -> eyre::Result<()> {
     let (store_fixture, retained_history_floor_height) = retained_history_floor_store_fixture()?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
     let floor_height = u64::from(retained_history_floor_height.value());
 
     let Err(status) = adapter
@@ -1185,14 +1093,7 @@ async fn compact_block_methods_serve_first_block_above_retained_history_floor() 
     let retained_block =
         expected_empty_lightwalletd_block(&boundary_fixture.retained_compact_block);
     let retained_height = u64::from(boundary_fixture.retained_compact_block.height().value());
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            boundary_fixture.store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&boundary_fixture.store_fixture);
 
     let block = adapter
         .get_block(Request::new(lightwalletd::BlockId {
@@ -1245,14 +1146,7 @@ async fn tree_state_methods_serve_first_checkpoint_above_retained_history_floor(
 {
     let boundary_fixture = retained_history_boundary_store_fixture()?;
     let retained_height = u64::from(boundary_fixture.retained_compact_block.height().value());
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            boundary_fixture.store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&boundary_fixture.store_fixture);
 
     let tree_state = adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -1277,10 +1171,6 @@ async fn tree_state_methods_serve_first_checkpoint_above_retained_history_floor(
 }
 
 #[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the compatibility fixture keeps transparent output and spend fact rows together"
-)]
 async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() -> eyre::Result<()>
 {
     let transparent_address =
@@ -1331,14 +1221,7 @@ async fn get_address_utxos_stream_returns_indexed_unspent_transparent_outputs() 
             )
         },
     )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![address.clone()],
@@ -1403,14 +1286,7 @@ async fn get_address_utxos_honors_start_height_floor() -> eyre::Result<()> {
             at_floor_block.hash,
         ));
     let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
     let request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![address],
         start_height: 2,
@@ -1476,14 +1352,7 @@ async fn get_address_utxos_txid_round_trips_through_get_transaction_by_hash() ->
             )
         },
     )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let utxos = adapter
         .get_address_utxos(Request::new(lightwalletd::GetAddressUtxosArg {
@@ -1613,14 +1482,7 @@ async fn get_transaction_returns_not_found_when_blob_is_unretained() -> eyre::Re
         RawBlobRetention::None,
         |block| vec![transaction_rows_without_blob(transaction_id, block)],
     )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let by_hash_status = match adapter
         .get_transaction(Request::new(lightwalletd::TxFilter {
@@ -1677,14 +1539,7 @@ async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction()
             }),
     )?;
 
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let by_hash_status = match adapter
         .get_transaction(Request::new(lightwalletd::TxFilter {
@@ -1861,14 +1716,7 @@ async fn send_transaction_forwards_node_error_code_when_present() -> eyre::Resul
 #[tokio::test]
 async fn send_transaction_reports_broadcast_disabled() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .send_transaction(Request::new(lightwalletd::RawTransaction {
@@ -1949,15 +1797,7 @@ async fn generated_lightwalletd_client_streams_over_grpc_transport() -> eyre::Re
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    )
-    .into_server();
+    let adapter = acceptance_adapter(&store_fixture).into_server();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server_handle = tokio::spawn(async move {
         Server::builder()
@@ -2015,14 +1855,7 @@ async fn tree_state_reports_missing_non_empty_final_state_as_data_loss() -> eyre
         br#"{"hash":"010101","height":1,"time":1296694002,"sapling":{"commitments":{"size":1}},"orchard":{"commitments":{}}}"#
             .to_vec(),
     )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -2047,14 +1880,7 @@ async fn tree_state_reports_missing_non_empty_final_state_as_data_loss() -> eyre
 #[tokio::test]
 async fn tree_state_rejects_zero_empty_block_id_without_reader_fallback() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -2077,14 +1903,7 @@ async fn tree_state_treats_absent_pool_and_empty_commitments_as_empty() -> eyre:
     let store_fixture = acceptance_store_fixture(
         br#"{"hash":"010101","height":1,"time":1296694002,"orchard":{"commitments":{}}}"#.to_vec(),
     )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let tree_state = adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -2107,14 +1926,7 @@ async fn tree_state_maps_ironwood_pool_final_state() -> eyre::Result<()> {
         br#"{"hash":"010101","height":1,"time":1296694002,"sapling":{"commitments":{}},"orchard":{"commitments":{}},"ironwood":{"commitments":{"finalState":"aabbcc"}}}"#
             .to_vec(),
     )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let tree_state = adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -2134,14 +1946,7 @@ async fn tree_state_reports_wrong_pool_shape_as_data_loss() -> eyre::Result<()> 
     let store_fixture = acceptance_store_fixture(
         br#"{"hash":"010101","height":1,"time":1296694002,"sapling":[]}"#.to_vec(),
     )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -2166,14 +1971,7 @@ async fn tree_state_reports_wrong_commitments_shape_as_data_loss() -> eyre::Resu
     let store_fixture = acceptance_store_fixture(
         br#"{"hash":"010101","height":1,"time":1296694002,"sapling":{"commitments":[]}}"#.to_vec(),
     )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -2201,14 +1999,7 @@ async fn tree_state_uses_typed_time_when_payload_omits_time() -> eyre::Result<()
         br#"{"hash":"010101","height":1,"sapling":{"commitments":{}},"orchard":{"commitments":{}}}"#
             .to_vec(),
     )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let response = adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -2229,14 +2020,7 @@ async fn tree_state_ignores_non_authoritative_payload_time() -> eyre::Result<()>
         br#"{"hash":"010101","height":1,"time":"1296694002","sapling":{"commitments":{}},"orchard":{"commitments":{}}}"#
             .to_vec(),
     )?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let response = adapter
         .get_tree_state(Request::new(lightwalletd::BlockId {
@@ -2254,14 +2038,7 @@ async fn tree_state_ignores_non_authoritative_payload_time() -> eyre::Result<()>
 #[tokio::test]
 async fn ping_returns_zero_entry_and_exit() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let response = adapter
         .ping(Request::new(lightwalletd::Duration { interval_us: 0 }))
@@ -2277,14 +2054,7 @@ async fn ping_returns_zero_entry_and_exit() -> eyre::Result<()> {
 #[tokio::test]
 async fn get_transaction_rejects_block_index_without_txid_like_lightwalletd() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .get_transaction(Request::new(lightwalletd::TxFilter {
@@ -2310,14 +2080,7 @@ async fn get_transaction_rejects_block_index_without_txid_like_lightwalletd() ->
 async fn get_transaction_rejects_unknown_block_index_without_txid_like_lightwalletd()
 -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = acceptance_adapter(&store_fixture);
 
     let status = match adapter
         .get_transaction(Request::new(lightwalletd::TxFilter {
@@ -2667,6 +2430,19 @@ fn reorg_replacement_artifacts(parent_hash: BlockHash, height: BlockHeight) -> C
         vec![replacement_block],
         vec![replacement_replay],
         vec![replacement_compact_block],
+    )
+}
+
+fn acceptance_adapter(
+    store_fixture: &StoreFixture,
+) -> LightwalletdGrpcAdapter<WalletQuery<PrimaryChainStore>> {
+    LightwalletdGrpcAdapter::new(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        ),
+        Arc::new(sample_regtest_upgrade_activations()),
     )
 }
 

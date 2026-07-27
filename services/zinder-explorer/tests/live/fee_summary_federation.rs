@@ -9,16 +9,13 @@
 //! invariants the wire shape promises (`block_count`,
 //! `transaction_count`, min/max bounds, total ≥ count × floor).
 
-use std::net::SocketAddr;
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use eyre::{Result, eyre};
-use tempfile::{TempDir, tempdir};
-use tokio::net::TcpListener;
+use tempfile::TempDir;
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, Network};
@@ -29,24 +26,19 @@ use zinder_explorer::{
 use zinder_ingest::{
     MaterializedViewReplayConfig, MaterializedViewReplayPolicy,
     catch_up_materialized_view_store_to_canonical,
-    open_primary_materialized_view_store_for_canonical, run_bulk_catchup,
+    open_primary_materialized_view_store_for_canonical,
 };
 use zinder_proto::capabilities::EXPLORER_FEE_SUMMARY_V1;
 use zinder_proto::v1::explorer::{
     FeeSummaryRequest, FeeSummaryResponse,
     explorer_query_server::ExplorerQuery as ExplorerQueryService,
 };
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::WalletQuery;
 use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
 use zinder_testkit::sample_regtest_upgrade_activations;
 
-use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
-    zebra_source_from_bulk_catchup,
-};
-
-const BACKFILL_DEPTH_BLOCKS: u32 = 50;
+use crate::common::{WalletQueryServerOptions, bulk_catchup_store, serve_wallet_query_grpc};
 
 /// ZIP-317 conventional-fee minimum: `MARGINAL_FEE × GRACE_ACTIONS`.
 /// Every non-coinbase transaction's `zip317_conventional_fee_zat` is at
@@ -125,16 +117,24 @@ impl FeeSummaryFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
         let (store_tempdir, store, tip_height) = bulk_catchup_store(env).await?;
+        let storage_path = store_tempdir.path().join("zinder-store");
+        catch_up_materialized_views(&store, &storage_path).await?;
         let wallet_query = WalletQuery::new(
             store.clone(),
             (),
             Arc::new(sample_regtest_upgrade_activations()),
         );
-        let (wallet_grpc_addr, wallet_server_handle) =
-            serve_wallet_query_grpc(wallet_query, network).await?;
+        let (wallet_grpc_addr, wallet_server_handle) = serve_wallet_query_grpc(
+            wallet_query,
+            WalletQueryServerOptions {
+                network: Some(network),
+                ingest_control_endpoint: None,
+            },
+        )
+        .await?;
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
         let materialized_view_store = MaterializedViewStore::open_secondary(
-            MaterializedViewStore::path_for_canonical(&store_tempdir.path().join("zinder-store")),
+            MaterializedViewStore::path_for_canonical(&storage_path),
             store_tempdir
                 .path()
                 .join("zinder-materialized-views-secondary-explorer"),
@@ -238,55 +238,19 @@ fn assert_fee_summary_shape(response: &FeeSummaryResponse, requested_blocks: u32
     Ok(())
 }
 
-async fn bulk_catchup_store(
-    env: &LiveTestEnv,
-) -> Result<(TempDir, PrimaryChainStore, BlockHeight)> {
-    let tip_height = fetch_live_tip_height(env).await?;
-    if tip_height.value() <= BACKFILL_DEPTH_BLOCKS {
-        return Err(eyre!(
-            "tip height {} is at or below the minimum {BACKFILL_DEPTH_BLOCKS}",
-            tip_height.value(),
-        ));
-    }
-    let checkpoint_height = BlockHeight::new(tip_height.value() - BACKFILL_DEPTH_BLOCKS - 1);
-    let from_height = BlockHeight::new(checkpoint_height.value() + 1);
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zinder-store");
-    let activations = fetch_live_network_upgrade_activations(env).await?;
-    let mut bulk_catchup_config = live_bulk_catchup_run_config(
-        env,
-        &storage_path,
-        from_height,
-        tip_height,
-        NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
-        true,
-        activations,
-    );
-    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    let checkpoint = source
-        .fetch_chain_checkpoint(
-            checkpoint_height,
-            &bulk_catchup_config.network_upgrade_activations,
-        )
-        .await?;
-    bulk_catchup_config.checkpoint = Some(checkpoint);
-    run_bulk_catchup(&bulk_catchup_config, &source)
-        .await?
-        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
-    let store =
-        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
+async fn catch_up_materialized_views(store: &PrimaryChainStore, storage_path: &Path) -> Result<()> {
     let materialized_view_primary = open_primary_materialized_view_store_for_canonical(
-        &storage_path,
+        storage_path,
         zinder_store::RocksDbResourceBudget::for_local_tests(),
     )?;
     catch_up_materialized_view_store_to_canonical(
-        &store,
+        store,
         &materialized_view_primary,
         materialized_view_replay_config()?,
     )
     .await?;
     drop(materialized_view_primary);
-    Ok((tempdir, store, tip_height))
+    Ok(())
 }
 
 /// Builds the one-shot materialized-view replay configuration used to populate the
@@ -304,35 +268,4 @@ fn materialized_view_replay_config() -> Result<MaterializedViewReplayConfig> {
         memory_resume_ratio: 0.75,
         startup_handoff_lag_blocks: 1_000,
     })
-}
-
-async fn serve_wallet_query_grpc(
-    wallet_query: WalletQuery<PrimaryChainStore>,
-    network: Network,
-) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let server_info = ServerInfoSettings {
-        network: encode_zinder_native_chain_name(network).to_owned(),
-        ..ServerInfoSettings::default()
-    };
-    let adapter = WalletQueryGrpcAdapter::new(wallet_query, server_info);
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    await_grpc_endpoint(addr).await?;
-    Ok((addr, handle))
-}
-
-async fn await_grpc_endpoint(addr: SocketAddr) -> Result<()> {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    Err(eyre!("gRPC endpoint {addr} did not become reachable"))
 }

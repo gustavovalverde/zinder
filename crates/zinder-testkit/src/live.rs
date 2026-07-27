@@ -119,15 +119,6 @@ pub fn require_live_mainnet() -> eyre::Result<Option<LiveTestEnv>> {
     require_live_for(&[Network::ZcashMainnet])
 }
 
-/// Reads a required environment variable, returning a wrapped error when it is unset.
-///
-/// Use for live-test inputs the operator must supply explicitly when the test
-/// cannot meaningfully proceed without them and the absence indicates
-/// operator misconfiguration rather than an unprovisioned subsystem.
-pub fn require_env(name: &str) -> eyre::Result<String> {
-    std::env::var(name).wrap_err_with(|| format!("missing required env var {name}"))
-}
-
 /// Reads an optional environment variable.
 ///
 /// Returns `Ok(None)` when the variable is unset so the caller can skip its

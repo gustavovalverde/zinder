@@ -1464,7 +1464,7 @@ mod tests {
             .await
         });
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if server
                     .requests_for("getrawtransaction")

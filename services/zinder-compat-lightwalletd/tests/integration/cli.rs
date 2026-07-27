@@ -101,74 +101,34 @@ fn missing_storage_path_is_rejected_before_binding() -> eyre::Result<()> {
 
 #[test]
 fn zero_reorg_window_is_rejected_before_storage_open() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("compat-zero-window-store");
-    let secondary_path = tempdir.path().join("compat-zero-window-secondary");
-    let wallet_path = tempdir.path().join("compat-zero-window-wallet");
-    let config_path = tempdir.path().join("zinder-compat.toml");
-    fs::write(
-        &config_path,
-        compat_config_toml(&storage_path, &secondary_path, &wallet_path)?,
-    )?;
-
-    let output = zinder_compat_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "--reorg-window-blocks",
-            "0",
-        ])
-        .output()?;
-
-    assert!(!output.status.success(), "{output:?}");
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("canonical build reorg window must be greater than zero"),
-        "{stderr}"
-    );
-    Ok(())
+    assert_compat_cli_rejects(
+        |root| {
+            compat_config_toml(
+                &root.join("compat-zero-window-store"),
+                &root.join("compat-zero-window-secondary"),
+                &root.join("compat-zero-window-wallet"),
+            )
+        },
+        &["--reorg-window-blocks", "0"],
+        "canonical build reorg window must be greater than zero",
+    )
 }
 
 #[test]
 fn missing_secondary_path_is_rejected_before_binding() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("compat-missing-secondary-store");
-    let config_path = tempdir.path().join("zinder-compat.toml");
-    fs::write(
-        &config_path,
-        compat_config_without_secondary_toml(&storage_path)?,
-    )?;
-
-    let output = zinder_compat_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("missing configuration field: storage.secondary_path"),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_compat_cli_rejects(
+        |root| compat_config_without_secondary_toml(&root.join("compat-missing-secondary-store")),
+        &[],
+        "missing configuration field: storage.secondary_path",
+    )
 }
 
 #[test]
 fn missing_wallet_secondary_path_is_rejected_before_binding() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("compat-missing-wallet-secondary-store");
-    let secondary_path = tempdir
-        .path()
-        .join("compat-missing-wallet-secondary-canonical");
-    let wallet_path = tempdir
-        .path()
-        .join("compat-missing-wallet-secondary-wallet");
-    let config_path = tempdir.path().join("zinder-compat.toml");
-    fs::write(
-        &config_path,
-        format!(
-            r#"[network]
+    assert_compat_cli_rejects(
+        |root| {
+            Ok(format!(
+                r#"[network]
 name = "zcash-regtest"
 
 [storage]
@@ -181,102 +141,63 @@ path = "{}"
 [compat]
 listen_addr = "127.0.0.1:9067"
 "#,
-            path_str(&storage_path)?,
-            path_str(&secondary_path)?,
-            path_str(&wallet_path)?,
-        ),
-    )?;
-
-    let output = zinder_compat_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("missing configuration field: wallet.secondary_path"),
-        "{stderr}"
-    );
-
-    Ok(())
+                path_str(&root.join("compat-missing-wallet-secondary-store"))?,
+                path_str(&root.join("compat-missing-wallet-secondary-canonical"))?,
+                path_str(&root.join("compat-missing-wallet-secondary-wallet"))?,
+            ))
+        },
+        &[],
+        "missing configuration field: wallet.secondary_path",
+    )
 }
 
 #[test]
 fn overlapping_primary_and_secondary_roots_are_rejected_before_binding() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("compat-overlapping-store");
-    let secondary_path = tempdir.path().join("compat-overlapping-secondary");
-    let config_path = tempdir.path().join("zinder-compat.toml");
-    fs::write(
-        &config_path,
-        compat_config_toml(&storage_path, &secondary_path, &storage_path)?,
-    )?;
-
-    let output = zinder_compat_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("storage.path, storage.secondary_path, wallet.path, and wallet.secondary_path must be disjoint roots"),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_compat_cli_rejects(
+        |root| {
+            let storage_path = root.join("compat-overlapping-store");
+            compat_config_toml(
+                &storage_path,
+                &root.join("compat-overlapping-secondary"),
+                &storage_path,
+            )
+        },
+        &[],
+        "storage.path, storage.secondary_path, wallet.path, and wallet.secondary_path must be disjoint roots",
+    )
 }
 
 #[test]
 fn nested_or_lexically_aliased_storage_roots_are_rejected_before_binding() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("compat-root-alias-store");
-    let canonical_secondary_path = storage_path.join("secondary");
-    let wallet_path = storage_path.join("..").join(
-        storage_path
-            .file_name()
-            .ok_or_else(|| eyre::eyre!("missing file name"))?,
-    );
-    let config_path = tempdir.path().join("zinder-compat.toml");
-    fs::write(
-        &config_path,
-        compat_config_toml(&storage_path, &canonical_secondary_path, &wallet_path)?,
-    )?;
-
-    let output = zinder_compat_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("storage.path, storage.secondary_path, wallet.path, and wallet.secondary_path must be disjoint roots"),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_compat_cli_rejects(
+        |root| {
+            let storage_path = root.join("compat-root-alias-store");
+            let canonical_secondary_path = storage_path.join("secondary");
+            let wallet_path = storage_path.join("..").join(
+                storage_path
+                    .file_name()
+                    .ok_or_else(|| eyre::eyre!("missing file name"))?,
+            );
+            compat_config_toml(&storage_path, &canonical_secondary_path, &wallet_path)
+        },
+        &[],
+        "storage.path, storage.secondary_path, wallet.path, and wallet.secondary_path must be disjoint roots",
+    )
 }
 
 #[test]
 fn ingest_only_section_is_rejected() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("compat-node-source-store");
-    let secondary_path = tempdir.path().join("compat-node-source-secondary");
-    let wallet_path = tempdir.path().join("compat-node-source-wallet");
-    let config_path = tempdir.path().join("zinder-compat.toml");
-    fs::write(
-        &config_path,
-        compat_config_with_ingest_section_toml(&storage_path, &secondary_path, &wallet_path)?,
-    )?;
-
-    let output = zinder_compat_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("unknown field `ingest`"), "{stderr}");
-
-    Ok(())
+    assert_compat_cli_rejects(
+        |root| {
+            compat_config_with_ingest_section_toml(
+                &root.join("compat-node-source-store"),
+                &root.join("compat-node-source-secondary"),
+                &root.join("compat-node-source-wallet"),
+            )
+        },
+        &[],
+        "unknown field `ingest`",
+    )
 }
 
 #[test]
@@ -307,26 +228,40 @@ fn wallet_rocksdb_section_is_accepted() -> eyre::Result<()> {
 
 #[test]
 fn unknown_storage_subsection_is_rejected() -> eyre::Result<()> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("compat-canonical");
-    let secondary_path = tempdir.path().join("compat-canonical-secondary");
-    let wallet_path = tempdir.path().join("compat-wallet");
-    let config_path = tempdir.path().join("zinder-compat.toml");
-    fs::write(
-        &config_path,
-        format!(
-            "{}\n[storage.unsupported.rocksdb]\nblock_cache_bytes = 134217728\n",
-            compat_config_toml(&storage_path, &secondary_path, &wallet_path)?
-        ),
-    )?;
+    assert_compat_cli_rejects(
+        |root| {
+            Ok(format!(
+                "{}\n[storage.unsupported.rocksdb]\nblock_cache_bytes = 134217728\n",
+                compat_config_toml(
+                    &root.join("compat-canonical"),
+                    &root.join("compat-canonical-secondary"),
+                    &root.join("compat-wallet"),
+                )?
+            ))
+        },
+        &[],
+        "unknown field `unsupported`",
+    )
+}
 
-    let output = zinder_compat_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
+fn assert_compat_cli_rejects(
+    build_config_toml: impl FnOnce(&Path) -> eyre::Result<String>,
+    args: &[&str],
+    expected_error: &str,
+) -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(&config_path, build_config_toml(tempdir.path())?)?;
+
+    let mut command = zinder_compat_command();
+    command.args(["--print-config", "--config", path_str(&config_path)?]);
+    command.args(args);
+    let output = command.output()?;
 
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("unknown field `unsupported`"), "{stderr}");
+    assert!(stderr.contains(expected_error), "{stderr}");
+
     Ok(())
 }
 

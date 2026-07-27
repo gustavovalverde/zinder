@@ -13,19 +13,26 @@
 )]
 
 use std::{
+    net::SocketAddr,
     num::{NonZeroU32, NonZeroU64},
     path::Path,
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
-use eyre::Result;
+use eyre::{Result, eyre};
+use tempfile::{TempDir, tempdir};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_stream::{Stream, wrappers::TcpListenerStream};
 use tonic::{Request, Response, Status};
-use zinder_core::{BlockHeight, NetworkUpgradeActivations};
-use zinder_ingest::{BulkCatchupRunConfig, CanonicalPipelineLimits, NodeSourceKind};
+use zinder_core::{
+    BlockHeight, Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name,
+};
+use zinder_ingest::{
+    BulkCatchupRunConfig, CanonicalPipelineLimits, NodeSourceKind, run_bulk_catchup,
+};
 use zinder_proto::v1::{
     ingest::{
         MempoolTransactionRequest, ServerInfoRequest, ServerInfoResponse, WriterStatusRequest,
@@ -34,8 +41,12 @@ use zinder_proto::v1::{
     },
     wallet,
 };
+use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_store::PrimaryChainStore;
 use zinder_testkit::live::LiveTestEnv;
+
+const BACKFILL_DEPTH_BLOCKS: u32 = 50;
 
 /// Builds a [`BulkCatchupRunConfig`] from a resolved live-test env plus per-test
 /// runtime knobs.
@@ -147,56 +158,94 @@ pub(crate) async fn fetch_live_network_upgrade_activations(
     ))
 }
 
-/// Calls Zebra's regtest-only `generate` JSON-RPC to mine `block_count` empty
-/// blocks. Returns the list of newly mined block hashes.
-///
-/// Mirrors the helper in `services/zinder-ingest/tests/common/mod.rs` so the
-/// materialized-view mempool overlay live test can drive deterministic chain-tip
-/// changes without depending on a wallet-side broadcast cycle. Errors on
-/// non-regtest networks because Zebra rejects `generate` outside regtest.
-pub(crate) async fn regtest_generate_blocks(
+/// Bulk catches up the window ending at the live upstream tip and opens the
+/// resulting canonical store.
+pub(crate) async fn bulk_catchup_store(
     env: &LiveTestEnv,
-    block_count: u32,
-) -> Result<Vec<String>> {
-    let body =
-        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"generate","params":[{block_count}]}}"#);
-    let output = tokio::process::Command::new("curl")
-        .arg("-s")
-        .args(["-X", "POST"])
-        .args(["-H", "content-type: application/json"])
-        .arg("-d")
-        .arg(&body)
-        .arg(env.target.json_rpc_addr.as_str())
-        .output()
+) -> Result<(TempDir, PrimaryChainStore, BlockHeight)> {
+    let tip_height = fetch_live_tip_height(env).await?;
+    if tip_height.value() <= BACKFILL_DEPTH_BLOCKS {
+        return Err(eyre!(
+            "tip height {} is at or below the minimum {BACKFILL_DEPTH_BLOCKS}",
+            tip_height.value(),
+        ));
+    }
+    let checkpoint_height = BlockHeight::new(tip_height.value() - BACKFILL_DEPTH_BLOCKS - 1);
+    let from_height = BlockHeight::new(checkpoint_height.value() + 1);
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("zinder-store");
+    let activations = fetch_live_network_upgrade_activations(env).await?;
+    let mut bulk_catchup_config = live_bulk_catchup_run_config(
+        env,
+        &storage_path,
+        from_height,
+        tip_height,
+        NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
+        true,
+        activations,
+    );
+    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(
+            checkpoint_height,
+            &bulk_catchup_config.network_upgrade_activations,
+        )
         .await?;
-    if !output.status.success() {
-        return Err(eyre::eyre!(
-            "regtest generate({block_count}) curl exited with status {:?}: stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
+    bulk_catchup_config.checkpoint = Some(checkpoint);
+    run_bulk_catchup(&bulk_catchup_config, &source)
+        .await?
+        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
+    let store =
+        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
+    Ok((tempdir, store, tip_height))
+}
+
+/// Per-test knobs for the in-process `WalletQuery` gRPC fixture.
+pub(crate) struct WalletQueryServerOptions {
+    /// Overrides the advertised `ServerInfo` chain name.
+    pub(crate) network: Option<Network>,
+    /// Routes ingest-owned reads through an in-process `IngestControl` server.
+    pub(crate) ingest_control_endpoint: Option<String>,
+}
+
+/// Serves `WalletQuery` over gRPC on an ephemeral loopback port.
+pub(crate) async fn serve_wallet_query_grpc(
+    wallet_query: WalletQuery<PrimaryChainStore>,
+    options: WalletQueryServerOptions,
+) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
+    let server_info = options
+        .network
+        .map_or_else(ServerInfoSettings::default, |network| ServerInfoSettings {
+            network: encode_zinder_native_chain_name(network).to_owned(),
+            ..ServerInfoSettings::default()
+        });
+    let adapter = match options.ingest_control_endpoint {
+        Some(endpoint) => {
+            WalletQueryGrpcAdapter::with_ingest_control_proxy(wallet_query, server_info, endpoint)
+        }
+        None => WalletQueryGrpcAdapter::new(wallet_query, server_info),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    await_grpc_endpoint(addr).await?;
+    Ok((addr, handle))
+}
+
+/// Waits until `addr` accepts connections.
+pub(crate) async fn await_grpc_endpoint(addr: SocketAddr) -> Result<()> {
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let body = String::from_utf8(output.stdout)?;
-    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
-        eyre::eyre!("regtest generate response is not JSON: {error}; body={body}")
-    })?;
-    if let Some(error_field) = parsed.get("error")
-        && !error_field.is_null()
-    {
-        return Err(eyre::eyre!(
-            "regtest generate({block_count}) RPC returned error: {error_field}"
-        ));
-    }
-    let result_field = parsed.get("result").ok_or_else(|| {
-        eyre::eyre!("regtest generate response missing result field; body={body}")
-    })?;
-    let block_hashes: Vec<String> =
-        serde_json::from_value(result_field.clone()).map_err(|error| {
-            eyre::eyre!(
-                "regtest generate result is not a list of block hashes: {error}; body={body}"
-            )
-        })?;
-    Ok(block_hashes)
+    Err(eyre!("gRPC endpoint {addr} did not become reachable"))
 }
 
 type TestChainEventStream =
@@ -211,10 +260,7 @@ type TestMempoolEventStream =
 /// the current private responses that Explorer reaches through `WalletQuery`.
 pub(crate) async fn serve_test_ingest_control(
     value_pools_response: Option<wallet::ChainValuePoolsAtTipResponse>,
-) -> Result<(
-    std::net::SocketAddr,
-    JoinHandle<Result<(), tonic::transport::Error>>,
-)> {
+) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let handle = tokio::spawn(async move {

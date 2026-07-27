@@ -29,6 +29,15 @@ use zinder_source::{
 };
 use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
 
+fn regtest_source(server: &JsonRpcTestServer) -> Result<ZebraJsonRpcSource, SourceError> {
+    ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )
+}
+
 #[tokio::test]
 async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre::Result<()> {
     // `fetch_block_at` keys the required RPCs on the requested height
@@ -89,12 +98,7 @@ async fn fetch_chain_update_after_start_emits_connected_block() -> eyre::Result<
         method("getbestblockheightandhash").reply(RpcReply::result(zebra_tip_response(&fixture)?)),
         method("getblock").reply(RpcReply::result(json!(fixture["raw_block_hex"]))),
     ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let update = source
         .fetch_chain_update_after(SourceChainCursor::before_first_block())
@@ -131,12 +135,7 @@ async fn fetch_chain_update_after_tip_cursor_returns_none() -> eyre::Result<()> 
     let server =
         JsonRpcTestServer::start([method("getbestblockheightandhash")
             .reply(RpcReply::result(zebra_tip_response(&fixture)?))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let update = source
         .fetch_chain_update_after(SourceChainCursor::at_block(block_id))
@@ -157,12 +156,7 @@ async fn fetch_chain_update_after_diverged_tip_emits_reverted_block() -> eyre::R
     let server =
         JsonRpcTestServer::start([method("getbestblockheightandhash")
             .reply(RpcReply::result(zebra_tip_response(&fixture)?))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let update = source
         .fetch_chain_update_after(SourceChainCursor::at_block(old_block_id))
@@ -187,12 +181,7 @@ async fn json_rpc_error_maps_to_block_unavailable_with_view_changed_class() -> e
     let server = JsonRpcTestServer::start([
         method("getblock").reply(RpcReply::error("height out of range"))
     ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
@@ -220,12 +209,7 @@ async fn json_rpc_warming_up_error_keeps_block_unavailable_classification() -> e
     let server = JsonRpcTestServer::start([
         method("getblock").reply(RpcReply::error_with_code(-28, "node warming up"))
     ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
@@ -249,12 +233,7 @@ async fn json_rpc_warming_up_error_keeps_block_unavailable_classification() -> e
 #[tokio::test]
 async fn missing_json_rpc_result_maps_to_protocol_mismatch() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([method("getblock").reply(RpcReply::empty())])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
@@ -314,12 +293,7 @@ async fn http_503_marks_node_unavailable_retryable() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([
         method("getbestblockheightandhash").reply(RpcReply::http_status(503))
     ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let error = match source.tip_id().await {
         Ok(tip_id) => {
@@ -341,12 +315,7 @@ async fn http_503_marks_node_unavailable_retryable() -> eyre::Result<()> {
 async fn json_rpc_warming_up_error_marks_tip_node_unreachable() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([method("getbestblockheightandhash")
         .reply(RpcReply::error_with_code(-28, "node warming up"))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let error = match source.tip_id().await {
         Ok(tip_id) => {
@@ -374,12 +343,7 @@ async fn tip_id_uses_atomic_height_and_hash_observation() -> eyre::Result<()> {
             "hash": expected_hash.as_bytes(),
         })),
     )])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let tip_id = source.tip_id().await?;
 
@@ -400,12 +364,7 @@ async fn tip_id_uses_atomic_height_and_hash_observation() -> eyre::Result<()> {
 async fn bad_raw_block_hex_maps_to_invalid_raw_block_hex() -> eyre::Result<()> {
     let server =
         JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(json!("not-hex")))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let error = match source.fetch_block_at(BlockHeight::new(1)).await {
         Ok(source_block) => {
@@ -428,12 +387,7 @@ async fn fetch_tree_state_response(
     let server = JsonRpcTestServer::start([
         method("z_gettreestate").reply(RpcReply::result(tree_state_response))
     ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
     let block_id = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0x11; 32]));
 
     Ok(source.fetch_tree_state_for_block(block_id).await)
@@ -593,12 +547,7 @@ async fn tree_state_hash_disagreement_maps_to_block_reorg_during_fetch() -> eyre
             "height": fixture["height"],
             "hash": "1111111111111111111111111111111111111111111111111111111111111111",
         })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
     let requested_block = BlockId::new(
         BlockHeight::new(1),
         decode_rpc_block_hash(string_field(&fixture, "hash")?)?,
@@ -635,12 +584,7 @@ async fn tree_state_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<
             "height": 2,
             "hash": fixture["hash"],
         })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
     let requested_block = BlockId::new(
         BlockHeight::new(1),
         decode_rpc_block_hash(string_field(&fixture, "hash")?)?,
@@ -781,12 +725,7 @@ async fn fetch_subtree_root_range_requires_every_requested_root() -> eyre::Resul
             ]
         })),
     )])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
     let requested_range = SubtreeRootRange::new(
         ShieldedProtocol::Orchard,
         SubtreeRootIndex::new(9),
@@ -817,12 +756,7 @@ async fn fetch_subtree_root_range_rejects_incomplete_response() -> eyre::Result<
             }]
         })),
     )])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
     let requested_range = SubtreeRootRange::new(
         ShieldedProtocol::Sapling,
         SubtreeRootIndex::new(4),
@@ -862,12 +796,7 @@ async fn fetch_subtree_roots_rejects_response_above_requested_bound() -> eyre::R
             ]
         })),
     )])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let outcome = source
         .fetch_subtree_roots(
@@ -903,12 +832,7 @@ async fn fetch_subtree_roots_rejects_descending_completion_heights() -> eyre::Re
             ]
         })),
     )])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let outcome = source
         .fetch_subtree_roots(
@@ -931,12 +855,7 @@ async fn json_rpc_warming_up_error_marks_subtree_roots_unavailable_retryable() -
     let server = JsonRpcTestServer::start([
         method("z_getsubtreesbyindex").reply(RpcReply::error_with_code(-28, "node warming up"))
     ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let error = match source
         .fetch_subtree_roots(
@@ -1007,12 +926,7 @@ async fn broadcast_transaction_classifies_invalid_encoding() -> eyre::Result<()>
     let server = JsonRpcTestServer::start([
         method("sendrawtransaction").reply(RpcReply::error_with_code(-22, "TX decode failed"))
     ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x00]))
@@ -1037,12 +951,7 @@ async fn broadcast_transaction_classifies_duplicate() -> eyre::Result<()> {
                 "transaction already in mempool",
             )),
         ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x01]))
@@ -1067,12 +976,7 @@ async fn broadcast_transaction_classifies_mempool_duplicate_message() -> eyre::R
                 "transaction already exists in mempool",
             )),
         ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x01]))
@@ -1097,12 +1001,7 @@ async fn broadcast_transaction_classifies_state_duplicate_message() -> eyre::Res
                 "failed to validate tx: WtxId(\"private\"), error: transaction is already in state",
             )),
         ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x01]))
@@ -1122,12 +1021,7 @@ async fn broadcast_transaction_classifies_state_duplicate_message() -> eyre::Res
 async fn broadcast_transaction_does_not_classify_unknown_as_duplicate() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([method("sendrawtransaction")
         .reply(RpcReply::error_with_code(-8, "transaction unknown to node"))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x01]))
@@ -1148,12 +1042,7 @@ async fn broadcast_transaction_without_error_code_returns_unknown() -> eyre::Res
     let server = JsonRpcTestServer::start([method("sendrawtransaction").reply(
         RpcReply::error_without_code("duplicate field contains a hex branch id already checked"),
     )])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let broadcast_outcome = source
         .broadcast_transaction(RawTransactionBytes::new([0x01]))
@@ -1186,12 +1075,7 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
                 {"name": "ping"},
             ],
         })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let probed = source.probe_capabilities().await?;
 
@@ -1213,12 +1097,7 @@ async fn probe_capabilities_rejects_missing_openrpc_discovery() -> eyre::Result<
     let server = JsonRpcTestServer::start([
         method("rpc.discover").reply(RpcReply::error_with_code(-32601, "Method not found"))
     ])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let error = match source.probe_capabilities().await {
         Ok(capabilities) => {
@@ -1250,12 +1129,7 @@ async fn probe_capabilities_requires_atomic_tip_method() -> eyre::Result<()> {
                 {"name": "rpc.discover"},
             ],
         })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let probed = source.probe_capabilities().await?;
 
@@ -1280,12 +1154,7 @@ async fn probe_capabilities_keeps_only_advertised_capabilities_on_success() -> e
                 {"name": "rpc.discover"},
             ],
         })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let probed = source.probe_capabilities().await?;
 
@@ -1452,12 +1321,7 @@ async fn fetch_checkpoint_response(
 ) -> eyre::Result<Result<zinder_core::CommitmentTreeCheckpoint, SourceError>> {
     let server =
         JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(response))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
     Ok(source
         .fetch_chain_checkpoint(BlockHeight::new(100), activations)
         .await)
@@ -1471,12 +1335,7 @@ async fn fetch_chain_checkpoint_uses_one_tree_state_request_and_decodes_nonempty
     let server = JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(
         checkpoint_response(Some(&final_root), Some(&final_state)),
     ))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
     let activations = checkpoint_activations(1, 200)?;
 
     let checkpoint = source
@@ -1763,12 +1622,7 @@ async fn fetch_chain_checkpoint_rejects_activation_table_for_another_network_bef
     )?;
     let server =
         JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(json!({})))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let outcome = source
         .fetch_chain_checkpoint(BlockHeight::new(100), &activations)
@@ -1899,12 +1753,7 @@ async fn fetch_chain_value_pools_at_tip_preserves_source_tip_and_pool_entries() 
                 }
             ]
         })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let value_pools = source.fetch_chain_value_pools_at_tip().await?;
 
@@ -1939,12 +1788,7 @@ async fn fetch_chain_value_pools_at_tip_requires_value_pools_field() -> eyre::Re
             "blocks": 1_234_567,
             "bestblockhash": "ab".repeat(32)
         })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let outcome = source.fetch_chain_value_pools_at_tip().await;
 
@@ -1972,12 +1816,7 @@ async fn fetch_block_value_pool_balances_binds_exact_block_and_preserves_pool_or
             {"id": "orchard", "monitored": true, "chainValueZat": 33}
         ]
     })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
     assert!(
         source
             .capabilities()
@@ -2037,12 +1876,7 @@ async fn fetch_block_value_pool_balances_rejects_response_identity_mismatches() 
     ] {
         let server =
             JsonRpcTestServer::start([method("getblock").reply(RpcReply::result(response))])?;
-        let source = ZebraJsonRpcSource::new(
-            Network::ZcashRegtest,
-            server.url(),
-            NodeAuth::None,
-            Duration::from_secs(5),
-        )?;
+        let source = regtest_source(&server)?;
 
         assert!(matches!(
             source.fetch_block_value_pool_balances(block_id).await,
@@ -2075,12 +1909,7 @@ async fn fetch_block_value_pool_balances_rejects_invalid_pool_entries() -> eyre:
                 "time": 1,
                 "valuePools": value_pools
             })))])?;
-        let source = ZebraJsonRpcSource::new(
-            Network::ZcashRegtest,
-            server.url(),
-            NodeAuth::None,
-            Duration::from_secs(5),
-        )?;
+        let source = regtest_source(&server)?;
 
         assert!(matches!(
             source.fetch_block_value_pool_balances(block_id).await,
@@ -2108,12 +1937,7 @@ async fn fetch_block_value_pool_balances_requires_verbose_value_pools() -> eyre:
         "height": 42,
         "time": 1
     })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     assert!(matches!(
         source.fetch_block_value_pool_balances(block_id).await,
@@ -2160,12 +1984,7 @@ async fn poll_upstream_health_falls_back_to_verification_progress() -> eyre::Res
             "valuePools": [],
             "upgrades": {},
         })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let snapshot = source.poll_upstream_health().await?;
     assert!(!snapshot.ready_for_queries);
@@ -2194,12 +2013,7 @@ async fn poll_upstream_health_flags_estimated_gap_when_progress_is_above_floor()
             "valuePools": [],
             "upgrades": {},
         })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let snapshot = source.poll_upstream_health().await?;
     assert!(!snapshot.ready_for_queries);
@@ -2223,12 +2037,7 @@ async fn poll_upstream_health_reports_ready_when_progress_and_gap_within_floors(
             "valuePools": [],
             "upgrades": {},
         })))])?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
+    let source = regtest_source(&server)?;
 
     let snapshot = source.poll_upstream_health().await?;
     assert!(snapshot.ready_for_queries);
@@ -2254,13 +2063,7 @@ async fn poll_upstream_health_falls_back_when_ready_endpoint_unreachable() -> ey
     // Point the health probe at a port that nothing listens on so the
     // first call errors out and the source falls back to the JSON-RPC
     // path within the same `poll_upstream_health` invocation.
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?
-    .with_health_config(Some(NodeHealthConfig::new(
+    let source = regtest_source(&server)?.with_health_config(Some(NodeHealthConfig::new(
         "http://127.0.0.1:1/ready".to_owned(),
         Duration::from_millis(500),
         0.999,
@@ -2317,13 +2120,7 @@ async fn poll_upstream_health_uses_ready_endpoint_when_configured() -> eyre::Res
     });
 
     let json_rpc_server = JsonRpcTestServer::start(Vec::<zinder_testkit::JsonRpcStub>::new())?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        json_rpc_server.url(),
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?
-    .with_health_config(Some(NodeHealthConfig::new(
+    let source = regtest_source(&json_rpc_server)?.with_health_config(Some(NodeHealthConfig::new(
         format!("http://{bound}/ready"),
         Duration::from_secs(5),
         0.999,

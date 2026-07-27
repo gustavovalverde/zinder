@@ -81,7 +81,7 @@ configuration, and restart the same owner against the same storage paths. The
 bounded RocksDB open path replays the WAL within the configured resource
 envelope. Do not delete individual WAL or SST files.
 
-If startup reports `SchemaMismatch`, `StoreCorruption`, or a network mismatch,
+If startup reports `SchemaMismatch`, `ArtifactCorrupt`, or a network mismatch,
 resource tuning is not the remedy. Follow [Initial sync](initial-sync.md) and
 create a fresh, empty storage path. Preserve the rejected path until the
 replacement is ready.

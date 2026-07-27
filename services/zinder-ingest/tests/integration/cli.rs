@@ -3,7 +3,7 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{error::Error, fs, path::Path, process::Command};
+use std::{error::Error, fs, path::Path};
 
 use tempfile::tempdir;
 use zinder_core::{
@@ -12,6 +12,8 @@ use zinder_core::{
 };
 use zinder_store::{ChainStoreOptions, PrimaryChainStore};
 use zinder_testkit::ChainFixture;
+
+use crate::common::zinder_ingest_command;
 
 #[test]
 fn version_reports_the_product_version() -> Result<(), Box<dyn Error>> {
@@ -424,30 +426,20 @@ fn wallet_serving_print_config_marks_coverage() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("wallet-serving-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    let config = wallet_serving_ingest_config_toml(&storage_path)?.replacen(
-        "[storage]\n",
-        "[storage]\nraw_blob_policy = \"none\"\n",
-        1,
-    );
-    fs::write(&config_path, config)?;
-
-    let output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success(), "{output:?}");
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains(
-            "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\""
-        ),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_ingest_cli_rejects(
+        |root| {
+            Ok(
+                wallet_serving_ingest_config_toml(&root.join("wallet-serving-store"))?.replacen(
+                    "[storage]\n",
+                    "[storage]\nraw_blob_policy = \"none\"\n",
+                    1,
+                ),
+            )
+        },
+        &[],
+        &[],
+        "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"",
+    )
 }
 
 #[test]
@@ -475,60 +467,30 @@ fn wallet_serving_preserves_full_block_blob_retention() -> Result<(), Box<dyn Er
 
 #[test]
 fn wallet_serving_rejects_explicit_checkpoint_height() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("wallet-serving-checkpoint-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(
-        &config_path,
-        wallet_serving_ingest_config_toml_with_checkpoint(&storage_path)?,
-    )?;
-
-    let output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains(
-            "ingest.run_overrides.coverage = \"wallet-serving\" requires complete transparent history and sets checkpoint_height to zero"
-        ),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_ingest_cli_rejects(
+        |root| {
+            wallet_serving_ingest_config_toml_with_checkpoint(
+                &root.join("wallet-serving-checkpoint-store"),
+            )
+        },
+        &[],
+        &[],
+        "ingest.run_overrides.coverage = \"wallet-serving\" requires complete transparent history and sets checkpoint_height to zero",
+    )
 }
 
 #[test]
 fn wallet_serving_rejects_reorg_window_settlement_override() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir
-        .path()
-        .join("wallet-serving-reorg-window-settlement-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(
-        &config_path,
-        wallet_serving_ingest_config_toml(&storage_path)?,
-    )?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "--allow-reorg-window-settlement",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr
-            .contains("ingest.run_overrides.coverage = \"wallet-serving\" cannot be combined with"),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_ingest_cli_rejects(
+        |root| {
+            wallet_serving_ingest_config_toml(
+                &root.join("wallet-serving-reorg-window-settlement-store"),
+            )
+        },
+        &["--allow-reorg-window-settlement"],
+        &[],
+        "ingest.run_overrides.coverage = \"wallet-serving\" cannot be combined with",
+    )
 }
 
 #[test]
@@ -612,230 +574,97 @@ fn print_config_redacts_inline_cookie_supplied_through_environment() -> Result<(
 
 #[test]
 fn zero_commit_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-commit-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "--canonical-batch-max-blocks",
-            "0",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ingest.construction.canonical_batch_max_blocks must be greater than zero"),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_ingest_cli_rejects(
+        |root| ingest_config_toml(&root.join("zero-commit-store")),
+        &["--canonical-batch-max-blocks", "0"],
+        &[],
+        "ingest.construction.canonical_batch_max_blocks must be greater than zero",
+    )
 }
 
 #[test]
 fn zero_estimated_write_batch_budget_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-estimated-write-budget-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "--canonical-batch-max-estimated-write-bytes",
-            "0",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains(
-            "ingest.construction.canonical_batch_max_estimated_write_bytes must be greater than zero"
-        ),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_ingest_cli_rejects(
+        |root| ingest_config_toml(&root.join("zero-estimated-write-budget-store")),
+        &["--canonical-batch-max-estimated-write-bytes", "0"],
+        &[],
+        "ingest.construction.canonical_batch_max_estimated_write_bytes must be greater than zero",
+    )
 }
 
 #[test]
 fn estimated_write_close_floor_above_block_cap_fails_before_storage_creation()
 -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir
-        .path()
-        .join("estimated-write-floor-above-block-cap-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
+    assert_ingest_cli_rejects(
+        |root| ingest_config_toml(&root.join("estimated-write-floor-above-block-cap-store")),
+        &[
             "--canonical-batch-max-blocks",
             "10",
             "--canonical-batch-min-blocks-before-estimated-write-close",
             "11",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains(
-            "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.construction.canonical_batch_max_blocks"
-        ),
-        "{stderr}"
-    );
-
-    Ok(())
+        ],
+        &[],
+        "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.construction.canonical_batch_max_blocks",
+    )
 }
 
 #[test]
 fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-source-segment-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .env(
+    assert_ingest_cli_rejects(
+        |root| ingest_config_toml(&root.join("zero-source-segment-store")),
+        &[],
+        &[(
             "ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_MAX_BLOCKS",
             "0",
-        )
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ingest.construction.source_segment_max_blocks must be greater than zero"),
-        "{stderr}"
-    );
-
-    Ok(())
+        )],
+        "ingest.construction.source_segment_max_blocks must be greater than zero",
+    )
 }
 
 #[test]
 fn zero_block_prepare_concurrency_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-block-prepare");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "--block-prepare-concurrency",
-            "0",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ingest.construction.block_prepare_concurrency must be greater than zero"),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_ingest_cli_rejects(
+        |root| ingest_config_toml(&root.join("zero-block-prepare")),
+        &["--block-prepare-concurrency", "0"],
+        &[],
+        "ingest.construction.block_prepare_concurrency must be greater than zero",
+    )
 }
 
 #[test]
 fn zero_max_response_bytes_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-response-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "--max-response-bytes",
-            "0",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("node.max_response_bytes must be greater than zero"),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_ingest_cli_rejects(
+        |root| ingest_config_toml(&root.join("zero-response-store")),
+        &["--max-response-bytes", "0"],
+        &[],
+        "node.max_response_bytes must be greater than zero",
+    )
 }
 
 #[test]
 fn source_fetch_byte_budget_below_max_response_fails_before_storage_creation()
 -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("source-fetch-budget-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
+    assert_ingest_cli_rejects(
+        |root| ingest_config_toml(&root.join("source-fetch-budget-store")),
+        &[
             "--max-response-bytes",
             "67108864",
             "--source-fetch-max-in-flight-bytes",
             "33554432",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains(
-            "invalid ingest.construction pipeline limits: source fetch watermark 33554432 is below maximum response 67108864"
-        ),
-        "{stderr}"
-    );
-
-    Ok(())
+        ],
+        &[],
+        "invalid ingest.construction pipeline limits: source fetch watermark 33554432 is below maximum response 67108864",
+    )
 }
 
 #[test]
 fn zero_poll_interval_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zero-poll-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "--poll-interval-ms",
-            "0",
-        ])
-        .output()?;
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        stderr.contains("ingest.follow.poll_interval_ms must be greater than zero"),
-        "{stderr}"
-    );
-
-    Ok(())
+    assert_ingest_cli_rejects(
+        |root| ingest_config_toml(&root.join("zero-poll-store")),
+        &["--poll-interval-ms", "0"],
+        &[],
+        "ingest.follow.poll_interval_ms must be greater than zero",
+    )
 }
 
 #[test]
@@ -933,10 +762,27 @@ fn partial_basic_auth_fails_before_storage_creation() -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-fn zinder_ingest_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-ingest"));
-    command.env_clear();
-    command
+fn assert_ingest_cli_rejects(
+    build_config_toml: impl FnOnce(&Path) -> Result<String, Box<dyn Error>>,
+    args: &[&str],
+    environment: &[(&str, &str)],
+    expected_error: &str,
+) -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, build_config_toml(tempdir.path())?)?;
+
+    let mut command = zinder_ingest_command();
+    command.args(["--print-config", "--config", path_str(&config_path)?]);
+    command.args(args);
+    command.envs(environment.iter().copied());
+    let output = command.output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains(expected_error), "{stderr}");
+
+    Ok(())
 }
 
 fn ingest_config_toml(storage_path: &Path) -> Result<String, Box<dyn Error>> {
