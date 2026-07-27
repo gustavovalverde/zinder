@@ -150,9 +150,9 @@ The most valuable automated check that exercises a real Zebra node.
 ### Prerequisites
 
 1. **z3 regtest sidecar** running. The default ZF z3 setup gives you:
-   - `z3_regtest_sidecar_zebra` (Zebra) listening JSON-RPC on host
-     `127.0.0.1:39232` and indexer gRPC on `127.0.0.1:39155`.
-   - Health endpoint at `127.0.0.1:38080`.
+   - `z3-regtest-zebra-1` (Zebra) listening JSON-RPC on host
+     `127.0.0.1:29232` and indexer gRPC on `127.0.0.1:39155`.
+   - Health endpoint at `127.0.0.1:28080`.
    - Mining target seed-derived address `tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx`
      (configured via `ZEBRA_MINING__MINER_ADDRESS`).
 2. **Container env contains** `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155`
@@ -166,7 +166,7 @@ The most valuable automated check that exercises a real Zebra node.
 # Zebra JSON-RPC reachable
 curl -s -u zebra:zebra -H "Content-Type: application/json" \
   -d '{"jsonrpc":"1.0","id":"1","method":"getblockchaininfo","params":[]}' \
-  http://127.0.0.1:39232 | jq '.result | {chain, blocks, bestblockhash}'
+  http://127.0.0.1:29232 | jq '.result | {chain, blocks, bestblockhash}'
 
 # Indexer gRPC reachable (and feature compiled in)
 grpcurl -plaintext 127.0.0.1:39155 list
@@ -203,7 +203,7 @@ already-running native gRPC surface under test.
 ```bash
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=zebra \
   ZINDER_NODE__AUTH__PASSWORD=zebra \
@@ -222,7 +222,7 @@ chain-event stream admission.
 ```bash
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
   ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39155 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=zebra \
@@ -482,7 +482,7 @@ Zebra rollback, current-writer replacement, and the ingest control stream.
 ```bash
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=zebra \
   ZINDER_NODE__AUTH__PASSWORD=zebra \
@@ -509,7 +509,7 @@ even when the tip happens to be in a "stable" upgrade window.
 ```bash
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=zebra \
   ZINDER_NODE__AUTH__PASSWORD=zebra \
@@ -674,7 +674,7 @@ Real Zebra, real RocksDB; reports microsecond budgets per call:
 ```bash
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=zebra \
   ZINDER_NODE__AUTH__PASSWORD=zebra \
@@ -736,7 +736,7 @@ gate on whether you actually changed trust-sensitive code.
   name = "zcash-regtest"
 
   [node]
-  json_rpc_addr = "http://127.0.0.1:39232"
+  json_rpc_addr = "http://127.0.0.1:29232"
 
   [node.auth]
   method = "basic"
@@ -764,7 +764,7 @@ gate on whether you actually changed trust-sensitive code.
   name = "zcash-regtest"
 
   [node]
-  json_rpc_addr = "http://127.0.0.1:39232"
+  json_rpc_addr = "http://127.0.0.1:29232"
 
   [node.auth]
   method = "basic"
@@ -793,7 +793,7 @@ gate on whether you actually changed trust-sensitive code.
   name = "zcash-regtest"
 
   [node]
-  json_rpc_addr = "http://127.0.0.1:39232"
+  json_rpc_addr = "http://127.0.0.1:29232"
 
   [node.auth]
   method = "basic"
@@ -823,7 +823,7 @@ gate on whether you actually changed trust-sensitive code.
   name = "zcash-regtest"
 
   [node]
-  json_rpc_addr = "http://127.0.0.1:39232"
+  json_rpc_addr = "http://127.0.0.1:29232"
 
   [node.auth]
   method = "basic"
