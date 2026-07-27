@@ -1,0 +1,6 @@
+kind: added
+body: Reserve the `postgres-horizontal` deployment topology and add an unreleased PostgreSQL canonical tracer with explicit migrations, verified TLS, and strict role and database identity admission; `rocksdb-single-host` remains the supported default.
+time: 2026-07-27T14:47:44Z
+custom:
+  Bump: minor
+  PR: "59"
