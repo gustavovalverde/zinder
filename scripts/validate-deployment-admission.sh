@@ -25,6 +25,7 @@ release_workflow=""
 build_images_workflow=""
 release_images_catalog="$repository_root/deploy/release-images.json"
 release_images_catalog_explicit=false
+release_binaries_catalog="$repository_root/deploy/release-binaries.json"
 prometheus_config=""
 verify_railway_default=false
 compose_contract=""
@@ -108,6 +109,43 @@ EOF
     cat >&2 <<'EOF'
 release admission rejected: the release image catalog must contain exactly
 ingest, projector, native query, and lightwalletd compatibility images.
+EOF
+    exit 1
+  fi
+}
+
+validate_release_binaries_catalog() {
+  [[ -r "$release_binaries_catalog" ]] || {
+    echo "release admission rejected: cannot read release binary catalog $release_binaries_catalog" >&2
+    exit 1
+  }
+
+  jq -e '
+    type == "array"
+    and length == 5
+    and all(.[]; type == "string" and test("^zinder[a-z0-9-]*$"))
+    and ([.[]] | unique | length) == length
+  ' "$release_binaries_catalog" >/dev/null || {
+    cat >&2 <<'EOF'
+release admission rejected: the release binary catalog must be a JSON array of
+five unique, safely named Zinder executables.
+EOF
+    exit 1
+  }
+
+  required_release_binaries="$({
+    printf '%s\n' \
+      zinder-ingest \
+      zinder-projector \
+      zinder-query \
+      zinder-compat-lightwalletd \
+      zinderctl
+  } | sort)"
+  configured_release_binaries="$(jq -r '.[]' "$release_binaries_catalog" | sort)"
+  if [[ "$configured_release_binaries" != "$required_release_binaries" ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: the release binary catalog must contain exactly
+the four release runtimes and the zinderctl operator tool.
 EOF
     exit 1
   fi
@@ -411,6 +449,7 @@ if [[ -n "$release_workflow" ]]; then
     exit 1
   }
   validate_release_images_catalog
+  validate_release_binaries_catalog
 
   if grep -Fq 'workflow_dispatch:' "$release_workflow"; then
     cat >&2 <<'EOF'
@@ -652,7 +691,7 @@ EOF
     sed -n 's#^COPY --from=zinder-binaries .* /bin/\([^ ]*\)$#\1#p' \
       <<< "$binary_export_stage" | sort
   )"
-  if [[ "$exported_binary_catalog" != "$configured_release_images" ]] \
+  if [[ "$exported_binary_catalog" != "$configured_release_binaries" ]] \
     || grep -Eq 'zinder-(bench|explorer|compat-cipherscan|proto-codegen)' <<< "$binary_export_stage" \
     || ! grep -Fq 'ARG RUST_VERSION=1.95.0' "$dockerfile" \
     || ! grep -Eq '^ARG RUST_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$dockerfile" \
@@ -668,8 +707,8 @@ EOF
     || ! grep -Fq 'libstdc++6' "$dockerfile"; then
     cat >&2 <<'EOF'
 release admission rejected: the Docker release-binaries target must export
-exactly the four runtime catalog binaries with the pinned reproducible GNU
-build inputs and runtime libstdc++ dependency.
+exactly the release binary catalog with the pinned reproducible GNU build
+inputs and runtime libstdc++ dependency.
 EOF
     exit 1
   fi

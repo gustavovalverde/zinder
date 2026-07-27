@@ -52,6 +52,22 @@ pub struct CanonicalOwnerCheckpointEvidence {
     pub ready_evidence: CanonicalStoreReadyEvidence,
 }
 
+/// Exact identity and resource limits used to cold-admit a restored canonical
+/// checkpoint.
+#[derive(Clone, Copy, Debug)]
+pub struct CanonicalRecoveryAdmissionConfig {
+    /// Network committed by the recovery manifest.
+    pub network: Network,
+    /// Upgrade-table fingerprint committed by the canonical build plan.
+    pub activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+    /// Immutable canonical workload.
+    pub workload: CanonicalStoreWorkload,
+    /// Immutable canonical replacement policy.
+    pub reorg_policy: super::CanonicalReorgPolicy,
+    /// Bounded `RocksDB` resources used for the cold reader.
+    pub resource_budget: RocksDbResourceBudget,
+}
+
 /// Immutable context captured by the canonical owner when it creates a
 /// physical checkpoint.
 ///
@@ -376,6 +392,45 @@ impl RocksDbCanonicalStore {
         }
         Ok(CanonicalOwnerCheckpointEvidence {
             database_identity: cold_database_identity,
+            store_identity: CANONICAL_STORE_IDENTITY,
+            schema_version: CANONICAL_STORE_SCHEMA_VERSION,
+            workload: cold_checkpoint.workload,
+            build_plan: cold_checkpoint.build_plan.clone(),
+            ready_evidence: cold_checkpoint.ready_evidence,
+        })
+    }
+
+    /// Cold-admits a restored READY canonical checkpoint without granting
+    /// mutation authority to the caller.
+    ///
+    /// The caller supplies the exact identity committed by an already admitted
+    /// recovery manifest and must compare the returned evidence, including the
+    /// physical database identity, with that manifest before restore.
+    pub fn cold_admit_recovery_checkpoint(
+        target: impl AsRef<Path>,
+        config: CanonicalRecoveryAdmissionConfig,
+    ) -> Result<CanonicalOwnerCheckpointEvidence, CanonicalStoreError> {
+        validate_resource_budget(config.resource_budget)?;
+        let target = target.as_ref();
+        let expectation = CanonicalStoreAdmissionExpectation {
+            network: config.network,
+            activations_fingerprint: config.activations_fingerprint,
+            workload: config.workload,
+            reorg_policy: config.reorg_policy,
+        };
+        let cold_checkpoint =
+            Self::open_ready_with_expectation(target, expectation, config.resource_budget)?;
+        let database_identity =
+            cold_checkpoint
+                .bounded_open
+                .db
+                .get_db_identity()
+                .map_err(|source| CanonicalStoreError::CheckpointFailed {
+                    path: target.to_path_buf(),
+                    source,
+                })?;
+        Ok(CanonicalOwnerCheckpointEvidence {
+            database_identity,
             store_identity: CANONICAL_STORE_IDENTITY,
             schema_version: CANONICAL_STORE_SCHEMA_VERSION,
             workload: cold_checkpoint.workload,

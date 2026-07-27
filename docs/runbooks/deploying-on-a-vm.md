@@ -332,6 +332,7 @@ every gate above.
 
 - [Public environment-variable contract](../architecture/public-interfaces.md#environment-variable-mapping)
 - [Initial sync](initial-sync.md)
+- [State portability](state-portability.md)
 - [Testing](testing.md)
 - [ADR-0035](../adrs/0035-canonical-storage-topologies.md)
 - [ADR-0036](../adrs/0036-gnu-linux-binary-release-bundles.md)

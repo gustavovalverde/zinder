@@ -273,7 +273,7 @@ The GitHub Release must contain `zinder.v1.descriptor.bin`, the versioned
 SPDX 2.3 JSON SBOMs, `SHA256SUMS`, and `SHA256SUMS.sigstore.json`. The API
 archive contains the exact native `.proto` source closure alongside OpenAPI and
 the descriptor. Each binary archive is rooted and contains exactly `bin/` with
-the 4 runtime executables plus
+the 4 runtime executables plus the `zinderctl` operator tool, followed by
 `BUILD-INFO.json`, `LICENSE`, `README.md`, and an internal `SHA256SUMS`. Each
 image must contain amd64 and arm64 runtime manifests, and its OCI revision
 label must equal the tag-target commit. Binary SBOMs describe the recoverable

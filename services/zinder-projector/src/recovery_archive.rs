@@ -29,7 +29,8 @@ use zinder_store::{
 use crate::state_bundle::{
     CANONICAL_CHECKPOINT_DIRECTORY_NAME, STATE_BUNDLE_MANIFEST_FILE_NAME,
     STATE_BUNDLE_MANIFEST_MAX_BYTES, StateBundleCapturePaths, StateBundleError,
-    StateBundleManifest, WALLET_CHECKPOINT_DIRECTORY_NAME,
+    StateBundleManifest, StateBundleRecoveryAdmissionConfig, WALLET_CHECKPOINT_DIRECTORY_NAME,
+    admit_completed_state_bundle_capture,
 };
 
 /// Exact outer recovery-artifact identity admitted by this release.
@@ -101,6 +102,74 @@ pub struct RecoveryArchiveManifest {
 }
 
 impl RecoveryArchiveManifest {
+    /// Decodes and validates one bounded outer manifest before payload download.
+    pub fn decode(encoded: &[u8]) -> Result<Self, RecoveryArchiveError> {
+        require_contract(
+            u64::try_from(encoded.len())
+                .is_ok_and(|length| length <= MAX_RECOVERY_ARCHIVE_MANIFEST_BYTES),
+            "recovery archive manifest exceeds the fixed byte limit",
+        )?;
+        let manifest: Self = serde_json::from_slice(encoded).map_err(|source| {
+            RecoveryArchiveError::ManifestDecode {
+                path: PathBuf::from(RECOVERY_ARCHIVE_MANIFEST_FILE_NAME),
+                source,
+            }
+        })?;
+        manifest.validate_shape()?;
+        Ok(manifest)
+    }
+
+    /// Exact artifact identity.
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Exact artifact format version.
+    #[must_use]
+    pub const fn format_version(&self) -> u16 {
+        self.format_version
+    }
+
+    /// Opaque candidate identifier.
+    #[must_use]
+    pub fn candidate_id(&self) -> &str {
+        &self.candidate_id
+    }
+
+    /// Network committed by the artifact.
+    pub fn network(&self) -> Result<Network, RecoveryArchiveError> {
+        parse_network(&self.network).ok_or_else(|| {
+            RecoveryArchiveError::contract(
+                "recovery archive network is not an exact supported spelling",
+            )
+        })
+    }
+
+    /// Number of regular payload files committed by the artifact.
+    #[must_use]
+    pub const fn payload_file_count(&self) -> u64 {
+        self.payload_file_count
+    }
+
+    /// Aggregate regular payload byte length.
+    #[must_use]
+    pub const fn payload_byte_length(&self) -> u64 {
+        self.payload_byte_length
+    }
+
+    /// Ordered aggregate payload SHA-256.
+    #[must_use]
+    pub fn payload_sha256(&self) -> &str {
+        &self.payload_sha256
+    }
+
+    /// Fixed-path payload inventory used by object-store downloaders.
+    #[must_use]
+    pub fn payload_files(&self) -> &[RecoveryArchiveFile] {
+        &self.payload_files
+    }
+
     fn from_state_bundle(
         state_bundle: &StateBundleManifest,
         state_bundle_manifest_sha256: String,
@@ -190,6 +259,12 @@ impl RecoveryArchiveManifest {
             self.payload_file_count <= MAX_RECOVERY_ARCHIVE_FILE_COUNT,
             "recovery payload file count exceeds the fixed limit",
         )?;
+        require_contract(
+            self.payload_files
+                .windows(2)
+                .all(|pair| pair[0].path < pair[1].path),
+            "recovery payload paths must be strictly sorted",
+        )?;
         let mut paths = BTreeSet::new();
         let total = self.payload_files.iter().try_fold(0_u64, |total, file| {
             file.validate()?;
@@ -227,6 +302,24 @@ pub struct RecoveryArchiveFile {
 }
 
 impl RecoveryArchiveFile {
+    /// Safe fixed-layout relative object key.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Expected object byte length.
+    #[must_use]
+    pub const fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+
+    /// Expected object SHA-256.
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
     fn validate(&self) -> Result<(), RecoveryArchiveError> {
         validate_payload_path(&self.path)?;
         require_contract(
@@ -311,6 +404,22 @@ pub fn package_recovery_archive(
     admit_recovery_archive(&archive_root, source.candidate_id(), expected_network)
 }
 
+/// Packages one complete projector capture after reconstructing its fixed-path
+/// capability below the configured staging root.
+pub fn package_completed_recovery_archive(
+    configured_archive_root: impl AsRef<Path>,
+    configured_staging_root: impl AsRef<Path>,
+    candidate_id: &str,
+    expected_network: Network,
+) -> Result<AdmittedRecoveryArchive, RecoveryArchiveError> {
+    let source = admit_completed_state_bundle_capture(
+        configured_staging_root,
+        candidate_id,
+        expected_network,
+    )?;
+    package_recovery_archive(configured_archive_root, &source, expected_network)
+}
+
 /// Reconstructs the configured-root-derived artifact path and verifies every
 /// payload byte before a later restore or serving state may use it.
 pub fn admit_recovery_archive(
@@ -343,6 +452,131 @@ pub fn admit_recovery_archive(
     )?;
     let root = fs::canonicalize(&root).map_err(|source| RecoveryArchiveError::io(&root, source))?;
     Ok(AdmittedRecoveryArchive { root, manifest })
+}
+
+/// Cold-opens both stores in an already byte-admitted archive and compares all
+/// observed evidence with its inner manifest.
+pub fn cold_admit_recovery_archive(
+    archive: &AdmittedRecoveryArchive,
+    config: StateBundleRecoveryAdmissionConfig<'_>,
+) -> Result<(), RecoveryArchiveError> {
+    let state_bundle = read_admitted_state_bundle(archive)?;
+    state_bundle.cold_admit_recovery_checkpoints(&archive.root, config)?;
+    Ok(())
+}
+
+/// Reads the inner coherent state-bundle manifest from an already byte-admitted
+/// recovery archive.
+pub fn read_admitted_state_bundle(
+    archive: &AdmittedRecoveryArchive,
+) -> Result<StateBundleManifest, RecoveryArchiveError> {
+    StateBundleManifest::read_with_additional_root_entries(
+        &archive.root,
+        archive.manifest.network()?,
+        &[RECOVERY_ARCHIVE_MANIFEST_FILE_NAME],
+    )
+    .map_err(RecoveryArchiveError::from)
+}
+
+/// Final canonical and wallet paths populated by a successful restore.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoredStatePaths {
+    canonical: PathBuf,
+    wallet: PathBuf,
+}
+
+impl RestoredStatePaths {
+    /// Restored canonical READY store path.
+    #[must_use]
+    pub fn canonical(&self) -> &Path {
+        &self.canonical
+    }
+
+    /// Restored wallet READY store path.
+    #[must_use]
+    pub fn wallet(&self) -> &Path {
+        &self.wallet
+    }
+}
+
+/// Cold-admits an archive, copies both checkpoints into fresh sibling staging
+/// paths, and renames the completed copies into absent deployment paths.
+///
+/// Services must be stopped while restore owns the archive and destination
+/// parents. Materialized views and mempool state are intentionally absent and
+/// rebuild after the restored stores start.
+pub fn restore_recovery_archive(
+    archive: &AdmittedRecoveryArchive,
+    canonical_target: impl AsRef<Path>,
+    wallet_target: impl AsRef<Path>,
+    config: StateBundleRecoveryAdmissionConfig<'_>,
+) -> Result<RestoredStatePaths, RecoveryArchiveError> {
+    cold_admit_recovery_archive(archive, config)?;
+    let canonical_target =
+        resolve_absent_target(canonical_target.as_ref(), "canonical restore target")?;
+    let wallet_target = resolve_absent_target(wallet_target.as_ref(), "wallet restore target")?;
+    require_contract(
+        canonical_target != wallet_target,
+        "canonical and wallet restore targets must differ",
+    )?;
+    let canonical_staging = restore_staging_path(
+        &canonical_target,
+        archive.candidate_id(),
+        "canonical restore staging",
+    )?;
+    let wallet_staging = restore_staging_path(
+        &wallet_target,
+        archive.candidate_id(),
+        "wallet restore staging",
+    )?;
+    require_contract(
+        canonical_staging != wallet_staging,
+        "canonical and wallet restore staging paths must differ",
+    )?;
+
+    let mut budget = PayloadBudget::default();
+    copy_directory(
+        &archive.root.join(CANONICAL_CHECKPOINT_DIRECTORY_NAME),
+        &canonical_staging,
+        Path::new(CANONICAL_CHECKPOINT_DIRECTORY_NAME),
+        &mut budget,
+    )?;
+    copy_directory(
+        &archive.root.join(WALLET_CHECKPOINT_DIRECTORY_NAME),
+        &wallet_staging,
+        Path::new(WALLET_CHECKPOINT_DIRECTORY_NAME),
+        &mut budget,
+    )?;
+    budget
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    let expected_checkpoint_files = archive
+        .manifest
+        .payload_files
+        .iter()
+        .filter(|file| {
+            file.path
+                .starts_with(&format!("{CANONICAL_CHECKPOINT_DIRECTORY_NAME}/"))
+                || file
+                    .path
+                    .starts_with(&format!("{WALLET_CHECKPOINT_DIRECTORY_NAME}/"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    require_contract(
+        budget.files == expected_checkpoint_files,
+        "restored checkpoint bytes do not match the admitted recovery archive",
+    )?;
+    fs::rename(&canonical_staging, &canonical_target)
+        .map_err(|source| RecoveryArchiveError::io(&canonical_target, source))?;
+    sync_parent_directory(&canonical_target)?;
+    fs::rename(&wallet_staging, &wallet_target)
+        .map_err(|source| RecoveryArchiveError::io(&wallet_target, source))?;
+    sync_parent_directory(&wallet_target)?;
+    Ok(RestoredStatePaths {
+        canonical: canonical_target,
+        wallet: wallet_target,
+    })
 }
 
 fn admit_recovery_archive_outer(
@@ -869,6 +1103,52 @@ fn resolve_existing_directory(
     Ok(resolved)
 }
 
+fn resolve_absent_target(
+    path: &Path,
+    purpose: &'static str,
+) -> Result<PathBuf, RecoveryArchiveError> {
+    validate_absolute_lexical_path(path, purpose)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| RecoveryArchiveError::UnsafePath {
+            path: path.to_path_buf(),
+            purpose,
+            reason: "path must end in a normal file name",
+        })?;
+    validate_component_name(&name.to_os_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| RecoveryArchiveError::UnsafePath {
+            path: path.to_path_buf(),
+            purpose,
+            reason: "path must have an existing parent directory",
+        })?;
+    let parent = resolve_existing_directory(parent, purpose)?;
+    let resolved = parent.join(name);
+    require_absent(&resolved, purpose)?;
+    Ok(resolved)
+}
+
+fn restore_staging_path(
+    target: &Path,
+    candidate_id: &str,
+    purpose: &'static str,
+) -> Result<PathBuf, RecoveryArchiveError> {
+    let name = target
+        .file_name()
+        .ok_or_else(|| RecoveryArchiveError::UnsafePath {
+            path: target.to_path_buf(),
+            purpose,
+            reason: "restore target must end in a normal file name",
+        })?;
+    let mut staging_name = OsString::from(".");
+    staging_name.push(name);
+    staging_name.push(format!(".zinder-restore-{candidate_id}.incomplete"));
+    let staging = target.with_file_name(staging_name);
+    require_absent(&staging, purpose)?;
+    Ok(staging)
+}
+
 fn validate_absolute_lexical_path(
     path: &Path,
     purpose: &'static str,
@@ -1124,6 +1404,13 @@ fn sync_directory(path: &Path) -> Result<(), RecoveryArchiveError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| RecoveryArchiveError::io(path, source))
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), RecoveryArchiveError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| RecoveryArchiveError::contract("restored path has no parent directory"))?;
+    sync_directory(parent)
 }
 
 fn read_bounded_regular_file(

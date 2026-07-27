@@ -56,7 +56,10 @@ pub use publication::{
     ValidatedRocksDbCanonicalBuild,
 };
 pub use rocksdb::RocksDbCanonicalStore;
-pub use rocksdb::{CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence};
+pub use rocksdb::{
+    CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence,
+    CanonicalRecoveryAdmissionConfig,
+};
 pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary};
 pub use subtree_load::{CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence};
 

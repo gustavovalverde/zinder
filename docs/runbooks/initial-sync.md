@@ -8,6 +8,9 @@ process-local secondary readers form a wallet-serving pair.
 
 There is no in-place migration from an incompatible store identity or schema.
 Use empty target paths or a certified coherent restore bundle.
+Use the [state-portability runbook](state-portability.md) to restore an
+exact-schema bundle or rebuild the current schema from a logical source
+archive.
 
 ## Prerequisites
 

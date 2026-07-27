@@ -22,11 +22,13 @@ Every stable or prerelease tag produces two GNU/Linux archives:
 - `x86_64-v3-unknown-linux-gnu`, built for the x86-64-v3 CPU baseline; and
 - `aarch64-unknown-linux-gnu`, built for the Armv8-A baseline.
 
-Each archive contains exactly the four runtime catalog executables from
-`deploy/release-images.json`: ingest, projector, native query, and lightwalletd
-compatibility. Benchmark, explorer, Cipherscan, and code-generation binaries
-are excluded. The archive root also contains `BUILD-INFO.json`, `LICENSE`,
-`README.md`, and an internal `SHA256SUMS`.
+Each archive contains the exact catalog from `deploy/release-binaries.json`:
+the four release runtimes plus the `zinderctl` state-portability operator
+tool. The runtime image catalog remains independently defined by
+`deploy/release-images.json`; `zinderctl` is not a daemon or an image.
+Benchmark, explorer, Cipherscan, and code-generation binaries are excluded.
+The archive root also contains `BUILD-INFO.json`, `LICENSE`, `README.md`, and
+an internal `SHA256SUMS`.
 
 The release build uses Rust 1.95.0, explicit GNU target triples, an embedded
 full commit, `SOURCE_DATE_EPOCH`, disabled Cargo incremental state, and remapped
@@ -45,8 +47,8 @@ epoch, and every binary hash and size.
 
 ## Consequences
 
-- Operators can install the same four-process topology without extracting a
-  container image.
+- Operators can install the same four-process topology and its state
+  portability tool without extracting a container image.
 - x86 hosts must support x86-64-v3; the filename makes that requirement
   visible before execution.
 - Binary release failure blocks crates.io authentication and every image

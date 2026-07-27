@@ -20,13 +20,16 @@ use thiserror::Error;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestVersion, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
-    Network,
+    Network, NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
+    ShieldedProtocol,
     wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name},
 };
 use zinder_proto::v1::ingest::{CanonicalWriterFence, CreateCanonicalOwnerCheckpointResponse};
 use zinder_store::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CANONICAL_STORE_IDENTITY,
-    CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreWorkload, RocksDbResourceBudget,
+    CANONICAL_STORE_SCHEMA_VERSION, CanonicalOwnerCheckpointEvidence,
+    CanonicalRecoveryAdmissionConfig, CanonicalReorgPolicy, CanonicalStoreWorkload,
+    RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_STORE_IDENTITY, WalletCanonicalSourceIdentity,
@@ -34,6 +37,7 @@ use zinder_wallet_projection::{
 };
 use zinder_wallet_rocksdb::{
     RocksDbWalletFollowingStore, WALLET_ROCKSDB_SCHEMA_VERSION, WalletOwnerCheckpointEvidence,
+    WalletRecoveryAdmissionConfig,
 };
 
 /// Exact bundle identity admitted by this release.
@@ -52,6 +56,15 @@ pub const STATE_BUNDLE_MANIFEST_FILE_NAME: &str = "state-bundle.json";
 pub const STATE_BUNDLE_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 
 const MANIFEST_TEMPORARY_FILE_NAME: &str = ".state-bundle.json.incomplete";
+
+/// Bounded resources for cold-admitting both checkpoints in a recovery bundle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StateBundleRecoveryAdmissionConfig<'staging> {
+    /// Canonical checkpoint `RocksDB` budget.
+    pub canonical_resource_budget: RocksDbResourceBudget,
+    /// Wallet checkpoint validation and temporary-storage budget.
+    pub wallet: WalletRecoveryAdmissionConfig<'staging>,
+}
 
 /// Fixed paths in one unpublished state-bundle capture directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,6 +213,24 @@ impl StateBundleFence {
     pub const fn visible_tip_height(&self) -> u32 {
         self.visible_tip.height
     }
+
+    /// Visible canonical tip hash in internal byte order.
+    #[must_use]
+    pub fn visible_tip_hash(&self) -> &str {
+        &self.visible_tip.hash
+    }
+
+    /// Ordered visible canonical-fact sequence digest.
+    #[must_use]
+    pub fn sequence_digest_sha256(&self) -> &str {
+        &self.sequence_digest.sha256
+    }
+
+    /// Number of visible blocks committed by the ordered sequence digest.
+    #[must_use]
+    pub const fn visible_block_count(&self) -> u64 {
+        self.sequence_digest.block_count
+    }
 }
 
 /// Validated state-bundle manifest.
@@ -329,6 +360,18 @@ impl StateBundleManifest {
         &self.canonical_checkpoint.database_identity_sha256
     }
 
+    /// Physical canonical schema that produced the checkpoint.
+    #[must_use]
+    pub const fn canonical_schema_version(&self) -> u16 {
+        self.canonical_checkpoint.schema_version
+    }
+
+    /// First canonical block retained by this checkpoint.
+    #[must_use]
+    pub const fn canonical_first_retained_height(&self) -> u32 {
+        self.canonical_checkpoint.first_retained_block.height
+    }
+
     /// Exact construction-manifest version bound by the canonical READY proof.
     #[must_use]
     pub const fn canonical_construction_manifest_version(&self) -> u16 {
@@ -345,6 +388,65 @@ impl StateBundleManifest {
     #[must_use]
     pub fn wallet_checkpoint_database_identity_sha256(&self) -> &str {
         &self.wallet_checkpoint.database_identity_sha256
+    }
+
+    /// Cold-opens both checkpoints, validates their complete READY evidence,
+    /// and compares the observed identities with this manifest.
+    ///
+    /// The bundle root and validation staging directory must remain under
+    /// exclusive operator ownership for the duration of the call.
+    pub fn cold_admit_recovery_checkpoints(
+        &self,
+        root: impl AsRef<Path>,
+        config: StateBundleRecoveryAdmissionConfig<'_>,
+    ) -> Result<(), StateBundleError> {
+        let root = resolve_existing_directory(root.as_ref(), "state-bundle root")?;
+        let network = self.network()?;
+        let fingerprint_version = NetworkUpgradeActivationsFingerprintVersion::try_from(
+            self.canonical_checkpoint
+                .build_plan
+                .activation_fingerprint_version,
+        )
+        .map_err(|source| StateBundleError::manifest_contract(source.to_string()))?;
+        let activation_fingerprint = NetworkUpgradeActivationsFingerprint::from_bytes(
+            fingerprint_version,
+            decode_lower_hex_32(
+                &self.canonical_checkpoint.build_plan.activation_fingerprint,
+                "canonical activation fingerprint",
+            )?,
+        );
+        let reorg_policy =
+            CanonicalReorgPolicy::new(self.canonical_checkpoint.build_plan.reorg_window_blocks)
+                .map_err(|source| StateBundleError::manifest_contract(source.to_string()))?;
+        let canonical = RocksDbCanonicalStore::cold_admit_recovery_checkpoint(
+            root.join(CANONICAL_CHECKPOINT_DIRECTORY_NAME),
+            CanonicalRecoveryAdmissionConfig {
+                network,
+                activations_fingerprint: activation_fingerprint,
+                workload: CanonicalStoreWorkload::Wallet,
+                reorg_policy,
+                resource_budget: config.canonical_resource_budget,
+            },
+        )
+        .map_err(|source| StateBundleError::CanonicalRecoveryAdmission { source })?;
+        let canonical = CanonicalAdmission::from(&canonical);
+        require_manifest_value(
+            CanonicalCheckpointManifest::from_admitted(&canonical) == self.canonical_checkpoint,
+            "cold-admitted canonical checkpoint evidence does not match the manifest",
+        )?;
+
+        let wallet = RocksDbWalletFollowingStore::cold_admit_recovery_checkpoint(
+            root.join(WALLET_CHECKPOINT_DIRECTORY_NAME),
+            network,
+            config.wallet,
+        )
+        .map_err(|source| StateBundleError::WalletRecoveryAdmission { source })?;
+        let wallet = WalletAdmission::try_from(&wallet)?;
+        require_manifest_value(
+            WalletCheckpointManifest::from_admitted(&wallet)? == self.wallet_checkpoint,
+            "cold-admitted wallet checkpoint evidence does not match the manifest",
+        )?;
+        validate_exact_fence(&canonical, &wallet)
     }
 
     fn from_admitted(
@@ -421,6 +523,30 @@ pub fn prepare_state_bundle_capture(
         }
         Err(source) => Err(StateBundleError::io(&paths.root, source)),
     }
+}
+
+/// Reconstructs the fixed-path capability for one already complete capture.
+///
+/// This is the handoff used by a separate operator process after the projector
+/// publishes the manifest. The configured root and candidate are revalidated;
+/// callers cannot use it to package arbitrary filesystem paths.
+pub fn admit_completed_state_bundle_capture(
+    configured_staging_root: impl AsRef<Path>,
+    candidate_id: &str,
+    expected_network: Network,
+) -> Result<StateBundleCapturePaths, StateBundleError> {
+    validate_candidate_id(candidate_id)?;
+    let staging_root = resolve_existing_directory(
+        configured_staging_root.as_ref(),
+        "configured state-bundle staging root",
+    )?;
+    let paths = StateBundleCapturePaths::for_candidate(&staging_root, candidate_id.to_owned());
+    let manifest = StateBundleManifest::read(&paths.root, expected_network)?;
+    require_manifest_value(
+        manifest.candidate_id() == candidate_id,
+        "state-bundle candidate does not match its manifest",
+    )?;
+    Ok(paths)
 }
 
 /// Creates the wallet checkpoint and publishes a coherent manifest last.
@@ -525,6 +651,20 @@ pub enum StateBundleError {
         #[source]
         source: zinder_wallet_rocksdb::RocksDbWalletError,
     },
+    /// A restored canonical checkpoint failed exact cold admission.
+    #[error("canonical recovery checkpoint admission failed: {source}")]
+    CanonicalRecoveryAdmission {
+        /// Concrete canonical checkpoint failure.
+        #[source]
+        source: zinder_store::CanonicalStoreError,
+    },
+    /// A restored wallet checkpoint failed exact cold admission.
+    #[error("wallet recovery checkpoint admission failed: {source}")]
+    WalletRecoveryAdmission {
+        /// Concrete wallet checkpoint failure.
+        #[source]
+        source: zinder_wallet_rocksdb::RocksDbWalletError,
+    },
     /// Filesystem operation failed.
     #[error("state-bundle filesystem operation failed at {path}: {source}")]
     Io {
@@ -599,6 +739,80 @@ struct CanonicalHistoryPredecessorAdmission {
 struct CanonicalFrontierAdmission {
     final_root: [u8; 32],
     final_state: Vec<u8>,
+}
+
+impl From<&CanonicalOwnerCheckpointEvidence> for CanonicalAdmission {
+    fn from(evidence: &CanonicalOwnerCheckpointEvidence) -> Self {
+        let ready = evidence.ready_evidence;
+        let sequence_checkpoint = ready.sequence_checkpoint;
+        Self {
+            database_identity_sha256: sha256_hex(&evidence.database_identity),
+            construction_manifest_version: ready.construction_manifest_version,
+            construction_manifest_sha256: ready.construction_manifest_sha256,
+            store_identity: evidence.store_identity.to_owned(),
+            schema_version: evidence.schema_version,
+            network: evidence.build_plan.network(),
+            workload: evidence.workload,
+            build_plan: CanonicalBuildPlanAdmission::from(evidence.build_plan.clone()),
+            first_retained_block: ready.first_retained_block,
+            visible_tip: ready.visible_tip,
+            visible_epoch: ready.visible_epoch.value(),
+            visible_event_sequence: ready.visible_event_sequence,
+            visible_block_count: ready.visible_block_count,
+            block_digest_version: ready.block_digest_version.value(),
+            replay_format_version: ready.replay_format_version.value(),
+            visible_sequence_digest:
+                CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                    ready.sequence_digest_version,
+                    ready.visible_block_count,
+                    ready.visible_sequence_digest,
+                ),
+            visible_logical_replay_bytes: ready.visible_logical_replay_bytes,
+            settled_tip: sequence_checkpoint.through(),
+            settled_retained_block_count: sequence_checkpoint.retained_block_count(),
+            settled_sequence_digest: sequence_checkpoint.sequence_digest(),
+            settled_logical_replay_bytes: sequence_checkpoint.logical_replay_bytes(),
+        }
+    }
+}
+
+impl From<zinder_store::CanonicalStoreBuildPlan> for CanonicalBuildPlanAdmission {
+    fn from(build_plan: zinder_store::CanonicalStoreBuildPlan) -> Self {
+        let fingerprint = build_plan.network_upgrade_activations_fingerprint();
+        let predecessor = build_plan.history_predecessor();
+        Self {
+            activation_fingerprint_version: fingerprint.version().value(),
+            activation_fingerprint: fingerprint.as_bytes(),
+            reorg_window_blocks: build_plan.reorg_policy().reorg_window_blocks(),
+            history_preceding_checkpoint: build_plan.history_bounds().preceding_checkpoint(),
+            history_predecessor: CanonicalHistoryPredecessorAdmission {
+                block_id: predecessor.block_id,
+                block_time_seconds: predecessor.block_time_seconds,
+                sapling_frontier: predecessor
+                    .frontiers
+                    .get(ShieldedProtocol::Sapling)
+                    .map(CanonicalFrontierAdmission::from),
+                orchard_frontier: predecessor
+                    .frontiers
+                    .get(ShieldedProtocol::Orchard)
+                    .map(CanonicalFrontierAdmission::from),
+                ironwood_frontier: predecessor
+                    .frontiers
+                    .get(ShieldedProtocol::Ironwood)
+                    .map(CanonicalFrontierAdmission::from),
+            },
+            build_tip: build_plan.build_tip(),
+        }
+    }
+}
+
+impl From<&zinder_core::CommitmentTreeFrontier> for CanonicalFrontierAdmission {
+    fn from(frontier: &zinder_core::CommitmentTreeFrontier) -> Self {
+        Self {
+            final_root: frontier.final_root().as_bytes(),
+            final_state: frontier.final_state_bytes().to_vec(),
+        }
+    }
 }
 
 struct DecodedCanonicalCheckpointResponse {
@@ -1977,6 +2191,10 @@ fn validate_event_cursor(cursor: &str, event_sequence: u64) -> Result<(), StateB
 }
 
 fn validate_lower_hex_32(encoded_hex: &str, field: &str) -> Result<(), StateBundleError> {
+    decode_lower_hex_32(encoded_hex, field).map(|_| ())
+}
+
+fn decode_lower_hex_32(encoded_hex: &str, field: &str) -> Result<[u8; 32], StateBundleError> {
     let mut bytes = [0_u8; 32];
     hex::decode_to_slice(encoded_hex, &mut bytes).map_err(|_| {
         StateBundleError::manifest_contract(format!("{field} must be exactly 32-byte hexadecimal"))
@@ -1984,7 +2202,8 @@ fn validate_lower_hex_32(encoded_hex: &str, field: &str) -> Result<(), StateBund
     require_manifest_value(
         hex::encode(bytes) == encoded_hex,
         format!("{field} must use canonical lowercase hexadecimal"),
-    )
+    )?;
+    Ok(bytes)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

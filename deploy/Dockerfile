@@ -74,6 +74,7 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
         --bin zinder-projector \
         --bin zinder-query \
         --bin zinder-compat-lightwalletd \
+        --bin zinderctl \
         --bin zinder-explorer \
         --bin zinder-bench \
     && mkdir -p /zinder-binaries \
@@ -81,6 +82,7 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
     && cp "/workspace/target/${rust_target}/release/zinder-projector" /zinder-binaries/zinder-projector \
     && cp "/workspace/target/${rust_target}/release/zinder-query" /zinder-binaries/zinder-query \
     && cp "/workspace/target/${rust_target}/release/zinder-compat-lightwalletd" /zinder-binaries/zinder-compat-lightwalletd \
+    && cp "/workspace/target/${rust_target}/release/zinderctl" /zinder-binaries/zinderctl \
     && cp "/workspace/target/${rust_target}/release/zinder-explorer" /zinder-binaries/zinder-explorer \
     && cp "/workspace/target/${rust_target}/release/zinder-bench" /zinder-binaries/zinder-bench
 
@@ -90,6 +92,7 @@ COPY --from=zinder-binaries /zinder-binaries/zinder-ingest /bin/zinder-ingest
 COPY --from=zinder-binaries /zinder-binaries/zinder-projector /bin/zinder-projector
 COPY --from=zinder-binaries /zinder-binaries/zinder-query /bin/zinder-query
 COPY --from=zinder-binaries /zinder-binaries/zinder-compat-lightwalletd /bin/zinder-compat-lightwalletd
+COPY --from=zinder-binaries /zinder-binaries/zinderctl /bin/zinderctl
 
 FROM zinder-build-base AS zinder-ingest-live-test-binary
 

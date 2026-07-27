@@ -51,11 +51,11 @@ case "$rust_target" in
     ;;
 esac
 
-mapfile -t runtime_binaries < <(jq -r '.[]' "$repository_root/deploy/release-images.json")
+mapfile -t runtime_binaries < <(jq -r '.[]' "$repository_root/deploy/release-binaries.json")
 expected_catalog="$(printf '%s\n' "${runtime_binaries[@]}" | LC_ALL=C sort)"
 actual_catalog="$(find "$binaries_directory" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
 [[ "$actual_catalog" == "$expected_catalog" ]] || {
-  echo >&2 "release binary input differs from deploy/release-images.json"
+  echo >&2 "release binary input differs from deploy/release-binaries.json"
   diff -u <(printf '%s\n' "$expected_catalog") <(printf '%s\n' "$actual_catalog") || true
   exit 1
 }

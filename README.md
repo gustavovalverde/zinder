@@ -25,13 +25,14 @@ compatibility protocols over immutable exact-fence pairs. Explorer and mixed
 single-container images are not built or published by the release workflow.
 
 Tagged releases also provide checksum-bound GNU/Linux bundles containing these
-same 4 executables for `x86_64-v3` and AArch64 hosts. The x86 archive
-requires an x86-64-v3 CPU; both archives require glibc 2.34 or newer and
-dynamic `libstdc++.so.6` with `GLIBCXX_3.4.30`, with Debian 12 Bookworm as the
-certified runtime baseline. Each archive is accompanied by an SPDX 2.3 SBOM
-and signed SLSA provenance. Multi-platform GHCR images carry child SBOM
-attestations, root provenance, and a keyless root signature; the immutable
-GitHub Release binds all downloadable assets. See the
+four executables plus the `zinderctl` state-portability tool for `x86_64-v3`
+and AArch64 hosts. The x86 archive requires an x86-64-v3 CPU; both archives
+require glibc 2.34 or newer and dynamic `libstdc++.so.6` with
+`GLIBCXX_3.4.30`, with Debian 12 Bookworm as the certified runtime baseline.
+Each archive is accompanied by an SPDX 2.3 SBOM and signed SLSA provenance.
+Multi-platform GHCR images carry child SBOM attestations, root provenance, and
+a keyless root signature; the immutable GitHub Release binds all downloadable
+assets. See the
 [VM deployment runbook](docs/runbooks/deploying-on-a-vm.md) for native
 installation and runtime ownership requirements.
 
@@ -80,8 +81,10 @@ not by itself production certification. The acceptance boundaries live in the
 [service operations](docs/architecture/service-operations.md#recovery).
 
 For phase behavior and recovery, see
-[Initial sync](docs/runbooks/initial-sync.md). For the storage and publication
-lifecycle, see
+[Initial sync](docs/runbooks/initial-sync.md). To seed a deployment from a
+verified snapshot or rebuild state across schemas, see
+[State portability](docs/runbooks/state-portability.md). For the storage and
+publication lifecycle, see
 [ADR-0035](docs/adrs/0035-canonical-storage-topologies.md).
 
 ## Further reading

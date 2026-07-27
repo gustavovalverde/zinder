@@ -32,7 +32,7 @@ rocksdb_version="$(awk '
 mkdir -p "$scratch/bin"
 while IFS= read -r binary_name; do
   cp /bin/true "$scratch/bin/$binary_name"
-done < <(jq -r '.[]' "$repository_root/deploy/release-images.json")
+done < <(jq -r '.[]' "$repository_root/deploy/release-binaries.json")
 
 archive_directory="$scratch/archive"
 "$repository_root/scripts/build-release-binary-archive.sh" \
