@@ -99,7 +99,23 @@ PostgreSQL support in `zinder-bench` is a diagnostic persistence arm for the
 same canonical replay corpus and digest oracle. It does not provide the
 runtime ownership, wallet projection, wallet-serving admission, replication,
 recovery, or operational contracts required for a deployable topology. Zinder
-therefore does not advertise a PostgreSQL deployment mode.
+therefore does not advertise that benchmark path as a deployment mode.
+
+`postgres-horizontal` is reserved in the deployment-topology catalog while a
+second production option is built and certified. Its first unreleased tracer
+adds a separate `zinder-migrate` schema authority and lets a feature-gated
+`zinder-ingest` process commit one real Zebra canonical append through
+PostgreSQL, exit, and have a fresh process verify the durable identity and tip.
+The tracer requires a pre-provisioned least-privilege writer role, verified TLS
+outside an explicit loopback-only test posture, a database identity bound to one
+network, and strict rejection of RocksDB configuration.
+
+The tracer is not a supported deployment topology. It does not yet implement
+canonical construction or following, reorg replacement, durable mempool state,
+writer takeover, wallet projection, serving admission, native or compatibility
+queries, connection pooling, backup and recovery, release artifacts, or
+production certification. Those boundaries must be completed end to end before
+`postgres-horizontal` can become an operator-facing production choice.
 
 ### Recovery boundary
 
@@ -119,6 +135,8 @@ not prove this contract.
   sockets or individually healthy stores.
 - A second storage engine requires a complete topology implementation, not a
   generic database adapter or a successful persistence microbenchmark.
+- Reserving `postgres-horizontal` gives implementation and test artifacts one
+  stable identity without implying that an incomplete tracer is deployable.
 - Operators must place the supported primary stores on one host filesystem and
   preserve separate secondary metadata paths per reader process.
 

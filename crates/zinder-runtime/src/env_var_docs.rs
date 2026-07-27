@@ -409,6 +409,45 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       root binding to canonical control, never a path.",
     },
     EnvVarDoc {
+        name: "ZINDER_DEPLOYMENT__TOPOLOGY",
+        toml_path: "deployment.topology",
+        used_by: &["zinder-ingest", "zinder-migrate"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Deployment shape: `rocksdb-single-host` (the supported default) or \
+                      `postgres-horizontal` (an unreleased certification tracer). \
+                      `zinder-migrate` accepts only the latter and requires it explicitly.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__POSTGRES__DATABASE_URL_PATH",
+        toml_path: "storage.postgres.database_url_path",
+        used_by: &["zinder-ingest", "zinder-migrate"],
+        requirement: Requirement::ConditionalOn("ZINDER_DEPLOYMENT__TOPOLOGY=postgres-horizontal"),
+        sensitive: true,
+        description: "Path to a secret file containing the PostgreSQL connection URI. The \
+                      migration and writer processes use separately provisioned roles. The path \
+                      and file contents are redacted from printed configuration and logs.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__POSTGRES__TLS",
+        toml_path: "storage.postgres.tls",
+        used_by: &["zinder-ingest", "zinder-migrate"],
+        requirement: Requirement::ConditionalOn("ZINDER_DEPLOYMENT__TOPOLOGY=postgres-horizontal"),
+        sensitive: false,
+        description: "PostgreSQL transport posture: `verify-full` for certificate and hostname \
+                      verification, or `loopback-plaintext` only when every configured host and \
+                      host address is loopback-local.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__POSTGRES__TLS_ROOT_CERTIFICATE_PATH",
+        toml_path: "storage.postgres.tls_root_certificate_path",
+        used_by: &["zinder-ingest", "zinder-migrate"],
+        requirement: Requirement::ConditionalOn("ZINDER_STORAGE__POSTGRES__TLS=verify-full"),
+        sensitive: false,
+        description: "Path to the PEM trust root used for PostgreSQL certificate-chain and \
+                      hostname verification. Rejected with `loopback-plaintext`.",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__PATH",
         toml_path: "storage.path",
         used_by: &[

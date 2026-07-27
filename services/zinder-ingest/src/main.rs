@@ -10,6 +10,8 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
+#[cfg(feature = "postgres-topology")]
+use zinder_ingest::prepare_canonical_block;
 use zinder_ingest::{
     CanonicalCheckpointStagingRoot, CanonicalConstructionConfig, CanonicalControlCommand,
     CanonicalControlGrpcAdapter, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
@@ -28,9 +30,9 @@ use zinder_ingest::{
 };
 use zinder_materialized_views::MaterializedViewPreset;
 use zinder_runtime::{
-    OpsEndpointHandle, Readiness, ReadinessState, RuntimeService, StartupPhase,
-    cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
-    spawn_ops_endpoint_for,
+    OpsEndpointHandle, PostgresStorageConfig, Readiness, ReadinessState, RuntimeService,
+    StartupPhase, cancel_on_terminating_signal, host_cpu_meets_compiled_baseline,
+    install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, NodeCapabilities,
@@ -232,46 +234,108 @@ async fn run_probe(
     let runtime_config = command_config.runtime_config;
     let source =
         zebra_json_rpc_source_for_target(runtime_config.node_source, &runtime_config.node)?;
-    let activations = source
-        .discover_network_upgrade_activations("zinder-ingest-probe")
-        .await
-        .map_err(IngestError::from)?;
     let upstream_tip = source
         .tip_id()
         .await
         .map_err(IngestError::from)?
         .height
         .value();
-    let store = zinder_store::RocksDbCanonicalStore::open_ready(
-        &runtime_config.storage_path,
-        &activations,
-        zinder_store::CanonicalStoreWorkload::Wallet,
-        zinder_store::CanonicalReorgPolicy::new(runtime_config.reorg_window_blocks)
-            .map_err(zinder_ingest::CanonicalWriterError::from)?,
-        runtime_config.canonical_rocksdb_budget,
-    )
-    .map_err(zinder_ingest::CanonicalWriterError::from)
-    .map_err(IngestConfigError::from)?;
-    let store_tip_height = store.event_fence().visible_tip().height.value();
-    let store_tip = Some(store_tip_height);
-    let phase = classify_phase(
-        store_tip,
-        upstream_tip,
-        runtime_config.phase_classification.catchup_threshold_blocks,
-    );
-    let gap_blocks = i64::from(upstream_tip).saturating_sub(i64::from(store_tip_height));
-    let upstream_health = match source.poll_upstream_health().await {
-        Ok(snapshot) => format!("{}/{}", snapshot.source, snapshot.reason),
-        Err(error) => format!("unavailable ({error})"),
-    };
+    match &runtime_config.storage {
+        zinder_ingest::IngestStorageConfig::RocksDbSingleHost {
+            storage_path,
+            canonical_rocksdb_budget,
+            ..
+        } => {
+            let activations = source
+                .discover_network_upgrade_activations("zinder-ingest-probe")
+                .await
+                .map_err(IngestError::from)?;
+            let store = zinder_store::RocksDbCanonicalStore::open_ready(
+                storage_path,
+                &activations,
+                zinder_store::CanonicalStoreWorkload::Wallet,
+                zinder_store::CanonicalReorgPolicy::new(runtime_config.reorg_window_blocks)
+                    .map_err(zinder_ingest::CanonicalWriterError::from)?,
+                *canonical_rocksdb_budget,
+            )
+            .map_err(zinder_ingest::CanonicalWriterError::from)
+            .map_err(IngestConfigError::from)?;
+            let store_tip_height = store.event_fence().visible_tip().height.value();
+            let store_tip = Some(store_tip_height);
+            let phase = classify_phase(
+                store_tip,
+                upstream_tip,
+                runtime_config.phase_classification.catchup_threshold_blocks,
+            );
+            let gap_blocks = i64::from(upstream_tip).saturating_sub(i64::from(store_tip_height));
+            let upstream_health = match source.poll_upstream_health().await {
+                Ok(snapshot) => format!("{}/{}", snapshot.source, snapshot.reason),
+                Err(error) => format!("unavailable ({error})"),
+            };
 
-    println!(
-        "{{\"store_tip\": {store_tip:?}, \"upstream_tip\": {upstream_tip}, \
-         \"gap_blocks\": {gap_blocks}, \"phase_that_would_run\": \"{phase}\", \
-         \"upstream_health\": \"{upstream_health}\"}}",
-        phase = phase.wire_label(),
-    );
+            println!(
+                "{{\"store_tip\": {store_tip:?}, \"upstream_tip\": {upstream_tip}, \
+                 \"gap_blocks\": {gap_blocks}, \"phase_that_would_run\": \"{phase}\", \
+                 \"upstream_health\": \"{upstream_health}\"}}",
+                phase = phase.wire_label(),
+            );
+            Ok(())
+        }
+        zinder_ingest::IngestStorageConfig::PostgresHorizontal(postgres) => {
+            run_postgres_probe(&runtime_config, postgres.clone(), upstream_tip).await
+        }
+    }
+}
+
+#[cfg(feature = "postgres-topology")]
+#[allow(
+    clippy::print_stdout,
+    reason = "probe is a CLI diagnostic; the structured snapshot is what operators read."
+)]
+async fn run_postgres_probe(
+    runtime_config: &zinder_ingest::IngestRuntimeConfig,
+    postgres: PostgresStorageConfig,
+    upstream_tip: u32,
+) -> Result<(), IngestConfigError> {
+    let database_config = postgres_database_config(runtime_config, postgres);
+    let store = zinder_postgres::CanonicalStore::open(&database_config).await?;
+    let database_state = store.database_state().clone();
+    let canonical_state = store.state().await?.ok_or_else(|| {
+        zinder_runtime::ConfigError::invalid(
+            "PostgreSQL canonical state is absent; run bounded ingest before probe",
+        )
+    })?;
+    store.close().await?;
+    let visible_tip = canonical_state.visible_tip();
+    let response = serde_json::json!({
+        "deployment_topology": database_state.deployment_topology().as_str(),
+        "network": encode_zinder_native_chain_name(database_state.network()),
+        "canonical": {
+            "schema": "canonical",
+            "schema_version": database_state.schema_version(),
+            "visible_epoch_id": canonical_state.visible_epoch_id(),
+            "event_sequence": canonical_state.event_sequence(),
+            "visible_tip": {
+                "height": visible_tip.height.value(),
+                "block_hash": zinder_core::wire::encode_rpc_block_hash_hex(visible_tip.hash),
+            }
+        },
+        "upstream_tip": upstream_tip,
+    });
+    println!("{response}");
     Ok(())
+}
+
+#[cfg(not(feature = "postgres-topology"))]
+fn run_postgres_probe(
+    _runtime_config: &zinder_ingest::IngestRuntimeConfig,
+    _postgres: PostgresStorageConfig,
+    _upstream_tip: u32,
+) -> impl std::future::Future<Output = Result<(), IngestConfigError>> {
+    std::future::ready(Err(zinder_runtime::ConfigError::invalid(
+        "deployment.topology = \"postgres-horizontal\" requires the postgres-topology build feature",
+    )
+    .into()))
 }
 
 #[expect(
@@ -312,6 +376,21 @@ async fn run_ingest(
         .map_err(IngestError::from)?;
     check_schema_phase.complete();
 
+    if let zinder_ingest::IngestStorageConfig::PostgresHorizontal(postgres) =
+        &command_config.runtime_config.storage
+    {
+        start_api_phase.complete();
+        let postgres_ingest_result = run_postgres_ingest(
+            &command_config,
+            &source,
+            network_upgrade_activations,
+            postgres.clone(),
+        )
+        .await;
+        shutdown_ops_endpoint(ops_handle).await;
+        return postgres_ingest_result;
+    }
+
     let recover_state_phase = StartupPhase::RecoverState.start();
     resolve_wallet_serving_modifiers(&mut command_config);
     recover_state_phase.complete();
@@ -348,7 +427,7 @@ async fn run_ingest(
     StartupPhase::Ready.start().complete();
 
     let mut writer_config =
-        canonical_writer_config(&command_config, Arc::clone(&network_upgrade_activations));
+        canonical_writer_config(&command_config, Arc::clone(&network_upgrade_activations))?;
     let mut canonical_control_tasks = spawn_canonical_control_tasks(
         &command_config,
         &source,
@@ -380,6 +459,124 @@ async fn run_ingest(
     )
     .await
     .map_err(IngestConfigError::from)
+}
+
+#[cfg(feature = "postgres-topology")]
+async fn run_postgres_ingest(
+    command_config: &IngestCommandConfig,
+    source: &ZebraJsonRpcSource,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    postgres: PostgresStorageConfig,
+) -> Result<(), IngestConfigError> {
+    let (checkpoint_height, target_height) =
+        postgres_single_append_bounds(&command_config.runtime_config)?;
+    let checkpoint = source
+        .fetch_chain_checkpoint(checkpoint_height, &network_upgrade_activations)
+        .await
+        .map_err(IngestError::from)?;
+    let source_block = source
+        .fetch_block_at(target_height)
+        .await
+        .map_err(IngestError::from)?;
+    let prepared = prepare_canonical_block(
+        &source_block,
+        &network_upgrade_activations,
+        zinder_ingest::RawBlobPolicy::Transactions,
+    )
+    .map_err(IngestError::from)?;
+    let append = zinder_postgres::CanonicalAppend::new(
+        checkpoint.block_id,
+        prepared.facts,
+        prepared.replay_envelope,
+    );
+    let database_config = postgres_database_config(&command_config.runtime_config, postgres);
+    let mut store = zinder_postgres::CanonicalStore::open(&database_config).await?;
+    let outcome = store.commit_append(append).await?;
+    let state = match outcome {
+        zinder_postgres::CanonicalAppendOutcome::Committed(state) => {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "postgres_canonical_transition_committed",
+                visible_tip_height = state.visible_tip().height.value(),
+                chain_epoch = state.visible_epoch_id(),
+                chain_event_sequence = state.event_sequence(),
+                "committed the PostgreSQL canonical tracer transition"
+            );
+            state
+        }
+        zinder_postgres::CanonicalAppendOutcome::AlreadyCommitted(state) => {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "postgres_canonical_transition_already_committed",
+                visible_tip_height = state.visible_tip().height.value(),
+                chain_epoch = state.visible_epoch_id(),
+                chain_event_sequence = state.event_sequence(),
+                "the PostgreSQL canonical tracer transition was already durable"
+            );
+            state
+        }
+    };
+    store.close().await?;
+    if state.visible_tip().height != target_height {
+        return Err(zinder_runtime::ConfigError::invalid(
+            "PostgreSQL canonical readback does not match target_height",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "postgres-topology")]
+fn postgres_single_append_bounds(
+    runtime_config: &zinder_ingest::IngestRuntimeConfig,
+) -> Result<(BlockHeight, BlockHeight), IngestConfigError> {
+    let checkpoint_height = runtime_config
+        .run_overrides
+        .checkpoint_height
+        .ok_or_else(|| {
+            zinder_runtime::ConfigError::invalid(
+                "the PostgreSQL tracer requires ingest.run_overrides.checkpoint_height",
+            )
+        })?;
+    let target_height = runtime_config.run_overrides.target_height.ok_or_else(|| {
+        zinder_runtime::ConfigError::invalid(
+            "the PostgreSQL tracer requires ingest.run_overrides.target_height",
+        )
+    })?;
+    if checkpoint_height.next() != Some(target_height) {
+        return Err(zinder_runtime::ConfigError::invalid(
+            "the PostgreSQL tracer requires target_height = checkpoint_height + 1",
+        )
+        .into());
+    }
+    Ok((checkpoint_height, target_height))
+}
+
+#[cfg(not(feature = "postgres-topology"))]
+fn run_postgres_ingest(
+    _command_config: &IngestCommandConfig,
+    _source: &ZebraJsonRpcSource,
+    _network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    _postgres: PostgresStorageConfig,
+) -> impl std::future::Future<Output = Result<(), IngestConfigError>> {
+    std::future::ready(Err(zinder_runtime::ConfigError::invalid(
+        "deployment.topology = \"postgres-horizontal\" requires the postgres-topology build feature",
+    )
+    .into()))
+}
+
+#[cfg(feature = "postgres-topology")]
+fn postgres_database_config(
+    runtime_config: &zinder_ingest::IngestRuntimeConfig,
+    postgres: PostgresStorageConfig,
+) -> zinder_postgres::DatabaseConfig {
+    let (database_url_path, tls) = postgres.into_parts();
+    zinder_postgres::DatabaseConfig::new(
+        database_url_path,
+        tls,
+        runtime_config.node.network,
+        "zinder-ingest",
+    )
 }
 
 type CanonicalControlServer = JoinHandle<Result<(), tonic::transport::Error>>;
@@ -438,7 +635,7 @@ fn spawn_canonical_control_tasks(
                     .ingest_control_checkpoint_staging_root
                     .clone(),
             ),
-            command_config.runtime_config.canonical_rocksdb_budget,
+            writer_config.resource_budget,
         )
         .with_bearer_token(command_config.ingest_control_bearer_token.clone())
         .with_checkpoint_bearer_token(
@@ -690,11 +887,22 @@ fn materialized_view_plane_spec(
     activations: Arc<NetworkUpgradeActivations>,
 ) -> Result<MaterializedViewPlaneSpec, IngestConfigError> {
     let runtime_config = &command_config.runtime_config;
+    let zinder_ingest::IngestStorageConfig::RocksDbSingleHost {
+        storage_path,
+        canonical_rocksdb_budget,
+        materialized_view_rocksdb_budget,
+    } = &runtime_config.storage
+    else {
+        return Err(zinder_runtime::ConfigError::invalid(
+            "materialized-view plane requires rocksdb-single-host storage",
+        )
+        .into());
+    };
     Ok(MaterializedViewPlaneSpec {
-        secondary_path: materialized_view_secondary_path(&runtime_config.storage_path),
-        storage_path: runtime_config.storage_path.clone(),
-        canonical_rocksdb_budget: runtime_config.canonical_rocksdb_budget,
-        materialized_view_rocksdb_budget: runtime_config.materialized_view_rocksdb_budget,
+        secondary_path: materialized_view_secondary_path(storage_path),
+        storage_path: storage_path.clone(),
+        canonical_rocksdb_budget: *canonical_rocksdb_budget,
+        materialized_view_rocksdb_budget: *materialized_view_rocksdb_budget,
         activations,
         reorg_policy: CanonicalReorgPolicy::new(runtime_config.reorg_window_blocks)
             .map_err(zinder_ingest::CanonicalWriterError::from)?,
@@ -848,10 +1056,21 @@ async fn open_canonical_secondary_when_published(
 fn canonical_writer_config(
     command_config: &IngestCommandConfig,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-) -> CanonicalWriterConfig {
-    CanonicalWriterConfig {
-        storage_path: command_config.runtime_config.storage_path.clone(),
-        resource_budget: command_config.runtime_config.canonical_rocksdb_budget,
+) -> Result<CanonicalWriterConfig, IngestConfigError> {
+    let zinder_ingest::IngestStorageConfig::RocksDbSingleHost {
+        storage_path,
+        canonical_rocksdb_budget,
+        ..
+    } = &command_config.runtime_config.storage
+    else {
+        return Err(zinder_runtime::ConfigError::invalid(
+            "RocksDB canonical writer requires rocksdb-single-host storage",
+        )
+        .into());
+    };
+    Ok(CanonicalWriterConfig {
+        storage_path: storage_path.clone(),
+        resource_budget: *canonical_rocksdb_budget,
         construction: CanonicalConstructionConfig {
             request_timeout: command_config.runtime_config.node.request_timeout,
             pipeline_limits: command_config.runtime_config.construction.pipeline_limits,
@@ -871,7 +1090,7 @@ fn canonical_writer_config(
             event_retention_check_interval: command_config.retention.chain_event_check_interval(),
             mempool_ready_gate: None,
         },
-    }
+    })
 }
 
 fn log_canonical_writer_start(

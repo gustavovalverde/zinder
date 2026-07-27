@@ -53,6 +53,19 @@ pub struct RocksDbResourceBudgetSection {
 }
 
 impl RocksDbResourceBudgetSection {
+    /// Returns whether no `RocksDB` override was configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.block_cache_bytes.is_none()
+            && self.max_wal_bytes.is_none()
+            && self.max_open_files.is_none()
+            && self.write_buffer_bytes.is_none()
+            && self.max_write_buffer_count.is_none()
+            && self.max_background_jobs.is_none()
+            && self.memtable_budget_bytes.is_none()
+            && self.statistics_level.is_none()
+    }
+
     /// Merges any `Some` overrides onto `defaults`. Use writer or reader
     /// defaults for the selected store posture.
     ///
@@ -105,6 +118,14 @@ impl RocksDbResourceBudgetSection {
 pub struct StorageRoleSection {
     /// `RocksDB` resource budget overrides for this storage role.
     pub rocksdb: RocksDbResourceBudgetSection,
+}
+
+impl StorageRoleSection {
+    /// Returns whether this role contains no engine-specific configuration.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rocksdb.is_empty()
+    }
 }
 
 /// Raw `[storage]` section consumed by reader binaries.

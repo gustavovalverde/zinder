@@ -17,7 +17,7 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, CommitmentTreeCheckpoint};
-use zinder_runtime::{IngestPhase, Readiness};
+use zinder_runtime::{DeploymentTopology, IngestPhase, PostgresStorageConfig, Readiness};
 use zinder_source::{MempoolSourceAdmissionLimits, NodeTarget};
 
 use crate::{CanonicalPipelineLimits, NodeSourceKind, RawBlobPolicy};
@@ -106,17 +106,14 @@ impl HistoricalWorkGate {
 /// TOML schema.
 #[derive(Clone, Debug)]
 pub struct IngestRuntimeConfig {
+    /// Selected coherent deployment topology.
+    pub deployment_topology: DeploymentTopology,
     /// Resolved upstream node endpoint.
     pub node: NodeTarget,
     /// Upstream node source adapter selector.
     pub node_source: NodeSourceKind,
-    /// Local canonical store path.
-    pub storage_path: PathBuf,
-    /// Bounded `RocksDB` resource budget for the canonical store.
-    pub canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
-    /// Bounded `RocksDB` resource budget for the materialized-view store the
-    /// in-process tailer writes.
-    pub materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget,
+    /// Topology-specific storage configuration.
+    pub storage: IngestStorageConfig,
     /// Optional raw-byte blob write policy for canonical ingest.
     pub raw_blob_policy: RawBlobPolicy,
     /// Reorg-window invariant. Bulk catch-up never advances the settled tip inside
@@ -145,17 +142,20 @@ pub struct MempoolIngestSettings {
     pub reconciliation_batch_target_raw_transaction_bytes: NonZeroU64,
 }
 
-impl IngestRuntimeConfig {
-    /// Returns the canonical writer options shared by run, probe, and both ingest phases.
-    #[must_use]
-    pub fn canonical_store_options(&self) -> zinder_store::ChainStoreOptions {
-        crate::chain_ingest::canonical_writer_store_options(
-            self.node.network,
-            self.reorg_window_blocks,
-            self.canonical_rocksdb_budget,
-            self.raw_blob_policy,
-        )
-    }
+/// Topology-specific ingest storage configuration.
+#[derive(Clone, Debug)]
+pub enum IngestStorageConfig {
+    /// Local primary plus in-process materialized-view storage.
+    RocksDbSingleHost {
+        /// Local canonical store path.
+        storage_path: PathBuf,
+        /// Bounded `RocksDB` resource budget for the canonical store.
+        canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget,
+        /// Bounded `RocksDB` resource budget for the materialized-view store.
+        materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget,
+    },
+    /// Shared `PostgreSQL` database used by the horizontal topology.
+    PostgresHorizontal(PostgresStorageConfig),
 }
 
 /// Resolved `[ingest.phase_classification]` configuration.

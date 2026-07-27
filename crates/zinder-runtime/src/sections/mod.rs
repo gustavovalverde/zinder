@@ -7,20 +7,27 @@
 //! defaults so a new service cannot drift from the established schema.
 
 pub mod defaults;
+mod deployment;
 mod ingest_control;
 mod ops;
+mod postgres;
 mod projector_control;
 mod retention;
 mod runtime_service;
 mod security;
 mod storage;
 
+pub use deployment::{DeploymentSection, DeploymentToml, DeploymentTopology};
 pub use ingest_control::{
     IngestControlReaderToml, IngestControlSection, IngestControlWriterToml,
     ResolvedIngestControlReader, ResolvedIngestControlWriter, resolve_ingest_control_reader,
     resolve_ingest_control_writer,
 };
 pub use ops::{OpsSection, OpsToml, resolve_ops_listen_addr};
+pub use postgres::{
+    PostgresStorageConfig, PostgresStorageSection, PostgresStorageToml, PostgresTlsMode,
+    PostgresTlsPolicy,
+};
 pub use projector_control::{
     ProjectorControlSection, ProjectorControlToml, ResolvedProjectorControl,
     resolve_projector_control,

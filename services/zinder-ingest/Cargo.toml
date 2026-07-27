@@ -11,6 +11,10 @@ repository.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+postgres-topology = ["dep:zinder-postgres"]
+
 [dependencies]
 async-trait.workspace = true
 clap = { workspace = true, features = ["derive"] }
@@ -33,6 +37,7 @@ tracing.workspace = true
 zebra-chain.workspace = true
 zinder-core.workspace = true
 zinder-materialized-views.workspace = true
+zinder-postgres = { workspace = true, optional = true }
 zinder-proto.workspace = true
 zinder-runtime.workspace = true
 zinder-source.workspace = true

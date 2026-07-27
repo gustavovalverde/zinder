@@ -1,0 +1,25 @@
+[package]
+name = "zinder-migrate"
+version.workspace = true
+description = "One-shot PostgreSQL schema migration command for Zinder"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "postgresql"]
+categories = ["command-line-utilities", "database"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml.workspace = true
+tracing.workspace = true
+zinder-postgres.workspace = true
+zinder-runtime.workspace = true
+
+[lints]
+workspace = true
