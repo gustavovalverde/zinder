@@ -8,6 +8,7 @@
 #     docker build -f deploy/Dockerfile --target zinder-projector -t zinder-projector .
 #     docker build -f deploy/Dockerfile --target zinder-query -t zinder-query .
 #     docker build -f deploy/Dockerfile --target zinder-compat-lightwalletd -t zinder-compat-lightwalletd .
+#     docker build -f deploy/Dockerfile --target zinder-explorer -t zinder-explorer .
 #     docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench .
 #     docker build -f deploy/Dockerfile --target zinder-ingest-live-tests -t zinder-ingest-live-tests .
 #
@@ -73,12 +74,14 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
         --bin zinder-projector \
         --bin zinder-query \
         --bin zinder-compat-lightwalletd \
+        --bin zinder-explorer \
         --bin zinder-bench \
     && mkdir -p /zinder-binaries \
     && cp "/workspace/target/${rust_target}/release/zinder-ingest" /zinder-binaries/zinder-ingest \
     && cp "/workspace/target/${rust_target}/release/zinder-projector" /zinder-binaries/zinder-projector \
     && cp "/workspace/target/${rust_target}/release/zinder-query" /zinder-binaries/zinder-query \
     && cp "/workspace/target/${rust_target}/release/zinder-compat-lightwalletd" /zinder-binaries/zinder-compat-lightwalletd \
+    && cp "/workspace/target/${rust_target}/release/zinder-explorer" /zinder-binaries/zinder-explorer \
     && cp "/workspace/target/${rust_target}/release/zinder-bench" /zinder-binaries/zinder-bench
 
 FROM scratch AS release-binaries
@@ -182,6 +185,20 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:9107/readyz || exit 1
 
 ENTRYPOINT ["zinder-compat-lightwalletd"]
+
+FROM zinder-runtime-base AS zinder-explorer
+
+COPY --from=zinder-binaries /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
+
+USER zinder:zinder
+WORKDIR /var/lib/zinder
+
+EXPOSE 9068 9069
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
+    CMD curl -fsS http://localhost:9069/readyz || exit 1
+
+ENTRYPOINT ["zinder-explorer"]
 
 FROM zinder-runtime-base AS zinder-bench
 

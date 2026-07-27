@@ -146,7 +146,7 @@ async fn runtime_starts_without_materialized_view_store_and_omits_materialized_v
         .ok_or_else(|| eyre::eyre!("server info missing common envelope"))?;
 
     assert!(
-        common
+        !common
             .capabilities
             .iter()
             .any(|capability| capability == EXPLORER_TRANSACTION_DETAIL_V4),

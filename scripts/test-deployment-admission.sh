@@ -86,6 +86,38 @@ docker compose \
   config --format json > "$resolved_compose"
 bash "$validator" --compose-contract "$resolved_compose"
 
+resolved_explorer_compose="$temporary_directory/resolved-explorer-compose.json"
+ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+docker compose \
+  --env-file "$repository_root/deploy/.env.testnet" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  -f "$repository_root/deploy/docker-compose.explorer.yml" \
+  config --format json > "$resolved_explorer_compose"
+jq -e '
+  .services["zinder-explorer"].build.target == "zinder-explorer"
+  and .services["zinder-explorer"].command == ["--config", "/etc/zinder/config.toml"]
+  and .services["zinder-explorer"].network_mode == "service:zinder-ingest"
+  and .services["zinder-explorer"].depends_on["zinder-query"].condition == "service_healthy"
+  and .services["zinder-explorer"].healthcheck.test == [
+    "CMD",
+    "curl",
+    "-fsS",
+    "http://localhost:9069/readyz"
+  ]
+  and .services["zinder-explorer"].environment.ZINDER_EXPLORER__LISTEN_ADDR == "[::]:9068"
+  and .services["zinder-explorer"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9069"
+  and (.services["zinder-ingest"].networks.z3.aliases | index("zinder-testnet-explorer")) != null
+  and (.services["zinder-ingest"].ports | any(.target == 9068 and .published == "19068"))
+  and (.services["zinder-ingest"].ports | any(.target == 9069 and .published == "19069"))
+  and (.services["zinder-explorer"].volumes
+    | any(.target == "/etc/zinder/config.toml" and .read_only == true))
+  and (.services["zinder-explorer"].volumes
+    | all(.target != "/var/lib/zinder/checkpoints"))
+  and (.services["zinder-explorer"].volumes
+    | all(.target != "/var/run/zinder-checkpoint/checkpoint.token"))
+' "$resolved_explorer_compose" >/dev/null \
+  || fail "the optional explorer overlay does not preserve its reader-only deployment contract"
+
 missing_state_init_compose="$temporary_directory/missing-state-init-compose.json"
 jq 'del(.services["state-init"]) | del(.services["zinder-ingest"].depends_on["state-init"])' \
   "$resolved_compose" > "$missing_state_init_compose"
@@ -225,6 +257,20 @@ jq '.services["zinder-ingest"].healthcheck.test[-1] = "http://localhost:9105/hea
 expect_rejected \
   "a Compose dependency gate using liveness instead of readiness" \
   --compose-contract "$healthz_compose"
+
+short_ingest_healthcheck_grace_compose="$temporary_directory/short-ingest-healthcheck-grace-compose.json"
+jq '.services["zinder-ingest"].healthcheck.start_period = "1m0s"' \
+  "$resolved_compose" > "$short_ingest_healthcheck_grace_compose"
+expect_rejected \
+  "an ingest readiness gate that expires before the canonical construction hard gate" \
+  --compose-contract "$short_ingest_healthcheck_grace_compose"
+
+short_projector_healthcheck_grace_compose="$temporary_directory/short-projector-healthcheck-grace-compose.json"
+jq '.services["zinder-projector"].healthcheck.start_period = "1m0s"' \
+  "$resolved_compose" > "$short_projector_healthcheck_grace_compose"
+expect_rejected \
+  "a projector readiness gate that expires before the wallet construction hard gate" \
+  --compose-contract "$short_projector_healthcheck_grace_compose"
 
 split_namespace_compose="$temporary_directory/split-namespace-compose.json"
 jq '.services["zinder-projector"].network_mode = null' \

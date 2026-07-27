@@ -17,7 +17,6 @@ use zinder_runtime::{
     spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
-use zinder_store::{ChainStoreOptions, SecondaryChainStore};
 
 mod config;
 
@@ -50,10 +49,10 @@ struct Cli {
     /// Network name, such as zcash-regtest.
     #[arg(long)]
     network: Option<String>,
-    /// Filesystem path of the canonical store the writer opens as primary.
+    /// Canonical storage root containing the explorer materialized-view store.
     #[arg(long = "storage-path")]
     storage_path: Option<PathBuf>,
-    /// Process-unique `RocksDB` secondary metadata path.
+    /// Process-unique metadata root for explorer `RocksDB` secondaries.
     #[arg(long = "secondary-path")]
     secondary_path: Option<PathBuf>,
     /// `ExplorerQuery` gRPC listen address, such as 127.0.0.1:9068.
@@ -134,14 +133,6 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     readiness.set(ReadinessState::starting());
     let start_api_phase = StartupPhase::StartApi.start();
 
-    let canonical_store = match open_canonical_store(&explorer_config) {
-        Ok(store) => store,
-        Err(error) => {
-            start_api_phase.fail(&error);
-            return Err(error);
-        }
-    };
-
     let materialized_view_store = match open_materialized_view_store(&explorer_config) {
         Ok(materialized_view_store) => materialized_view_store,
         Err(error) => {
@@ -160,11 +151,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
             .map(|materialized_view_store| {
                 spawn_materialized_view_catchup_task(materialized_view_store, cancel.clone())
             });
-    let canonical_catchup_handle =
-        spawn_canonical_catchup_task(canonical_store.clone(), cancel.clone());
-
-    let grpc_adapter =
-        build_grpc_adapter(&explorer_config, canonical_store, materialized_view_store).await;
+    let grpc_adapter = build_grpc_adapter(&explorer_config, materialized_view_store).await;
     let upstream_observation_handle =
         spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, cancel.clone())?;
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
@@ -206,7 +193,6 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     shutdown_background_tasks(
         ops_handle,
         upstream_observation_handle,
-        canonical_catchup_handle,
         materialized_view_catchup_handle,
     )
     .await;
@@ -236,7 +222,6 @@ fn report_materialized_view_workload(
 async fn shutdown_background_tasks(
     ops_handle: Option<OpsEndpointHandle>,
     upstream_observation_handle: Option<JoinHandle<()>>,
-    canonical_catchup_handle: JoinHandle<()>,
     materialized_view_catchup_handle: Option<JoinHandle<()>>,
 ) {
     if let Some(handle) = ops_handle {
@@ -245,7 +230,6 @@ async fn shutdown_background_tasks(
     if let Some(handle) = upstream_observation_handle {
         let _ = handle.await;
     }
-    let _ = canonical_catchup_handle.await;
     if let Some(handle) = materialized_view_catchup_handle {
         let _ = handle.await;
     }
@@ -299,31 +283,6 @@ fn build_zebra_json_rpc_source(
         },
     )?;
     Ok(source.with_health_config(node.health.clone()))
-}
-
-fn open_canonical_store(
-    explorer_config: &ExplorerConfig,
-) -> Result<SecondaryChainStore, ExplorerConfigError> {
-    let open_storage_phase = StartupPhase::OpenStorage.start();
-    match SecondaryChainStore::open(
-        &explorer_config.storage.path,
-        &explorer_config.storage.secondary_path,
-        ChainStoreOptions {
-            rocksdb_resource_budget: explorer_config.storage.canonical_rocksdb_budget,
-            ..ChainStoreOptions::for_network(explorer_config.network)
-        },
-    ) {
-        Ok(handle) => {
-            handle.try_catch_up()?;
-            open_storage_phase.complete();
-            Ok(handle)
-        }
-        Err(error) => {
-            let wrapped = ExplorerConfigError::CanonicalStore(error);
-            open_storage_phase.fail(&wrapped);
-            Err(wrapped)
-        }
-    }
 }
 
 fn open_materialized_view_store(
@@ -398,30 +357,6 @@ fn open_materialized_view_store(
     }
 }
 
-fn spawn_canonical_catchup_task(
-    store: SecondaryChainStore,
-    cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(MATERIALIZED_VIEW_CATCHUP_INTERVAL);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    if let Err(error) = store.try_catch_up() {
-                        tracing::warn!(
-                            target: "zinder::explorer",
-                            event = "canonical_secondary_catchup_failed",
-                            error = %error,
-                            "canonical store secondary catchup failed"
-                        );
-                    }
-                }
-                () = cancel.cancelled() => break,
-            }
-        }
-    })
-}
-
 fn spawn_materialized_view_catchup_task(
     store: MaterializedViewStore,
     cancel: CancellationToken,
@@ -485,7 +420,6 @@ async fn fetch_network_upgrade_activations(
 
 async fn build_grpc_adapter(
     explorer_config: &ExplorerConfig,
-    canonical_store: SecondaryChainStore,
     materialized_view_store: Option<MaterializedViewStore>,
 ) -> ExplorerQueryGrpcAdapter {
     let server_info = ExplorerServerInfoSettings {
@@ -493,7 +427,6 @@ async fn build_grpc_adapter(
     };
     let has_materialized_view_store = materialized_view_store.is_some();
     let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info)
-        .with_canonical_store(canonical_store)
         .with_prevout_resolution_online(has_materialized_view_store);
     if let Some(materialized_view_store) = materialized_view_store {
         grpc_adapter = grpc_adapter.with_materialized_view_store(materialized_view_store);

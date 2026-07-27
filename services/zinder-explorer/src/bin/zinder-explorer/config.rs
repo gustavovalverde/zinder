@@ -27,9 +27,8 @@ pub(crate) struct ExplorerConfig {
     pub(crate) bearer_token_path: Option<PathBuf>,
     pub(crate) bearer_token: Option<BearerToken>,
     /// Wallet-query endpoint that backs the explorer's wallet-composed reads
-    /// (transaction detail, block views, search, mempool activity). Empty
-    /// string omits the explorer capabilities that compose canonical wallet
-    /// reads.
+    /// (transaction detail, block views, search, mempool activity). An empty
+    /// string omits the explorer capabilities that compose wallet reads.
     pub(crate) wallet_query_endpoint: Option<String>,
     /// Resolved upstream node target. `None` when the operator did not
     /// configure `[node]`; the upstream-observation probe stays unspawned
@@ -58,9 +57,6 @@ pub(crate) enum ExplorerConfigError {
     #[error(transparent)]
     Store(#[from] zinder_explorer::MaterializedViewStoreError),
 
-    #[error(transparent)]
-    CanonicalStore(#[from] zinder_store::StoreError),
-
     #[error("explorer runtime failed: {0}")]
     Runtime(#[from] zinder_explorer::MaterializedViewError),
 
@@ -87,8 +83,9 @@ pub(crate) fn load_explorer_config(
 ) -> Result<ExplorerConfig, ExplorerConfigError> {
     let raw: ExplorerRawConfig = ConfigLoader::new()
         // Storage defaults match the canonical Zinder layout. The explorer
-        // reads through a RocksDB secondary keyed at `explorer-secondary` so it
-        // does not contend with the wallet-query reader's secondary directory.
+        // locates the materialized-view primary beneath `storage.path` and
+        // keeps its process-owned secondary metadata beneath
+        // `storage.secondary_path`; it does not open the canonical primary.
         // Operators override via env vars (`ZINDER_STORAGE__PATH`,
         // `ZINDER_STORAGE__SECONDARY_PATH`) or CLI flags.
         .with_default("storage.path", "/var/lib/zinder/store")?

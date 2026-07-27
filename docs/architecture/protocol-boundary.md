@@ -25,7 +25,7 @@ Storage encodings belong to [Storage backend](storage-backend.md).
 | Surface | Rust module | Service owner | Release status |
 | --- | --- | --- | --- |
 | Native wallet API | `zinder_proto::v1::wallet` | `WalletQueryGrpcAdapter` in `zinder-query` | Published native query runtime |
-| Native explorer API | `zinder_proto::v1::explorer` | `zinder-explorer` | Optional workspace runtime; no published release image |
+| Native explorer API | `zinder_proto::v1::explorer` | `zinder-explorer` | Optional Compose overlay and local image target; no published release image |
 | Private control APIs | `zinder_proto::v1::ingest` | `zinder-ingest` and `zinder-projector` | Internal deployed services |
 | Shared operations messages | `zinder_proto::v1::ops` | Runtime and service adapters | Embedded in native/control surfaces |
 | Lightwalletd compatibility API | `zinder_proto::compat::lightwalletd` | `zinder-compat-lightwalletd` | Published compatibility service |
@@ -68,10 +68,15 @@ features on those strings rather than parsing a Zinder version.
 
 ## Native explorer API
 
-`ExplorerQuery` serves explorer, dashboard, and analytics shapes. It composes
-materialized views, a canonical secondary, and selected `WalletQuery` calls.
+`ExplorerQuery` serves explorer, dashboard, and analytics shapes. The deployed
+runtime composes a process-owned materialized-view secondary with selected
+`WalletQuery` calls. Library compositions may also provide a canonical
+secondary for capabilities whose policies require retained canonical facts.
 Every response carries `ExplorerFreshness`, and optional fields use typed
-unavailability reasons. See [Explorer plane](explorer-plane.md).
+unavailability reasons. The checked-in
+`deploy/docker-compose.explorer.yml` overlay runs the explorer beside the
+wallet-serving topology for Zexplorer and other named explorer consumers. See
+[Explorer plane](explorer-plane.md).
 
 ## Private control APIs
 

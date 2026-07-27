@@ -170,10 +170,12 @@ pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 /// Capability advertised for `ExplorerQuery.TransactionDetail`.
 ///
 /// Signals that the response carries the full `TransactionPublicFacts` shape
-/// plus ordered transparent inputs that combine their spent outpoint with
-/// independently resolved canonical prevout values and scripts. The always-on
-/// wallet capability for raw transaction lookup remains
-/// [`WALLET_READ_TRANSACTION_BY_ID_V2`].
+/// plus ordered transparent inputs and outputs parsed from wallet-retained
+/// transaction bytes. The explorer materialized-view store supplies projected
+/// input values, paid fees, and epoch-covered canonical output-spend state.
+/// The wallet capability for typed transaction lookup remains
+/// [`WALLET_READ_TRANSACTION_BY_ID_V2`], while mined bytes require
+/// [`WALLET_READ_TRANSACTION_BYTES_V1`].
 pub const EXPLORER_TRANSACTION_DETAIL_V4: &str = "explorer.transaction.detail_v4";
 /// Capability advertised for `ExplorerQuery.BlockSummariesInRange`.
 ///
@@ -274,9 +276,10 @@ pub const EXPLORER_MEMPOOL_ACTIVITY_V1: &str = "explorer.mempool.activity_v1";
 ///
 /// Signals that the explorer serves cursor- or offset-paged confirmed address
 /// activity with current balance/lifetime coverage from the active ranking
-/// generation. Retained canonical transaction facts add block position,
-/// transaction shape, and request-time transparent counterparty facts without
-/// changing the persisted activity schema.
+/// generation. A library composition with retained canonical transaction facts
+/// may additionally enrich rows with block position, transaction shape, and
+/// transparent counterparty facts without changing the persisted activity
+/// schema.
 pub const EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2: &str =
     "explorer.transparent_address.activity_v2";
 /// Capability advertised for `ExplorerQuery.TransparentAddressDeltas`.
@@ -1014,7 +1017,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_TRANSACTION_DETAIL_V4,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransactionDetail"),
-        AdvertisePolicy::RequiresWalletQueryAndCanonicalStore,
+        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_BLOCK_SUMMARY_V1,
@@ -1098,7 +1101,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransparentAddressActivity"),
-        AdvertisePolicy::RequiresMaterializedViewStoreWalletQueryAndCanonicalStore,
+        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,

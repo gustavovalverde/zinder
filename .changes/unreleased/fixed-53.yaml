@@ -1,5 +1,5 @@
 kind: fixed
-body: Expose typed wallet-sync capabilities through zinder-client so external consumers can preflight current Zinder without importing protocol constants, align the regtest setup with Z3's current host ports, and preserve cold admission when the same block hash is displaced more than once.
+body: Expose typed wallet-sync capabilities through zinder-client, preserve cold admission when a block hash is displaced repeatedly, and provide a current-contract ExplorerQuery overlay that serves transaction detail and transparent activity without opening the canonical store.
 time: 2026-07-27T02:13:41Z
 custom:
   Bump: patch

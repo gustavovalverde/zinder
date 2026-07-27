@@ -59,7 +59,7 @@ pub enum BulkLoadError {
         source: std::collections::TryReserveError,
     },
     /// A staging path could not be read, written, or removed.
-    #[error("RocksDB bulk-load path is unavailable: {path}")]
+    #[error("RocksDB bulk-load path is unavailable: {path}: {source}")]
     PathUnavailable {
         /// Path whose operation failed.
         path: PathBuf,
@@ -767,6 +767,19 @@ mod tests {
             Err(BulkLoadError::InvalidInput { .. })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn path_failure_display_includes_the_underlying_io_cause() {
+        let failure = BulkLoadError::PathUnavailable {
+            path: PathBuf::from("/staging/run.bin"),
+            source: std::io::Error::from_raw_os_error(28),
+        };
+
+        assert!(
+            failure.to_string().contains("No space left on device"),
+            "path failures must preserve the actionable operating-system cause: {failure}"
+        );
     }
 
     #[test]
