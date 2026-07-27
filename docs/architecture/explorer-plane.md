@@ -3,7 +3,8 @@
 The explorer plane is implemented by the optional `zinder-explorer` workspace
 service. The service compiles and is tested with the workspace, but the release
 workflow does not build or publish an explorer image. Operators that need the
-native `ExplorerQuery` surface deploy its binary separately.
+native `ExplorerQuery` surface can build its local image through the optional
+Compose overlay.
 
 The explorer plane is the Zinder product surface for block explorers, dashboards, and analytics consumers. It serves UI-ready, API-ready, and agent-ready views over canonical chain artifacts and replayable event streams, with explicit freshness, typed unavailability, and capability-gated panels. It is owned by `zinder-explorer`.
 
@@ -27,14 +28,15 @@ The decisions that govern this plane:
 `zinder-explorer` is an optional runtime over the shared query and storage
 libraries. It:
 
-- **Consumes** a prepared materialized-view store as a RocksDB secondary under `storage.path` when available, plus `WalletQuery` over gRPC for federated read paths.
-- **Owns** no primary RocksDB. `storage.path` is the canonical store path, and the optional materialized-view store lives in its `materialized-views` subdirectory. No release runtime currently writes that store.
+- **Consumes** the explorer materialized-view store through a process-owned RocksDB secondary when available, plus `WalletQuery` over gRPC for federated read paths.
+- **Owns** no primary RocksDB. `storage.path` identifies the canonical root whose `materialized-views` subdirectory ingest owns, while `storage.secondary_path/materialized-views` holds the explorer's secondary metadata. The deployed binary does not open the canonical store.
 - **Produces** the `ExplorerQuery` gRPC service.
 - **Does not** open any primary store, custody wallet secrets, or serve wallet balance RPCs. It may parse transaction bytes through `zinder-source` and attach an optional cached upstream-health observation to freshness; neither is an authoritative chain-fact read.
 
 The boundary rules:
 
 - A `zinder-explorer` crash does not stop ingest or wallet sync. The wallet plane keeps serving every `WalletQuery` primitive, including `WalletQuery.TransparentAddressBalance`.
+- Library compositions may provide a canonical secondary for capabilities whose policies explicitly require retained canonical facts. The checked-in Compose overlay uses the current materialized-view plus wallet composition and omits those capabilities.
 - The explorer plane never extends canonical artifact schemas. When a view needs an authoritative chain fact the canonical surface does not carry, the source boundary extends first, the canonical artifact or event gains the field, then the explorer subscribes.
 - Server-side shielded address scanning, persisted viewing keys, and memo decryption are out of scope by product invariant.
 
@@ -60,7 +62,9 @@ The same service also owns `BlockSummariesInRange`, `BlockDetail`, `Search`, `Tr
 
 ## Transaction detail shape
 
-`ExplorerQuery.TransactionDetail` resolves one transaction at an epoch-pinned wallet location. For a mined transaction it reads the canonical `TransactionFactsArtifact`, batch-loads the unique retained parent transaction facts, and returns public facts plus ordered transparent inputs and outputs. Each `TransparentInput` combines `input_index`, `spent_outpoint`, and independently optional `value_zat` and `script_pub_key` fields. Retained parent facts normally recover both; a retained fee row may preserve the value after the parent script is unavailable. Missing facts remain absent rather than becoming zero values or empty scripts. Each `TransparentOutput` combines its explicit `output_index` and intrinsic value/script with an optional canonical `spent_by` relation from `WalletQuery.TransparentSpendsByOutpoint`. The reverse-spend lookup is chunked at the wallet request cap, pins every chunk to the transaction's epoch, and requires the complete epoch identity to match before merging rows. Because the output itself is a retained canonical fact and an incomplete reverse-spend lookup fails closed, absent `spent_by` means unspent on that canonical epoch; mempool spends remain separate. For a mempool transaction, the wallet-provided payload is parsed through the same `TransactionPublicFactSet` parser ingest uses: ordered inputs carry their index and outpoint without pretending their parent value/script was resolved, while ordered outputs carry exact intrinsic values and scripts with no canonical spender. The parsed transaction id must match the requested id. Standard-address decoding remains an edge concern, shielded values are not implied, and the mined path does not parse raw bytes or change raw-byte retention.
+`ExplorerQuery.TransactionDetail` resolves one transaction at an epoch-pinned wallet location. In the deployed composition, `WalletQuery.Transaction` supplies the mined or mempool location and retained raw transaction bytes. The explorer parses those bytes through the same `TransactionPublicFactSet` parser ingest uses and rejects a transaction-id mismatch. Mined inputs combine intrinsic outpoints with values projected by `TransactionFeesConsumer`; scripts remain absent when no retained canonical parent fact is configured. Mined outputs carry exact intrinsic values and scripts, while `TransparentOutpointSpendConsumer` supplies canonical `spent_by` relations only after its state and historical coverage match the complete requested epoch. A missing or stale projection fails closed rather than turning unknown spent state into “unspent.” Mempool rows expose intrinsic inputs and outputs without claiming canonical parent resolution, canonical spent state, or paid fees.
+
+Library compositions that provide a canonical secondary retain the deeper enrichment path: the handler reads `TransactionFactsArtifact`, batch-loads unique retained parent facts, and may recover input values and scripts when projection rows are partial. Reverse-spend lookup remains epoch-pinned and bounded. Standard-address decoding is an edge concern, shielded values are not implied, and readers never write either store.
 
 `TransactionFeesConsumer` materializes `paid_fee_zat` only when every
 transparent prevout resolves and the canonical privacy shape is
@@ -71,18 +75,19 @@ therefore retain resolved input values but leave `paid_fee_zat` absent.
 An incompatible transaction-fee consumer layout requires a fresh
 materialized-view store rebuilt from canonical history. Every read requires an independently
 classified privacy shape and suppresses a paid-fee value unless that shape is
-`TransparentOnly`. Retained parent rows reconstruct fee input values when a fee
-row is missing or partial. Transaction detail uses one epoch-pinned canonical
-reader and one parent-fact batch for both public prevout enrichment and fee
-recovery, then merges projected and recovered values by input index so neither
-source can erase an available value. Recent-transaction pages apply the same
+`TransparentOnly`. When a canonical secondary is configured, retained parent
+rows reconstruct fee input values when a fee row is missing or partial.
+Transaction detail uses one epoch-pinned canonical reader and one parent-fact
+batch for both public prevout enrichment and fee recovery, then merges projected
+and recovered values by input index so neither source can erase an available
+value. Recent-transaction pages apply the same
 merge only to transparent-only rows that still lack a proven fee, using two
 bounded batched canonical reads for at most the request's 1,024 rows. Readers
 never write materialized-view rows.
 
 Mempool transactions retain their location semantics. Mempool rows expose transaction-intrinsic transparent facts from their transient payload, but do not claim canonical parent resolution, canonical spent state, or actual paid fees.
 
-The response composes canonical facts with the durable reverse-spend relation. A spender remains visible beyond the first wallet request batch, while epoch-pinned reads report the same outpoint as unspent before its spending epoch and spent afterwards.
+The response composes parsed intrinsic facts with a durable reverse-spend relation. A spender remains visible beyond the first request batch, while epoch-pinned reads report the same outpoint as unspent before its spending epoch and spent afterwards.
 
 ## Block view shape
 
@@ -217,27 +222,25 @@ product-neutral sources without adding another materialized view:
    transaction count, first and last activity timestamps, and explicit
    coverage. A valid address absent from the generation returns a typed zero
    summary rather than a not-found error.
-3. The explorer's local canonical secondary batch-loads retained transaction
-   and parent facts at the response epoch. Rows gain canonical index, size,
-   component counts, address-specific input and output values, and deduplicated
-   raw scripts for other transparent inputs and outputs. Missing retained facts
-   stay optional, and `input_facts_complete` prevents a partial input sum or
-   receiving counterparty from being presented as complete.
+3. An optional canonical secondary in library compositions may batch-load
+   retained transaction and parent facts at the response epoch. Those rows gain
+   canonical index, size, component counts, address-specific input and output
+   values, and deduplicated scripts for other transparent inputs and outputs.
+   Missing retained facts stay optional, and `input_facts_complete` prevents a
+   partial input sum or receiving counterparty from being presented as complete.
 
-The handler resolves its epoch from the same local canonical secondary used for
-transaction enrichment. It does not label ranking or canonical facts with an
-independently advancing `WalletQuery` reader epoch. Ranking coverage newer than
-the selected epoch is rejected; active metadata is read again after the summary
-to close generation activation and live-tail races. `ExplorerFreshness` carries
-the shared materialized-view indexed tip, including its hash, so adapters can mark a
-same-height canonical mismatch as degraded. This design remains correct during
-ordinary one-block reader skew without requiring retries or returning a mixed
-snapshot.
+Without a canonical secondary, the handler pins its epoch through
+`WalletQuery.VisibleTipBlock`; with one, it uses the matching local canonical
+epoch. Ranking coverage newer than the selected epoch is rejected, and active
+metadata is read again after the summary to close generation activation and
+live-tail races. `ExplorerFreshness` carries the shared materialized-view
+indexed tip, including its hash, so adapters can mark a same-height mismatch as
+degraded.
 
-Offset paging, summary composition, and canonical enrichment are request-time
-operations over the activity and ranking materialized views and retained canonical
-facts. Mempool address activity remains a separate surface; confirmed
-pagination therefore stays deterministic.
+Offset paging and summary composition are request-time operations over the
+activity and ranking materialized views. Canonical enrichment remains optional,
+and mempool address activity remains a separate surface, so confirmed
+pagination stays deterministic.
 
 ## Transparent-address deltas
 
@@ -339,14 +342,14 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | Capability | Owner method | Always-on? |
 | ---------- | ------------ | ---------- |
 | `explorer.server_info_v1` | `ExplorerQuery.ServerInfo` | Yes |
-| `explorer.transaction.detail_v4` | `ExplorerQuery.TransactionDetail` | When the wallet endpoint and canonical store are configured |
+| `explorer.transaction.detail_v4` | `ExplorerQuery.TransactionDetail` | When the wallet endpoint and explorer materialized-view store are configured |
 | `explorer.block.summary_v1` | `ExplorerQuery.BlockSummariesInRange` + `BlockDetail` summary part | When the block-summary consumer is built and caught up |
 | `explorer.block.production_series_v2` | `ExplorerQuery.BlockProductionSeries` | When the block-summary consumer and canonical secondary store are available |
 | `explorer.block.production_time_range_v1` | `ExplorerQuery.BlockProductionInTimeRange` | When the time index has contiguous height-domain coverage through its materialized-view tip |
 | `explorer.block.detail_v1` | `ExplorerQuery.BlockDetail` per-tx rows | When the block-detail consumer is built and caught up |
 | `explorer.block.activity_distribution_v1` | `ExplorerQuery.BlockActivityDistribution` | When the block-summary consumer and wallet endpoint are available |
 | `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint is configured |
-| `explorer.transparent_address.activity_v2` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint, activity and ranking consumers, and canonical secondary store are available, and the ranking has an active complete generation |
+| `explorer.transparent_address.activity_v2` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint plus explorer activity and ranking consumers are available, and the ranking has an active complete generation |
 | `explorer.transparent_address.deltas_v1` | `ExplorerQuery.TransparentAddressDeltas` | When the wallet endpoint is configured |
 | `explorer.transparent_address.ranking_v1` | `ExplorerQuery.TransparentAddressRanking` | When the ranking consumer has an active generation and the wallet endpoint is configured |
 | `explorer.mempool.summary_v1` | `ExplorerQuery.MempoolSummary` | When the wallet endpoint is configured |

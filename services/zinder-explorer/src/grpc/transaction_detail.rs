@@ -23,7 +23,10 @@ use zinder_core::{
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_DETAIL_V4;
 use zinder_proto::wire::encode_privacy_shape;
 
-use zinder_materialized_views::{MaterializedViewStore, TransactionFeesConsumer};
+use zinder_materialized_views::{
+    MaterializedViewStore, TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TransactionFeesConsumer,
+    TransparentOutpointSpendConsumer,
+};
 use zinder_proto::v1::{
     explorer::{
         LockTime as WireLockTime, LockTimeUnlocked, TransactionComponentCounts,
@@ -40,6 +43,7 @@ use zinder_proto::v1::{
 use zinder_runtime::AuthenticatedChannel;
 use zinder_store::{
     ChainEpochReader, SecondaryChainStore, chain_epoch_from_message, status_from_store_error,
+    transparent_spend_message,
 };
 
 use super::error::ExplorerError;
@@ -61,6 +65,7 @@ pub(crate) struct TransactionDetailContext<'context> {
     pub(crate) chain_store: Option<&'context SecondaryChainStore>,
     pub(crate) materialized_view_store: Option<&'context MaterializedViewStore>,
     pub(crate) network: zinder_core::Network,
+    pub(crate) network_upgrade_activations: &'context NetworkUpgradeActivations,
     pub(crate) upstream_observation_cache: &'context UpstreamObservationCache,
 }
 
@@ -74,6 +79,7 @@ pub(crate) async fn query_transaction_detail(
         chain_store,
         materialized_view_store,
         network,
+        network_upgrade_activations,
         upstream_observation_cache,
     } = context;
     let inner = request.into_inner();
@@ -99,8 +105,12 @@ pub(crate) async fn query_transaction_detail(
         })?;
     let canonical_reader = canonical_reader_for_location(chain_store, &chain_epoch, &location)?;
 
-    let transaction =
-        resolve_facts_and_location(canonical_reader.as_ref(), network, transaction_id, location)?;
+    let transaction = resolve_facts_and_location(
+        canonical_reader.as_ref(),
+        network_upgrade_activations,
+        transaction_id,
+        location,
+    )?;
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
@@ -117,17 +127,16 @@ pub(crate) async fn query_transaction_detail(
         canonical_reader.as_ref(),
         transaction.canonical_artifact.as_ref(),
     )?;
-    let fees = resolve_fee_record(
-        materialized_view_store,
-        transaction.canonical_artifact.as_ref(),
-        &parent_transactions,
-    )?;
+    let fees = resolve_fee_record(materialized_view_store, &transaction, &parent_transactions)?;
     let transparent_rows = resolve_transparent_rows(
-        wallet_client,
-        &chain_epoch,
         &transaction,
-        &parent_transactions,
-        fees.as_ref(),
+        TransparentRowsContext {
+            wallet_client,
+            chain_epoch: &chain_epoch,
+            parent_transactions: &parent_transactions,
+            fees: fees.as_ref(),
+            materialized_view_store,
+        },
     )
     .await?;
     let intrinsic_value_balances = resolve_detail_intrinsic_value_balances(
@@ -162,6 +171,14 @@ struct ResolvedTransparentRows {
     outputs: Vec<WireTransparentOutput>,
 }
 
+struct TransparentRowsContext<'context> {
+    wallet_client: &'context mut WalletQueryClient<AuthenticatedChannel>,
+    chain_epoch: &'context wallet::ChainEpoch,
+    parent_transactions: &'context HashMap<TransactionId, Option<TransactionFactsArtifact>>,
+    fees: Option<&'context TransactionFeesRecord>,
+    materialized_view_store: Option<&'context MaterializedViewStore>,
+}
+
 fn resolve_detail_intrinsic_value_balances(
     canonical_reader: Option<&ChainEpochReader<'_>>,
     network: zinder_core::Network,
@@ -180,19 +197,23 @@ fn resolve_detail_intrinsic_value_balances(
 }
 
 async fn resolve_transparent_rows(
-    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    chain_epoch: &wallet::ChainEpoch,
     transaction: &ResolvedTransactionDetail,
-    parent_transactions: &HashMap<TransactionId, Option<TransactionFactsArtifact>>,
-    fees: Option<&TransactionFeesRecord>,
+    context: TransparentRowsContext<'_>,
 ) -> Result<ResolvedTransparentRows, Status> {
+    let TransparentRowsContext {
+        wallet_client,
+        chain_epoch,
+        parent_transactions,
+        fees,
+        materialized_view_store,
+    } = context;
     let inputs = transaction.canonical_artifact.as_ref().map_or_else(
         || {
             transaction
                 .transient_fact_set
                 .as_ref()
                 .map_or_else(Vec::new, |fact_set| {
-                    encode_unresolved_transparent_inputs(&fact_set.transparent_inputs)
+                    encode_unresolved_transparent_inputs(&fact_set.transparent_inputs, fees)
                 })
         },
         |artifact| encode_mined_transparent_inputs(artifact, parent_transactions, fees),
@@ -200,7 +221,8 @@ async fn resolve_transparent_rows(
     let output_spends = resolve_transparent_output_spends(
         wallet_client,
         chain_epoch,
-        transaction.canonical_artifact.as_ref(),
+        transaction,
+        materialized_view_store,
     )
     .await?;
     let outputs = transaction.canonical_artifact.as_ref().map_or_else(
@@ -229,29 +251,66 @@ async fn resolve_transparent_rows(
 /// raw bytes for mempool transactions.
 fn resolve_facts_and_location(
     canonical_reader: Option<&ChainEpochReader<'_>>,
-    network: zinder_core::Network,
+    network_upgrade_activations: &NetworkUpgradeActivations,
     transaction_id: zinder_core::TransactionId,
     location: wire_location::Location,
 ) -> Result<ResolvedTransactionDetail, Status> {
     let (facts, inner, canonical_artifact, transient_fact_set) = match location {
         wire_location::Location::Mined(mined) => {
             let branch_id = mined_consensus_branch_id(&mined)?;
-            let artifact = read_mined_transaction_facts(canonical_reader, transaction_id)?;
-            let mut facts = artifact.public_facts.clone();
-            facts.consensus_branch_id = Some(branch_id);
-            (
-                facts,
-                wire_location::Location::Mined(mined),
-                Some(artifact),
-                None,
-            )
+            if let Some(canonical_reader) = canonical_reader {
+                let artifact =
+                    read_mined_transaction_facts(Some(canonical_reader), transaction_id)?;
+                let mut facts = artifact.public_facts.clone();
+                facts.consensus_branch_id = Some(branch_id);
+                (
+                    facts,
+                    wire_location::Location::Mined(mined),
+                    Some(artifact),
+                    None,
+                )
+            } else {
+                let raw_transaction_bytes =
+                    mined.raw_transaction_bytes.as_deref().ok_or_else(|| {
+                        ExplorerError::not_materialized(format!(
+                            "raw transaction bytes are not available for {transaction_id:?}"
+                        ))
+                    })?;
+                let fact_set = zinder_source::parse_transaction_public_fact_set(
+                    raw_transaction_bytes,
+                    Some(BlockHeight::new(
+                        mined
+                            .location
+                            .as_ref()
+                            .ok_or_else(|| {
+                                ExplorerError::internal("MinedTransaction missing block location")
+                            })?
+                            .block_height,
+                    )),
+                    network_upgrade_activations,
+                )
+                .map_err(|error| ExplorerError::internal(error.to_string()))?;
+                if fact_set.public_facts.transaction_id != transaction_id {
+                    return Err(ExplorerError::internal(
+                        "WalletQuery.Transaction mined payload transaction id mismatch",
+                    )
+                    .into());
+                }
+                let mut facts = fact_set.public_facts.clone();
+                facts.consensus_branch_id = Some(branch_id);
+                (
+                    facts,
+                    wire_location::Location::Mined(mined),
+                    None,
+                    Some(fact_set),
+                )
+            }
         }
         wire_location::Location::InMempool(mempool) => {
-            let activations = NetworkUpgradeActivations::empty(network);
             let fact_set = zinder_source::parse_transaction_public_fact_set(
                 &mempool.raw_transaction_bytes,
                 None,
-                &activations,
+                network_upgrade_activations,
             )
             .map_err(|error| ExplorerError::internal(error.to_string()))?;
             if fact_set.public_facts.transaction_id != transaction_id {
@@ -280,13 +339,10 @@ fn resolve_facts_and_location(
 
 fn resolve_fee_record(
     materialized_view_store: Option<&MaterializedViewStore>,
-    transaction: Option<&TransactionFactsArtifact>,
+    transaction: &ResolvedTransactionDetail,
     parent_transactions: &HashMap<TransactionId, Option<TransactionFactsArtifact>>,
 ) -> Result<Option<TransactionFeesRecord>, Status> {
-    let Some(transaction) = transaction else {
-        return Ok(None);
-    };
-    if transaction.public_facts.is_coinbase {
+    if transaction.facts.is_coinbase {
         return Ok(None);
     }
     let Some(materialized_view_store) = materialized_view_store else {
@@ -295,18 +351,25 @@ fn resolve_fee_record(
 
     let projected = TransactionFeesConsumer::read_fees_record(
         materialized_view_store,
-        transaction.location.transaction_id,
-        transaction.public_facts.privacy_shape,
+        transaction.facts.transaction_id,
+        transaction.facts.privacy_shape,
     )
     .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let Some(canonical_artifact) = transaction.canonical_artifact.as_ref() else {
+        return Ok(projected);
+    };
     let recovered = TransactionFeesConsumer::recover_fee_record_from_parent_facts(
-        transaction,
+        canonical_artifact,
         parent_transactions,
     );
     Ok(recovered
         .as_ref()
         .map(|record| {
-            TransactionFeesConsumer::merge_fee_records(transaction, projected.as_ref(), record)
+            TransactionFeesConsumer::merge_fee_records(
+                canonical_artifact,
+                projected.as_ref(),
+                record,
+            )
         })
         .or(projected))
 }
@@ -319,11 +382,9 @@ fn canonical_reader_for_location<'store>(
     if !matches!(location, wire_location::Location::Mined(_)) {
         return Ok(None);
     }
-    let store = chain_store.ok_or_else(|| {
-        ExplorerError::dependency_not_configured(
-            "TransactionDetail requires the canonical store; configure --storage-path",
-        )
-    })?;
+    let Some(store) = chain_store else {
+        return Ok(None);
+    };
     store
         .try_catch_up()
         .map_err(|error| status_from_store_error(&error))?;
@@ -360,16 +421,29 @@ fn read_parent_transaction_facts(
 async fn resolve_transparent_output_spends(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     chain_epoch: &wallet::ChainEpoch,
-    transaction: Option<&TransactionFactsArtifact>,
+    transaction: &ResolvedTransactionDetail,
+    materialized_view_store: Option<&MaterializedViewStore>,
 ) -> Result<HashMap<TransparentOutPoint, wallet::TransparentSpend>, Status> {
-    let Some(transaction) = transaction else {
+    if matches!(
+        transaction.location.location,
+        Some(wire_location::Location::InMempool(_))
+    ) {
         return Ok(HashMap::new());
-    };
-    let requested_outpoints: Vec<TransparentOutPoint> = transaction
-        .transparent_outputs
+    }
+    let transparent_outputs = transaction.canonical_artifact.as_ref().map_or_else(
+        || {
+            transaction
+                .transient_fact_set
+                .as_ref()
+                .map(|fact_set| fact_set.transparent_outputs.as_slice())
+                .unwrap_or_default()
+        },
+        |artifact| artifact.transparent_outputs.as_slice(),
+    );
+    let requested_outpoints: Vec<TransparentOutPoint> = transparent_outputs
         .iter()
         .map(|output| {
-            TransparentOutPoint::new(transaction.location.transaction_id, output.output_index)
+            TransparentOutPoint::new(transaction.facts.transaction_id, output.output_index)
         })
         .collect();
     if requested_outpoints.is_empty() {
@@ -384,6 +458,20 @@ async fn resolve_transparent_output_spends(
         .into());
     }
 
+    if transaction.canonical_artifact.is_none() {
+        let materialized_view_store = materialized_view_store.ok_or_else(|| {
+            ExplorerError::dependency_not_configured(
+                "TransactionDetail requires the explorer materialized-view store",
+            )
+        })?;
+        return resolve_materialized_transparent_output_spends(
+            materialized_view_store,
+            chain_epoch,
+            transaction,
+            &requested_outpoints,
+        );
+    }
+
     let mut spends = HashMap::new();
     for outpoint_batch in requested_outpoints.chunks(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST) {
         let batch_spends =
@@ -392,6 +480,68 @@ async fn resolve_transparent_output_spends(
         insert_transparent_output_spends(&mut spends, &requested_outpoint_set, batch_spends)?;
     }
     Ok(spends)
+}
+
+fn resolve_materialized_transparent_output_spends(
+    materialized_view_store: &MaterializedViewStore,
+    chain_epoch: &wallet::ChainEpoch,
+    transaction: &ResolvedTransactionDetail,
+    requested_outpoints: &[TransparentOutPoint],
+) -> Result<HashMap<TransparentOutPoint, wallet::TransparentSpend>, Status> {
+    materialized_view_store
+        .try_catch_up()
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let expected_epoch = chain_epoch_from_message(chain_epoch.clone())
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let mined_height = transaction
+        .location
+        .location
+        .as_ref()
+        .and_then(|location| match location {
+            wire_location::Location::Mined(mined) => mined
+                .location
+                .as_ref()
+                .map(|location| location.block_height),
+            wire_location::Location::InMempool(_) => None,
+        })
+        .map(BlockHeight::new)
+        .ok_or_else(|| ExplorerError::internal("MinedTransaction missing block location"))?;
+    let spends = {
+        let snapshot = materialized_view_store.read_snapshot();
+        let state = snapshot
+            .consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?
+            .ok_or_else(|| {
+                ExplorerError::not_materialized(
+                    "transparent outpoint spend materialized-view state is unavailable",
+                )
+            })?;
+        let state_matches_epoch = state.chain_epoch_id == expected_epoch.id
+            && state.tip_height == expected_epoch.visible_tip_height
+            && state.tip_hash == expected_epoch.visible_tip_hash;
+        let coverage_is_complete = state.coverage.is_some_and(|coverage| {
+            coverage.complete_from_height <= mined_height
+                && coverage.complete_through_height >= expected_epoch.visible_tip_height
+                && coverage.complete_through_hash == expected_epoch.visible_tip_hash
+        });
+        if !state_matches_epoch || !coverage_is_complete {
+            return Err(ExplorerError::not_materialized(
+                "transparent outpoint spend materialized view does not cover the requested chain epoch",
+            )
+            .into());
+        }
+        let spends = TransparentOutpointSpendConsumer::read_spends_by_outpoints_snapshot(
+            &snapshot,
+            requested_outpoints,
+        )
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+        drop(snapshot);
+        spends
+    };
+    Ok(spends
+        .into_iter()
+        .map(|(outpoint, spend)| (outpoint, transparent_spend_message(&spend)))
+        .collect())
 }
 
 async fn fetch_transparent_output_spend_batch(
@@ -614,7 +764,7 @@ mod tests {
 
         let resolved = resolve_facts_and_location(
             None,
-            Network::ZcashRegtest,
+            &activations,
             transaction_id,
             wire_location::Location::InMempool(wallet::MempoolEntry {
                 raw_transaction_bytes: payload_bytes,
@@ -625,7 +775,7 @@ mod tests {
         let fact_set = resolved
             .transient_fact_set
             .ok_or_else(|| eyre::eyre!("mempool fact set missing"))?;
-        let inputs = encode_unresolved_transparent_inputs(&fact_set.transparent_inputs);
+        let inputs = encode_unresolved_transparent_inputs(&fact_set.transparent_inputs, None);
         let outputs = encode_transparent_output_facts(
             transaction_id,
             &fact_set.transparent_outputs,
@@ -646,6 +796,47 @@ mod tests {
             Some(2_500)
         );
         assert!(outputs.iter().all(|output| output.spent_by.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn mined_detail_parses_wallet_bytes_without_legacy_canonical_store() -> eyre::Result<()> {
+        let payload_bytes = transparent_transaction_bytes();
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let parsed = zinder_source::parse_transaction_public_fact_set(
+            &payload_bytes,
+            Some(BlockHeight::new(1)),
+            &activations,
+        )?;
+        let transaction_id = parsed.public_facts.transaction_id;
+
+        let resolved = resolve_facts_and_location(
+            None,
+            &activations,
+            transaction_id,
+            wire_location::Location::Mined(wallet::MinedTransaction {
+                location: Some(wallet::MinedBlockLocation {
+                    transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+                    block_height: 1,
+                    block_hash: "00".repeat(32),
+                    tx_index_in_block: 0,
+                }),
+                chain_context: Some(wallet::MinedTransactionChainContext {
+                    consensus_branch_id: 0xAABB_CCDD,
+                    block_time: 1_700_000_000,
+                    confirmations: 1,
+                }),
+                raw_transaction_bytes: Some(payload_bytes),
+            }),
+        )?;
+
+        assert!(resolved.canonical_artifact.is_none());
+        assert!(resolved.transient_fact_set.is_some());
+        assert_eq!(resolved.facts.transaction_id, transaction_id);
+        assert_eq!(
+            resolved.facts.consensus_branch_id,
+            Some(ConsensusBranchId::new(0xAABB_CCDD))
+        );
         Ok(())
     }
 
@@ -677,7 +868,13 @@ mod tests {
             synthetic_transaction_public_facts(transaction_id, 64),
         );
 
-        let outcome = resolve_fee_record(None, Some(&transaction), &HashMap::new());
+        let resolved = ResolvedTransactionDetail {
+            facts: transaction.public_facts.clone(),
+            location: WireTransactionLocation::default(),
+            canonical_artifact: Some(transaction),
+            transient_fact_set: None,
+        };
+        let outcome = resolve_fee_record(None, &resolved, &HashMap::new());
 
         assert!(matches!(outcome, Ok(None)));
     }

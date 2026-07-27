@@ -123,11 +123,11 @@ if [[ -n "$compose_contract" ]]; then
   jq -e '
     .services as $services
     |
-    def exact_healthcheck($url):
+    def exact_healthcheck($url; $start_period):
       .test == ["CMD", "curl", "-fsS", $url]
       and .interval == "30s"
       and .timeout == "5s"
-      and .start_period == "1m0s"
+      and .start_period == $start_period
       and .retries == 3;
     def volume_mounts_at($service; $target):
       [ $services[$service].volumes[]? | select(.type == "volume" and .target == $target) ];
@@ -163,7 +163,7 @@ if [[ -n "$compose_contract" ]]; then
     and ($services["state-init"].command == [
       "sh",
       "-c",
-      "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary && chown -R 1000:1000 /var/lib/zinder"
+      "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary /var/lib/zinder/explorer/secondary && chown -R 1000:1000 /var/lib/zinder"
     ])
     and ($state_data | length == 1)
     and ($state_checkpoint | length == 1)
@@ -200,10 +200,10 @@ if [[ -n "$compose_contract" ]]; then
     and exact_read_only_bind("zinder-compat-lightwalletd"; "/etc/zinder/config.toml"; "/deploy/config/compat-lightwalletd.toml")
     and exact_read_only_bind("zinder-query"; "/var/run/zinder-control/ingest.token"; "/ingest.token")
     and exact_read_only_bind("zinder-compat-lightwalletd"; "/var/run/zinder-control/ingest.token"; "/ingest.token")
-    and ($services["zinder-ingest"].healthcheck | exact_healthcheck("http://localhost:9105/readyz"))
-    and ($services["zinder-projector"].healthcheck | exact_healthcheck("http://localhost:9110/readyz"))
-    and ($services["zinder-query"].healthcheck | exact_healthcheck("http://localhost:9106/readyz"))
-    and ($services["zinder-compat-lightwalletd"].healthcheck | exact_healthcheck("http://localhost:9107/readyz"))
+    and ($services["zinder-ingest"].healthcheck | exact_healthcheck("http://localhost:9105/readyz"; "3h0m0s"))
+    and ($services["zinder-projector"].healthcheck | exact_healthcheck("http://localhost:9110/readyz"; "2h0m0s"))
+    and ($services["zinder-query"].healthcheck | exact_healthcheck("http://localhost:9106/readyz"; "5m0s"))
+    and ($services["zinder-compat-lightwalletd"].healthcheck | exact_healthcheck("http://localhost:9107/readyz"; "5m0s"))
     and ($services["zinder-projector"].depends_on["zinder-ingest"].condition == "service_healthy")
     and ($services["zinder-compat-lightwalletd"].depends_on["zinder-ingest"].condition == "service_healthy")
     and ($services["zinder-compat-lightwalletd"].depends_on["zinder-projector"].condition == "service_healthy")

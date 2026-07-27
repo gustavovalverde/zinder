@@ -188,6 +188,62 @@ fn maximum_depth_replacement_is_atomic_archived_and_reopenable_then_appends()
 }
 
 #[test]
+fn repeatedly_displaced_block_hash_reopens_and_resolves_its_newest_occurrence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut store = published_store(&store_path, 2, BlockHeight::new(4), BlockHeight::new(2))?;
+
+    for (block_hash, transaction_tag, displaced_at) in [
+        ([33; 32], 203, 1_750_000_000_002),
+        ([3; 32], 103, 1_750_000_000_003),
+        ([44; 32], 204, 1_750_000_000_004),
+    ] {
+        let expected_fence = store.event_fence();
+        let replacement =
+            replacement_block(BlockHeight::new(3), block_hash, [2; 32], transaction_tag)?;
+        let (next, _) = store.commit_live_replacement(
+            CanonicalLiveReplacement::new(
+                expected_fence,
+                vec![CanonicalReplacementBlock::new(replacement, Vec::new())],
+                UnixTimestampMillis::new(displaced_at),
+            ),
+            &activations,
+        )?;
+        store = next;
+    }
+
+    assert_eq!(store.displaced_block_count()?, 4);
+    assert_eq!(
+        store
+            .displaced_block_by_hash(BlockHash::from_bytes([3; 32]))?
+            .ok_or("repeatedly displaced block is absent")?
+            .displacement_event_sequence,
+        4
+    );
+    assert_eq!(
+        store
+            .displaced_blocks_for_event(2, NonZeroU32::new(2).ok_or("zero limit")?)?
+            .last()
+            .ok_or("original displacement is absent")?
+            .block_hash,
+        BlockHash::from_bytes([3; 32])
+    );
+
+    drop(store);
+    let reopened = open_store(&store_path, &activations, 2)?;
+    assert_eq!(
+        reopened
+            .displaced_block_by_hash(BlockHash::from_bytes([3; 32]))?
+            .ok_or("repeatedly displaced block is absent after reopen")?
+            .displacement_event_sequence,
+        4
+    );
+    Ok(())
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one public-boundary lifecycle proof keeps cursor, reorg, lease, pruning, reopen, and corrupt-record assertions together"

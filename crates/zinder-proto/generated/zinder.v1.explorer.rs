@@ -268,13 +268,13 @@ pub struct TransactionDetailRequest {
 /// `WalletQuery.Transaction` returns, so a consumer writes one match shape
 /// for both surfaces.
 ///
-/// `transparent_inputs` is populated for mined transactions from their
-/// canonical transaction fact and retained parent facts. Each entry combines
-/// input identity and optional prevout resolution so callers do not have to
-/// correlate parallel arrays. `prevout_resolution_status` and `paid_fee_zat`
-/// remain fee materialized-view fields advertised by `EXPLORER_TRANSACTION_FEES_V1`.
-/// The handler merges a projected fee row with values recovered from the same
-/// parent facts used by `transparent_inputs`.
+/// `transparent_inputs` is populated for mined transactions from retained raw
+/// bytes plus projected fee rows. Each entry combines input identity and
+/// optional prevout resolution so callers do not have to correlate parallel
+/// arrays. Library compositions with a canonical secondary may merge values and
+/// scripts recovered from retained parent facts. `prevout_resolution_status`
+/// and `paid_fee_zat` remain fee materialized-view fields advertised by
+/// `EXPLORER_TRANSACTION_FEES_V1`.
 /// `paid_fee_zat` additionally requires `facts.privacy_shape ==  TRANSPARENT_ONLY`; shielded and unclassified transactions omit it because
 /// canonical facts do not retain the value balances needed to prove their
 /// actual fee. Consumers fall back to

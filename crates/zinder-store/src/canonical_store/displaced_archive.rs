@@ -674,9 +674,25 @@ fn validate_latest_hash_pointer(
         )
     })?;
     let pointed_position = decode_hash_pointer(&encoded_pointer, archived_position.block_hash)?;
-    if pointed_position != archived_position {
+    if pointed_position.height != archived_position.height {
+        return Err(CanonicalStoreError::displaced_archive(
+            "retained reorg newest-hash pointer changes block height",
+        ));
+    }
+    if pointed_position.event_sequence < archived_position.event_sequence {
         return Err(CanonicalStoreError::displaced_archive(
             "latest retained reorg newest-hash pointer is stale",
+        ));
+    }
+    if read_exact_db_row(
+        db,
+        &encode_order_key(pointed_position),
+        "reorg archive newest-hash pointer target admission read",
+    )?
+    .is_none()
+    {
+        return Err(CanonicalStoreError::displaced_archive(
+            "retained reorg newest-hash pointer target row is absent",
         ));
     }
     Ok(())

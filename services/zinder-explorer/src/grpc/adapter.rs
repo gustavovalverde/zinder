@@ -520,6 +520,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                     chain_store: self.canonical_store.as_ref(),
                     materialized_view_store: self.materialized_view_store.as_ref(),
                     network: self.settings.network,
+                    network_upgrade_activations: &self.network_upgrade_activations,
                     upstream_observation_cache: &self.upstream_observation_cache,
                 },
                 request,
@@ -1639,7 +1640,8 @@ mod tests {
         TRANSACTION_HISTORY_CONSUMER_NAME,
     };
     use zinder_proto::capabilities::{
-        EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_TRANSACTION_HISTORY_V1, EXPLORER_TRANSACTION_HISTORY_V2,
+        EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_TRANSACTION_DETAIL_V4, EXPLORER_TRANSACTION_HISTORY_V1,
+        EXPLORER_TRANSACTION_HISTORY_V2,
     };
     use zinder_store::{ChainStoreOptions, RocksDbResourceBudget, SecondaryChainStore};
     use zinder_testkit::{ChainFixture, StoreFixture};
@@ -1776,6 +1778,45 @@ mod tests {
         let (_tempdir, adapter) =
             adapter_with_transaction_history_state(Some(complete_state), false)?;
         assert_transaction_history_capabilities(&adapter, false, false);
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_detail_capability_requires_wallet_and_explorer_materialized_views()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let wallet_only = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
+        assert!(
+            !wallet_only
+                .advertised_capabilities()
+                .contains(&EXPLORER_TRANSACTION_DETAIL_V4)
+        );
+
+        let tempdir = tempdir()?;
+        let materialized_view_store = MaterializedViewStore::open_with_materialized_view_preset(
+            tempdir.path(),
+            MaterializedViewPreset::Explorer,
+            MaterializedViewStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?;
+        let materialized_views_only =
+            ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+                .with_materialized_view_store(materialized_view_store);
+        assert!(
+            !materialized_views_only
+                .advertised_capabilities()
+                .contains(&EXPLORER_TRANSACTION_DETAIL_V4)
+        );
+
+        let adapter =
+            materialized_views_only.with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
+        assert!(
+            adapter
+                .advertised_capabilities()
+                .contains(&EXPLORER_TRANSACTION_DETAIL_V4)
+        );
         Ok(())
     }
 

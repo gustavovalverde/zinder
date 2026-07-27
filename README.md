@@ -185,7 +185,7 @@ T3 live tests use the same env-var schema as production binaries and are double-
 ```bash
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=zebra \
   ZINDER_NODE__AUTH__PASSWORD=zebra \

@@ -32,8 +32,12 @@ docker compose \
 ```
 
 The dependency order is ingest, projector, then both serving runtimes, but
-container start does not imply traffic readiness. Follow all four operational
-endpoints:
+container start does not imply traffic readiness. Compose keeps each expected
+initial construction in Docker's `starting` state for the corresponding
+production hard gate: three hours for canonical construction, two hours for
+wallet construction, and five minutes for each serving reader. A process that
+is still non-ready after its grace period becomes unhealthy and stops the
+dependency chain. Follow all four operational endpoints:
 
 ```bash
 curl -sS http://127.0.0.1:19105/readyz  # ingest

@@ -76,7 +76,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          image_names="$(jq -r '.[]' <<< "$RELEASE_IMAGES_JSON")"
+          image_names="$(
+            jq -r '.[]' <<< "$RELEASE_IMAGES_JSON"
+            printf '%s\n' zinder-explorer
+          )"
           while IFS= read -r image_name; do
 
             docker buildx build \

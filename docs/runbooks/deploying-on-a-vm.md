@@ -4,8 +4,10 @@ This runbook operates the supported `rocksdb-single-host` wallet-serving
 topology. Four independent processes share one host filesystem:
 `zinder-ingest` owns canonical storage, `zinder-projector` owns the wallet
 projection, and `zinder-query` plus `zinder-compat-lightwalletd` independently
-serve immutable canonical and wallet secondary pairs. Explorer and mixed
-single-container images are not release paths.
+serve immutable canonical and wallet secondary pairs. The optional explorer
+overlay builds a local `zinder-explorer` image for named explorer consumers;
+it is not part of the published release-image catalog. Mixed single-container
+images are not release paths.
 
 A successful deployment is a canary until the release's mainnet construction,
 wallet-build, coherent-restore, capacity, replacement, and independent-client
@@ -128,7 +130,29 @@ The Compose topology gives projector, query, and compatibility containers the
 ingest container's network namespace. This keeps `CanonicalControl` and
 `IngestControl` on `127.0.0.1:9100` without weakening the non-loopback
 bearer-token rule. Both wallet-facing gRPC ports are published on host loopback
-only.
+only. Readiness is also the dependency gate: expected fresh construction stays
+in Docker's `starting` state for the documented three-hour canonical and
+two-hour wallet-build hard gates instead of being reported unhealthy after one
+minute. Query and compatibility receive five-minute startup grace periods.
+
+### Attach an explorer consumer
+
+When the same host serves Zexplorer or another named `ExplorerQuery` consumer,
+merge the explorer overlay:
+
+```bash
+docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.explorer.yml \
+  up -d --build
+```
+
+The overlay builds `zinder-explorer`, opens a process-owned materialized-view
+secondary, and federates `WalletQuery` over the shared loopback namespace. The
+runtime does not open a canonical secondary. It publishes gRPC and ops
+endpoints on host loopback using `ZINDER_EXPLORER_HOST_PORT` and
+`ZINDER_EXPLORER_OPS_HOST_PORT`. Inside the Z3 network, consumers use the stable
+`zinder-${Z3_NETWORK_LOWER}-explorer:9068` alias.
 
 Create two file-backed control secrets outside the shared data volume: the
 ordinary `ingest.token`, mounted into all four runtimes, and the separate

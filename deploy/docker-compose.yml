@@ -25,7 +25,7 @@ services:
       [
         "sh",
         "-c",
-        "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary && chown -R 1000:1000 /var/lib/zinder",
+        "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary /var/lib/zinder/explorer/secondary && chown -R 1000:1000 /var/lib/zinder",
       ]
     volumes:
       - type: volume
@@ -50,7 +50,13 @@ services:
     depends_on:
       state-init:
         condition: service_completed_successfully
-    networks: [z3, observability]
+    networks:
+      z3:
+        aliases:
+          - zinder-${Z3_NETWORK_LOWER:-mainnet}-ingest
+          - zinder-${Z3_NETWORK_LOWER:-mainnet}-query
+          - zinder-${Z3_NETWORK_LOWER:-mainnet}-explorer
+      observability:
     volumes:
       - data:/var/lib/zinder
       - checkpoint-staging:/var/lib/zinder/checkpoints
@@ -79,7 +85,9 @@ services:
       test: ["CMD", "curl", "-fsS", "http://localhost:9105/readyz"]
       interval: 30s
       timeout: 5s
-      start_period: 60s
+      # Fresh canonical construction has a three-hour production hard gate.
+      # Keep expected bootstrap failures in Docker's starting state until then.
+      start_period: 3h
       retries: 3
 
   zinder-projector:
@@ -113,7 +121,8 @@ services:
       test: ["CMD", "curl", "-fsS", "http://localhost:9110/readyz"]
       interval: 30s
       timeout: 5s
-      start_period: 60s
+      # Wallet construction has a two-hour production hard gate.
+      start_period: 2h
       retries: 3
 
   zinder-query:
@@ -147,7 +156,7 @@ services:
       test: ["CMD", "curl", "-fsS", "http://localhost:9106/readyz"]
       interval: 30s
       timeout: 5s
-      start_period: 60s
+      start_period: 5m
       retries: 3
 
   zinder-compat-lightwalletd:
@@ -181,7 +190,7 @@ services:
       test: ["CMD", "curl", "-fsS", "http://localhost:9107/readyz"]
       interval: 30s
       timeout: 5s
-      start_period: 60s
+      start_period: 5m
       retries: 3
 
   zinder-prometheus:
