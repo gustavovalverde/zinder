@@ -4,6 +4,28 @@ set -euo pipefail
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$repository_root"
 
+zebra_runtime_image='docker.io/zfnd/zebra:6.2.2@sha256:f464a4bf44c3402b2c9063c6df686b9177a4659ea61aecdc8aeb6947f2173197'
+zebra_runtime_pin_files=(
+  .github/workflows/live-tests.yml
+  .github/workflows/parity-compat.yml
+  docs/reference/lightwalletd-compatibility.md
+)
+
+mapfile -t zebra_runtime_images < <(
+  grep -hEo \
+    '(docker\.io/)?zfnd/zebra:[0-9A-Za-z._-]+(@sha256:[a-f0-9]{64})?' \
+    "${zebra_runtime_pin_files[@]}" |
+    sort -u
+)
+if [[
+  "${#zebra_runtime_images[@]}" -ne 1 ||
+  "${zebra_runtime_images[0]:-}" != "$zebra_runtime_image"
+]]; then
+  echo >&2 \
+    "Zebra runtime certification must use exactly $zebra_runtime_image; found: ${zebra_runtime_images[*]:-none}"
+  exit 1
+fi
+
 workspace_tree="$(cargo tree --workspace --locked --prefix none)"
 zebra_tree="$(cargo tree -p zebra-chain --locked --prefix none)"
 
