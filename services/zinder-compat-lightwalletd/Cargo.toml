@@ -46,7 +46,7 @@ sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "time"] }
 tokio-stream.workspace = true
-zcash_address = { version = "0.13.0", default-features = false, features = ["std"] }
+zcash_address = { workspace = true, features = ["std"] }
 zinder-ingest.workspace = true
 zinder-store.workspace = true
 zinder-testkit.workspace = true
