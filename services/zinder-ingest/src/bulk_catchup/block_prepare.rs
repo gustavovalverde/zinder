@@ -22,6 +22,7 @@ use futures_util::{
     stream::{self, BoxStream, FuturesUnordered, Stream, StreamExt},
 };
 use parking_lot::Mutex;
+use tokio_util::task::AbortOnDropHandle;
 use zinder_core::{
     BlockHeight, CanonicalBlockFacts, CanonicalTransactionFacts, CompactBlockArtifact,
     CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransaction,
@@ -41,7 +42,6 @@ use crate::chain_ingest::{
     prefetched_spent_transparent_output_bytes, record_ingest_block_prepare_outcome,
 };
 use crate::writer::construction::{
-    abort_on_drop::AbortOnDropTask,
     source_fetch::{
         CanonicalSourceFetchConfig, SourceBlockChunk, SourceSegmentSizer, build_source_block_stream,
     },
@@ -389,7 +389,7 @@ where
     let prepare_fn = state.prepare_fn.clone();
     // Spawned so per-block canonical preparation progresses on runtime workers
     // instead of only while this stream is polled by the commit consumer.
-    let block_prepare_task = AbortOnDropTask::spawn(async move {
+    let block_prepare_task = AbortOnDropHandle::new(tokio::spawn(async move {
         let height = source_block.height;
         let block_prepare_started_at = Instant::now();
         let block_prepare_outcome = async {
@@ -414,10 +414,10 @@ where
         .await;
         record_ingest_block_prepare_outcome(block_prepare_started_at, &block_prepare_outcome);
         block_prepare_outcome
-    });
+    }));
     state.in_flight_block_prepares.push(
         async move {
-            match block_prepare_task.join().await {
+            match block_prepare_task.await {
                 Ok(block_prepare_outcome) => block_prepare_outcome,
                 Err(join_error) => Err(IngestError::BlockingTaskFailed {
                     reason: join_error.to_string(),

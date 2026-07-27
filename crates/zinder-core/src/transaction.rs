@@ -57,10 +57,11 @@ impl AuthDigest {
 ///
 /// A post-Sapling Zcash transaction cannot exceed the maximum block size, since
 /// a transaction larger than a block could never be mined. The bound matches
-/// `zebra-chain`'s `MAX_BLOCK_BYTES`; the per-transaction limit is in practice a
-/// few bytes smaller (a block also carries a header and a transaction count),
-/// so the block size is a safe upper bound for the broadcast guard.
-pub const MAX_RAW_TRANSACTION_BYTES: usize = 2_000_000;
+/// The bound comes from [`zcash_protocol::constants::MAX_BLOCK_BYTES`]. The
+/// per-transaction limit is in practice a few bytes smaller (a block also
+/// carries a header and a transaction count), so the block size is a safe
+/// upper bound for the broadcast guard.
+pub const MAX_RAW_TRANSACTION_BYTES: usize = zcash_protocol::constants::MAX_BLOCK_BYTES;
 
 /// Raw serialized Zcash transaction bytes submitted by a wallet.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,0 +1,6 @@
+kind: changed
+body: Update the Ironwood dependency stack and report the NU6.3 mainnet activation height in the Cipherscan migration overview.
+time: 2026-07-25T15:02:38.655622326Z
+custom:
+  Bump: patch
+  PR: "51"

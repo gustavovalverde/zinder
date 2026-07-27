@@ -30,7 +30,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 zcash_address = { version = "0.13.0", default-features = false, features = ["std"] }
 zcash_primitives = { version = "0.29.0", default-features = false, features = ["circuits", "transparent-inputs", "std", "test-dependencies"] }
-zcash_protocol = { version = "0.10.0", default-features = false, features = ["local-consensus", "std"] }
+zcash_protocol = { version = "0.10.1", default-features = false, features = ["local-consensus", "std"] }
 zcash_transparent = { version = "0.9.0", default-features = false, features = ["transparent-inputs", "std"] }
 zinder-core.workspace = true
 zinder-materialized-views.workspace = true

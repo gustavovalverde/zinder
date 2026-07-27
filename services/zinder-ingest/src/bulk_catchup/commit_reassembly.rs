@@ -10,6 +10,7 @@
 use std::time::Instant;
 
 use futures_util::{Stream, StreamExt};
+use tokio_util::task::AbortOnDropHandle;
 use zinder_core::{BlockId, ChainEpoch, ChainEpochId, Network, TreeStateArtifact};
 use zinder_source::NodeSource;
 use zinder_store::{
@@ -33,10 +34,7 @@ use crate::chain_ingest::{
     observe_final_note_commitment_roots, populate_subtree_root_artifacts,
     record_ingest_batch_commit_trigger, record_ingest_batch_work_cost,
 };
-use crate::writer::construction::{
-    abort_on_drop::AbortOnDropTask,
-    watermark::{record_queue_depth, record_reorder_buffer},
-};
+use crate::writer::construction::watermark::{record_queue_depth, record_reorder_buffer};
 
 #[allow(
     clippy::too_many_lines,
@@ -269,7 +267,7 @@ where
 }
 
 type InFlightCanonicalCommit =
-    AbortOnDropTask<Result<CommittedCanonicalBatch, CanonicalCommitFailure>>;
+    AbortOnDropHandle<Result<CommittedCanonicalBatch, CanonicalCommitFailure>>;
 
 /// Owned handles moved into a spawned canonical-commit task.
 ///
@@ -367,7 +365,7 @@ where
         source: run.source.clone(),
         store: run.store.clone(),
     };
-    AbortOnDropTask::spawn(commit_canonical_batch(deps, request))
+    AbortOnDropHandle::new(tokio::spawn(commit_canonical_batch(deps, request)))
 }
 
 async fn commit_canonical_batch<Source>(
@@ -507,7 +505,7 @@ async fn wait_for_in_flight_canonical_commit(
     let Some(commit) = in_flight_commit.take() else {
         return Ok(());
     };
-    match commit.join().await {
+    match commit.await {
         Ok(Ok(committed_batch)) => {
             apply_committed_canonical_batch(
                 committed_batch,

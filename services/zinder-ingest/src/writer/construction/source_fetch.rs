@@ -14,13 +14,13 @@ use futures_util::{
     stream::{self, FuturesUnordered, Stream, StreamExt},
 };
 use parking_lot::Mutex;
+use tokio_util::task::AbortOnDropHandle;
 use zinder_core::{BlockHeight, BlockId, ConsensusBranchId, NetworkUpgradeActivations};
 use zinder_source::{
     NodeSource, SourceBlock, SourceChainCursor, SourceChainSegment, SourceChainSegmentLimits,
     SourceChainSegmentStats, SourceChainUpdate, SourceError,
 };
 
-use super::abort_on_drop::AbortOnDropTask;
 use super::watermark::{ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer};
 use crate::chain_ingest::{IngestError, IngestRetryState, fetch_chain_segment_with_retry};
 
@@ -257,7 +257,7 @@ where
 
     // Spawned so segment fetches and block decoding progress on runtime
     // workers instead of only while the segment stream itself is polled.
-    let fetch_task = AbortOnDropTask::spawn(async move {
+    let fetch_task = AbortOnDropHandle::new(tokio::spawn(async move {
         let mut retry_state = IngestRetryState::default();
         let limits = SourceChainSegmentLimits::new(
             cursor,
@@ -283,10 +283,10 @@ where
             feedback_action: None,
             reservation,
         })
-    });
+    }));
 
     async move {
-        match fetch_task.join().await {
+        match fetch_task.await {
             Ok(segment_result) => segment_result,
             Err(join_error) => Err(IngestError::SourceSegmentFetchTaskStopped {
                 reason: join_error.to_string(),

@@ -45,6 +45,7 @@ use time::{Date, Duration, Month, OffsetDateTime, format_description::well_known
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::Code;
+use zcash_protocol::consensus::{BLOCKS_PER_HOUR, SECONDS_PER_BLOCK};
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::Height as ZebraHeight,
@@ -127,7 +128,8 @@ const MAX_NON_CANONICAL_BLOCK_LIMIT: u32 = 200;
 const BLOCK_SUMMARY_PAGE_SIZE: u32 = 1_024;
 const MAX_RAW_TRANSACTION_BATCH_SIZE: usize = 1_000;
 const MAX_SCAN_RANGE_BLOCKS: u64 = 1_000_000;
-const MAX_ORCHARD_CANDIDATE_SCAN_BLOCKS: u64 = 8_064;
+const TARGET_BLOCKS_PER_DAY: u32 = BLOCKS_PER_HOUR * 24;
+const MAX_ORCHARD_CANDIDATE_SCAN_BLOCKS: u32 = TARGET_BLOCKS_PER_DAY * 7;
 const ORCHARD_CANDIDATE_SCAN_VIEWING_KEY_FIELDS: [&str; 6] = [
     "viewingKey",
     "viewing_key",
@@ -148,7 +150,6 @@ const ZIP317_COMPLEX_TX_FEE_ZAT: i64 = 25_000;
 const MAX_SUPPLY_ZEC: f64 = 21_000_000.0;
 const ZATOSHIS_PER_ZEC: f64 = 100_000_000.0;
 const SECONDS_PER_DAY: f64 = 86_400.0;
-const TARGET_BLOCKS_PER_DAY: u32 = 1_152;
 // Testnet block production can materially exceed the target spacing. This
 // bound covers the default seven-day route from timestamps rather than from a
 // target-rate estimate while keeping longer analytical windows bounded.
@@ -160,7 +161,7 @@ const MAX_MINING_METRICS_WINDOW: i64 = 100;
 const DEFAULT_MINING_METRICS_LIMIT: i64 = 120;
 const MIN_MINING_METRICS_LIMIT: i64 = 20;
 const MAX_MINING_METRICS_LIMIT: i64 = 500;
-const DEFAULT_MINING_BLOCK_INTERVAL_SECONDS: u32 = 75;
+const DEFAULT_MINING_BLOCK_INTERVAL_SECONDS: u32 = SECONDS_PER_BLOCK;
 const MAX_VALID_MINING_BLOCK_INTERVAL_SECONDS: u32 = 600;
 const COMPONENT_SUMMARY_FUTURE_TIME_MARGIN_SECONDS: i64 = 7_200;
 const PRIVACY_STATS_TREND_DAYS: i64 = 30;
@@ -241,7 +242,6 @@ const MAX_MIGRATION_HISTORY_ENTRIES: usize = 100_000;
 const MAX_MIGRATION_SCANNED_HISTORY_ENTRIES: u64 = 5_000_000;
 const UNIX_SECONDS_PER_DAY: i64 = 86_400;
 const MIGRATION_BOUNDARY_MODULUS: u32 = 256;
-const MIGRATION_AVERAGE_BLOCK_TIME_SECONDS: f64 = 75.0;
 const MAX_FORK_MONITOR_CHECK_HEIGHTS: usize = 10;
 const FORK_MONITOR_ANCHORS: &[(u32, &str)] = &[
     (19_138, "BFT finalized"),
@@ -12205,7 +12205,7 @@ fn migration_overview_json(
         "activationHeight": activation_height,
         "tipHeight": tip_height,
         "activated": activated,
-        "avgBlockTimeSecs": MIGRATION_AVERAGE_BLOCK_TIME_SECONDS,
+        "avgBlockTimeSecs": f64::from(SECONDS_PER_BLOCK),
         "referenceNode": Value::Null,
         "blocksUntilActivation": blocks_until_activation,
         "poolSizes": {
@@ -13469,7 +13469,9 @@ fn parse_orchard_candidate_scan_range(
         return Err("Viewing keys are not accepted");
     }
     let range = parse_scan_range(body, true)?;
-    if range.end_height.saturating_sub(range.start_height) > MAX_ORCHARD_CANDIDATE_SCAN_BLOCKS {
+    if range.end_height.saturating_sub(range.start_height)
+        > u64::from(MAX_ORCHARD_CANDIDATE_SCAN_BLOCKS)
+    {
         return Err("Range too large (max 8064 blocks)");
     }
     Ok(OrchardCandidateScanRange {
@@ -19822,8 +19824,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_overview_json_preserves_mainnet_no_activation_shape()
-    -> Result<(), CipherscanRestError> {
+    fn migration_overview_json_uses_mainnet_activation_height() -> Result<(), CipherscanRestError> {
         let tip_height = 3_500_000;
         let summary = explorer::ValuePoolSummaryResponse {
             freshness: None,
@@ -19835,12 +19836,12 @@ mod tests {
             Network::ZcashMainnet,
             tip_height,
             &summary,
-            &MigrationAnalyticsState::Unavailable(MigrationAnalyticsUnavailable::ActivationUnknown),
+            &MigrationAnalyticsState::Available(MigrationAnalytics::default()),
         )?;
 
         assert_eq!(overview["network"], json!("mainnet"));
-        assert_eq!(overview["activationHeight"], Value::Null);
-        assert_eq!(overview["activated"], json!(false));
+        assert_eq!(overview["activationHeight"], json!(3_428_143));
+        assert_eq!(overview["activated"], json!(true));
         assert_eq!(overview["blocksUntilActivation"], json!(0));
         Ok(())
     }
