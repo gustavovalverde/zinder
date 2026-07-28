@@ -2089,6 +2089,10 @@ mod tests {
             &sample_wallet_admission(7)?,
         )?;
         let valid = serde_json::to_value(manifest)?;
+        let unsupported_construction_manifest_version =
+            CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
+                .checked_add(1)
+                .ok_or("construction manifest test version overflow")?;
         let mutations: [(&str, Value); 17] = [
             ("/identity", Value::String("state_bundle".to_owned())),
             ("/format_version", Value::from(1)),
@@ -2102,7 +2106,7 @@ mod tests {
             ),
             (
                 "/canonical_checkpoint/construction_manifest_version",
-                Value::from(4),
+                Value::from(unsupported_construction_manifest_version),
             ),
             (
                 "/canonical_checkpoint/construction_manifest_sha256",
@@ -2323,11 +2327,15 @@ mod tests {
         assert!(CanonicalCheckpointAdmissionEvidence::try_from(malformed_digest).is_err());
 
         let mut wrong_construction_version = sample_canonical_control_response(7);
+        let unsupported_construction_manifest_version =
+            CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
+                .checked_add(1)
+                .ok_or("construction manifest test version overflow")?;
         wrong_construction_version
             .ready_evidence
             .as_mut()
             .ok_or("sample response must contain READY evidence")?
-            .construction_manifest_version = 4;
+            .construction_manifest_version = u32::from(unsupported_construction_manifest_version);
         assert!(
             CanonicalCheckpointAdmissionEvidence::try_from(wrong_construction_version).is_err()
         );

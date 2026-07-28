@@ -771,6 +771,60 @@ async fn canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold
 }
 
 #[tokio::test]
+async fn canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_reads() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let activations = sample_regtest_upgrade_activations();
+    let (checkpoint_source, _, _) = fixture_construction_checkpoint_source(&fixture)?;
+    capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+    let output_directory = tempdir()?;
+    let canonical_store_path = output_directory.path().join("canonical");
+    let report_path = output_directory
+        .path()
+        .join("canonical-fixture-replay.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+        .arg("rocksdb-canonical-fixture-replay")
+        .arg("--fixture")
+        .arg(fixture.directory.path())
+        .arg("--canonical-store")
+        .arg(&canonical_store_path)
+        .arg("--request-timeout-secs")
+        .arg("5")
+        .arg("--supported-reorg-depth")
+        .arg("1")
+        .arg("--report")
+        .arg(&report_path)
+        .output()?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "canonical fixture replay CLI failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let report: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
+    assert_eq!(
+        report["measurement_kind"],
+        "rocksdb-canonical-fixture-replay"
+    );
+    assert_eq!(
+        report["prohibited_reads"]["historical_prevout_read_count"],
+        0
+    );
+    assert_eq!(
+        report["prohibited_reads"]["cross_block_wallet_read_count"],
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_secondaries() -> Result<()>
 {
     let mut fixture = write_regtest_fixture()?;

@@ -76,18 +76,30 @@ campaign and verifies report, resource, alignment, and aggregation rejection
 paths. Neither requires Docker or a live PostgreSQL server.
 
 After changing captured fixture subtree roots, canonical subtree-root loading,
-or construction-manifest evidence, run the focused complete-prefix proof:
+construction-manifest evidence, or fixture format admission, run the focused
+complete-prefix proof:
 
 ```bash
 cargo nextest run -p zinder-store --profile=ci \
-  -E 'test(complete_prefix_import_and_readback_reject_a_wrong_predecessor_hash)'
+  -E 'test(complete_prefix_loader_rejects_invalid_input_atomically_and_accepts_retry)'
+cargo nextest run -p zinder-store --profile=ci \
+  -E 'test(cold_certification_rejects_tampered_complete_prefix_rows)'
+cargo nextest run -p zinder-bench --profile=ci \
+  -E 'test(canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_reads)'
 cargo nextest run -p zinder-bench --profile=ci \
   -E 'test(canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold_reopen_and_secondary)'
+scripts/test-storage-benchmark-campaign-validator.sh
 ```
 
-The first command proves import and cold-readback rejection at the authenticated
-predecessor boundary. The second replays an index-zero historical prefix through
-publication, independent cold reopen, and a fresh RocksDB secondary.
+The first command proves that the public complete-prefix loader atomically
+rejects missing, extra, misordered, and unauthenticated completion records and
+then accepts a valid retry. The second proves cold certification rejects
+post-load subtree-row tampering. The third executes the benchmark CLI in a
+separate process and proves its self-validation observes both prohibited-read
+series at zero. The fourth replays an index-zero historical prefix through
+publication, independent cold reopen, and a fresh RocksDB secondary. The script
+proves the hermetic campaign validator accepts fixture format v3 and refuses
+obsolete fixture format v2.
 
 `scripts/runbook-lint.sh` parses every fenced `bash` block in this runbook
 through `bash -n` (syntax-only mode) so a typo or unclosed quote in an

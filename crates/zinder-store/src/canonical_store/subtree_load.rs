@@ -765,25 +765,40 @@ const fn shielded_protocols() -> [ShieldedProtocol; 3] {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{num::NonZeroU32, path::Path};
 
-    use rust_rocksdb::ReadOptions;
+    use incrementalmerkletree::{
+        Position,
+        frontier::{CommitmentTree, Frontier},
+    };
+    use rust_rocksdb::IteratorMode;
+    use sapling::Node as SaplingNode;
     use tempfile::tempdir;
+    use zcash_primitives::merkle_tree::write_commitment_tree;
     use zinder_core::{
-        BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, Network,
-        SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash,
-        SubtreeRootIndex, SubtreeRootRange,
+        BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
+        CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion, ChainTipMetadata,
+        CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontiers,
+        CompactBlockArtifact, CompactChainMetadata, FinalNoteCommitmentRoot, Network,
+        SUBTREE_LEAF_COUNT, SerializedBytesDigest, ShieldedProtocol, SubtreeRootArtifact,
+        SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, encode_canonical_block_replay,
     };
 
     use super::{
-        CanonicalSubtreeRootLoadCoverage, ExpectedCompletePrefixSubtreeRoot, decode_subtree_root,
-        encode_subtree_root_key, encode_subtree_root_value, persisted_completion_block_matches,
-        required_subtree_root_ranges, validate_complete_prefix_subtree_root,
+        CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_key,
+        encode_subtree_root_value, required_subtree_root_ranges,
     };
     use crate::{
-        CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention,
-        RocksDbCanonicalBuilder, RocksDbResourceBudget,
+        CanonicalBuildBlock, CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError,
+        CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbResourceBudget,
     };
+
+    const PREDECESSOR: BlockId =
+        BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([99; 32]));
+    const FIRST_RETAINED: BlockId =
+        BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([100; 32]));
+    const BUILD_TIP: BlockId =
+        BlockId::new(BlockHeight::new(101), BlockHash::from_bytes([101; 32]));
 
     #[test]
     fn checkpointed_ranges_begin_after_predecessor_completed_subtrees()
@@ -841,83 +856,340 @@ mod tests {
     }
 
     #[test]
-    fn complete_prefix_import_and_readback_reject_a_wrong_predecessor_hash()
+    fn complete_prefix_loader_rejects_invalid_input_atomically_and_accepts_retry()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempdir()?;
+        let mut builder =
+            loaded_builder_with_complete_prefix_requirements(temporary.path().join("canonical"))?;
+        let valid_roots = valid_complete_prefix_roots();
+        let invalid_cases = invalid_complete_prefix_cases(&valid_roots);
+
+        for (case_name, invalid_roots, expected_error) in invalid_cases {
+            let error = builder
+                .load_complete_subtree_root_prefix(invalid_roots)
+                .err()
+                .ok_or_else(|| format!("{case_name} must be rejected"))?;
+            assert!(
+                error.to_string().contains(expected_error),
+                "{case_name} returned the wrong error: {error}"
+            );
+            assert_eq!(
+                persisted_subtree_root_count(&builder)?,
+                0,
+                "{case_name} wrote rows before rejection"
+            );
+        }
+
+        let evidence = builder.load_complete_subtree_root_prefix(valid_roots)?;
+        assert_eq!(
+            evidence.coverage,
+            CanonicalSubtreeRootLoadCoverage::CompletePrefix
+        );
+        assert_eq!(evidence.subtree_root_count, 3);
+        assert_eq!(persisted_subtree_root_count(&builder)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn cold_certification_rejects_tampered_complete_prefix_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let tip_frontiers = completed_sapling_tip_frontiers()?;
+        cold_certifiable_nonempty_prefix_builder(temporary.path().join("valid"), &tip_frontiers)?
+            .prepare_cold_certified_publication()?;
+
+        let tampered = cold_certifiable_nonempty_prefix_builder(
+            temporary.path().join("tampered"),
+            &tip_frontiers,
+        )?;
+        let loaded_root = complete_prefix_root(ShieldedProtocol::Sapling, 0, 0x51, BUILD_TIP);
+        let tampered_root = complete_prefix_root(ShieldedProtocol::Sapling, 0, 0x99, BUILD_TIP);
+        {
+            let family = tampered
+                .bounded_open
+                .db
+                .cf_handle(super::SUBTREE_ROOT_COLUMN_FAMILY)
+                .ok_or("subtree-root family must exist")?;
+            tampered.bounded_open.db.put_cf(
+                &family,
+                encode_subtree_root_key(&loaded_root),
+                encode_subtree_root_value(&tampered_root),
+            )?;
+        }
+        tampered.bounded_open.db.flush_wal(true)?;
+
+        let error = tampered
+            .prepare_cold_certified_publication()
+            .err()
+            .ok_or("cold certification must reject a tampered subtree-root family")?;
+        assert!(matches!(
+            error,
+            CanonicalStoreError::PublicationRefused { .. }
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("cold subtree-root evidence differs")
+        );
+        Ok(())
+    }
+
+    fn loaded_builder_with_complete_prefix_requirements(
+        path: impl AsRef<Path>,
+    ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
         let activations =
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
-        let predecessor = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
+        let tip_frontiers =
+            crate::canonical_store::test_checkpoint_frontiers(&activations, BUILD_TIP.height);
+        let mut builder = loaded_checkpointed_builder(path, tip_frontiers)?;
+        builder
+            .canonical_block_evidence
+            .as_mut()
+            .ok_or("canonical block evidence must be loaded")?
+            .tip_metadata = ChainTipMetadata::new(SUBTREE_LEAF_COUNT * 2, SUBTREE_LEAF_COUNT, 0);
+        Ok(builder)
+    }
+
+    fn cold_certifiable_nonempty_prefix_builder(
+        path: impl AsRef<Path>,
+        tip_frontiers: &CommitmentTreeFrontiers,
+    ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
+        let mut builder = loaded_checkpointed_builder(path, tip_frontiers.clone())?;
+        let loaded_root = complete_prefix_root(ShieldedProtocol::Sapling, 0, 0x51, BUILD_TIP);
+        let evidence = builder.load_complete_subtree_root_prefix([loaded_root])?;
+        assert_eq!(
+            evidence.coverage,
+            CanonicalSubtreeRootLoadCoverage::CompletePrefix
+        );
+        assert_eq!(evidence.subtree_root_count, 1);
+        builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+            BUILD_TIP,
+            BUILD_TIP.height.value(),
+            tip_frontiers.clone(),
+        ))?;
+        Ok(builder)
+    }
+
+    fn loaded_checkpointed_builder(
+        path: impl AsRef<Path>,
+        tip_frontiers: CommitmentTreeFrontiers,
+    ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let build_plan = CanonicalStoreBuildPlan::checkpointed(
             &activations,
             CommitmentTreeCheckpoint::new(
-                predecessor,
-                99,
-                crate::canonical_store::test_checkpoint_frontiers(&activations, predecessor.height),
+                PREDECESSOR,
+                PREDECESSOR.height.value(),
+                crate::canonical_store::test_checkpoint_frontiers(&activations, PREDECESSOR.height),
             ),
-            BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
+            BUILD_TIP,
             RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
         )?;
-        let builder = RocksDbCanonicalBuilder::create_fresh(
-            temporary.path().join("canonical"),
+        let mut builder = RocksDbCanonicalBuilder::create_fresh(
+            path,
             CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        let wrong_artifact = SubtreeRootArtifact::new(
-            ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            SubtreeRootHash::from_bytes([0x51; 32]),
-            predecessor.height,
-            BlockHash::from_bytes([0x9a; 32]),
-        );
-        let expected = ExpectedCompletePrefixSubtreeRoot {
-            protocol: ShieldedProtocol::Sapling,
-            index: SubtreeRootIndex::new(0),
-            previous_completion_height: None,
+        let mut first =
+            complete_prefix_test_block(FIRST_RETAINED, PREDECESSOR.hash, ChainTipMetadata::empty());
+        first.tree_state_checkpoint = Some(CommitmentTreeCheckpoint::new(
+            FIRST_RETAINED,
+            FIRST_RETAINED.height.value(),
+            crate::canonical_store::test_checkpoint_frontiers(&activations, FIRST_RETAINED.height),
+        ));
+        let tip_metadata = tip_frontiers.tip_metadata();
+        let mut tip = complete_prefix_test_block(BUILD_TIP, FIRST_RETAINED.hash, tip_metadata);
+        tip.tree_state_checkpoint = Some(CommitmentTreeCheckpoint::new(
+            BUILD_TIP,
+            BUILD_TIP.height.value(),
+            tip_frontiers,
+        ));
+        builder.bulk_load_blocks([Ok::<_, std::io::Error>(first), Ok::<_, std::io::Error>(tip)])?;
+        Ok(builder)
+    }
+
+    fn complete_prefix_test_block(
+        block_id: BlockId,
+        parent_hash: BlockHash,
+        tip_metadata: ChainTipMetadata,
+    ) -> CanonicalBuildBlock {
+        let facts = CanonicalBlockFacts {
+            block_header: BlockHeaderArtifact::new(
+                block_id.height,
+                block_id.hash,
+                parent_hash,
+                [3; 32],
+                [4; 32],
+                i64::from(block_id.height.value()),
+                0x1d00_ffff,
+                [5; 32],
+                4,
+                128,
+            ),
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[]),
+            transactions: Vec::new(),
         };
+        let replay_envelope = encode_canonical_block_replay(
+            &facts,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
+        );
+        CanonicalBuildBlock {
+            compact_block: CompactBlockArtifact::empty(
+                block_id,
+                parent_hash,
+                block_id.height.value(),
+                CompactChainMetadata {
+                    sapling_commitment_tree_size: tip_metadata.sapling_commitment_tree_size,
+                    orchard_commitment_tree_size: tip_metadata.orchard_commitment_tree_size,
+                    ironwood_commitment_tree_size: tip_metadata.ironwood_commitment_tree_size,
+                },
+            ),
+            replay_envelope,
+            tip_metadata,
+            tree_state_checkpoint: None,
+            block_final_note_commitment_roots: None,
+            transaction_blobs: Vec::new(),
+            block_blob: None,
+            facts,
+        }
+    }
 
-        let import_error = validate_complete_prefix_subtree_root(
-            &builder.bounded_open.db,
-            builder.build_plan(),
-            expected,
-            &wrong_artifact,
+    fn completed_sapling_tip_frontiers()
+    -> Result<CommitmentTreeFrontiers, Box<dyn std::error::Error>> {
+        let mut leaf_bytes = [0; 32];
+        leaf_bytes[0] = 1;
+        let sapling_leaf = Option::<SaplingNode>::from(SaplingNode::from_bytes(leaf_bytes))
+            .ok_or("one must be a canonical Sapling field element")?;
+        let completed_position = u64::from(SUBTREE_LEAF_COUNT)
+            .checked_sub(1)
+            .ok_or("subtree leaf count must be nonzero")?;
+        let ommer_count = usize::try_from(SUBTREE_LEAF_COUNT.trailing_zeros())?;
+        let frontier: Frontier<SaplingNode, 32> = Frontier::from_parts(
+            Position::from(completed_position),
+            sapling_leaf,
+            vec![sapling_leaf; ommer_count],
         )
-        .err()
-        .ok_or("complete-prefix import must reject a wrong predecessor hash")?;
-        assert!(
-            import_error
-                .to_string()
-                .contains("differs from the authenticated predecessor")
-        );
-        assert!(!persisted_completion_block_matches(
-            &builder.bounded_open.db,
-            builder.build_plan(),
-            CanonicalSubtreeRootLoadCoverage::CompletePrefix,
-            &ReadOptions::default(),
-            &wrong_artifact,
-        )?);
-
-        let matching_artifact = SubtreeRootArtifact::new(
+        .map_err(|error| format!("valid completed Sapling frontier rejected: {error:?}"))?;
+        let tree = CommitmentTree::from_frontier(&frontier);
+        let mut final_state_bytes = Vec::new();
+        write_commitment_tree(&tree, &mut final_state_bytes)?;
+        let mut final_root_bytes = frontier.root().to_bytes();
+        final_root_bytes.reverse();
+        let sapling = CommitmentTreeFrontier::from_canonical_final_state(
             ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            SubtreeRootHash::from_bytes([0x51; 32]),
-            predecessor.height,
-            predecessor.hash,
-        );
-        validate_complete_prefix_subtree_root(
-            &builder.bounded_open.db,
-            builder.build_plan(),
-            expected,
-            &matching_artifact,
+            FinalNoteCommitmentRoot::from_bytes(final_root_bytes),
+            final_state_bytes,
         )?;
-        assert!(persisted_completion_block_matches(
-            &builder.bounded_open.db,
-            builder.build_plan(),
-            CanonicalSubtreeRootLoadCoverage::CompletePrefix,
-            &ReadOptions::default(),
-            &matching_artifact,
-        )?);
-        Ok(())
+        Ok(CommitmentTreeFrontiers::from_validated_parts(
+            Some(sapling),
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Ironwood)),
+        ))
+    }
+
+    fn valid_complete_prefix_roots() -> Vec<SubtreeRootArtifact> {
+        vec![
+            complete_prefix_root(ShieldedProtocol::Sapling, 0, 0x51, PREDECESSOR),
+            complete_prefix_root(ShieldedProtocol::Sapling, 1, 0x52, FIRST_RETAINED),
+            complete_prefix_root(ShieldedProtocol::Orchard, 0, 0x61, BUILD_TIP),
+        ]
+    }
+
+    fn invalid_complete_prefix_cases(
+        valid_roots: &[SubtreeRootArtifact],
+    ) -> Vec<(&'static str, Vec<SubtreeRootArtifact>, &'static str)> {
+        let missing_root = valid_roots[..2].to_vec();
+        let mut extra_root = valid_roots.to_vec();
+        extra_root.push(complete_prefix_root(
+            ShieldedProtocol::Ironwood,
+            0,
+            0x71,
+            BUILD_TIP,
+        ));
+        let mut wrong_protocol = valid_roots.to_vec();
+        wrong_protocol[0] = complete_prefix_root(ShieldedProtocol::Orchard, 0, 0x51, PREDECESSOR);
+        let mut wrong_index_order = valid_roots.to_vec();
+        wrong_index_order.swap(0, 1);
+        let mut retained_hash_mismatch = valid_roots.to_vec();
+        retained_hash_mismatch[1] = complete_prefix_root(
+            ShieldedProtocol::Sapling,
+            1,
+            0x52,
+            BlockId::new(FIRST_RETAINED.height, BlockHash::from_bytes([0xfa; 32])),
+        );
+        let mut predecessor_hash_mismatch = valid_roots.to_vec();
+        predecessor_hash_mismatch[0] = complete_prefix_root(
+            ShieldedProtocol::Sapling,
+            0,
+            0x51,
+            BlockId::new(PREDECESSOR.height, BlockHash::from_bytes([0xfb; 32])),
+        );
+        vec![
+            (
+                "missing root",
+                missing_root,
+                "missing Orchard complete-prefix subtree root at index 0",
+            ),
+            (
+                "extra root",
+                extra_root,
+                "unexpected Ironwood complete-prefix subtree root at index 0",
+            ),
+            (
+                "wrong protocol",
+                wrong_protocol,
+                "expected Sapling complete-prefix subtree index 0, observed Orchard index 0",
+            ),
+            (
+                "wrong index ordering",
+                wrong_index_order,
+                "expected Sapling complete-prefix subtree index 0, observed Sapling index 1",
+            ),
+            (
+                "retained completion-block hash mismatch",
+                retained_hash_mismatch,
+                "completing block differs from retained canonical history",
+            ),
+            (
+                "predecessor hash mismatch",
+                predecessor_hash_mismatch,
+                "completing block differs from the authenticated predecessor",
+            ),
+        ]
+    }
+
+    fn complete_prefix_root(
+        protocol: ShieldedProtocol,
+        index: u32,
+        root_hash_byte: u8,
+        completing_block: BlockId,
+    ) -> SubtreeRootArtifact {
+        SubtreeRootArtifact::new(
+            protocol,
+            SubtreeRootIndex::new(index),
+            SubtreeRootHash::from_bytes([root_hash_byte; 32]),
+            completing_block.height,
+            completing_block.hash,
+        )
+    }
+
+    fn persisted_subtree_root_count(
+        builder: &RocksDbCanonicalBuilder,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let family = builder
+            .bounded_open
+            .db
+            .cf_handle(super::SUBTREE_ROOT_COLUMN_FAMILY)
+            .ok_or("subtree-root family must exist")?;
+        let rows = builder
+            .bounded_open
+            .db
+            .iterator_cf(&family, IteratorMode::Start)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.len())
     }
 }

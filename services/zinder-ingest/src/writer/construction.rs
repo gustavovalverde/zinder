@@ -346,6 +346,7 @@ pub async fn load_fresh_canonical_blocks<Source>(
 where
     Source: NodeSource + Clone,
 {
+    register_prohibited_read_metrics();
     let build_plan = builder.build_plan().clone();
     validate_construction_identity(&build_plan, config)?;
     let block_queue_capacity =
@@ -439,7 +440,6 @@ pub async fn load_fresh_canonical<Source>(
 where
     Source: NodeSource + Clone,
 {
-    register_prohibited_read_metrics();
     let block_outcome = load_fresh_canonical_blocks(builder, source, config).await?;
     load_fresh_canonical_source_families(block_outcome, source, config).await
 }

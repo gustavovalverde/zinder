@@ -17,11 +17,19 @@ producer_report_format_version="$(sed -n \
   "$repository_root/services/zinder-bench/src/report.rs")"
 [[ "$producer_report_format_version" =~ ^[1-9][0-9]*$ ]] ||
   fail "could not resolve the producer report format version"
+producer_fixture_format_version="$(sed -n \
+  's/^pub const FIXTURE_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
+  "$repository_root/services/zinder-bench/src/fixture.rs")"
+[[ "$producer_fixture_format_version" == "3" ]] ||
+  fail "producer fixture format version must be the exact v3 campaign contract"
 for report_validator in "$validator" "$storage_lifecycle_validator"; do
   grep -Fq ".report_format_version == $producer_report_format_version" \
     "$report_validator" ||
     fail "$(basename "$report_validator") does not require producer report format $producer_report_format_version"
 done
+grep -Fq ".fixture.fixture_format_version == $producer_fixture_format_version" \
+  "$validator" ||
+  fail "campaign validator does not require producer fixture format $producer_fixture_format_version"
 
 write_report() {
   local candidate="$1"
@@ -122,7 +130,7 @@ write_report() {
         },
         fixture: {
           contract_identity: "canonical-fixture",
-          fixture_format_version: 2,
+          fixture_format_version: 3,
           canonical_artifact_schema_version: 18,
           canonical_block_facts_digest_evidence: {
             block_digest_version: 1,
@@ -525,6 +533,13 @@ mutate_report \
   "$unrecognized_fixture_identity_campaign/postgres-canonical-replay-storage-trial-03.json" \
   '.fixture.contract_identity = "zinder-bench-fixture-manifest"'
 expect_failure "unrecognized fixture contract identity" "$unrecognized_fixture_identity_campaign"
+
+fixture_v2_campaign="$scratch_directory/fixture-v2"
+cp -R "$valid_campaign" "$fixture_v2_campaign"
+mutate_report \
+  "$fixture_v2_campaign/rocksdb-canonical-replay-storage-trial-03.json" \
+  '.fixture.fixture_format_version = 2'
+expect_failure "obsolete fixture format v2" "$fixture_v2_campaign"
 
 wrong_rocksdb_schema_campaign="$scratch_directory/wrong-rocksdb-schema"
 cp -R "$valid_campaign" "$wrong_rocksdb_schema_campaign"
