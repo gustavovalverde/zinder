@@ -140,10 +140,11 @@ into hash-driven scans.
 Zinder ships a canonical best-chain hash-to-height resolver through the typed
 [`zinder_core::BlockSelector`] enum (`Height(BlockHeight) | Hash(BlockHash)`).
 The resolver is backed by the `block_hash_index` column family in `zinder-store`:
-every committed block writes a `(network, hash) -> (height, source_chain_epoch)`
-entry, and read paths verify the recorded height is still visible at the
-request's chain epoch via the existing height-visibility index. Reorged-out
-hashes return `BlockHashLookup::NotInBestChain` without an eager delete.
+every committed block writes a hash-to-height entry, and read paths treat that
+entry as a hint until the canonical header at the recorded height proves the
+same hash is still visible. A missing, displaced, or stale entry never resolves
+to the replacement block at that height; the native API reports that the
+requested block is not in the best chain.
 
 The native surface is `WalletQuery.BlockIdBySelector` (capability
 `wallet.read.block_id_by_selector_v1`) returning `BlockIdResponse { chain_view,
@@ -165,12 +166,18 @@ bytes are not part of the normal wallet read path. If repeated reads become
 the larger cost, the implementation should improve the typed header row rather
 than reintroducing raw-block parsing.
 
-The primary-store query implements both selector arms through the canonical
-hash index. The release serving-pair query currently resolves arbitrary
-heights but only the visible-tip hash because its narrow secondary-reader
-contract does not yet expose `BlockHashLookup`. The standalone `zinder-query`
-therefore omits both selector capability strings until that complete resolver
-is composed; partial method behavior is not advertised as support.
+Both the temporary primary-store query and the release serving-pair query
+resolve height and hash selectors. Height selectors read canonical headers;
+hash selectors use the canonical hash index and verify the header at the
+indexed height. The release composition therefore advertises
+`wallet.read.block_id_by_selector_v1`.
+
+The release composition does not advertise
+`wallet.read.block_header_by_selector_v1`. The current native `BlockHeader`
+message omits the Equihash solution and is not a consensus-complete header
+contract. Consumers that require the complete serialized header read a
+retained full block and decode its header instead; method presence alone does
+not justify a capability claim.
 
 `BlockSelector` is `#[non_exhaustive]`. Non-best-chain `(txid, block_hash)`
 lookup is a *separate method*, not a third selector arm. That form is a

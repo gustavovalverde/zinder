@@ -1,12 +1,15 @@
 //! Typed serving reads for an admitted canonical store.
 
-use crate::BoundedRocksDbOpen;
+use std::mem::size_of;
+
+use crate::{BlockHashLookup, BoundedRocksDbOpen};
 use rust_rocksdb::{Direction, IteratorMode};
 use zinder_core::{
     ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
     BlockHeightRange, BlockId, ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint,
     CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
-    TransactionId, TransactionLocation, UnixTimestampMillis, wire::encode_internal_transaction_id,
+    TransactionId, TransactionLocation, UnixTimestampMillis,
+    wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
 use super::{
@@ -18,9 +21,10 @@ use super::{
     },
     publication::column_family,
     rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
-        COMPACT_BLOCK_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
+        CHAIN_EPOCH_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY,
+        TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
     subtree_load::{decode_subtree_root, encode_subtree_root_key},
 };
@@ -100,6 +104,14 @@ macro_rules! impl_canonical_typed_reads {
                 height: BlockHeight,
             ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
                 read_block_header_at(self, height)
+            }
+
+            /// Resolves a block hash through the canonical best-chain index.
+            pub fn block_hash_lookup(
+                &self,
+                block_hash: BlockHash,
+            ) -> Result<BlockHashLookup, CanonicalStoreError> {
+                read_block_hash_lookup(self, block_hash)
             }
 
             /// Reads one retained raw block by height.
@@ -208,6 +220,36 @@ fn read_block_header_at(
     )?
     .map(|encoded| decode_block_header(height, &encoded))
     .transpose()
+}
+
+fn read_block_hash_lookup(
+    store: &impl CanonicalServingRead,
+    block_hash: BlockHash,
+) -> Result<BlockHashLookup, CanonicalStoreError> {
+    let Some(encoded_height) = read_optional(
+        store,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY,
+        &encode_internal_block_hash(block_hash),
+        "block hash index read",
+    )?
+    else {
+        return Ok(BlockHashLookup::NotIndexed);
+    };
+    if encoded_height.len() != size_of::<u32>() {
+        return Err(CanonicalStoreError::publication(
+            "block hash index height is not the exact version-1 value",
+        ));
+    }
+    let height = BlockHeight::new(read_u32_be(&encoded_height, 0)?);
+    if height > read_chain_epoch(store)?.visible_tip_height {
+        return Ok(BlockHashLookup::NotInBestChain);
+    }
+    match read_block_header_at(store, height)? {
+        Some(header) if header.block_hash == block_hash => {
+            Ok(BlockHashLookup::Resolved(BlockId::new(height, block_hash)))
+        }
+        Some(_) | None => Ok(BlockHashLookup::NotInBestChain),
+    }
 }
 
 fn read_compact_block_at(

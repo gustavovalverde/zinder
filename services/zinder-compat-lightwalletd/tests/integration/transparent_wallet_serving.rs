@@ -562,6 +562,13 @@ impl CanonicalReader for MissingTransactionBlobCanonicalReader {
         self.canonical_reader.block_header_at(height)
     }
 
+    fn block_hash_lookup(
+        &self,
+        block_hash: zinder_core::BlockHash,
+    ) -> Result<zinder_store::BlockHashLookup, CanonicalStoreError> {
+        self.canonical_reader.block_hash_lookup(block_hash)
+    }
+
     fn compact_block_at(
         &self,
         height: BlockHeight,

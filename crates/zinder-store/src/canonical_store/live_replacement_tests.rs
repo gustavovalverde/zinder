@@ -31,9 +31,9 @@ use super::{
     rocksdb::{BLOCK_HASH_INDEX_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY},
 };
 use crate::{
-    ChainEpochCommitted, ChainEvent, ChainEventHistoryRequest, ChainEventStreamFamily,
-    ChainRangeReverted, EventStreamStartPosition, RawBlobRetention, RocksDbResourceBudget,
-    StreamCursorTokenV1,
+    BlockHashLookup, ChainEpochCommitted, ChainEvent, ChainEventHistoryRequest,
+    ChainEventStreamFamily, ChainRangeReverted, EventStreamStartPosition, RawBlobRetention,
+    RocksDbResourceBudget, StreamCursorTokenV1,
     format::{ChainEventCursorAnchor, ChainEventLocator},
 };
 
@@ -54,6 +54,17 @@ fn maximum_depth_replacement_is_atomic_archived_and_reopenable_then_appends()
     let old_fence = store.event_fence();
     let old_three_location = transaction_location(BlockHeight::new(3), [3; 32], 103);
     let old_four_location = transaction_location(BlockHeight::new(4), [4; 32], 104);
+    assert_eq!(
+        store.block_hash_lookup(BlockHash::from_bytes([3; 32]))?,
+        BlockHashLookup::Resolved(BlockId::new(
+            BlockHeight::new(3),
+            BlockHash::from_bytes([3; 32]),
+        ))
+    );
+    assert_eq!(
+        store.block_hash_lookup(BlockHash::from_bytes([0xff; 32]))?,
+        BlockHashLookup::NotIndexed
+    );
     assert_eq!(
         store.transaction_location(old_three_location.transaction_id)?,
         Some(old_three_location)
@@ -115,6 +126,17 @@ fn maximum_depth_replacement_is_atomic_archived_and_reopenable_then_appends()
             .map(|header| header.block_hash),
         Some(BlockHash::from_bytes([33; 32]))
     );
+    assert_eq!(
+        store.block_hash_lookup(BlockHash::from_bytes([3; 32]))?,
+        BlockHashLookup::NotIndexed
+    );
+    assert_eq!(
+        store.block_hash_lookup(BlockHash::from_bytes([33; 32]))?,
+        BlockHashLookup::Resolved(BlockId::new(
+            BlockHeight::new(3),
+            BlockHash::from_bytes([33; 32]),
+        ))
+    );
     assert_eq!(store.block_header_at(BlockHeight::new(4))?, None);
     assert_eq!(
         store.transaction_location(old_three_location.transaction_id)?,
@@ -138,6 +160,14 @@ fn maximum_depth_replacement_is_atomic_archived_and_reopenable_then_appends()
     assert_eq!(
         store.bounded_open.db.get_cf(&old_hash_family, [4; 32])?,
         None
+    );
+    store
+        .bounded_open
+        .db
+        .put_cf(&old_hash_family, [3; 32], 3_u32.to_be_bytes())?;
+    assert_eq!(
+        store.block_hash_lookup(BlockHash::from_bytes([3; 32]))?,
+        BlockHashLookup::NotInBestChain
     );
     let event_family = store
         .bounded_open

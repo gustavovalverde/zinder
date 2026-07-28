@@ -309,7 +309,7 @@ impl ChainIndex for RemoteChainIndex {
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
-        block_id_from_message(response.block_id)
+        block_id_from_selector_response(self.network, at_epoch_id, selector, response)
     }
 
     async fn block_header_by_selector(
@@ -326,10 +326,7 @@ impl ChainIndex for RemoteChainIndex {
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
-        let header_message = response
-            .block_header
-            .ok_or_else(|| IndexerError::malformed("block_header", "field is missing"))?;
-        block_header_from_message(header_message)
+        block_header_from_selector_response(self.network, at_epoch_id, selector, response)
     }
 
     async fn compact_block_at(
@@ -2394,6 +2391,78 @@ fn block_id_from_message(block_id: Option<wallet::BlockId>) -> Result<BlockId, I
     ))
 }
 
+fn block_id_from_selector_response(
+    expected_network: Network,
+    expected_epoch_id: Option<ChainEpochId>,
+    requested_selector: BlockSelector,
+    response: wallet::BlockIdResponse,
+) -> Result<BlockId, IndexerError> {
+    let chain_epoch = chain_epoch_from_chain_view_with_pin(
+        expected_network,
+        expected_epoch_id,
+        response.chain_view,
+    )?;
+    let block_id = block_id_from_message(response.block_id)?;
+    ensure_block_id_matches_selector_and_visible_tip(
+        "block_id",
+        requested_selector,
+        block_id,
+        BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash),
+    )?;
+    Ok(block_id)
+}
+
+fn block_header_from_selector_response(
+    expected_network: Network,
+    expected_epoch_id: Option<ChainEpochId>,
+    requested_selector: BlockSelector,
+    response: wallet::BlockHeaderResponse,
+) -> Result<BlockHeader, IndexerError> {
+    let chain_epoch = chain_epoch_from_chain_view_with_pin(
+        expected_network,
+        expected_epoch_id,
+        response.chain_view,
+    )?;
+    let header_message = response
+        .block_header
+        .ok_or_else(|| IndexerError::malformed("block_header", "field is missing"))?;
+    let header = block_header_from_message(header_message)?;
+    ensure_block_id_matches_selector_and_visible_tip(
+        "block_header.block_id",
+        requested_selector,
+        header.block_id,
+        BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash),
+    )?;
+    Ok(header)
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "BlockSelector is #[non_exhaustive]; new selector variants require an explicit response-validation contract"
+)]
+fn ensure_block_id_matches_selector_and_visible_tip(
+    field: &'static str,
+    requested_selector: BlockSelector,
+    block_id: BlockId,
+    visible_tip: BlockId,
+) -> Result<(), IndexerError> {
+    let matches_selector = match requested_selector {
+        BlockSelector::Height(requested_height) => block_id.height == requested_height,
+        BlockSelector::Hash(requested_hash) => block_id.hash == requested_hash,
+        _ => false,
+    };
+    let is_at_or_below_visible_tip = block_id.height <= visible_tip.height;
+    let has_coherent_visible_tip_identity =
+        (block_id.height == visible_tip.height) == (block_id.hash == visible_tip.hash);
+    if !matches_selector || !is_at_or_below_visible_tip || !has_coherent_visible_tip_identity {
+        return Err(IndexerError::malformed(
+            field,
+            "resolved block identity does not match the requested selector or response visible tip",
+        ));
+    }
+    Ok(())
+}
+
 fn block_header_from_message(message: wallet::BlockHeader) -> Result<BlockHeader, IndexerError> {
     let block_id = block_id_from_message(message.block_id)?;
     let previous_block_hash = block_hash_from_rpc_hex(
@@ -2652,6 +2721,68 @@ mod tests {
         }
     }
 
+    fn synthetic_block_id(height: u32, hash_byte: u8) -> wallet::BlockId {
+        wallet::BlockId {
+            height,
+            block_hash: format!("{hash_byte:02x}").repeat(32),
+        }
+    }
+
+    fn synthetic_block_id_response(
+        chain_view: wallet::ChainView,
+        block_id: wallet::BlockId,
+    ) -> wallet::BlockIdResponse {
+        wallet::BlockIdResponse {
+            chain_view: Some(chain_view),
+            block_id: Some(block_id),
+        }
+    }
+
+    fn synthetic_block_header_response(
+        chain_view: wallet::ChainView,
+        block_id: wallet::BlockId,
+    ) -> wallet::BlockHeaderResponse {
+        wallet::BlockHeaderResponse {
+            chain_view: Some(chain_view),
+            block_header: Some(wallet::BlockHeader {
+                block_id: Some(block_id),
+                previous_block_hash: "55".repeat(32),
+                merkle_root_hash: "66".repeat(32),
+                commitment_bytes: vec![0x77; 32],
+                block_time: 1_774_670_400,
+                bits: 0x1f07_ffff,
+                nonce: vec![0x88; 32],
+                version: 4,
+            }),
+        }
+    }
+
+    fn synthetic_selector_response_results(
+        expected_network: Network,
+        expected_epoch_id: Option<ChainEpochId>,
+        requested_selector: BlockSelector,
+        chain_view: wallet::ChainView,
+        block_id: wallet::BlockId,
+    ) -> (
+        Result<BlockId, IndexerError>,
+        Result<BlockHeader, IndexerError>,
+    ) {
+        (
+            block_id_from_selector_response(
+                expected_network,
+                expected_epoch_id,
+                requested_selector,
+                synthetic_block_id_response(chain_view.clone(), block_id.clone()),
+            ),
+            block_header_from_selector_response(
+                expected_network,
+                expected_epoch_id,
+                requested_selector,
+                synthetic_block_header_response(chain_view, block_id),
+            ),
+        )
+    }
+
     fn synthetic_mempool_entry(network: Network) -> wallet::MempoolEntry {
         wallet::MempoolEntry {
             transaction_id: "33".repeat(32),
@@ -2799,6 +2930,215 @@ mod tests {
         ));
         assert!(ensure_supported_contract_revision(5).is_ok());
         assert!(ensure_supported_contract_revision(6).is_ok());
+    }
+
+    #[test]
+    fn block_selector_responses_reject_the_wrong_network() {
+        let (block_id_result, block_header_result) = synthetic_selector_response_results(
+            EXPECTED_NETWORK,
+            None,
+            BlockSelector::Height(BlockHeight::new(41)),
+            synthetic_chain_view(MISMATCHED_NETWORK),
+            synthetic_block_id(41, 0x33),
+        );
+        assert!(matches!(
+            block_id_result,
+            Err(IndexerError::NetworkMismatch { expected, .. })
+                if expected == EXPECTED_NETWORK
+        ));
+        assert!(matches!(
+            block_header_result,
+            Err(IndexerError::NetworkMismatch { expected, .. })
+                if expected == EXPECTED_NETWORK
+        ));
+    }
+
+    #[test]
+    fn block_selector_responses_reject_the_wrong_pinned_epoch() {
+        let (block_id_result, block_header_result) = synthetic_selector_response_results(
+            EXPECTED_NETWORK,
+            Some(ChainEpochId::new(8)),
+            BlockSelector::Height(BlockHeight::new(41)),
+            synthetic_chain_view(EXPECTED_NETWORK),
+            synthetic_block_id(41, 0x33),
+        );
+        assert!(matches!(
+            block_id_result,
+            Err(IndexerError::MalformedResponse {
+                field: "chain_view.chain_epoch.chain_epoch_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            block_header_result,
+            Err(IndexerError::MalformedResponse {
+                field: "chain_view.chain_epoch.chain_epoch_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn block_selector_responses_reject_the_wrong_requested_height() {
+        let (block_id_result, block_header_result) = synthetic_selector_response_results(
+            EXPECTED_NETWORK,
+            None,
+            BlockSelector::Height(BlockHeight::new(41)),
+            synthetic_chain_view(EXPECTED_NETWORK),
+            synthetic_block_id(40, 0x33),
+        );
+        assert!(matches!(
+            block_id_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            block_header_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_header.block_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn block_selector_responses_reject_the_wrong_requested_hash() {
+        let (block_id_result, block_header_result) = synthetic_selector_response_results(
+            EXPECTED_NETWORK,
+            None,
+            BlockSelector::Hash(BlockHash::from_bytes([0x44; 32])),
+            synthetic_chain_view(EXPECTED_NETWORK),
+            synthetic_block_id(41, 0x33),
+        );
+        assert!(matches!(
+            block_id_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            block_header_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_header.block_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn block_selector_responses_reject_an_identity_above_the_visible_tip() {
+        let (block_id_result, block_header_result) = synthetic_selector_response_results(
+            EXPECTED_NETWORK,
+            None,
+            BlockSelector::Height(BlockHeight::new(43)),
+            synthetic_chain_view(EXPECTED_NETWORK),
+            synthetic_block_id(43, 0x33),
+        );
+        assert!(matches!(
+            block_id_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            block_header_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_header.block_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn block_selector_responses_reject_a_conflicting_visible_tip_hash() {
+        for selector in [
+            BlockSelector::Height(BlockHeight::new(42)),
+            BlockSelector::Hash(BlockHash::from_bytes([0x33; 32])),
+        ] {
+            let (block_id_result, block_header_result) = synthetic_selector_response_results(
+                EXPECTED_NETWORK,
+                None,
+                selector,
+                synthetic_chain_view(EXPECTED_NETWORK),
+                synthetic_block_id(42, 0x33),
+            );
+            assert!(matches!(
+                block_id_result,
+                Err(IndexerError::MalformedResponse {
+                    field: "block_id",
+                    ..
+                })
+            ));
+            assert!(matches!(
+                block_header_result,
+                Err(IndexerError::MalformedResponse {
+                    field: "block_header.block_id",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn block_selector_responses_reject_the_visible_tip_hash_at_a_lower_height() {
+        for selector in [
+            BlockSelector::Height(BlockHeight::new(41)),
+            BlockSelector::Hash(BlockHash::from_bytes([0x11; 32])),
+        ] {
+            let (block_id_result, block_header_result) = synthetic_selector_response_results(
+                EXPECTED_NETWORK,
+                None,
+                selector,
+                synthetic_chain_view(EXPECTED_NETWORK),
+                synthetic_block_id(41, 0x11),
+            );
+            assert!(matches!(
+                block_id_result,
+                Err(IndexerError::MalformedResponse {
+                    field: "block_id",
+                    ..
+                })
+            ));
+            assert!(matches!(
+                block_header_result,
+                Err(IndexerError::MalformedResponse {
+                    field: "block_header.block_id",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn block_selector_responses_accept_matching_height_and_hash_identities()
+    -> Result<(), IndexerError> {
+        for (selector, wire_block_id, expected_block_id) in [
+            (
+                BlockSelector::Height(BlockHeight::new(41)),
+                synthetic_block_id(41, 0x33),
+                BlockId::new(BlockHeight::new(41), BlockHash::from_bytes([0x33; 32])),
+            ),
+            (
+                BlockSelector::Hash(BlockHash::from_bytes([0x11; 32])),
+                synthetic_block_id(42, 0x11),
+                BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x11; 32])),
+            ),
+        ] {
+            let (block_id_result, block_header_result) = synthetic_selector_response_results(
+                EXPECTED_NETWORK,
+                Some(ChainEpochId::new(7)),
+                selector,
+                synthetic_chain_view(EXPECTED_NETWORK),
+                wire_block_id,
+            );
+            assert_eq!(block_id_result?, expected_block_id);
+            assert_eq!(block_header_result?.block_id, expected_block_id);
+        }
+        Ok(())
     }
 
     #[test]

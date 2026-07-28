@@ -42,18 +42,18 @@ pub use remote::{MIN_SUPPORTED_CONTRACT_REVISION, RemoteChainIndex, RemoteOpenOp
 #[cfg(feature = "remote")]
 pub use server_info::{NodeServerInfo, ServerInfo};
 pub use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeader, BlockHeight, BlockHeightRange, BlockId,
-    BlockSelector, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
-    BroadcastQueued, BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainEpoch,
-    ChainEpochId, ChainValuePool, ChainValuePools, ChainValuePoolsAtTip, CompactBlockArtifact,
-    ConsensusBranchId, MAX_SUBTREE_ROOTS_PER_REQUEST, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST,
-    MempoolEntry, MempoolEvictionReason, MinedTransaction, MinedTransactionChainContext, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentMempoolOutput, TransparentMempoolOutputsRequest, TransparentMempoolSpend,
-    TransparentOutPoint, TransparentUnspentOutput, TransparentUtxoSetCommitment, TreeStateArtifact,
-    TxStatus, UtxoSetCommitmentScheme,
+    ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeader, BlockHeight,
+    BlockHeightRange, BlockId, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
+    BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
+    BroadcastUnknown, ChainEpoch, ChainEpochId, ChainValuePool, ChainValuePools,
+    ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId, MAX_SUBTREE_ROOTS_PER_REQUEST,
+    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, MempoolEntry, MempoolEvictionReason, MinedTransaction,
+    MinedTransactionChainContext, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBroadcastOutcome, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentUnspentOutput,
+    TransparentUtxoSetCommitment, TreeStateArtifact, TxStatus, UtxoSetCommitmentScheme,
 };
 /// The server-side wallet recipe, compiled as a doctest so its worked skeleton
 /// cannot drift from the real `connect` and stream API.

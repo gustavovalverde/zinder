@@ -9,9 +9,9 @@ use zinder_core::{
     TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
 };
 use zinder_store::{
-    CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention,
-    RocksDbCanonicalSecondary,
+    BlockHashLookup, CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope,
+    ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
+    EventStreamStartPosition, RawBlobRetention, RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -52,6 +52,12 @@ pub trait CanonicalReader: Send + Sync + 'static {
         &self,
         height: BlockHeight,
     ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError>;
+
+    /// Resolves a block hash through the admitted canonical best-chain index.
+    fn block_hash_lookup(
+        &self,
+        block_hash: zinder_core::BlockHash,
+    ) -> Result<BlockHashLookup, CanonicalStoreError>;
 
     /// Reads one compact block by height.
     fn compact_block_at(
@@ -236,6 +242,13 @@ macro_rules! impl_canonical_read {
                 height: BlockHeight,
             ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
                 self.block_header_at(height)
+            }
+
+            fn block_hash_lookup(
+                &self,
+                block_hash: zinder_core::BlockHash,
+            ) -> Result<BlockHashLookup, CanonicalStoreError> {
+                self.block_hash_lookup(block_hash)
             }
 
             fn compact_block_at(

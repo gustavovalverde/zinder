@@ -87,13 +87,13 @@ The request shape is valid but the deployment is in a state that cannot serve it
 
 ### `NOT_FOUND` family
 
-The requested resource does not exist. Retry disposition: **RetryAfterBackoff** (the resource may appear after a future commit). Some reasons carry `ResourceInfo` naming the family/key. The `resource_type` is the on-wire artifact-family label (the `zinder_core::artifact_family` constants such as `compact_block`, `chain_epoch`); clients read it directly without a Rust-side translation table.
+The requested resource is not available in the visible query state. Retry disposition: **RetryAfterBackoff** (the resource may appear after a future commit). Some reasons carry `ResourceInfo` naming the family/key. The `resource_type` is the on-wire artifact-family label (the `zinder_core::artifact_family` constants such as `compact_block`, `chain_epoch`); clients read it directly without a Rust-side translation table.
 
 | Reason | What it means | Example metadata |
 | --- | --- | --- |
 | `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch (also raised by explorer reads for a not-yet-materialized materialized-view row) | `resource_type=<family>, resource_name=<key>` |
 | `CHAIN_EPOCH_MISSING` | Chain epoch is not retained (often: pruned) | `resource_type=chain_epoch, resource_name=chain_epoch:<id>` |
-| `BLOCK_NOT_IN_BEST_CHAIN` | The requested block exists but is not on the visible best chain | — |
+| `BLOCK_NOT_IN_BEST_CHAIN` | No block matching the requested selector is visible in the best chain; unknown and reorged-out selectors share this reason | — |
 
 ### `DATA_LOSS` family
 
@@ -138,7 +138,7 @@ A self-inflicted failure that needs investigation. Retry disposition: **NonRetry
 
 ### Sentinel
 
-`ERROR_REASON_UNSPECIFIED = 0` is the default scalar. It is never emitted intentionally; if a client receives it, treat as a Zinder bug and report it. Clients with `IndexerError::reason() == None` for an error carried over the wire have hit a server that omitted `ErrorInfo` or emitted `Unspecified`.
+`ERROR_REASON_UNSPECIFIED = 0` is the default scalar. It is never emitted intentionally; if a client receives it, treat it as a Zinder bug and report it. The Rust client preserves an explicitly received `Unspecified` reason through `IndexerError::RemoteFailure`. Do not infer a missing wire reason from `IndexerError::reason() == None`: deliberately coarser variants such as `IndexerError::NotFound` do not retain their originating reason.
 
 ## Stability
 

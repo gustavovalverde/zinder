@@ -26,8 +26,8 @@ use zinder_proto::capabilities::{
 };
 use zinder_source::{NodeCapability, NodeSource, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
-    ArtifactFamily, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
-    EventStreamStartPosition, StreamCursorTokenV1,
+    ArtifactFamily, BlockHashLookup, ChainEventHistoryRequest, ChainEventStreamFamily,
+    ChainEventStreamResume, EventStreamStartPosition, StreamCursorTokenV1,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -451,10 +451,13 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
             BlockSelector::Height(height) if height <= chain_epoch.visible_tip_height => {
                 Self::block_id_at(pair, height)?
             }
-            BlockSelector::Hash(hash) if hash == chain_epoch.visible_tip_hash => {
-                BlockId::new(chain_epoch.visible_tip_height, hash)
-            }
-            BlockSelector::Height(_) | BlockSelector::Hash(_) => {
+            BlockSelector::Hash(hash) => match pair.canonical().block_hash_lookup(hash)? {
+                BlockHashLookup::Resolved(block_id) => block_id,
+                BlockHashLookup::NotInBestChain | BlockHashLookup::NotIndexed => {
+                    return Err(QueryError::BlockNotInBestChain);
+                }
+            },
+            BlockSelector::Height(_) => {
                 return Err(QueryError::BlockNotInBestChain);
             }
             _ => {

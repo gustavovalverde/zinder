@@ -1042,7 +1042,7 @@ mod tests {
         server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
     };
     use zinder_core::{
-        BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+        BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
         CanonicalBlockFacts, CanonicalBlockFactsDigestVersion,
         CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
         ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontiers, ConsensusBranchId,
@@ -1620,6 +1620,7 @@ mod tests {
         for required in [
             WALLET_READ_VISIBLE_TIP_BLOCK_V1,
             WALLET_READ_SETTLED_TIP_BLOCK_V1,
+            WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
             WALLET_READ_COMPACT_BLOCK_AT_V2,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2,
             WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
@@ -1637,7 +1638,6 @@ mod tests {
             );
         }
         for partially_implemented in [
-            WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
             WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
             WALLET_READ_TRANSACTION_BY_ID_V2,
             WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
@@ -1812,6 +1812,17 @@ mod tests {
         assert!(!Arc::ptr_eq(&old_pair, &refreshed_pair));
         assert_eq!(refreshed_pair.canonical_fence(), append_fence);
         assert_eq!(refreshed_pair.wallet_source(), updated_source);
+        let historical_block = query
+            .block_id_by_selector(BlockSelector::Hash(initial_fence.visible_tip().hash), None)
+            .await?;
+        assert_eq!(historical_block.block_id, initial_fence.visible_tip());
+        let unknown_block = query
+            .block_id_by_selector(BlockSelector::Hash(BlockHash::from_bytes([0xff; 32])), None)
+            .await;
+        assert!(matches!(
+            unknown_block,
+            Err(crate::QueryError::BlockNotInBestChain)
+        ));
         let stale_epoch_outcome = query
             .visible_tip_block(Some(visible_tip.chain_epoch.id))
             .await;

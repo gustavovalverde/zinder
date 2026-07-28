@@ -168,6 +168,7 @@ fn typed_capability_variants_match_table_strings() {
         Capability::TransparentAddressBalance,
         Capability::FullBlock,
         Capability::FullBlockRange,
+        Capability::BlockIdBySelector,
         Capability::NetworkUpgradeActivations,
     ] {
         assert!(
