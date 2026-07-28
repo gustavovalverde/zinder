@@ -56,6 +56,29 @@ fn print_config_validates_and_redacts_basic_auth() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn print_config_applies_ops_listener_override() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("ops-listener-override-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "--ops-listen-addr",
+            "127.0.0.1:29105",
+        ])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8(output.stdout)?.contains("listen_addr = \"127.0.0.1:29105\""));
+
+    Ok(())
+}
+
+#[test]
 fn print_config_resolves_the_materialized_view_writer_budget() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("materialized-view-budget-store");

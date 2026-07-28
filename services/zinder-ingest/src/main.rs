@@ -1107,7 +1107,8 @@ fn spawn_upstream_health_probe_for(
     reason = "--print-config is a structured TOML data dump, not a log event"
 )]
 fn run_print_config(cli: Cli) -> ExitCode {
-    let overrides = ingest_overrides(&cli);
+    let ops_listen_addr_override = cli.ops_listen_addr;
+    let overrides = ingest_overrides_with_ops(&cli, ops_listen_addr_override);
     let config_path = cli.config_path.clone();
     let render_result = match cli.command {
         None | Some(Command::Probe) => print_ingest_config(config_path, overrides),
@@ -1151,10 +1152,6 @@ fn emit_runtime_error(error: &IngestConfigError) -> ExitCode {
         "ingest run failed"
     );
     ExitCode::FAILURE
-}
-
-fn ingest_overrides(cli: &Cli) -> IngestConfigOverrides {
-    ingest_overrides_with_ops(cli, None)
 }
 
 fn ingest_overrides_with_ops(
