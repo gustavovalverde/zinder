@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use async_trait::async_trait;
 use zinder_core::{
     BlockHeight, BlockId, BlockValuePoolBalances, ChainValuePools, CommitmentTreeCheckpoint,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
+    Network, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
     SubtreeRootRange, TransactionBroadcastOutcome,
 };
 
@@ -20,6 +20,22 @@ use crate::{
 pub trait NodeSource: Send + Sync + 'static {
     /// Returns the source capabilities discovered or declared at startup.
     fn capabilities(&self) -> NodeCapabilities;
+
+    /// Returns the immutable capability evidence admitted for serving.
+    ///
+    /// Every source must state this decision explicitly. Sources with a fixed
+    /// declared contract return `Some(self.capabilities())`; sources whose
+    /// initial capability set is only an optimistic fallback return `None`
+    /// until discovery succeeds.
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities>;
+
+    /// Returns the immutable network identity exposed by this source.
+    ///
+    /// Sources that do not expose a network identity use the default and
+    /// cannot be composed into an endpoint that advertises a network.
+    fn network(&self) -> Option<Network> {
+        None
+    }
 
     /// Fetches one block by height from the configured node.
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;

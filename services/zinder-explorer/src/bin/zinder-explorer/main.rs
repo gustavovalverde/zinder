@@ -8,7 +8,7 @@ use clap::Parser;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
-    ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, MaterializedViewStore,
+    ExplorerEndpointMetadata, ExplorerQueryGrpcAdapter, MaterializedViewStore,
     MaterializedViewStoreError, MaterializedViewStoreOptions, describe_request_metrics,
 };
 use zinder_runtime::{
@@ -69,6 +69,9 @@ struct Cli {
     /// Empty/unset disables every capability that needs upstream reads.
     #[arg(long = "wallet-query-endpoint")]
     wallet_query_endpoint: Option<String>,
+    /// Path to a file containing the bearer token sent to `WalletQuery`.
+    #[arg(long = "wallet-query-bearer-token-path")]
+    wallet_query_bearer_token_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -145,13 +148,11 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
 
-    let materialized_view_catchup_handle =
-        materialized_view_store
-            .clone()
-            .map(|materialized_view_store| {
-                spawn_materialized_view_catchup_task(materialized_view_store, cancel.clone())
-            });
-    let grpc_adapter = build_grpc_adapter(&explorer_config, materialized_view_store).await;
+    let grpc_adapter =
+        build_grpc_adapter(&explorer_config, materialized_view_store.clone()).await?;
+    let materialized_view_catchup_handle = materialized_view_store.map(|materialized_view_store| {
+        spawn_materialized_view_catchup_task(materialized_view_store, cancel.clone())
+    });
     let upstream_observation_handle =
         spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, cancel.clone())?;
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
@@ -162,7 +163,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(explorer_config.network),
         readiness.clone(),
-        Arc::from(advertised_capabilities),
+        advertised_capabilities,
     )
     .await?;
     describe_request_metrics();
@@ -399,64 +400,54 @@ fn spawn_materialized_view_catchup_task(
 
 /// Fetches the node-advertised network-upgrade activation table.
 ///
-/// Feeds the `NetworkUpgradeStatus` handler. Returns `None` when no `[node]`
-/// section is configured or the upstream fetch fails; the adapter then serves
-/// an empty table.
+/// Feeds the `NetworkUpgradeStatus` and commitment-root handlers. An
+/// unconfigured `[node]` section deliberately omits those contracts. Once the
+/// operator configures `[node]`, source construction, discovery, and required
+/// Sapling evidence are startup admission checks.
 async fn fetch_network_upgrade_activations(
     explorer_config: &ExplorerConfig,
-) -> Option<Arc<NetworkUpgradeActivations>> {
-    let node = explorer_config.node.as_ref()?;
-    let source = match build_zebra_json_rpc_source(node) {
-        Ok(source) => source,
-        Err(error) => {
-            tracing::warn!(
-                target: "zinder::explorer",
-                event = "network_upgrade_activations_source_build_failed",
-                error = %error,
-                "could not build node source for network-upgrade activations; \
-                 NetworkUpgradeStatus serves an empty table"
-            );
-            return None;
-        }
+) -> Result<Option<Arc<NetworkUpgradeActivations>>, ExplorerConfigError> {
+    let Some(node) = explorer_config.node.as_ref() else {
+        return Ok(None);
     };
-    match source.fetch_network_upgrade_activations().await {
-        Ok(activations) => Some(Arc::new(activations)),
-        Err(error) => {
-            tracing::warn!(
-                target: "zinder::explorer",
-                event = "network_upgrade_activations_fetch_failed",
-                error = %error,
-                "could not fetch network-upgrade activations from the node; \
-                 NetworkUpgradeStatus serves an empty table"
-            );
-            None
-        }
+    let source = build_zebra_json_rpc_source(node)?;
+    let activations = source.fetch_network_upgrade_activations().await?;
+    admit_network_upgrade_activations(activations).map(Some)
+}
+
+fn admit_network_upgrade_activations(
+    activations: NetworkUpgradeActivations,
+) -> Result<Arc<NetworkUpgradeActivations>, ExplorerConfigError> {
+    if activations.activation_height_by_name("Sapling").is_none() {
+        return Err(ExplorerConfigError::MissingSaplingActivation);
     }
+    Ok(Arc::new(activations))
 }
 
 async fn build_grpc_adapter(
     explorer_config: &ExplorerConfig,
     materialized_view_store: Option<MaterializedViewStore>,
-) -> ExplorerQueryGrpcAdapter {
-    let server_info = ExplorerServerInfoSettings {
+) -> Result<ExplorerQueryGrpcAdapter, ExplorerConfigError> {
+    let server_info = ExplorerEndpointMetadata {
         network: explorer_config.network,
     };
-    let has_materialized_view_store = materialized_view_store.is_some();
-    let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info)
-        .with_prevout_resolution_online(has_materialized_view_store);
+    let mut grpc_adapter = ExplorerQueryGrpcAdapter::builder(server_info);
     if let Some(materialized_view_store) = materialized_view_store {
         grpc_adapter = grpc_adapter.with_materialized_view_store(materialized_view_store);
     }
-    if let Some(activations) = fetch_network_upgrade_activations(explorer_config).await {
+    if let Some(activations) = fetch_network_upgrade_activations(explorer_config).await? {
         grpc_adapter = grpc_adapter.with_network_upgrade_activations(activations);
     }
     if let Some(endpoint) = explorer_config.wallet_query_endpoint.clone() {
         grpc_adapter = grpc_adapter.with_wallet_query_endpoint(endpoint);
     }
+    if let Some(token) = explorer_config.wallet_query_bearer_token.clone() {
+        grpc_adapter = grpc_adapter.with_wallet_query_bearer_token(token);
+    }
     if let Some(token) = explorer_config.bearer_token.clone() {
         grpc_adapter = grpc_adapter.with_bearer_token(token);
     }
-    grpc_adapter
+    Ok(grpc_adapter.build().await?)
 }
 
 fn emit_runtime_error(error: &ExplorerConfigError) -> ExitCode {
@@ -479,6 +470,22 @@ impl From<Cli> for ExplorerConfigOverrides {
             ops_listen_addr: cli.ops_listen_addr,
             bearer_token_path: cli.bearer_token_path,
             wallet_query_endpoint: cli.wallet_query_endpoint,
+            wallet_query_bearer_token_path: cli.wallet_query_bearer_token_path,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_node_admission_requires_sapling_activation() {
+        let activations = NetworkUpgradeActivations::empty(zinder_core::Network::ZcashRegtest);
+
+        assert!(matches!(
+            admit_network_upgrade_activations(activations),
+            Err(ExplorerConfigError::MissingSaplingActivation)
+        ));
     }
 }

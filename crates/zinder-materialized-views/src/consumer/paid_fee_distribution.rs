@@ -15,7 +15,6 @@ use zinder_core::{
     BlockHash, BlockHeight, TransactionFactsArtifact, TransactionId,
     TransactionIntrinsicValueBalances, TransparentOutPoint, TransparentSpendFact,
 };
-use zinder_proto::capabilities::EXPLORER_PAID_FEE_DISTRIBUTION_V1;
 
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
@@ -51,9 +50,6 @@ pub const PAID_FEE_DISTRIBUTION_SCHEMA: MaterializedViewConsumerSchema =
         1,
         PAID_FEE_DISTRIBUTION_COLUMN_FAMILIES,
     );
-
-/// Capability advertised when this materialized view is ready.
-pub const PAID_FEE_DISTRIBUTION_CAPABILITIES: &[&str] = &[EXPLORER_PAID_FEE_DISTRIBUTION_V1];
 
 const SECONDS_PER_DAY: i64 = 86_400;
 const TIME_KEY_LEN: usize = 8;

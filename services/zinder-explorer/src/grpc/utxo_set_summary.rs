@@ -8,7 +8,8 @@ use tonic::{Request, Response, Status};
 use zinder_proto::capabilities::EXPLORER_UTXO_SET_SUMMARY_V1;
 use zinder_proto::v1::explorer::{UtxoSetSummaryRequest, UtxoSetSummaryResponse};
 use zinder_proto::v1::wallet::{
-    TransparentUtxoSetSummaryRequest, wallet_query_client::WalletQueryClient,
+    TransparentUtxoSetCommitment, TransparentUtxoSetSummaryRequest,
+    wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
 
@@ -22,6 +23,7 @@ use zinder_materialized_views::MaterializedViewStore;
 pub(crate) async fn query_utxo_set_summary(
     materialized_view_store: Option<&MaterializedViewStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    include_commitment: bool,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<UtxoSetSummaryRequest>,
 ) -> Result<Response<UtxoSetSummaryResponse>, Status> {
@@ -56,6 +58,29 @@ pub(crate) async fn query_utxo_set_summary(
         utxo_count: response.utxo_count,
         total_value_zat: response.total_value_zat,
         summarized_height: response.summarized_height,
-        commitment: response.commitment,
+        commitment: admitted_commitment(include_commitment, response.commitment),
     }))
+}
+
+fn admitted_commitment(
+    include_commitment: bool,
+    commitment: Option<TransparentUtxoSetCommitment>,
+) -> Option<TransparentUtxoSetCommitment> {
+    include_commitment.then_some(commitment).flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_commitment_is_suppressed_without_the_explorer_field_capability() {
+        let commitment = TransparentUtxoSetCommitment::default();
+
+        assert_eq!(admitted_commitment(false, Some(commitment.clone())), None,);
+        assert_eq!(
+            admitted_commitment(true, Some(commitment.clone())),
+            Some(commitment)
+        );
+    }
 }

@@ -272,6 +272,10 @@ impl NodeSource for ViewChangingSource {
         zinder_source::ZebraJsonRpcSource::baseline_capabilities()
     }
 
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        Some(self.capabilities())
+    }
+
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         *self.fetch_attempts.lock() += 1;
         Err(SourceError::BlockUnavailable {
@@ -340,6 +344,10 @@ impl NodeSource for ControllableTipSource {
         zinder_source::ZebraJsonRpcSource::baseline_capabilities()
     }
 
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        Some(self.capabilities())
+    }
+
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.fetch_attempts.fetch_add(1, Ordering::SeqCst);
         Err(SourceError::BlockUnavailable {
@@ -390,6 +398,10 @@ impl ProtocolMismatchSource {
 impl NodeSource for ProtocolMismatchSource {
     fn capabilities(&self) -> NodeCapabilities {
         zinder_source::ZebraJsonRpcSource::baseline_capabilities()
+    }
+
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        Some(self.capabilities())
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

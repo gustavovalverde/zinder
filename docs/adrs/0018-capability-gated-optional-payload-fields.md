@@ -10,18 +10,15 @@ Related: [ADR-0009](0009-explorer-plane-as-product-surface.md),
 Several wire fields in the explorer plane carry values that depend on
 upstream state the operator may or may not have wired:
 
-- `TransactionDetailResponse.paid_fee_zat` requires the wallet plane's
-  transparent prevout resolution (capability
-  `wallet.read.transparent_outputs_by_outpoint_v1`) to be online and the
-  transaction to be classified `TransparentOnly`. Canonical facts do not
-  retain the value balances needed to prove shielded transaction fees.
-- `MempoolActivityEntry.paid_fee_zat` requires the same upstream
-  capability plus a per-mempool-tx lookup path.
-- `BlockSummary.paid_fees_collected_zat` requires the
-  `TransactionFeesConsumer` to have materialized rows for every
-  non-coinbase transaction in the block.
-- `TransparentAddressActivityEntry.net_value_zat` requires the same
-  prevout resolution; the row materializes either way.
+- `TransactionDetailResponse.paid_fee_zat` requires the
+  `TransactionFeesConsumer` projection. The admissible detail path parses the
+  raw transaction bytes retained by the admitted wallet endpoint; a canonical
+  secondary is not an alternative transaction-fact provider. The current
+  release wallet endpoint does not advertise the two required transaction
+  capabilities, so the release explorer omits TransactionDetail entirely.
+- `TransparentAddressActivityEntry.net_value_zat` requires resolved prevout
+  evidence in the admitted activity projection; the row materializes either
+  way.
 - `TransactionHistoryEntry.zip317_conventional_fee_zat` is unset for
   coinbase rows; non-coinbase rows always carry a value.
 
@@ -49,7 +46,9 @@ convention. Specifically:
    every row so the handler renders a chip rather than guessing.
 
 3. The capability string is registered in `zinder-proto::capabilities` and
-   added to the `CAPABILITIES` table with the method that owns the field.
+   added to the `CAPABILITIES` table. The table owns vocabulary, surface,
+   ordering, and method association; it does not decide whether a running
+   endpoint supports the field.
 
 4. The handler returns the field as `None` / empty whenever the
    underlying upstream is unavailable, and the field is fully populated
@@ -58,21 +57,24 @@ convention. Specifically:
    `net_value_zat = 0` to mean "we only saw one side of the
    transaction".
 
-5. Capabilities are gated at the adapter's `advertised_capabilities()`
-   on a per-named-flag basis. The flags are set by the binary at
-   startup based on:
+5. Each service derives one immutable endpoint capability set after all
+   dependencies have been admitted and before it binds gRPC or operational
+   listeners. Evidence is concrete: exact materialized-view consumer
+   membership, admitted storage, configured providers, and the capability
+   strings returned by an authenticated dependency's `ServerInfo`. Mutable
+   readiness, replica lag, backfill progress, and current epochs never rewrite
+   structural support.
 
-   - probing the upstream's `ServerInfo`
-     (`wallet.read.transparent_outputs_by_outpoint_v1` flips on when the wallet
-     advertises it);
-   - whether the materialized-view store has been wired
-     (`materialized_view_store_online` covers `BlockSummary`, `BlockDetail`,
-     `MempoolEventCounts`, `RecentTransactions`, and
-     `TransparentAddressActivity`).
+6. A field capability is retained only when at least one response method that
+   carries the field is admitted by the same endpoint. The carrier invariant is
+   endpoint-local; the protocol registry remains free of runtime composition
+   policy.
 
-   `advertised_capabilities()` is the single source of truth: the gRPC
-   `ServerInfo` and the ops endpoint's `/healthz` both read from it. A flag flipped in
-   one place therefore reaches every consumer.
+7. The finalized adapter consults its frozen set at the emission point. It
+   suppresses the optional value and avoids the supporting read when the field
+   capability is absent, even if a stored row or upstream response contains a
+   value. The gRPC `ServerInfo` and operational endpoint share the exact same
+   immutable capability allocation.
 
 ## Examples shipped under this convention
 
@@ -80,8 +82,6 @@ convention. Specifically:
 | ----- | ---------- | ---------------------- |
 | `TransactionDetailResponse.paid_fee_zat` | `explorer.transaction.fees_v1` | `prevout_resolution_status` |
 | `TransactionDetailResponse.transparent_inputs[].value_zat` | `explorer.transaction.fees_v1` | (status on the parent) |
-| `MempoolActivityEntry.paid_fee_zat` | `explorer.transaction.fees_v1` (when mempool prevouts are online) | (none; fall back to ZIP-317 floor) |
-| `BlockSummary.paid_fees_collected_zat` | `explorer.transaction.fees_v1` (advertised when the consumer is wired and prevouts are online) | (none; the row carries `fees_collected_zat` as the ZIP-317 floor always) |
 | `TransparentAddressActivityRecord.net_value_zat` | `explorer.transparent_address.activity_v1` | `prevout_resolution_status` on the record |
 | `RecentTransactionEntry.zip317_conventional_fee_zat` | `explorer.transaction.recent_v1` | (none; `is_coinbase = true` explains absence) |
 | `RecentTransactionEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not provable from retained facts") |
@@ -89,26 +89,26 @@ convention. Specifically:
 | `TransactionHistoryEntry.intrinsic_value_balances` | `explorer.transaction.intrinsic_value_balances_v1` | (none; absence remains unknown and never means all-zero balances) |
 | `TransactionDetailResponse.intrinsic_value_balances` | `explorer.transaction.intrinsic_value_balances_v1` | (none; absence remains unknown and never means all-zero balances) |
 | `TransactionHistoryEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not provable from retained facts") |
+| `BlockTransaction.transparent_inputs[].value_zat` fee-projection fallback | `explorer.transaction.fees_v1` | (none; retained parent values remain independent) |
+| `BlockTransactionsResponse.final_note_commitment_roots` | `explorer.block.final_note_commitment_roots_v1` | (none; individual pool roots remain optional by activation and artifact availability) |
+| `CommitmentRootSearchResponse.displaced_matches` and `.displaced_coverage` | `explorer.commitment_root.displaced_matches_v1` | `displaced_coverage` explains the retained range when the field capability is present |
+| `UtxoSetSummaryResponse.commitment` | `explorer.utxo_set.commitment_v1` | (none; absence is required when the field capability is unavailable) |
 | `MinedTransaction.raw_transaction_bytes` | `wallet.read.transaction_bytes_v1` | (none; absence means "transaction blob not retained") |
 
 `MinedTransaction.raw_transaction_bytes` is the wallet-surface example.
-The field is `optional bytes`, gated on the `RequiresTransactionBlobs`
-advertise policy. The handler reads the transaction blob from the store
-and carries its `Option<Vec<u8>>` straight into the field: `None` when no
-blob is retained, `Some(bytes)` when it is. The gate is the store's
-persisted raw-blob retention, surfaced through `WalletQuery.ServerInfo`.
+The field is `optional bytes`. The native query derives
+`wallet.read.transaction_bytes_v1` from admitted persisted transaction-blob
+retention, and the handler carries the store's `Option<Vec<u8>>` into the
+field. No caller-populated policy or support boolean can add the claim.
 
-## Advertise policies gated on persisted blob retention
+## Persisted blob retention as capability evidence
 
 Blob-serving wallet capabilities are gated on the retention the writer
 persisted, not advertised unconditionally:
 
-- `RequiresBlockBlobs` advertises `wallet.read.full_block_at_v1` and
-  `wallet.read.full_block_range_v1` when the store retains full block
-  blobs (ingest `raw_blob_policy = all`).
-- `RequiresTransactionBlobs` advertises
-  `wallet.read.transaction_bytes_v1` when the store retains transaction
-  blobs (ingest `raw_blob_policy` in `{transactions, all}`).
+- Full-block retention admits `wallet.read.full_block_at_v1` and
+  `wallet.read.full_block_range_v1`.
+- Transaction-blob retention admits `wallet.read.transaction_bytes_v1`.
 
 The signal travels in a `StorageControl` `raw_blob_policy` singleton
 (key byte 16, one-byte value: `0 = none`, `1 = transactions`,
@@ -119,9 +119,14 @@ coverage contract: opening the primary with another policy fails with
 persisted value. A non-empty store with no signal is corrupt and
 fails closed; it is never treated as `none`.
 
-## Materialized-view capabilities require materialized-view evidence
+## Materialized-view support is structural
 
-An online materialized-view store is not enough to advertise a backfilled materialized view as complete. The service evaluates the named consumer's materialized-view checkpoint and coverage from one read snapshot. A base capability may be advertised when partial rows are useful and the response exposes their bounds. A completeness capability is advertised only when verified contiguous coverage reaches the fenced materialized-view tip and the ending hash matches. Canonical artifact schema, block-summary freshness, and global ingest readiness are inputs, not substitutes for this evidence.
+An attached materialized-view store supports only the consumers named in its
+admitted manifest. Explorer capability derivation checks those exact stable
+identities. Materializing, partial, and fully covered states do not change the
+advertised set. A request made while a structurally present consumer is not yet
+ready returns its typed materialization outcome; responses that expose
+coverage continue to report the mutable range in-band.
 
 ## Consequences
 
@@ -137,7 +142,7 @@ An online materialized-view store is not enough to advertise a backfilled materi
 - Operators see in `/healthz` and `ExplorerQuery.ServerInfo` which
   optional fields are populated on their deployment, since the
   capability list mirrors the proto-field decisions.
-- The convention scales: when a future field requires its own upstream
-  flag, the binary adds a new named gate next to the existing ones,
-  `advertised_capabilities()` adds one `if flag` arm, and the
-  capability string lights up only when the gate is true.
+- Adding a field capability requires its exact structural evidence, carrier
+  methods, emission guard, negative composition proof where one exists, and a
+  current production consumer. Readiness flags and generic capability-policy
+  layers are not extension points.

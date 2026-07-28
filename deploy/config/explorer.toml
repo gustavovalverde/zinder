@@ -18,6 +18,8 @@ secondary_path = "/var/lib/zinder/explorer/secondary"
 [explorer]
 listen_addr = "127.0.0.1:9068"
 wallet_query_endpoint = "http://127.0.0.1:9102"
+# Set when the WalletQuery endpoint enforces its private-control bearer token.
+# wallet_query_bearer_token_path = "/var/run/auth/wallet-query.token"
 
 [ops]
 listen_addr = "127.0.0.1:9069"

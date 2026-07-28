@@ -34,8 +34,8 @@ pub use consumer::block_production_time::{
     BlockProductionTimePageRequest, BlockProductionTimeRow, BlockProductionTimeTailCoverage,
 };
 pub use consumer::block_summary::{
-    BLOCK_SUMMARY_CAPABILITIES, BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME,
-    BLOCK_SUMMARY_SCHEMA, BlockSummaryConsumer, BlockSummaryConsumerError, decode_stored_record,
+    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BLOCK_SUMMARY_SCHEMA,
+    BlockSummaryConsumer, BlockSummaryConsumerError, decode_stored_record,
     project_block_summary_record,
 };
 pub use consumer::commitment_root_search::{
@@ -46,8 +46,8 @@ pub use consumer::commitment_root_search::{
     CommitmentRootSearchConsumerError,
 };
 pub use consumer::conventional_fee_distribution::{
-    CONVENTIONAL_FEE_DISTRIBUTION_CAPABILITIES, CONVENTIONAL_FEE_DISTRIBUTION_COLUMN_FAMILIES,
-    CONVENTIONAL_FEE_DISTRIBUTION_COLUMN_FAMILY, CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
+    CONVENTIONAL_FEE_DISTRIBUTION_COLUMN_FAMILIES, CONVENTIONAL_FEE_DISTRIBUTION_COLUMN_FAMILY,
+    CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
     CONVENTIONAL_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY,
     CONVENTIONAL_FEE_DISTRIBUTION_DAY_COLUMN_FAMILY,
     CONVENTIONAL_FEE_DISTRIBUTION_INDEX_COLUMN_FAMILY, CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA,
@@ -68,11 +68,11 @@ pub use consumer::mempool_event_counts::{
     MempoolEventCountsConsumer,
 };
 pub use consumer::paid_fee_distribution::{
-    PAID_FEE_DISTRIBUTION_CAPABILITIES, PAID_FEE_DISTRIBUTION_COLUMN_FAMILIES,
-    PAID_FEE_DISTRIBUTION_COLUMN_FAMILY, PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
-    PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY, PAID_FEE_DISTRIBUTION_DAY_COLUMN_FAMILY,
-    PAID_FEE_DISTRIBUTION_INDEX_COLUMN_FAMILY, PAID_FEE_DISTRIBUTION_SCHEMA, PaidFeeBlockTotal,
-    PaidFeeDistribution, PaidFeeDistributionBackfillCoverage, PaidFeeDistributionConsumer,
+    PAID_FEE_DISTRIBUTION_COLUMN_FAMILIES, PAID_FEE_DISTRIBUTION_COLUMN_FAMILY,
+    PAID_FEE_DISTRIBUTION_CONSUMER_NAME, PAID_FEE_DISTRIBUTION_COVERAGE_COLUMN_FAMILY,
+    PAID_FEE_DISTRIBUTION_DAY_COLUMN_FAMILY, PAID_FEE_DISTRIBUTION_INDEX_COLUMN_FAMILY,
+    PAID_FEE_DISTRIBUTION_SCHEMA, PaidFeeBlockTotal, PaidFeeDistribution,
+    PaidFeeDistributionBackfillCoverage, PaidFeeDistributionConsumer,
     PaidFeeDistributionConsumerError, PaidFeeDistributionDay, PaidFeeDistributionTailCoverage,
     PaidFeeFrequency,
 };

@@ -20,11 +20,11 @@ use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, Network};
-use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
+use zinder_explorer::{ExplorerEndpointMetadata, ExplorerQueryGrpcAdapter};
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
-    CanonicalPipelineLimits, CanonicalWriterConfig, LiveMempoolOwner, canonical_control_channel,
-    run_canonical_writer_with_control,
+    CanonicalPipelineLimits, CanonicalWriterConfig, IngestNodeComposition, LiveMempoolOwner,
+    canonical_control_channel, run_canonical_writer_with_control,
 };
 use zinder_proto::capabilities::EXPLORER_VALUE_POOL_SUMMARY_V1;
 use zinder_proto::v1::explorer::{
@@ -175,8 +175,7 @@ impl ValuePoolSummaryFixture {
             Arc::new(sample_regtest_upgrade_activations()),
         );
         let (ingest_control_addr, ingest_control_handle) =
-            serve_ingest_control_grpc(network, canonical, source, readiness, writer_cancel.clone())
-                .await?;
+            serve_ingest_control_grpc(canonical, source, readiness, writer_cancel.clone()).await?;
         let (wallet_grpc_addr, wallet_server_handle) = serve_wallet_query_grpc(
             wallet_query,
             WalletQueryServerOptions {
@@ -188,8 +187,10 @@ impl ValuePoolSummaryFixture {
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
 
         let explorer_adapter =
-            ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
-                .with_wallet_query_endpoint(wallet_endpoint);
+            ExplorerQueryGrpcAdapter::builder(ExplorerEndpointMetadata { network })
+                .with_wallet_query_endpoint(wallet_endpoint)
+                .build()
+                .await?;
 
         Ok(Self {
             network,
@@ -311,20 +312,20 @@ async fn wait_for_writer(canonical: &zinder_ingest::CanonicalControlHandle) -> R
 }
 
 async fn serve_ingest_control_grpc(
-    network: Network,
     canonical: zinder_ingest::CanonicalControlHandle,
     source: zinder_source::ZebraJsonRpcSource,
     readiness: zinder_runtime::Readiness,
     cancel: CancellationToken,
 ) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
+    source.probe_capabilities().await?;
     let node_source: Arc<dyn NodeSource> = Arc::new(source);
+    let node_composition = IngestNodeComposition::new(node_source)?;
     let adapter = CanonicalIngestControlGrpcAdapter::new(
-        network,
         canonical,
         // The current production adapter owns its `MempoolIndex` through this
         // live owner rather than accepting the index as a separate argument.
         LiveMempoolOwner::default(),
-        node_source,
+        node_composition,
         readiness,
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;

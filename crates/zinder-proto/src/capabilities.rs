@@ -2,10 +2,9 @@
 //!
 //! Every served RPC on `WalletQuery`, `ExplorerQuery`, and `IngestControl`
 //! has one row in [`CAPABILITIES`]. Each row binds a capability string to its
-//! surface, the fully qualified proto method it gates, and a declarative
-//! [`AdvertisePolicy`]. The registry defines vocabulary, stable ordering, and
-//! descriptive requirements; it does not discover the capabilities of a
-//! composed wallet runtime. The `capability-table-vs-descriptor` CI guard
+//! surface and the fully qualified proto method it gates. The registry defines
+//! vocabulary and stable ordering; each runtime derives support from its
+//! admitted composition. The `capability-table-vs-descriptor` CI guard
 //! cross-checks the table against the compiled `FileDescriptorSet`. The full
 //! protocol contract is in [Public interfaces §Capability
 //! Discovery](../../docs/architecture/public-interfaces.md#capability-discovery).
@@ -175,13 +174,14 @@ pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 /// [`WALLET_READ_TRANSACTION_BY_ID_V2`], while mined bytes require
 /// [`WALLET_READ_TRANSACTION_BYTES_V1`].
 pub const EXPLORER_TRANSACTION_DETAIL_V4: &str = "explorer.transaction.detail_v4";
-/// Capability advertised for `ExplorerQuery.BlockSummariesInRange`.
+/// Registry identifier assigned to `ExplorerQuery.BlockSummariesInRange`.
 ///
-/// Signals that the explorer plane is materializing the `BlockSummary`
-/// materialized view and the consumer has caught up far enough to serve the
-/// summary shape (`block_height`, `block_hash`, `block_time_unix_seconds`,
-/// `transaction_count`, `previous_block_hash`). The companion
-/// [`EXPLORER_BLOCK_DETAIL_V1`] covers the per-block transaction-id list.
+/// The identifier names the summary shape (`block_height`, `block_hash`,
+/// `block_time_unix_seconds`, `transaction_count`, `previous_block_hash`).
+/// A runtime advertises it only when that endpoint installs the method and
+/// admits its exact dependencies; the protocol registry does not make that
+/// support decision. The companion [`EXPLORER_BLOCK_DETAIL_V1`] covers the
+/// per-block transaction-id list.
 pub const EXPLORER_BLOCK_SUMMARY_V1: &str = "explorer.block.summary_v1";
 /// Capability advertised for `ExplorerQuery.BlockProductionSeries`.
 ///
@@ -397,13 +397,14 @@ pub const EXPLORER_UTXO_SET_COMMITMENT_V1: &str = "explorer.utxo_set.commitment_
 ///
 /// Signals that the explorer plane has transparent-output facts online and
 /// the `TransactionFeesConsumer` has materialized per-transaction fee rows.
-/// When advertised, `TransactionDetail` responses populate resolved
-/// `transparent_inputs[].value_zat`. They populate `paid_fee_zat` only for
-/// transparent-only transactions because canonical facts do not retain the
-/// value balances required to prove shielded fees. Consumers fall back to
-/// `zip317_conventional_fee_zat` when the paid fee is absent and use
-/// `prevout_resolution_status` for transparent-input resolution. Gates fields
-/// on `TransactionDetail` rather than a dedicated RPC.
+/// When advertised, transaction-detail and block-transaction responses may
+/// use the fee projection to preserve `transparent_inputs[].value_zat` after
+/// retained parent facts become unavailable. Transaction-detail, history, and
+/// recent rows populate `paid_fee_zat` only when the projection proves it.
+/// Consumers fall back to `zip317_conventional_fee_zat` when the paid fee is
+/// absent and use `prevout_resolution_status` where the response carries it.
+/// The endpoint advertises this field capability only alongside at least one
+/// admitted carrier RPC; it does not introduce a dedicated method.
 pub const EXPLORER_TRANSACTION_FEES_V1: &str = "explorer.transaction.fees_v1";
 /// Capability advertised for `ExplorerQuery.RecentTransactions`.
 ///
@@ -537,172 +538,7 @@ pub enum CapabilitySurface {
     Ingest,
 }
 
-/// Declarative runtime requirement associated with a capability.
-///
-/// Each variant classifies evidence an owning runtime may require before it
-/// advertises a capability. The registry records this metadata but does not
-/// derive wallet runtime support from it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum AdvertisePolicy {
-    /// No additional deployment requirement.
-    AlwaysOn,
-    /// Wallet: requires a configured transaction broadcaster.
-    RequiresBroadcaster,
-    /// Wallet: requires a served chain-event stream.
-    RequiresChainEvents,
-    /// Advertised when the upstream node reports chain value-pool totals.
-    ///
-    /// Ingest resolves this against the source handle's
-    /// `NodeCapability::ChainValuePools`; wallet compositions require the
-    /// corresponding admitted upstream read path.
-    RequiresChainValuePools,
-    /// Explorer: advertised when a `WalletQuery` endpoint is wired.
-    RequiresWalletQuery,
-    /// Explorer: advertised when the canonical secondary store is online.
-    RequiresCanonicalStore,
-    /// Explorer: advertised when the materialized-view store is online.
-    RequiresMaterializedViewStore,
-    /// Explorer: advertised when both a `WalletQuery` endpoint and the
-    /// canonical store are online.
-    RequiresWalletQueryAndCanonicalStore,
-    /// Explorer: advertised when both the materialized-view store and a `WalletQuery`
-    /// endpoint are online.
-    RequiresMaterializedViewStoreAndWalletQuery,
-    /// Explorer: advertised when both the materialized-view store and canonical secondary
-    /// store are online.
-    RequiresMaterializedViewStoreAndCanonicalStore,
-    /// Explorer: advertised when the materialized-view store, canonical secondary store,
-    /// and `WalletQuery` endpoint are all online.
-    RequiresMaterializedViewStoreWalletQueryAndCanonicalStore,
-    /// Explorer: advertised when the transparent-output prevout resolution
-    /// path is online (which itself requires a `WalletQuery` endpoint).
-    RequiresPrevoutResolution,
-    /// Explorer: advertised when transaction history has materialized a typed
-    /// projection position and the wallet-query dependency is online.
-    RequiresTransactionHistory,
-    /// Explorer: advertised when transaction history has verified full
-    /// coverage through its typed projection position and wallet-query is online.
-    RequiresCompleteTransactionHistory,
-    /// Wallet: requires a store that retains full block blobs (ingest
-    /// `raw_blob_policy = all`).
-    RequiresBlockBlobs,
-    /// Wallet: requires a store that retains transaction blobs
-    /// (ingest `raw_blob_policy` in `{transactions, all}`).
-    RequiresTransactionBlobs,
-    /// Wallet: requires an admitted transparent UTXO-set commitment fold.
-    ///
-    /// No release composition currently satisfies this policy.
-    RequiresUtxoSetCommitment,
-    /// Wallet: requires an available transparent-address history projection.
-    RequiresTransparentAddressHistory,
-    /// Wallet: requires an available durable transparent-spend projection.
-    RequiresTransparentOutpointSpend,
-}
-
-impl AdvertisePolicy {
-    /// Resolves an `ExplorerQuery` capability against the adapter's readiness.
-    ///
-    /// `prevout_resolution_online` is expected to already fold in the
-    /// `WalletQuery`-endpoint precondition.
-    #[must_use]
-    pub fn explorer_satisfied(self, readiness: ExplorerReadiness) -> bool {
-        match self {
-            Self::AlwaysOn => true,
-            Self::RequiresWalletQuery => readiness.wallet_query_online,
-            Self::RequiresCanonicalStore => readiness.canonical_store_online,
-            Self::RequiresMaterializedViewStore => readiness.materialized_view_store_online,
-            Self::RequiresWalletQueryAndCanonicalStore => {
-                readiness.wallet_query_online && readiness.canonical_store_online
-            }
-            Self::RequiresMaterializedViewStoreAndWalletQuery => {
-                readiness.materialized_view_store_online && readiness.wallet_query_online
-            }
-            Self::RequiresMaterializedViewStoreAndCanonicalStore => {
-                readiness.materialized_view_store_online && readiness.canonical_store_online
-            }
-            Self::RequiresMaterializedViewStoreWalletQueryAndCanonicalStore => {
-                readiness.materialized_view_store_online
-                    && readiness.wallet_query_online
-                    && readiness.canonical_store_online
-            }
-            Self::RequiresPrevoutResolution => readiness.prevout_resolution_online,
-            Self::RequiresTransactionHistory => {
-                readiness.transaction_history_available && readiness.wallet_query_online
-            }
-            Self::RequiresCompleteTransactionHistory => {
-                readiness.transaction_history_complete && readiness.wallet_query_online
-            }
-            Self::RequiresBroadcaster
-            | Self::RequiresChainEvents
-            | Self::RequiresChainValuePools
-            | Self::RequiresBlockBlobs
-            | Self::RequiresTransactionBlobs
-            | Self::RequiresUtxoSetCommitment
-            | Self::RequiresTransparentAddressHistory
-            | Self::RequiresTransparentOutpointSpend => false,
-        }
-    }
-
-    /// Resolves an `IngestControl` capability against the source handle.
-    ///
-    /// Ingest capabilities are always on except chain-value-pools, which is
-    /// gated on the upstream node reporting the matching node capability.
-    #[must_use]
-    pub fn ingest_satisfied(self, chain_value_pools_supported: bool) -> bool {
-        match self {
-            Self::AlwaysOn => true,
-            Self::RequiresChainValuePools => chain_value_pools_supported,
-            Self::RequiresBroadcaster
-            | Self::RequiresChainEvents
-            | Self::RequiresCanonicalStore
-            | Self::RequiresMaterializedViewStore
-            | Self::RequiresWalletQuery
-            | Self::RequiresWalletQueryAndCanonicalStore
-            | Self::RequiresMaterializedViewStoreAndWalletQuery
-            | Self::RequiresMaterializedViewStoreAndCanonicalStore
-            | Self::RequiresMaterializedViewStoreWalletQueryAndCanonicalStore
-            | Self::RequiresPrevoutResolution
-            | Self::RequiresBlockBlobs
-            | Self::RequiresTransactionBlobs
-            | Self::RequiresUtxoSetCommitment
-            | Self::RequiresTransparentAddressHistory
-            | Self::RequiresTransparentOutpointSpend
-            | Self::RequiresTransactionHistory
-            | Self::RequiresCompleteTransactionHistory => false,
-        }
-    }
-}
-
-/// Readiness inputs the explorer plane resolves an [`AdvertisePolicy`] against.
-///
-/// Each field mirrors an online/offline gate the `ExplorerQuery` adapter
-/// already tracks. `prevout_resolution_online` folds in the
-/// `WalletQuery`-endpoint precondition at the call site. The explorer
-/// constructs this directly per request, so it is not `#[non_exhaustive]`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "Each bool is an independent explorer readiness gate, not a state machine."
-)]
-pub struct ExplorerReadiness {
-    /// A `WalletQuery` endpoint is wired.
-    pub wallet_query_online: bool,
-    /// The canonical secondary store is open.
-    pub canonical_store_online: bool,
-    /// The materialized-view store is open.
-    pub materialized_view_store_online: bool,
-    /// Transparent-output prevout resolution is online (implies
-    /// `wallet_query_online`).
-    pub prevout_resolution_online: bool,
-    /// Transaction history has a typed materialized projection position.
-    pub transaction_history_available: bool,
-    /// Transaction history has verified complete coverage through its position.
-    pub transaction_history_complete: bool,
-}
-
-/// One row binding a capability string to its surface, proto method, and
-/// advertise policy.
+/// One row binding a capability string to its surface and proto method.
 ///
 /// `method` is the fully qualified proto method name as it appears in the
 /// compiled `FileDescriptorSet`
@@ -718,8 +554,6 @@ pub struct CapabilitySpec {
     /// The fully qualified proto method the capability gates, or `None` for a
     /// field-level capability that rides on another RPC.
     pub method: Option<&'static str>,
-    /// Declarative runtime-requirement metadata for the capability.
-    pub policy: AdvertisePolicy,
 }
 
 impl CapabilitySpec {
@@ -727,13 +561,11 @@ impl CapabilitySpec {
         string: &'static str,
         surface: CapabilitySurface,
         method: Option<&'static str>,
-        policy: AdvertisePolicy,
     ) -> Self {
         Self {
             string,
             surface,
             method,
-            policy,
         }
     }
 }
@@ -751,560 +583,455 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         WALLET_READ_VISIBLE_TIP_BLOCK_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.VisibleTipBlock"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_SETTLED_TIP_BLOCK_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.SettledTipBlock"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.BlockIdBySelector"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.BlockHeaderBySelector"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_COMPACT_BLOCK_AT_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.CompactBlock"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_COMPACT_BLOCK_RANGE_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.CompactBlocksInRange"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
         CapabilitySurface::Wallet,
         None,
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_FULL_BLOCK_AT_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.FullBlock"),
-        AdvertisePolicy::RequiresBlockBlobs,
     ),
     CapabilitySpec::new(
         WALLET_READ_FULL_BLOCK_RANGE_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.FullBlocksInRange"),
-        AdvertisePolicy::RequiresBlockBlobs,
     ),
     CapabilitySpec::new(
         WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TreeStateAtHeight"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.LatestTreeStateCheckpoint"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.SubtreeRoots"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
         CapabilitySurface::Wallet,
         None,
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_TRANSACTION_BY_ID_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.Transaction"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_TRANSACTION_BYTES_V1,
         CapabilitySurface::Wallet,
         None,
-        AdvertisePolicy::RequiresTransactionBlobs,
     ),
     CapabilitySpec::new(
         WALLET_READ_SERVER_INFO_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.ServerInfo"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.NetworkUpgradeActivations"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_TRANSPARENT_OUTPUTS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentOutputsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_TRANSPARENT_SPENDS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentSpendsByOutpoint"),
-        AdvertisePolicy::RequiresTransparentOutpointSpend,
     ),
     CapabilitySpec::new(
         WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentUnspentOutputsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.ChainValuePoolsAtTip"),
-        AdvertisePolicy::RequiresChainValuePools,
     ),
     CapabilitySpec::new(
         WALLET_BROADCAST_TRANSACTION_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.BroadcastTransaction"),
-        AdvertisePolicy::RequiresBroadcaster,
     ),
     CapabilitySpec::new(
         WALLET_EVENTS_CHAIN_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.ChainEvents"),
-        AdvertisePolicy::RequiresChainEvents,
     ),
     CapabilitySpec::new(
         WALLET_SNAPSHOT_MEMPOOL_V3,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.MempoolSnapshot"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_EVENTS_MEMPOOL_V2,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.MempoolEvents"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentMempoolOutputsByAddress"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentMempoolSpendsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentMempoolOutputsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentAddressUnspentOutputs"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentAddressTxIdsInRange"),
-        AdvertisePolicy::RequiresTransparentAddressHistory,
     ),
     CapabilitySpec::new(
         WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentAddressBalance"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentUtxoSetSummary"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1,
         CapabilitySurface::Wallet,
         None,
-        AdvertisePolicy::RequiresUtxoSetCommitment,
     ),
     CapabilitySpec::new(
         EXPLORER_SERVER_INFO_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ServerInfo"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_DETAIL_V4,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransactionDetail"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_BLOCK_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockSummariesInRange"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockProductionSeries"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockProductionInTimeRange"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_BLOCK_DETAIL_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockDetail"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_BLOCK_TRANSACTIONS_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockTransactions"),
-        AdvertisePolicy::RequiresMaterializedViewStoreWalletQueryAndCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_V1,
         CapabilitySurface::Explorer,
         None,
-        AdvertisePolicy::RequiresMaterializedViewStoreWalletQueryAndCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockActivityDistribution"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_SEARCH_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.Search"),
-        AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_COMMITMENT_ROOT_SEARCH_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.CommitmentRootSearch"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1,
         CapabilitySurface::Explorer,
         None,
-        AdvertisePolicy::RequiresMaterializedViewStoreAndCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_MEMPOOL_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MempoolSummary"),
-        AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_MEMPOOL_SNAPSHOT_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MempoolSnapshot"),
-        AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_MEMPOOL_ACTIVITY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MempoolActivity"),
-        AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransparentAddressActivity"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransparentAddressDeltas"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_FEE_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.FeeSummary"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ConventionalFeeDistribution"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_PAID_FEE_DISTRIBUTION_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.PaidFeeDistribution"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransactionComponentSummary"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransparentAddressRanking"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_VALUE_POOL_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolSummary"),
-        AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_NETWORK_UPGRADE_STATUS_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.NetworkUpgradeStatus"),
-        AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowHistory"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowEventsInRange"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_VALUE_POOL_FLOW_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowSummary"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowAmountThresholdSummary"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_VALUE_POOL_FLOW_ROUNDED_AMOUNT_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolFlowRoundedAmountSummary"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ValuePoolBalanceHistory"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_UTXO_SET_SUMMARY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.UtxoSetSummary"),
-        AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_UTXO_SET_COMMITMENT_V1,
         CapabilitySurface::Explorer,
         None,
-        AdvertisePolicy::RequiresWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_CHAIN_REORG_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ChainReorgHistory"),
-        AdvertisePolicy::RequiresMaterializedViewStore,
     ),
     CapabilitySpec::new(
         EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.DisplacedBlockHistory"),
-        AdvertisePolicy::RequiresCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.DisplacedBlockDetail"),
-        AdvertisePolicy::RequiresCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MempoolEventCounts"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_FEES_V1,
         CapabilitySurface::Explorer,
         None,
-        AdvertisePolicy::RequiresPrevoutResolution,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_RECENT_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.RecentTransactions"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransactionHistory"),
-        AdvertisePolicy::RequiresTransactionHistory,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_HISTORY_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.TransactionHistory"),
-        AdvertisePolicy::RequiresCompleteTransactionHistory,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,
         CapabilitySurface::Explorer,
         None,
-        AdvertisePolicy::RequiresMaterializedViewStoreWalletQueryAndCanonicalStore,
     ),
     CapabilitySpec::new(
         EXPLORER_OVERVIEW_SNAPSHOT_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.OverviewSnapshot"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_MIGRATION_OVERVIEW_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MigrationOverview"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_MIGRATION_COHORTS_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MigrationCohorts"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         EXPLORER_MIGRATION_DENOMINATIONS_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MigrationDenominations"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
         INGEST_CONTROL_SERVER_INFO_V1,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.ServerInfo"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         INGEST_CONTROL_WRITER_STATUS_V1,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.WriterStatus"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.VisibleChainEvents"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.MempoolSnapshot"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         INGEST_CONTROL_MEMPOOL_TRANSACTION_V2,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.MempoolTransaction"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         INGEST_CONTROL_MEMPOOL_EVENTS_V2,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.MempoolEvents"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.TransparentMempoolOutputsByAddress"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.TransparentMempoolSpendsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.TransparentMempoolOutputsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
     ),
-    CapabilitySpec::new(
-        INGEST_WRITER_PHASE_V1,
-        CapabilitySurface::Ingest,
-        None,
-        AdvertisePolicy::AlwaysOn,
-    ),
+    CapabilitySpec::new(INGEST_WRITER_PHASE_V1, CapabilitySurface::Ingest, None),
     CapabilitySpec::new(
         INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1,
         CapabilitySurface::Ingest,
         Some("zinder.v1.ingest.IngestControl.ChainValuePoolsAtTip"),
-        AdvertisePolicy::RequiresChainValuePools,
     ),
 ];
 
 /// Returns the capability rows owned by `surface`, in table order.
 ///
-/// This registry query preserves vocabulary order and does not evaluate
-/// [`AdvertisePolicy`] or discover runtime support.
+/// This registry query preserves vocabulary order and does not discover
+/// runtime support.
 pub fn capabilities_for_surface(
     surface: CapabilitySurface,
 ) -> impl Iterator<Item = &'static CapabilitySpec> {
     CAPABILITIES
         .iter()
         .filter(move |spec| spec.surface == surface)
-}
-
-/// Returns the always-on capability strings for `surface`.
-///
-/// This is a classification query over registry metadata, not evidence that a
-/// particular runtime composed or admitted the corresponding methods.
-#[must_use]
-pub fn always_on_capability_strings(surface: CapabilitySurface) -> Vec<&'static str> {
-    capabilities_for_surface(surface)
-        .filter(|spec| matches!(spec.policy, AdvertisePolicy::AlwaysOn))
-        .map(|spec| spec.string)
-        .collect()
 }
 
 /// A typed wallet-plane capability a client probes before issuing a call.

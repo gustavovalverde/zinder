@@ -31,7 +31,7 @@ use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto;
 use zinder_core::wire::{encode_rpc_transaction_id_hex, encode_zinder_native_chain_name};
 use zinder_core::{BlockHeight, Network, TransactionId};
-use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
+use zinder_explorer::{ExplorerEndpointMetadata, ExplorerQueryGrpcAdapter};
 use zinder_ingest::run_bulk_catchup;
 use zinder_proto::v1::explorer::{
     PrivacyShape as WirePrivacyShape, TransactionDetailRequest, TransactionVersionKind,
@@ -195,9 +195,11 @@ impl TransactionDetailFixture {
         )?;
         canonical_secondary.try_catch_up()?;
         let explorer_adapter =
-            ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
+            ExplorerQueryGrpcAdapter::builder(ExplorerEndpointMetadata { network })
                 .with_canonical_store(canonical_secondary)
-                .with_wallet_query_endpoint(format!("http://{wallet_grpc_addr}"));
+                .with_wallet_query_endpoint(format!("http://{wallet_grpc_addr}"))
+                .build()
+                .await?;
 
         Ok(Self {
             network,

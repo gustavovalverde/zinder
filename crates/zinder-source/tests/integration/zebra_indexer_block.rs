@@ -16,7 +16,7 @@ use std::{
 use eyre::Result;
 use futures_util::{Stream, future::join_all};
 use parking_lot::Mutex;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 use zinder_core::{BlockHeight, Network, wire::encode_rpc_block_hash_hex};
@@ -29,6 +29,7 @@ use zinder_source::{
     NodeAuth, NodeSource, ZebraIndexerBlockSource, ZebraIndexerBlockSourceOptions,
     ZebraIndexerSourceTarget, ZebraJsonRpcSource,
 };
+use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
 
 type ChainTipStream =
     Pin<Box<dyn Stream<Item = Result<BlockHashAndHeight, Status>> + Send + 'static>>;
@@ -140,6 +141,58 @@ async fn start_block_source(
         max_active_requests,
         server,
     })
+}
+
+#[tokio::test]
+async fn indexer_source_forwards_control_plane_capability_admission() -> Result<()> {
+    let (response, _) = fixture_block()?;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(
+        Server::builder()
+            .add_service(IndexerServer::new(BlockService {
+                response,
+                requests,
+                response_delay: Duration::ZERO,
+                active_requests: Arc::new(AtomicU64::new(0)),
+                max_active_requests: Arc::new(AtomicU64::new(0)),
+            }))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let json_rpc_server =
+        JsonRpcTestServer::start([method("rpc.discover").reply(RpcReply::result(json!({
+            "openrpc": "1.3.2",
+            "info": {"title": "Zebra", "version": "8.0.0"},
+            "methods": [
+                {"name": "getblock"},
+                {"name": "getbestblockheightandhash"},
+                {"name": "z_gettreestate"},
+                {"name": "z_getsubtreesbyindex"},
+                {"name": "sendrawtransaction"},
+                {"name": "getblockchaininfo"},
+                {"name": "rpc.discover"},
+            ],
+        })))])?;
+    let control_plane = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        json_rpc_server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+    let source = ZebraIndexerBlockSource::connect(
+        ZebraIndexerSourceTarget::new(format!("http://{address}")),
+        control_plane.clone(),
+        ZebraIndexerBlockSourceOptions::default(),
+    )
+    .await?;
+
+    assert!(source.admitted_capabilities().is_none());
+    let admitted = control_plane.probe_capabilities().await?;
+    assert_eq!(source.admitted_capabilities(), Some(admitted));
+
+    server.abort();
+    Ok(())
 }
 
 fn fixture_block() -> Result<(BlockAndHash, zinder_source::SourceBlock)> {

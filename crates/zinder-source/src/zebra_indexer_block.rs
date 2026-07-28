@@ -181,6 +181,14 @@ impl NodeSource for ZebraIndexerBlockSource {
         self.control_plane.capabilities()
     }
 
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        self.control_plane.admitted_capabilities()
+    }
+
+    fn network(&self) -> Option<Network> {
+        Some(self.network)
+    }
+
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.fetch_indexer_block_at(height).await
     }

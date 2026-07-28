@@ -602,6 +602,10 @@ mod tests {
             NodeCapabilities::new([]).unwrap_or_default()
         }
 
+        fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+            Some(self.capabilities())
+        }
+
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
             if height != BlockHeight::new(0) {
                 return Err(SourceError::BlockUnavailable {

@@ -1715,6 +1715,10 @@ mod tests {
             ZebraJsonRpcSource::baseline_capabilities()
         }
 
+        fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+            Some(self.capabilities())
+        }
+
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
             if consume_retryable_failure(&self.block_failures_remaining) {
                 return Err(SourceError::BlockUnavailable {

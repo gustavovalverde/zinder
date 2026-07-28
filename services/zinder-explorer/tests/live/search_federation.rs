@@ -19,7 +19,7 @@ use zinder_core::wire::{
     encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex, encode_zinder_native_chain_name,
 };
 use zinder_core::{BlockHash, BlockHeight, Network, TransactionId};
-use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
+use zinder_explorer::{ExplorerEndpointMetadata, ExplorerQueryGrpcAdapter};
 use zinder_ingest::run_bulk_catchup;
 use zinder_proto::capabilities::EXPLORER_SEARCH_V1;
 use zinder_proto::v1::explorer::{
@@ -312,8 +312,10 @@ impl SearchFixture {
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
 
         let explorer_adapter =
-            ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
-                .with_wallet_query_endpoint(wallet_endpoint);
+            ExplorerQueryGrpcAdapter::builder(ExplorerEndpointMetadata { network })
+                .with_wallet_query_endpoint(wallet_endpoint)
+                .build()
+                .await?;
 
         Ok(Self {
             network,

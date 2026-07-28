@@ -168,6 +168,10 @@ where
         self.fixture_source.capabilities()
     }
 
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        self.fixture_source.admitted_capabilities()
+    }
+
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         let block = self.transport_source.fetch_block_at(height).await?;
         self.authenticate_block(&block).await?;
@@ -316,6 +320,10 @@ impl CanonicalFixtureNodeSource {
 impl NodeSource for CanonicalFixtureNodeSource {
     fn capabilities(&self) -> NodeCapabilities {
         self.fixture_source.capabilities()
+    }
+
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        self.fixture_source.admitted_capabilities()
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

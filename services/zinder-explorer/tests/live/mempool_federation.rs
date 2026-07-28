@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tonic::Request;
 use zinder_core::Network;
 use zinder_core::wire::encode_zinder_native_chain_name;
-use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
+use zinder_explorer::{ExplorerEndpointMetadata, ExplorerQueryGrpcAdapter};
 use zinder_proto::capabilities::{
     EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MEMPOOL_SUMMARY_V1,
 };
@@ -139,8 +139,10 @@ impl MempoolFixture {
         let wallet_endpoint = format!("http://{wallet_grpc_addr}");
 
         let explorer_adapter =
-            ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
-                .with_wallet_query_endpoint(wallet_endpoint);
+            ExplorerQueryGrpcAdapter::builder(ExplorerEndpointMetadata { network })
+                .with_wallet_query_endpoint(wallet_endpoint)
+                .build()
+                .await?;
 
         Ok(Self {
             network,

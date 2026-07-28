@@ -12,7 +12,6 @@ use zinder_core::wire::{
     encode_internal_block_hash,
 };
 use zinder_core::{BlockHash, BlockHeight};
-use zinder_proto::capabilities::EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1;
 
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
@@ -51,10 +50,6 @@ pub const CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA: MaterializedViewConsumerSchema =
         1,
         CONVENTIONAL_FEE_DISTRIBUTION_COLUMN_FAMILIES,
     );
-
-/// Capability advertised when this materialized view is ready.
-pub const CONVENTIONAL_FEE_DISTRIBUTION_CAPABILITIES: &[&str] =
-    &[EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1];
 
 const SECONDS_PER_DAY: i64 = 86_400;
 const TIME_KEY_LEN: usize = 8;

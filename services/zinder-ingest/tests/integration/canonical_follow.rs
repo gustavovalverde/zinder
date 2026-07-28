@@ -165,6 +165,10 @@ impl NodeSource for RecordingParseableSource {
         NodeCapabilities::default()
     }
 
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        Some(self.capabilities())
+    }
+
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.calls.lock().push(SourceCall::Block(height));
         self.block_at(height)
