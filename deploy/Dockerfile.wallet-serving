@@ -1,22 +1,21 @@
 # syntax=docker/dockerfile:1.7
 
-# Railway wallet-serving Zinder runtime image builder without BuildKit cache
-# mounts. Mirrors deploy/Dockerfile but drops `--mount=type=cache` entirely so
-# this file is portable across Railway service IDs (Railway requires literal
-# `s/<service-id>-<cache-name>` prefixes that can't be parameterized via
-# ${...}). Cold builds are ~5 minutes; Railway's ephemeral builders rarely
-# reuse the cache, so the loss is negligible in practice.
+# Wallet-serving Zinder runtime image for single-volume hosts: the canonical
+# writer, the wallet writer, and the native WalletQuery reader run as three
+# supervised processes against the one volume mounted at /var/lib/zinder,
+# because the readers open secondaries over paths the writers own. Hosts with
+# shared volumes across containers use deploy/docker-compose.yml instead.
 #
-# Railway attaches one volume to one service and has no shared network
-# namespace, so the canonical writer, the wallet writer, and the native
-# WalletQuery reader run as three supervised processes in this image against
-# the single volume mounted at /var/lib/zinder.
+# Mirrors deploy/Dockerfile but drops `--mount=type=cache` entirely so hosts
+# that reject parameterized cache IDs (Railway requires literal
+# `s/<service-id>-<cache-name>` prefixes) can build it. Cold builds are ~5
+# minutes on an ephemeral builder.
 
 ARG RUST_VERSION=1.95
 ARG DEBIAN_RELEASE=bookworm
-# A deployed Railway service must choose an admitted target explicitly. This
-# image is the native WalletQuery topology; it does not serve the
-# lightwalletd compatibility protocol.
+# A deployment must name the admitted target explicitly. This image is the
+# native WalletQuery topology; it does not serve the lightwalletd
+# compatibility protocol.
 ARG RAILWAY_DOCKER_TARGET_STAGE=zinder-admission-required
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS zinder-build-base
@@ -78,14 +77,14 @@ COPY --from=zinder-binaries /zinder-binaries/zinder-ingest /usr/local/bin/zinder
 COPY --from=zinder-binaries /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
 COPY --from=zinder-binaries /zinder-binaries/zinder-query /usr/local/bin/zinder-query
 
-COPY deploy/config/railway-wallet-serving/ingest.toml /etc/zinder/ingest.toml
-COPY deploy/config/railway-wallet-serving/projector.toml /etc/zinder/projector.toml
-COPY deploy/config/railway-wallet-serving/query.toml /etc/zinder/query.toml
+COPY deploy/config/wallet-serving/ingest.toml /etc/zinder/ingest.toml
+COPY deploy/config/wallet-serving/projector.toml /etc/zinder/projector.toml
+COPY deploy/config/wallet-serving/query.toml /etc/zinder/query.toml
 
 COPY --chmod=0755 deploy/wallet-serving-runtime-entrypoint \
     /usr/local/bin/zinder-wallet-serving-runtime-entrypoint
 
-# Railway volume mounts replace the ownership baked into the image, and the
+# Platform volume mounts replace the ownership baked into the image, and the
 # nofile limit is raised before any store opens. Start as root; the entrypoint
 # drops every runtime process to zinder.
 USER root:root
@@ -100,13 +99,14 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=6h --retries=3 \
 
 ENTRYPOINT ["zinder-wallet-serving-runtime-entrypoint"]
 
-# Railway's final image is structurally fixed to the wallet-serving runtime.
-# The argument is an admission token, not a dynamic Docker stage selector: the
-# closed default fails this build, and naming another bundle cannot change the
-# final image or bypass the guard.
-FROM zinder-wallet-serving-runtime AS zinder-railway-wallet-serving-runtime
+# Hosts that build a file's final stage without target selection (Railway sets
+# RAILWAY_DOCKER_TARGET_STAGE as a service variable) land here. The argument is
+# an admission token, not a stage selector: the closed default fails the build,
+# and naming another bundle cannot change the final image or bypass the guard.
+# Hosts with --target build zinder-wallet-serving-runtime directly.
+FROM zinder-wallet-serving-runtime AS zinder-wallet-serving-admission
 
 ARG RAILWAY_DOCKER_TARGET_STAGE
 
 RUN test "${RAILWAY_DOCKER_TARGET_STAGE}" = "zinder-wallet-serving-runtime" \
-    || { echo >&2 "Railway target must be zinder-wallet-serving-runtime"; exit 1; }
+    || { echo >&2 "target stage must be zinder-wallet-serving-runtime"; exit 1; }

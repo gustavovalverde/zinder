@@ -5,7 +5,7 @@ correctness, restart, or performance validation. It projects no wallet state
 and serves no client protocol.
 
 Use [Deploying on a VM](deploying-on-a-vm.md) for the complete topology, or
-[Railway wallet-serving deployment](deploying-wallet-serving-on-railway.md)
+[Wallet-serving deployment (single-volume hosts)](deploying-wallet-serving.md)
 for the native `WalletQuery` service.
 
 ## Target admission

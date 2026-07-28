@@ -4,7 +4,7 @@
 # railway.toml and builds the canonical canary image instead.
 [build]
 builder = "DOCKERFILE"
-dockerfilePath = "deploy/Dockerfile.railway-wallet-serving"
+dockerfilePath = "deploy/Dockerfile.wallet-serving"
 
 [deploy]
 # The container is only useful once the native query surface serves, so the

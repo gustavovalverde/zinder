@@ -1,12 +1,19 @@
-# Railway wallet-serving deployment
+# Wallet-serving deployment (single-volume hosts)
 
-This target serves the native `WalletQuery` protocol from one Railway service.
-Railway attaches one volume to one service and has no shared network
-namespace, so `zinder-ingest`, `zinder-projector`, and `zinder-query` run as
-three supervised processes in one container over the volume mounted at
-`/var/lib/zinder`. The canonical and wallet primaries keep one owner each and
-the reader opens process-unique secondary generations, as
+This target serves the native `WalletQuery` protocol from one container
+against one volume. `zinder-ingest`, `zinder-projector`, and `zinder-query`
+run as three supervised processes over the volume mounted at
+`/var/lib/zinder`, because the readers open secondaries over paths the
+writers own. The canonical and wallet primaries keep one owner each and the
+reader opens process-unique secondary generations, as
 [ADR-0035](../adrs/0035-canonical-storage-topologies.md) requires.
+
+Any Docker host that attaches one persistent volume to one container can run
+this image. Hosts that share a volume across containers use
+[docker-compose](../../deploy/docker-compose.yml) instead. Railway is the
+reference host; the sections marked Railway are its adapter, and other
+platforms substitute their own health-check, restart-policy, and variable
+plumbing around the same image.
 
 This target does not serve the lightwalletd compatibility protocol and is not
 the certified complete release topology. Use
@@ -14,17 +21,25 @@ the certified complete release topology. Use
 [Railway canonical-writer validation](deploying-on-railway.md) for isolated
 canonical evidence.
 
-## Target admission
+## Building the image
 
-The Railway build requires:
+Hosts with stage selection build the runtime stage directly:
+
+```bash
+docker build -f deploy/Dockerfile.wallet-serving \
+    --target zinder-wallet-serving-runtime .
+```
+
+Hosts that always build a file's final stage land on an admission guard
+instead and must present the target as a build argument:
 
 ```text
 RAILWAY_DOCKER_TARGET_STAGE=zinder-wallet-serving-runtime
 ```
 
-`deploy/railway.wallet-serving-runtime.toml` builds
-`deploy/Dockerfile.railway-wallet-serving`; see [Deploy](#deploy) for how the
-service selects it. The closed default target fails the build.
+On Railway, `deploy/railway.wallet-serving-runtime.toml` builds
+`deploy/Dockerfile.wallet-serving`; see [Deploy on Railway](#deploy-on-railway)
+for how the service selects it. The closed default target fails the build.
 
 ## Service configuration
 
@@ -47,7 +62,8 @@ smaller container the cgroup OOM-killer takes one process during construction.
 That terminates the whole container, and the restart resumes construction from
 the last durable fence only to be killed again.
 
-Set these variables on the service:
+Set these variables on the service (node addresses shown for Railway's
+private network; substitute your host's):
 
 | Variable | Value |
 | --- | --- |
@@ -74,12 +90,12 @@ Every process rejects a `ZINDER_*` variable naming a section it does not own,
 and the entrypoint delivers the two role-scoped variables above to their owner
 alone. Add no other role-scoped variable. Storage paths, listen addresses,
 control endpoints, and bearer token paths are fixed in
-`deploy/config/railway-wallet-serving/`.
+`deploy/config/wallet-serving/`.
 
 `PORT` names the port Railway healthchecks. It must stay `9106`, the
 operational endpoint of the query process.
 
-## Deploy
+## Deploy on Railway
 
 Railway reads `railway.toml` at the repository root unless the service names
 another file. That default builds the ingest-only canary image, so set the
