@@ -335,6 +335,10 @@ The aggregate is taken at the resolved chain epoch's settled tip, and `summarize
 
 The totals count every unspent transparent output, including non-standard and provably-unspendable scripts (OP_RETURN, bare data outputs). The current-UTXO projection keys outputs by the hash of their raw `scriptPubKey` and never inspects the script template, so it does not apply zcashd's `IsUnspendable` filter. The two totals can therefore sit slightly above a zcashd `gettxoutsetinfo` that excludes the unspendable class.
 
+## Overview snapshot optional fields
+
+`ExplorerQuery.OverviewSnapshot` requires an admitted wallet tip to anchor its coherent bundle, while its `mempool` and `value_pools` fields are optional. When WalletQuery returns the typed `ENDPOINT_CAPABILITY_UNAVAILABLE` precondition for the exact field capability, `mempool` stays absent or `value_pools` stays empty and `freshness.unavailable` records the corresponding `mempool` or `value_pools` field path with `UNAVAILABLE_UPSTREAM_NOT_SUPPORTED`. The unavailable marker distinguishes structural absence from an observed empty mempool or value-pool list. Transient upstream failures and preconditions whose structured reason, domain, violation type, or capability subject do not match continue to fail the Overview request.
+
 ## Capability namespace
 
 The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:

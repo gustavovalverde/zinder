@@ -5842,6 +5842,7 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-reflection",
+ "tonic-types",
  "tracing",
  "zebra-chain",
  "zinder-core",

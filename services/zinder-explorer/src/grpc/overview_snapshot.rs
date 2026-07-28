@@ -9,25 +9,34 @@
 //! windows. This handler instead anchors every sub-field to the same
 //! `WalletQuery.VisibleTipBlock` tip and reads every materialized-view
 //! column-family in one pass, so the response carries one
-//! `ExplorerFreshness`. The `freshness.chain_epoch.tip_hash` is the
-//! bundle's snapshot identity; two responses with the same `tip_hash`
-//! are guaranteed to have been read against the same upstream snapshot.
+//! `ExplorerFreshness`. The bundle's snapshot identity is
+//! `freshness.chain_view.chain_epoch`; consumers compare its
+//! `chain_epoch_id` and `visible_tip` across responses.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message as _;
 use tonic::{Code, Request, Response, Status};
-use zinder_core::BlockHeight;
-use zinder_core::wire::encode_height_key_ascending;
+use tonic_types::StatusExt as _;
+use zinder_core::{
+    BlockHeight, explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
+    wire::encode_height_key_ascending,
+};
 use zinder_materialized_views::{
     BLOCK_SUMMARY_COLUMN_FAMILY, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MaterializedViewStore,
     MempoolEventCountsConsumer, TRANSACTION_HISTORY_COLUMN_FAMILY,
 };
-use zinder_proto::capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1;
+use zinder_proto::ZINDER_ERROR_DOMAIN;
+use zinder_proto::capabilities::{
+    EXPLORER_OVERVIEW_SNAPSHOT_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+    WALLET_SNAPSHOT_MEMPOOL_V3,
+};
 use zinder_proto::v1::explorer::{
     BlockSummary, BlockSummaryRecord, OverviewFeeSummary, OverviewMempool, OverviewMempoolEvents,
-    OverviewSnapshotRequest, OverviewSnapshotResponse, TransactionHistoryEntry,
+    OverviewSnapshotRequest, OverviewSnapshotResponse, TransactionHistoryEntry, UnavailableField,
+    UnavailableReason,
 };
+use zinder_proto::v1::ops::ErrorReason;
 use zinder_proto::v1::wallet::{
     self, ChainValuePoolsAtTipRequest, MempoolSnapshotRequest, VisibleTipBlockRequest,
     wallet_query_client::WalletQueryClient,
@@ -73,6 +82,11 @@ const DEFAULT_FEE_SUMMARY_BLOCK_COUNT: u32 = 50;
 /// handlers.
 const MAX_MEMPOOL_SNAPSHOT_ENTRIES: u32 = 4_096;
 
+/// Field path for an unavailable Overview mempool snapshot.
+const MEMPOOL_FIELD_PATH: &str = "mempool";
+/// Field path for unavailable Overview chain value pools.
+const VALUE_POOLS_FIELD_PATH: &str = "value_pools";
+
 /// Executes one `ExplorerQuery.OverviewSnapshot` request.
 pub(crate) async fn query_overview_snapshot(
     materialized_view_store: &MaterializedViewStore,
@@ -95,21 +109,35 @@ pub(crate) async fn query_overview_snapshot(
     let mempool_events =
         read_mempool_event_counts(materialized_view_store, limits.mempool_window_seconds)?;
     let mempool = aggregate_mempool_summary(wallet_client).await?;
-    let value_pools = read_value_pools(wallet_client).await?;
-    let freshness = attach_upstream_observation(
-        upstream_observation_cache,
-        build_explorer_freshness(
-            Some(materialized_view_store),
-            EXPLORER_OVERVIEW_SNAPSHOT_V1,
-            Some(anchor.chain_epoch),
-            0,
-        )?,
-    )
-    .await;
+    let available_value_pools = read_value_pools(wallet_client).await?;
+    let mut freshness = build_explorer_freshness(
+        Some(materialized_view_store),
+        EXPLORER_OVERVIEW_SNAPSHOT_V1,
+        Some(anchor.chain_epoch),
+        0,
+    )?;
+    if mempool.is_none() {
+        freshness
+            .unavailable
+            .push(build_wallet_capability_unavailable_field(
+                MEMPOOL_FIELD_PATH,
+            ));
+    }
+    let value_pools = if let Some(value_pools) = available_value_pools {
+        value_pools
+    } else {
+        freshness
+            .unavailable
+            .push(build_wallet_capability_unavailable_field(
+                VALUE_POOLS_FIELD_PATH,
+            ));
+        Vec::new()
+    };
+    let freshness = attach_upstream_observation(upstream_observation_cache, freshness).await;
     Ok(Response::new(OverviewSnapshotResponse {
         freshness: Some(freshness),
         tip_block_time_unix_seconds,
-        mempool: Some(mempool),
+        mempool,
         mempool_events: Some(mempool_events),
         fee_summary: Some(fee_summary),
         value_pools,
@@ -328,12 +356,10 @@ fn read_mempool_event_counts(
 
 async fn aggregate_mempool_summary(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-) -> Result<OverviewMempool, Status> {
-    // Best-effort: if the wallet's MempoolSnapshot is wired off (e.g.
-    // the ingest-control proxy is not configured) the bundle still
-    // returns with zero mempool counts rather than failing the entire
-    // overview. The response model has no unavailable marker, so this path
-    // returns the default mempool summary.
+) -> Result<Option<OverviewMempool>, Status> {
+    // Mempool is an optional Overview field. Structural absence is
+    // represented through the response freshness envelope; transient
+    // transport failures still fail the request.
     let snapshot = match wallet_client
         .mempool_snapshot(Request::new(MempoolSnapshotRequest {
             max_entries: MAX_MEMPOOL_SNAPSHOT_ENTRIES,
@@ -342,7 +368,9 @@ async fn aggregate_mempool_summary(
         .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) if status.code() == Code::Unavailable => return Ok(OverviewMempool::default()),
+        Err(status) if is_endpoint_capability_unavailable(&status, WALLET_SNAPSHOT_MEMPOOL_V3) => {
+            return Ok(None);
+        }
         Err(status) => return Err(status),
     };
     let now_millis = current_unix_millis();
@@ -365,29 +393,68 @@ async fn aggregate_mempool_summary(
             }),
         );
     }
-    Ok(OverviewMempool {
+    Ok(Some(OverviewMempool {
         transaction_count,
         total_size_bytes,
         oldest_entry_age_millis: oldest_first_seen
             .map_or(0, |seen| now_millis.saturating_sub(seen)),
         newest_entry_age_millis: newest_first_seen
             .map_or(0, |seen| now_millis.saturating_sub(seen)),
-    })
+    }))
 }
 
 async fn read_value_pools(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-) -> Result<Vec<wallet::ChainValuePool>, Status> {
-    // Best-effort parallel to `aggregate_mempool_summary`: the bundle
-    // returns with empty pool data rather than failing when the wallet's
-    // `ChainValuePoolsAtTip` is unavailable upstream.
+) -> Result<Option<Vec<wallet::ChainValuePool>>, Status> {
+    // Value pools are optional in the Overview bundle. An absent capability
+    // is distinguished from an observed empty pool list by
+    // `ExplorerFreshness.unavailable`.
     match wallet_client
         .chain_value_pools_at_tip(Request::new(ChainValuePoolsAtTipRequest {}))
         .await
     {
-        Ok(response) => Ok(response.into_inner().pools),
-        Err(status) if status.code() == Code::Unavailable => Ok(Vec::new()),
+        Ok(response) => Ok(Some(response.into_inner().pools)),
+        Err(status)
+            if is_endpoint_capability_unavailable(
+                &status,
+                WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+            ) =>
+        {
+            Ok(None)
+        }
         Err(status) => Err(status),
+    }
+}
+
+fn is_endpoint_capability_unavailable(status: &Status, capability: &str) -> bool {
+    if status.code() != Code::FailedPrecondition {
+        return false;
+    }
+
+    let details = status.get_error_details();
+    let has_matching_error_info = details.error_info().is_some_and(|error_info| {
+        error_info.domain == ZINDER_ERROR_DOMAIN
+            && error_info.reason == ErrorReason::EndpointCapabilityUnavailable.as_str_name()
+    });
+    if !has_matching_error_info {
+        return false;
+    }
+
+    details
+        .precondition_failure()
+        .is_some_and(|precondition_failure| {
+            matches!(precondition_failure.violations.as_slice(), [violation] if {
+                violation.r#type == ErrorReason::EndpointCapabilityUnavailable.as_str_name()
+                    && violation.subject == capability
+            })
+        })
+}
+
+fn build_wallet_capability_unavailable_field(field_path: &str) -> UnavailableField {
+    UnavailableField {
+        field_path: field_path.to_owned(),
+        reason: UnavailableReason::UnavailableUpstreamNotSupported as i32,
+        human_reason: WALLET_QUERY_CAPABILITY_NOT_SUPPORTED.to_owned(),
     }
 }
 
@@ -413,5 +480,164 @@ const fn clamp(requested: u32, default: u32, min: u32, max: u32) -> u32 {
         max
     } else {
         target
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tonic_types::{ErrorDetails, StatusExt as _};
+
+    use super::*;
+
+    fn status_with_capability_detail(
+        code: Code,
+        error_domain: &str,
+        error_reason: &str,
+        violation_type: &str,
+        capability: &str,
+    ) -> Status {
+        let mut details = ErrorDetails::with_precondition_failure_violation(
+            violation_type,
+            capability,
+            "test precondition",
+        );
+        details.set_error_info(error_reason, error_domain, HashMap::new());
+        Status::with_error_details(code, "test status", details)
+    }
+
+    #[test]
+    fn endpoint_capability_unavailable_requires_exact_structured_details() {
+        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
+        let status = status_with_capability_detail(
+            Code::FailedPrecondition,
+            ZINDER_ERROR_DOMAIN,
+            endpoint_reason,
+            endpoint_reason,
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+        );
+
+        assert!(is_endpoint_capability_unavailable(
+            &status,
+            WALLET_SNAPSHOT_MEMPOOL_V3
+        ));
+    }
+
+    #[test]
+    fn transient_unavailable_is_not_structural_capability_absence() {
+        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
+        let status = status_with_capability_detail(
+            Code::Unavailable,
+            ZINDER_ERROR_DOMAIN,
+            endpoint_reason,
+            endpoint_reason,
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+        );
+
+        assert!(!is_endpoint_capability_unavailable(
+            &status,
+            WALLET_SNAPSHOT_MEMPOOL_V3
+        ));
+    }
+
+    #[test]
+    fn endpoint_capability_unavailable_requires_zinder_error_domain() {
+        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
+        let status = status_with_capability_detail(
+            Code::FailedPrecondition,
+            "foreign.example",
+            endpoint_reason,
+            endpoint_reason,
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+        );
+
+        assert!(!is_endpoint_capability_unavailable(
+            &status,
+            WALLET_SNAPSHOT_MEMPOOL_V3
+        ));
+    }
+
+    #[test]
+    fn endpoint_capability_unavailable_requires_matching_error_reason() {
+        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
+        let status = status_with_capability_detail(
+            Code::FailedPrecondition,
+            ZINDER_ERROR_DOMAIN,
+            ErrorReason::DependencyNotConfigured.as_str_name(),
+            endpoint_reason,
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+        );
+
+        assert!(!is_endpoint_capability_unavailable(
+            &status,
+            WALLET_SNAPSHOT_MEMPOOL_V3
+        ));
+    }
+
+    #[test]
+    fn endpoint_capability_unavailable_requires_matching_precondition_type() {
+        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
+        let status = status_with_capability_detail(
+            Code::FailedPrecondition,
+            ZINDER_ERROR_DOMAIN,
+            endpoint_reason,
+            ErrorReason::DependencyNotConfigured.as_str_name(),
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+        );
+
+        assert!(!is_endpoint_capability_unavailable(
+            &status,
+            WALLET_SNAPSHOT_MEMPOOL_V3
+        ));
+    }
+
+    #[test]
+    fn endpoint_capability_unavailable_requires_exact_capability_subject() {
+        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
+        let status = status_with_capability_detail(
+            Code::FailedPrecondition,
+            ZINDER_ERROR_DOMAIN,
+            endpoint_reason,
+            endpoint_reason,
+            WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+        );
+
+        assert!(!is_endpoint_capability_unavailable(
+            &status,
+            WALLET_SNAPSHOT_MEMPOOL_V3
+        ));
+    }
+
+    #[test]
+    fn endpoint_capability_unavailable_rejects_composite_preconditions() {
+        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
+        let mut details = ErrorDetails::with_precondition_failure_violation(
+            endpoint_reason,
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+            "test precondition",
+        );
+        details.add_precondition_failure_violation(
+            ErrorReason::DependencyNotConfigured.as_str_name(),
+            "unrelated dependency",
+            "unrelated precondition",
+        );
+        details.set_error_info(endpoint_reason, ZINDER_ERROR_DOMAIN, HashMap::new());
+        let status = Status::with_error_details(Code::FailedPrecondition, "test status", details);
+
+        assert!(!is_endpoint_capability_unavailable(
+            &status,
+            WALLET_SNAPSHOT_MEMPOOL_V3
+        ));
+    }
+
+    #[test]
+    fn endpoint_capability_unavailable_requires_structured_details() {
+        let status = Status::failed_precondition("missing structured details");
+
+        assert!(!is_endpoint_capability_unavailable(
+            &status,
+            WALLET_SNAPSHOT_MEMPOOL_V3
+        ));
     }
 }
