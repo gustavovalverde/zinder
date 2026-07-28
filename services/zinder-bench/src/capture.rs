@@ -2,6 +2,7 @@
 //! write them into a deterministic fixture directory.
 
 use std::{
+    collections::HashMap,
     future::Future,
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
@@ -11,7 +12,7 @@ use std::{
 
 use futures_util::StreamExt as _;
 use zinder_core::{
-    BlockHeight, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
+    BlockHeight, BlockId, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestBuilder,
     CanonicalBlockFactsSequenceDigestVersion, Network, NetworkUpgradeActivations, ShieldedProtocol,
     SubtreeRootIndex, wire::encode_zinder_native_chain_name,
@@ -25,8 +26,8 @@ use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
 use crate::{
     error::BenchError,
     fixture::{
-        ActivationRecord, CanonicalBlockFactsDigestEvidence, FIXTURE_CONTRACT_IDENTITY,
-        FIXTURE_FORMAT_VERSION, FixtureManifest, SegmentDescriptor, SubtreeRootRecord,
+        ActivationRecord, CanonicalBlockFactsDigestEvidence, CapturedBlockId, CapturedSubtreeRoot,
+        FIXTURE_CONTRACT_IDENTITY, FIXTURE_FORMAT_VERSION, FixtureManifest, SegmentDescriptor,
         SubtreeRootSet, WorkloadDensity, write_segment,
     },
 };
@@ -100,16 +101,16 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
         tip_hash_hex,
         workload_density,
         canonical_block_facts_digest_evidence,
+        block_ids_by_height,
     } = capture_segments(&source, &config, &activations).await?;
 
-    let subtree_roots = SubtreeRootSet {
-        sapling: capture_subtree_roots(&source, ShieldedProtocol::Sapling, config.to_height)
-            .await?,
-        orchard: capture_subtree_roots(&source, ShieldedProtocol::Orchard, config.to_height)
-            .await?,
-        ironwood: capture_subtree_roots(&source, ShieldedProtocol::Ironwood, config.to_height)
-            .await?,
-    };
+    let subtree_roots = capture_subtree_root_set(
+        &source,
+        config.network,
+        config.to_height,
+        &block_ids_by_height,
+    )
+    .await?;
 
     let block_count = config
         .to_height
@@ -140,6 +141,7 @@ struct CapturedSegments {
     tip_hash_hex: String,
     workload_density: WorkloadDensity,
     canonical_block_facts_digest_evidence: CanonicalBlockFactsDigestEvidence,
+    block_ids_by_height: HashMap<u32, BlockId>,
 }
 
 /// Density and canonical-fact digest evidence computed while parsing fixture blocks once.
@@ -177,6 +179,7 @@ async fn capture_segments(
     let mut sequence_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
         CanonicalBlockFactsSequenceDigestVersion::CURRENT,
     );
+    let mut block_ids_by_height = HashMap::new();
     while segment_from <= config.to_height.value() {
         let segment_started = Instant::now();
         let segment_to = segment_end_height(segment_from, config.segment_blocks, config.to_height);
@@ -197,6 +200,18 @@ async fn capture_segments(
         workload_density.merge(measurements.workload_density);
         for digest in measurements.block_digests {
             append_sequence_digest(&mut sequence_builder, digest)?;
+        }
+        for block in blocks.iter() {
+            let block_id = BlockId::new(block.height, block.hash);
+            if block_ids_by_height
+                .insert(block.height.value(), block_id)
+                .is_some()
+            {
+                return Err(BenchError::fixture_format(format!(
+                    "captured block height {} appears more than once",
+                    block.height.value()
+                )));
+            }
         }
         if let Some(last) = blocks.last()
             && last.height.value() == config.to_height.value()
@@ -231,6 +246,7 @@ async fn capture_segments(
         canonical_block_facts_digest_evidence: digest_evidence_from_sequence(
             sequence_builder.finish(),
         ),
+        block_ids_by_height,
     })
 }
 
@@ -417,11 +433,13 @@ async fn fetch_segment_blocks(
     Ok(blocks)
 }
 
-async fn capture_subtree_roots(
-    source: &ZebraJsonRpcSource,
+async fn capture_subtree_roots<S: NodeSource>(
+    source: &S,
+    network: Network,
     protocol: ShieldedProtocol,
     to_height: BlockHeight,
-) -> Result<Vec<SubtreeRootRecord>, BenchError> {
+    block_ids: &mut SubtreeCompletionBlockIds<'_>,
+) -> Result<Vec<CapturedSubtreeRoot>, BenchError> {
     let Some(page_size) = NonZeroU32::new(SUBTREE_ROOT_PAGE_SIZE) else {
         return Ok(Vec::new());
     };
@@ -431,22 +449,51 @@ async fn capture_subtree_roots(
         let response = source
             .fetch_subtree_roots(protocol, SubtreeRootIndex::new(next_index), page_size)
             .await?;
+        if response.protocol != protocol
+            || response.start_index != SubtreeRootIndex::new(next_index)
+        {
+            return Err(BenchError::fixture_format(format!(
+                "{protocol:?} subtree-root response does not match requested protocol and start index {next_index}"
+            )));
+        }
         let returned = response.subtree_roots.len();
         if returned == 0 {
             break;
         }
         let mut passed_range = false;
         for root in response.subtree_roots {
+            if root.subtree_index != SubtreeRootIndex::new(next_index) {
+                return Err(BenchError::fixture_format(format!(
+                    "{protocol:?} subtree-root response has index {}, expected {next_index}",
+                    root.subtree_index.value()
+                )));
+            }
             if root.completing_block_height.value() > to_height.value() {
                 passed_range = true;
                 break;
             }
-            records.push(SubtreeRootRecord {
+            let completing_block = capture_completing_block_id(
+                source,
+                network,
+                root.completing_block_height,
+                block_ids.captured_range,
+                block_ids.fetched_by_height,
+            )
+            .await?;
+            records.push(CapturedSubtreeRoot {
+                protocol: protocol.rpc_pool_name().to_owned(),
                 index: root.subtree_index.value(),
                 root_hash_hex: hex::encode(root.root_hash.as_bytes()),
-                completing_height: root.completing_block_height.value(),
+                completing_block: CapturedBlockId {
+                    height: completing_block.height.value(),
+                    hash_hex: hex::encode(completing_block.hash.as_bytes()),
+                },
             });
-            next_index = root.subtree_index.value().saturating_add(1);
+            next_index = root.subtree_index.value().checked_add(1).ok_or_else(|| {
+                BenchError::fixture_format(format!(
+                    "{protocol:?} subtree-root index exceeds the fixture format"
+                ))
+            })?;
         }
         if passed_range || returned < page_size.get() as usize {
             break;
@@ -455,26 +502,234 @@ async fn capture_subtree_roots(
     Ok(records)
 }
 
+struct SubtreeCompletionBlockIds<'a> {
+    captured_range: &'a HashMap<u32, BlockId>,
+    fetched_by_height: &'a mut HashMap<u32, BlockId>,
+}
+
+async fn capture_subtree_root_set<S: NodeSource>(
+    source: &S,
+    network: Network,
+    to_height: BlockHeight,
+    captured_block_ids: &HashMap<u32, BlockId>,
+) -> Result<SubtreeRootSet, BenchError> {
+    let mut fetched_by_height = HashMap::new();
+    let mut block_ids = SubtreeCompletionBlockIds {
+        captured_range: captured_block_ids,
+        fetched_by_height: &mut fetched_by_height,
+    };
+    Ok(SubtreeRootSet {
+        sapling: capture_subtree_roots(
+            source,
+            network,
+            ShieldedProtocol::Sapling,
+            to_height,
+            &mut block_ids,
+        )
+        .await?,
+        orchard: capture_subtree_roots(
+            source,
+            network,
+            ShieldedProtocol::Orchard,
+            to_height,
+            &mut block_ids,
+        )
+        .await?,
+        ironwood: capture_subtree_roots(
+            source,
+            network,
+            ShieldedProtocol::Ironwood,
+            to_height,
+            &mut block_ids,
+        )
+        .await?,
+    })
+}
+
+async fn capture_completing_block_id<S: NodeSource>(
+    source: &S,
+    network: Network,
+    height: BlockHeight,
+    captured_block_ids: &HashMap<u32, BlockId>,
+    completing_block_ids: &mut HashMap<u32, BlockId>,
+) -> Result<BlockId, BenchError> {
+    if let Some(block_id) = completing_block_ids.get(&height.value()) {
+        return Ok(*block_id);
+    }
+    let block = source.fetch_block_at(height).await?;
+    if block.network != network || block.height != height {
+        return Err(BenchError::fixture_format(format!(
+            "subtree completion block request for {network:?} height {} returned {:?} height {}",
+            height.value(),
+            block.network,
+            block.height.value()
+        )));
+    }
+    let block_id = BlockId::new(block.height, block.hash);
+    if captured_block_ids
+        .get(&height.value())
+        .is_some_and(|captured| captured != &block_id)
+    {
+        return Err(BenchError::fixture_format(format!(
+            "subtree completion block at height {} differs from the captured fixture range",
+            height.value()
+        )));
+    }
+    completing_block_ids.insert(height.value(), block_id);
+    Ok(block_id)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, num::NonZeroU32, sync::Arc};
+    use std::{collections::HashMap, error::Error, num::NonZeroU32, sync::Arc};
 
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
     use serde_json::Value;
     use zinder_core::{
-        BlockHeight, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion, Network,
+        BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigest,
+        CanonicalBlockFactsDigestVersion, Network, ShieldedProtocol, SubtreeRootHash,
+        SubtreeRootIndex,
     };
-    use zinder_source::SourceBlock;
+    use zinder_source::{
+        NodeCapabilities, NodeSource, SourceBlock, SourceError, SourceSubtreeRoot,
+        SourceSubtreeRoots,
+    };
     use zinder_testkit::sample_regtest_upgrade_activations;
 
     use super::{
-        FixtureBlockMeasurement, collect_fixture_block_measurements, measure_fixture_blocks,
-        measure_fixture_blocks_bounded,
+        FixtureBlockMeasurement, SubtreeCompletionBlockIds, capture_subtree_roots,
+        collect_fixture_block_measurements, measure_fixture_blocks, measure_fixture_blocks_bounded,
     };
 
     const REGTEST_BLOCK_1: &str =
         include_str!("../../zinder-ingest/tests/fixtures/z3-regtest-block-1.json");
     const REGTEST_BLOCK_603: &str =
         include_str!("../../zinder-ingest/tests/fixtures/z3-regtest-ironwood-block-603.json");
+
+    #[derive(Clone)]
+    struct SubtreeCaptureSource {
+        completing_block: SourceBlock,
+        requested_block_heights: Arc<Mutex<Vec<BlockHeight>>>,
+    }
+
+    #[async_trait]
+    impl NodeSource for SubtreeCaptureSource {
+        fn capabilities(&self) -> NodeCapabilities {
+            NodeCapabilities::default()
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+            self.requested_block_heights.lock().push(height);
+            if height == self.completing_block.height {
+                Ok(self.completing_block.clone())
+            } else {
+                Err(SourceError::BlockUnavailable {
+                    height,
+                    reason: "test source has only the subtree completion block".to_owned(),
+                })
+            }
+        }
+
+        async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            Ok(BlockId::new(
+                self.completing_block.height,
+                self.completing_block.hash,
+            ))
+        }
+
+        async fn fetch_subtree_roots(
+            &self,
+            protocol: ShieldedProtocol,
+            start_index: SubtreeRootIndex,
+            _max_entries: NonZeroU32,
+        ) -> Result<SourceSubtreeRoots, SourceError> {
+            let roots = (start_index == SubtreeRootIndex::new(0))
+                .then(|| {
+                    SourceSubtreeRoot::new(
+                        SubtreeRootIndex::new(0),
+                        SubtreeRootHash::from_bytes([0x51; 32]),
+                        self.completing_block.height,
+                    )
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            Ok(SourceSubtreeRoots::new(protocol, start_index, roots))
+        }
+    }
+
+    #[tokio::test]
+    async fn subtree_capture_fetches_and_records_the_exact_historical_completing_block()
+    -> Result<(), Box<dyn Error>> {
+        let completing_block = source_block(REGTEST_BLOCK_1)?;
+        let requested_block_heights = Arc::new(Mutex::new(Vec::new()));
+        let source = SubtreeCaptureSource {
+            completing_block: completing_block.clone(),
+            requested_block_heights: Arc::clone(&requested_block_heights),
+        };
+        let captured_range = HashMap::new();
+        let mut fetched_by_height = HashMap::new();
+        let mut block_ids = SubtreeCompletionBlockIds {
+            captured_range: &captured_range,
+            fetched_by_height: &mut fetched_by_height,
+        };
+        let records = capture_subtree_roots(
+            &source,
+            Network::ZcashRegtest,
+            ShieldedProtocol::Sapling,
+            BlockHeight::new(603),
+            &mut block_ids,
+        )
+        .await?;
+
+        assert_eq!(
+            requested_block_heights.lock().as_slice(),
+            [BlockHeight::new(1)]
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].completing_block.height, 1);
+        assert_eq!(
+            records[0].completing_block.hash_hex,
+            hex::encode(completing_block.hash.as_bytes())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subtree_capture_rejects_a_completion_identity_that_disagrees_with_the_segment()
+    -> Result<(), Box<dyn Error>> {
+        let completing_block = source_block(REGTEST_BLOCK_1)?;
+        let source = SubtreeCaptureSource {
+            completing_block: completing_block.clone(),
+            requested_block_heights: Arc::new(Mutex::new(Vec::new())),
+        };
+        let captured_block_ids = HashMap::from([(
+            completing_block.height.value(),
+            BlockId::new(completing_block.height, BlockHash::from_bytes([0x9a; 32])),
+        )]);
+        let mut fetched_by_height = HashMap::new();
+        let mut block_ids = SubtreeCompletionBlockIds {
+            captured_range: &captured_block_ids,
+            fetched_by_height: &mut fetched_by_height,
+        };
+        let error = capture_subtree_roots(
+            &source,
+            Network::ZcashRegtest,
+            ShieldedProtocol::Sapling,
+            BlockHeight::new(603),
+            &mut block_ids,
+        )
+        .await
+        .err()
+        .ok_or("a completion identity mismatch must be rejected")?;
+
+        assert!(
+            error
+                .to_string()
+                .contains("differs from the captured fixture range")
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn bounded_measurements_equal_serial_measurements() -> Result<(), Box<dyn Error>> {

@@ -75,6 +75,20 @@ publication against a fake cgroup; the other constructs a complete synthetic
 campaign and verifies report, resource, alignment, and aggregation rejection
 paths. Neither requires Docker or a live PostgreSQL server.
 
+After changing captured fixture subtree roots, canonical subtree-root loading,
+or construction-manifest evidence, run the focused complete-prefix proof:
+
+```bash
+cargo nextest run -p zinder-store --profile=ci \
+  -E 'test(complete_prefix_import_and_readback_reject_a_wrong_predecessor_hash)'
+cargo nextest run -p zinder-bench --profile=ci \
+  -E 'test(canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold_reopen_and_secondary)'
+```
+
+The first command proves import and cold-readback rejection at the authenticated
+predecessor boundary. The second replays an index-zero historical prefix through
+publication, independent cold reopen, and a fresh RocksDB secondary.
+
 `scripts/runbook-lint.sh` parses every fenced `bash` block in this runbook
 through `bash -n` (syntax-only mode) so a typo or unclosed quote in an
 operator recipe fails CI immediately rather than ambushing an on-call

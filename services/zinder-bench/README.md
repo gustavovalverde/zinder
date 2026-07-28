@@ -41,10 +41,12 @@ Optional flags: `--node-auth-cookie <path>` for cookie auth, `--segment-blocks`
 The fixture directory holds one `segment-NNNNNN.bin` file per segment plus a
 `manifest.json` recording the network, range, consensus activations,
 canonical artifact schema version, replay tip hash, per-segment SHA-256,
-and any shielded subtree roots that complete inside the range. Fixture format
-version 2 records the versioned `CanonicalBlockFacts` block-digest and
-ordered sequence-digest evidence used by both canonical-replay-storage arms. Workload totals
-and per-block maxima let reviewers detect burst-dominated ranges.
+and each shielded protocol's complete subtree-root prefix through the fixed
+tip. Fixture format version 3 records the exact completing block identity for
+every root, including roots completed before the captured block range, plus
+the versioned `CanonicalBlockFacts` block and ordered-sequence digest evidence
+used by both canonical-replay-storage arms. Workload totals and per-block
+maxima let reviewers detect burst-dominated ranges.
 
 ### Capture canonical fixture checkpoints
 
@@ -88,12 +90,13 @@ field has an explicit positive override for controlled source-admission
 experiments, and `--source-segment-delay-millis` injects a fixed delay into each
 outer fixture segment response.
 
-This command certifies the exact captured bytes, replay-plan checkpoints,
-canonical READY fence, cold reopen, full scan, explicit zero prohibited reads,
-and per-family cold publication scan attribution. It does not contact live
-Zebra and is not live-source, advancing-tip, restart, reorg, canary, or
-production certification. Physical read I/O and Linux peak RSS still require a
-runner that can expose them.
+This command certifies the exact captured bytes, the complete index-zero
+subtree-root prefixes through the fixed tip, replay-plan checkpoints, canonical
+READY fence, cold reopen, full scan, explicit zero prohibited reads, and
+per-family cold publication scan attribution. It does not contact live Zebra
+and is not live-source, advancing-tip, restart, reorg, canary, or production
+certification. Physical read I/O and Linux peak RSS still require a runner that
+can expose them.
 
 ### Compare raw-blob retention costs
 
@@ -114,13 +117,14 @@ All four store paths must be absent, have existing parents, and be pairwise
 disjoint from each other and the fixture. The command uses the same fixture,
 pipeline limits, reorg policy, wallet workload, writer budget, and reader
 budget for both arms. It fails instead of reporting if their authenticated
-fixture, replay plan, logical replay, fence, or effective-limit identities
-differ. The report records each retention contract, raw-blob counts, physical
-canonical bytes, replay throughput, and a fresh secondary READY-admission
-timing. `authenticated_replay_lifecycle_seconds` and its throughput field cover
-the complete authenticated replay lifecycle: load, publication, cold reopen,
-and full-scan certification. They are not isolated ingest timings, and the
-report records the fixed arm execution order so cache effects remain visible.
+fixture, replay plan, logical replay, subtree-root load coverage and digest,
+fence, or effective-limit identities differ. The report records each retention
+contract, raw-blob counts, physical canonical bytes, replay throughput, and a
+fresh secondary READY-admission timing. `authenticated_replay_lifecycle_seconds`
+and its throughput field cover the complete authenticated replay lifecycle:
+load, publication, cold reopen, and full-scan certification. They are not
+isolated ingest timings, and the report records the fixed arm execution order
+so cache effects remain visible.
 
 ## 2. Snapshot the starting store
 
@@ -448,8 +452,8 @@ component diagnostics in the external resource artifacts.
   `fixture.canonical_block_facts_digest_evidence`, `fixture.tip_hash_hex`, and
   `fixture.digest_sha256`: fixture provenance required to compare candidates
   against identical source bytes and digest contracts. Each driver verifies
-  every segment SHA-256 before writing its rows. Version 1 requires the exact
-  fixture identity `canonical-fixture`; numeric version 2 alone is not enough.
+  every segment SHA-256 before writing its rows. Fixture format 3 requires the
+  exact identity `canonical-fixture`; earlier numeric versions are refused.
 - `fixture.workload_density`: the immutable workload totals and per-block
   maxima copied from the captured fixture manifest.
 - `replay.wall_clock_seconds`, `replay.blocks_committed`,
@@ -544,8 +548,10 @@ roots, and complete report-window coverage for every component.
   Everything downstream runs the production bulk-catchup pipeline against
   `PrimaryChainStore`; canonical construction shares the source planner but not
   this command's canonical storage boundary.
-- Shielded subtree roots that complete inside the range are captured verbatim
-  and served during replay, so post-Sapling ranges commit correctly.
+- Each shielded protocol's complete subtree-root prefix through the fixed tip is
+  captured from index zero. Every root carries the exact block identity that
+  completed it; identities inside the fixture range are checked against the
+  captured block bytes before replay.
 - Sparse tree-state checkpoints are not captured; the fixture source does not
   advertise the tree-state capability, so the pipeline skips them. They are not
   on the transparent hot path the backlog targets.

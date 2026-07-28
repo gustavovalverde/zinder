@@ -2985,7 +2985,10 @@ mod tests {
         ));
         assert_eq!(report.provenance.run.started_at_unix_millis, 1_000);
         assert_eq!(report.provenance.run.completed_at_unix_millis, 14_000);
-        assert_eq!(report.fixture.fixture_format_version, 2);
+        assert_eq!(
+            report.fixture.fixture_format_version,
+            crate::fixture::FIXTURE_FORMAT_VERSION
+        );
         assert_eq!(
             report.fixture.contract_identity,
             crate::fixture::FIXTURE_CONTRACT_IDENTITY
@@ -3656,7 +3659,7 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
     fn fixture_summary() -> FixtureSummary {
         FixtureSummary {
             contract_identity: crate::fixture::FIXTURE_CONTRACT_IDENTITY.to_owned(),
-            fixture_format_version: 2,
+            fixture_format_version: crate::fixture::FIXTURE_FORMAT_VERSION,
             canonical_artifact_schema_version: 18,
             canonical_block_facts_digest_evidence:
                 crate::fixture::CanonicalBlockFactsDigestEvidence {

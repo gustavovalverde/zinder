@@ -24,11 +24,12 @@ use zinder_core::{BlockId, ChainTipMetadata};
 use zinder_ingest::CanonicalPipelineLimits;
 use zinder_store::{
     CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
-    RawBlobRetention, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    CanonicalSubtreeRootLoadCoverage, RawBlobRetention, RocksDbCanonicalSecondary,
+    RocksDbResourceBudget,
 };
 
 const REPORT_CONTRACT_IDENTITY: &str = "rocksdb-raw-blob-retention-comparison";
-const REPORT_FORMAT_VERSION: u16 = 1;
+const REPORT_FORMAT_VERSION: u16 = 2;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = 100;
@@ -184,6 +185,8 @@ struct LogicalReplayIdentity {
     sequence_digest_sha256: String,
     subtree_root_count: u64,
     subtree_root_logical_bytes: u64,
+    subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
+    subtree_root_sequence_digest_version: u16,
     subtree_root_sequence_digest_sha256: String,
     source_tip_checkpoint_authenticated: bool,
     settled_tip: BlockIdSummary,
@@ -619,6 +622,8 @@ impl LogicalReplayIdentity {
             sequence_digest_sha256: hex::encode(load.sequence_digest.as_bytes()),
             subtree_root_count: subtree.subtree_root_count,
             subtree_root_logical_bytes: subtree.subtree_root_logical_bytes,
+            subtree_root_coverage: subtree.coverage,
+            subtree_root_sequence_digest_version: subtree.sequence_digest_version,
             subtree_root_sequence_digest_sha256: hex::encode(subtree.subtree_root_sequence_digest),
             source_tip_checkpoint_authenticated: outcome.source_tip_checkpoint_authenticated,
             settled_tip: BlockIdSummary::from(outcome.settled_tip),
@@ -1014,6 +1019,6 @@ mod tests {
             REPORT_CONTRACT_IDENTITY,
             "rocksdb-raw-blob-retention-comparison"
         );
-        assert_eq!(REPORT_FORMAT_VERSION, 1);
+        assert_eq!(REPORT_FORMAT_VERSION, 2);
     }
 }

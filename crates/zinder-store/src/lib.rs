@@ -53,7 +53,7 @@ pub use canonical_store::{
     CanonicalRetainedEvent, CanonicalSecondaryCatchupOutcome, CanonicalSequenceCheckpoint,
     CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError,
     CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, CanonicalSubtreeRootLoadEvidence,
+    CanonicalStoreWorkload, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
     MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, PreparedCanonicalBaselinePublication,
     ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,

@@ -53,6 +53,23 @@ manifest identity, per-block replay envelopes, and the ordered facts digest,
 then publishes `CanonicalBaselinePublication`. The candidate is not readable as
 a canonical store until publication succeeds.
 
+Subtree-root construction makes its load coverage explicit. The normal
+node-backed path loads `RetainedRange`: roots completed after the authenticated
+history predecessor. An admitted captured corpus may instead call
+`load_complete_subtree_root_prefix` with `CompletePrefix`: every root from index
+zero through each protocol's completed count at the fixed tip. This import is a
+caller-authenticated boundary, not a claim that the store can prove headers it
+does not retain. Completion blocks strictly before retained history preserve
+the captured identity; a root completing at the authenticated predecessor must
+match that predecessor hash; roots completing in retained history must match
+retained headers.
+
+`CanonicalSubtreeRootLoadCoverage`, sequence-digest version 2, and the exact
+ordered root rows are bound into construction-manifest format 4. Cold
+publication readback recomputes the same coverage-aware digest and repeats the
+available predecessor and retained-header checks. Coverage is never inferred
+from row counts.
+
 On restart, a ready staging store is installed and cold-opened at the configured
 path. An unpublished or invalid staging store is removed and reconstructed. A
 ready configured store is never replaced by staging data.

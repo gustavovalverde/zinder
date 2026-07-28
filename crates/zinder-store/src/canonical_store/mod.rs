@@ -61,7 +61,9 @@ pub use publication::{
 pub use rocksdb::RocksDbCanonicalStore;
 pub use rocksdb::{CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence};
 pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary};
-pub use subtree_load::{CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence};
+pub use subtree_load::{
+    CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
+};
 
 /// Exact persisted identity of the clean canonical store.
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
@@ -653,7 +655,7 @@ pub enum CanonicalStoreError {
     #[error("canonical subtree roots are already populated; full build cleanup is required")]
     SubtreeRootLoadAlreadyLoaded,
 
-    /// Source subtree roots do not exactly cover the predecessor-to-tip ranges.
+    /// Source subtree roots do not exactly cover the selected load ranges.
     #[error("canonical subtree-root sequence is invalid: {reason}")]
     SubtreeRootSequenceInvalid {
         /// Exact source or chain-identity mismatch.

@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestVersion, ConsensusBranchId, Network, NetworkUpgradeActivation,
-    NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex,
-    SubtreeRootRange, wire::decode_zinder_native_chain_name,
+    NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash,
+    SubtreeRootIndex, SubtreeRootRange, wire::decode_zinder_native_chain_name,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceBlockHeader,
@@ -29,7 +29,7 @@ use zinder_source::{
 use crate::error::BenchError;
 
 /// Version stamped into every manifest this crate writes.
-pub const FIXTURE_FORMAT_VERSION: u32 = 2;
+pub const FIXTURE_FORMAT_VERSION: u32 = 3;
 /// Stable identity stamped into every canonical fixture manifest.
 pub const FIXTURE_CONTRACT_IDENTITY: &str = "canonical-fixture";
 
@@ -50,16 +50,28 @@ pub struct ActivationRecord {
     pub name: String,
 }
 
-/// One captured shielded subtree root.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Exact block identity captured from the canonical node source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SubtreeRootRecord {
+pub struct CapturedBlockId {
+    /// Canonical block height.
+    pub height: u32,
+    /// Block hash in Zinder's internal byte order, lowercase hex-encoded.
+    pub hash_hex: String,
+}
+
+/// One source-authenticated shielded subtree root.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedSubtreeRoot {
+    /// Shielded protocol name in Zebra RPC vocabulary.
+    pub protocol: String,
     /// Subtree index within its protocol.
     pub index: u32,
     /// Subtree root hash in canonical byte order, hex-encoded.
     pub root_hash_hex: String,
-    /// Height of the block that completed this subtree.
-    pub completing_height: u32,
+    /// Exact canonical block that completed this subtree.
+    pub completing_block: CapturedBlockId,
 }
 
 /// Captured subtree roots grouped by shielded protocol.
@@ -67,11 +79,11 @@ pub struct SubtreeRootRecord {
 #[serde(deny_unknown_fields)]
 pub struct SubtreeRootSet {
     /// Sapling subtree roots, ordered by index.
-    pub sapling: Vec<SubtreeRootRecord>,
+    pub sapling: Vec<CapturedSubtreeRoot>,
     /// Orchard subtree roots, ordered by index.
-    pub orchard: Vec<SubtreeRootRecord>,
+    pub orchard: Vec<CapturedSubtreeRoot>,
     /// Ironwood subtree roots, ordered by index.
-    pub ironwood: Vec<SubtreeRootRecord>,
+    pub ironwood: Vec<CapturedSubtreeRoot>,
 }
 
 /// One captured segment of contiguous raw blocks.
@@ -247,7 +259,7 @@ impl FixtureManifest {
         self.validate_structure()?;
         let normalized_manifest = serde_json::to_vec(self)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"zinder-bench-fixture-manifest-v2\0");
+        hasher.update(b"zinder-bench-fixture-manifest-v3\0");
         hasher.update(normalized_manifest);
         Ok(hex::encode(hasher.finalize()))
     }
@@ -267,7 +279,56 @@ impl FixtureManifest {
         }
         self.validate_range_and_density()?;
         self.validate_canonical_block_facts_digest_evidence()?;
+        self.validate_subtree_roots()?;
         self.validate_segments()
+    }
+
+    fn validate_subtree_roots(&self) -> Result<(), BenchError> {
+        for (protocol, records) in self.subtree_roots.by_protocol() {
+            let mut previous_completion_height = None;
+            for (position, record) in records.iter().enumerate() {
+                let expected_index = u32::try_from(position).map_err(|_| {
+                    BenchError::fixture_format(format!(
+                        "{protocol:?} fixture subtree-root count exceeds u32::MAX"
+                    ))
+                })?;
+                if record.protocol != protocol.rpc_pool_name() {
+                    return Err(BenchError::fixture_format(format!(
+                        "{protocol:?} fixture subtree root at position {position} claims protocol {:?}",
+                        record.protocol
+                    )));
+                }
+                if record.index != expected_index {
+                    return Err(BenchError::fixture_format(format!(
+                        "{protocol:?} fixture subtree root at position {position} has index {}, expected {expected_index}",
+                        record.index
+                    )));
+                }
+                validate_digest_hex(
+                    &record.root_hash_hex,
+                    &format!("{protocol:?} subtree root {expected_index} hash"),
+                )?;
+                validate_digest_hex(
+                    &record.completing_block.hash_hex,
+                    &format!("{protocol:?} subtree root {expected_index} completing block hash"),
+                )?;
+                if record.completing_block.height > self.to_height {
+                    return Err(BenchError::fixture_format(format!(
+                        "{protocol:?} fixture subtree root {expected_index} completes at height {}, after fixture tip {}",
+                        record.completing_block.height, self.to_height
+                    )));
+                }
+                if previous_completion_height
+                    .is_some_and(|previous| record.completing_block.height < previous)
+                {
+                    return Err(BenchError::fixture_format(format!(
+                        "{protocol:?} fixture subtree-root completion heights are not ascending"
+                    )));
+                }
+                previous_completion_height = Some(record.completing_block.height);
+            }
+        }
+        Ok(())
     }
 
     fn validate_range_and_density(&self) -> Result<(), BenchError> {
@@ -405,6 +466,36 @@ impl FixtureManifest {
         let hash = decode_internal_block_hash_hex(&self.tip_hash_hex)?;
         Ok(BlockId::new(BlockHeight::new(self.to_height), hash))
     }
+
+    /// Decodes the complete captured subtree-root prefix in canonical storage order.
+    pub fn subtree_root_artifacts(&self) -> Result<Vec<SubtreeRootArtifact>, BenchError> {
+        self.validate_subtree_roots()?;
+        let mut artifacts = Vec::new();
+        for (protocol, records) in self.subtree_roots.by_protocol() {
+            artifacts.reserve(records.len());
+            for record in records {
+                let root_hash = decode_32_byte_hex(
+                    &record.root_hash_hex,
+                    &format!("{protocol:?} subtree root {} hash", record.index),
+                )?;
+                let completing_block_hash = decode_32_byte_hex(
+                    &record.completing_block.hash_hex,
+                    &format!(
+                        "{protocol:?} subtree root {} completing block hash",
+                        record.index
+                    ),
+                )?;
+                artifacts.push(SubtreeRootArtifact::new(
+                    protocol,
+                    SubtreeRootIndex::new(record.index),
+                    SubtreeRootHash::from_bytes(root_hash),
+                    BlockHeight::new(record.completing_block.height),
+                    BlockHash::from_bytes(completing_block_hash),
+                ));
+            }
+        }
+        Ok(artifacts)
+    }
 }
 
 fn validate_digest_hex(encoded: &str, field: &str) -> Result<(), BenchError> {
@@ -424,13 +515,23 @@ fn validate_digest_hex(encoded: &str, field: &str) -> Result<(), BenchError> {
 }
 
 fn decode_internal_block_hash_hex(encoded: &str) -> Result<BlockHash, BenchError> {
-    let bytes = hex::decode(encoded).map_err(|source| {
-        BenchError::fixture_format(format!("invalid block hash hex: {source}"))
-    })?;
-    let fixed: [u8; 32] = bytes
+    Ok(BlockHash::from_bytes(decode_32_byte_hex(
+        encoded,
+        "block hash",
+    )?))
+}
+
+fn decode_32_byte_hex(encoded: &str, field: &str) -> Result<[u8; 32], BenchError> {
+    if encoded.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(BenchError::fixture_format(format!(
+            "{field} must use lowercase hexadecimal"
+        )));
+    }
+    let bytes = hex::decode(encoded)
+        .map_err(|source| BenchError::fixture_format(format!("invalid {field} hex: {source}")))?;
+    bytes
         .try_into()
-        .map_err(|_| BenchError::fixture_format("block hash must be 32 bytes".to_owned()))?;
-    Ok(BlockHash::from_bytes(fixed))
+        .map_err(|_| BenchError::fixture_format(format!("{field} must contain 32 bytes")))
 }
 
 fn segment_file_name(index: u32) -> String {
@@ -678,22 +779,27 @@ impl SubtreeRootsByProtocol {
     }
 }
 
+impl SubtreeRootSet {
+    fn by_protocol(&self) -> [(ShieldedProtocol, &[CapturedSubtreeRoot]); 3] {
+        [
+            (ShieldedProtocol::Sapling, &self.sapling),
+            (ShieldedProtocol::Orchard, &self.orchard),
+            (ShieldedProtocol::Ironwood, &self.ironwood),
+        ]
+    }
+}
+
 fn subtree_roots_from_records(
-    records: &[SubtreeRootRecord],
+    records: &[CapturedSubtreeRoot],
 ) -> Result<Vec<SourceSubtreeRoot>, BenchError> {
     records
         .iter()
         .map(|record| {
-            let bytes = hex::decode(&record.root_hash_hex).map_err(|source| {
-                BenchError::fixture_format(format!("invalid subtree root hex: {source}"))
-            })?;
-            let fixed: [u8; 32] = bytes.try_into().map_err(|_| {
-                BenchError::fixture_format("subtree root hash must be 32 bytes".to_owned())
-            })?;
+            let fixed = decode_32_byte_hex(&record.root_hash_hex, "subtree root hash")?;
             Ok(SourceSubtreeRoot::new(
                 SubtreeRootIndex::new(record.index),
                 SubtreeRootHash::from_bytes(fixed),
-                BlockHeight::new(record.completing_height),
+                BlockHeight::new(record.completing_block.height),
             ))
         })
         .collect()
@@ -731,6 +837,7 @@ impl FixtureNodeSource {
         let network = manifest.network_typed()?;
         let tip = manifest.tip_id()?;
         let locations = index_segments(directory, manifest)?;
+        validate_in_range_subtree_root_blocks(network, manifest, &locations)?;
         let subtree_roots = SubtreeRootsByProtocol {
             sapling: subtree_roots_from_records(&manifest.subtree_roots.sapling)?,
             orchard: subtree_roots_from_records(&manifest.subtree_roots.orchard)?,
@@ -752,6 +859,34 @@ impl FixtureNodeSource {
             segment_response_delay: delay,
         })
     }
+}
+
+fn validate_in_range_subtree_root_blocks(
+    network: Network,
+    manifest: &FixtureManifest,
+    locations: &HashMap<u32, BlockLocation>,
+) -> Result<(), BenchError> {
+    for subtree_root in manifest.subtree_root_artifacts()? {
+        let completion_height = subtree_root.completing_block_height.value();
+        if completion_height < manifest.from_height {
+            continue;
+        }
+        let location = locations.get(&completion_height).ok_or_else(|| {
+            BenchError::fixture_format(format!(
+                "fixture omits in-range subtree completion block at height {completion_height}"
+            ))
+        })?;
+        let completion_block =
+            read_and_decode_block(network, location, subtree_root.completing_block_height)?;
+        if completion_block.hash != subtree_root.completing_block_hash {
+            return Err(BenchError::fixture_format(format!(
+                "{:?} fixture subtree root {} completing block hash differs from captured block at height {completion_height}",
+                subtree_root.protocol,
+                subtree_root.subtree_index.value()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn index_segments(

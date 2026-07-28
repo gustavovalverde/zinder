@@ -21,22 +21,23 @@ use zinder_rocksdb_bulk_load::{
 
 use super::{
     CanonicalBlockLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, block_load::CanonicalStagedSstEvidence,
-    subtree_load::CanonicalSubtreeRootLoadEvidence,
+    CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    block_load::CanonicalStagedSstEvidence,
+    subtree_load::{CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence},
 };
 
 /// Fixed sidecar name copied with every owner-created canonical checkpoint.
 pub(super) const CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME: &str =
-    "canonical-construction-manifest.v3.json";
+    "canonical-construction-manifest.v4.json";
 /// Exact immutable construction-manifest format accepted by this release.
-pub const CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION: u16 = 3;
+pub const CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION: u16 = 4;
 const MAX_CONSTRUCTION_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const CONSTRUCTION_MANIFEST_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.file.v3\0";
+    b"zinder.canonical.construction-manifest.file.v4\0";
 const CONSTRUCTION_BUILD_PLAN_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.build-plan.v3\0";
+    b"zinder.canonical.construction-manifest.build-plan.v4\0";
 const CONSTRUCTION_CHECKPOINT_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.checkpoint.v3\0";
+    b"zinder.canonical.construction-manifest.checkpoint.v4\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CanonicalConstructionProofProvenance {
@@ -509,7 +510,7 @@ impl PersistedConstructionManifest {
             || self.block_evidence.sequence_digest_version != 1
             || self.block_evidence.block_digest_version != 1
             || self.block_evidence.replay_format_version != 1
-            || self.subtree_evidence.sequence_digest_version != 1
+            || self.subtree_evidence.sequence_digest_version != 2
         {
             return Err(CanonicalStoreError::publication(
                 "construction manifest has unsupported source evidence",
@@ -751,6 +752,7 @@ impl PersistedBlockEvidence {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedSubtreeEvidence {
+    coverage: CanonicalSubtreeRootLoadCoverage,
     subtree_root_count: u64,
     subtree_root_logical_bytes: u64,
     subtree_root_sequence_digest: [u8; 32],
@@ -760,10 +762,11 @@ struct PersistedSubtreeEvidence {
 impl PersistedSubtreeEvidence {
     const fn from_evidence(evidence: CanonicalSubtreeRootLoadEvidence) -> Self {
         Self {
+            coverage: evidence.coverage,
             subtree_root_count: evidence.subtree_root_count,
             subtree_root_logical_bytes: evidence.subtree_root_logical_bytes,
             subtree_root_sequence_digest: evidence.subtree_root_sequence_digest,
-            sequence_digest_version: 1,
+            sequence_digest_version: evidence.sequence_digest_version,
         }
     }
 }

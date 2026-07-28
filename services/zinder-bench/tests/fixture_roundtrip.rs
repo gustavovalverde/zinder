@@ -13,9 +13,9 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tempfile::tempdir;
 use zinder_bench::fixture::{
-    ActivationRecord, CanonicalBlockFactsDigestEvidence, FIXTURE_CONTRACT_IDENTITY,
-    FIXTURE_FORMAT_VERSION, FixtureManifest, FixtureNodeSource, SegmentDescriptor,
-    SubtreeRootRecord, SubtreeRootSet, WorkloadDensity, read_segment_blocks, write_segment,
+    ActivationRecord, CanonicalBlockFactsDigestEvidence, CapturedBlockId, CapturedSubtreeRoot,
+    FIXTURE_CONTRACT_IDENTITY, FIXTURE_FORMAT_VERSION, FixtureManifest, FixtureNodeSource,
+    SegmentDescriptor, SubtreeRootSet, WorkloadDensity, read_segment_blocks, write_segment,
 };
 use zinder_bench::{
     canonical_fixture_replay::{
@@ -28,7 +28,8 @@ use zinder_bench::{
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
     CommitmentTreeFrontier, CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
-    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, wire::encode_zinder_native_chain_name,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
+    wire::encode_zinder_native_chain_name,
 };
 use zinder_ingest::{CanonicalConstructionConfig, RawBlobPolicy, prepare_canonical_block};
 use zinder_source::{
@@ -36,10 +37,11 @@ use zinder_source::{
     SourceChainSegmentLimits, SourceError,
 };
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
+    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
+    CanonicalSubtreeRootLoadCoverage, RawBlobRetention, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore, RocksDbResourceBudget,
 };
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_testkit::{completed_sapling_subtree_frontier, sample_regtest_upgrade_activations};
 
 const REGTEST_BLOCK_1: &str =
     include_str!("../../zinder-ingest/tests/fixtures/z3-regtest-block-1.json");
@@ -206,11 +208,19 @@ fn write_repeated_payload_fixture() -> Result<RegtestFixtureCase> {
     Ok(fixture)
 }
 
-fn subtree_root_record(index: u32, root_byte: u8) -> SubtreeRootRecord {
-    SubtreeRootRecord {
+fn subtree_root_record(
+    index: u32,
+    root_byte: u8,
+    completing_block: BlockId,
+) -> CapturedSubtreeRoot {
+    CapturedSubtreeRoot {
+        protocol: ShieldedProtocol::Sapling.rpc_pool_name().to_owned(),
         index,
         root_hash_hex: hex::encode([root_byte; 32]),
-        completing_height: 603,
+        completing_block: CapturedBlockId {
+            height: completing_block.height.value(),
+            hash_hex: hex::encode(completing_block.hash.as_bytes()),
+        },
     }
 }
 
@@ -252,6 +262,37 @@ fn fixture_construction_checkpoint_source(
     CommitmentTreeCheckpoint,
 )> {
     let (_, predecessor, _) = fixture_checkpoint_source(fixture);
+    fixture_construction_checkpoint_source_from_predecessor(fixture, predecessor)
+}
+
+fn fixture_construction_checkpoint_source_with_completed_sapling(
+    fixture: &RegtestFixtureCase,
+) -> Result<(
+    CheckpointSource,
+    CommitmentTreeCheckpoint,
+    CommitmentTreeCheckpoint,
+)> {
+    let predecessor_height = BlockHeight::new(fixture.manifest.from_height - 1);
+    let predecessor = CommitmentTreeCheckpoint::new(
+        BlockId::new(predecessor_height, fixture.block.parent_hash),
+        fixture.block.block_time_seconds.saturating_sub(1),
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(completed_sapling_subtree_frontier()?),
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+            None,
+        ),
+    );
+    fixture_construction_checkpoint_source_from_predecessor(fixture, predecessor)
+}
+
+fn fixture_construction_checkpoint_source_from_predecessor(
+    fixture: &RegtestFixtureCase,
+    predecessor: CommitmentTreeCheckpoint,
+) -> Result<(
+    CheckpointSource,
+    CommitmentTreeCheckpoint,
+    CommitmentTreeCheckpoint,
+)> {
     let activations = sample_regtest_upgrade_activations();
     let prepared = prepare_canonical_block(&fixture.block, &activations, RawBlobPolicy::None)?;
     let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
@@ -286,6 +327,21 @@ fn fixture_construction_checkpoint_source(
     );
     let source = CheckpointSource::new(vec![predecessor.clone(), fixed_tip.clone()]);
     Ok((source, predecessor, fixed_tip))
+}
+
+fn add_historical_sapling_root(fixture: &mut RegtestFixtureCase) -> Result<SubtreeRootArtifact> {
+    let completing_block = BlockId::new(
+        BlockHeight::new(fixture.manifest.from_height.saturating_sub(1)),
+        fixture.block.parent_hash,
+    );
+    fixture.manifest.subtree_roots.sapling = vec![subtree_root_record(0, 0x51, completing_block)];
+    fixture.manifest.write(fixture.directory.path())?;
+    fixture
+        .manifest
+        .subtree_root_artifacts()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("historical Sapling root must be present"))
 }
 
 fn canonical_fixture_rocksdb_replay_config(
@@ -411,7 +467,7 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
         report["contract_identity"],
         "rocksdb-raw-blob-retention-comparison"
     );
-    assert_eq!(report["report_format_version"], 1);
+    assert_eq!(report["report_format_version"], 2);
     assert_eq!(
         report["arm_execution_order"],
         serde_json::json!(["transactions", "all"])
@@ -433,6 +489,18 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
     assert_eq!(
         report["transactions"]["logical_replay_identity"],
         report["all"]["logical_replay_identity"]
+    );
+    assert_eq!(
+        report["transactions"]["logical_replay_identity"]["subtree_root_count"],
+        1
+    );
+    assert_eq!(
+        report["transactions"]["logical_replay_identity"]["subtree_root_coverage"],
+        "complete-prefix"
+    );
+    assert_eq!(
+        report["transactions"]["logical_replay_identity"]["subtree_root_sequence_digest_version"],
+        2
     );
     assert_eq!(
         report["transactions"]["raw_blob_counts"]["transaction_blob_count"],
@@ -640,11 +708,76 @@ async fn canonical_fixture_rocksdb_replay_publishes_and_cold_reopens_ready() -> 
 }
 
 #[tokio::test]
+async fn canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold_reopen_and_secondary()
+-> Result<()> {
+    let mut fixture = write_regtest_fixture()?;
+    let expected_root = add_historical_sapling_root(&mut fixture)?;
+    let activations = sample_regtest_upgrade_activations();
+    let (checkpoint_source, _, _) =
+        fixture_construction_checkpoint_source_with_completed_sapling(&fixture)?;
+    capture_canonical_fixture_replay_plan(
+        fixture.directory.path(),
+        &checkpoint_source,
+        &activations,
+    )
+    .await?;
+    let output_directory = tempdir()?;
+    let canonical_store_path = output_directory.path().join("canonical");
+    let secondary_path = output_directory.path().join("secondary");
+    let config =
+        canonical_fixture_rocksdb_replay_config(fixture.directory.path(), &canonical_store_path);
+
+    let outcome = replay_canonical_fixture_into_rocksdb(config).await?;
+
+    assert_eq!(
+        outcome.subtree_root_load_evidence.coverage,
+        CanonicalSubtreeRootLoadCoverage::CompletePrefix
+    );
+    assert_eq!(
+        outcome.subtree_root_load_evidence.sequence_digest_version,
+        2
+    );
+    assert_eq!(outcome.subtree_root_load_evidence.subtree_root_count, 1);
+    let subtree_range = SubtreeRootRange::new(
+        ShieldedProtocol::Sapling,
+        SubtreeRootIndex::new(0),
+        NonZeroU32::MIN,
+    );
+    let primary = RocksDbCanonicalStore::open_ready(
+        &canonical_store_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(1)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(
+        primary.subtree_roots(subtree_range)?,
+        vec![expected_root.clone()]
+    );
+    drop(primary);
+
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        &canonical_store_path,
+        &secondary_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(1)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(secondary.subtree_roots(subtree_range)?, vec![expected_root]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_secondaries() -> Result<()>
 {
-    let fixture = write_regtest_fixture()?;
+    let mut fixture = write_regtest_fixture()?;
+    add_historical_sapling_root(&mut fixture)?;
     let activations = sample_regtest_upgrade_activations();
-    let (checkpoint_source, _, _) = fixture_construction_checkpoint_source(&fixture)?;
+    let (checkpoint_source, _, _) =
+        fixture_construction_checkpoint_source_with_completed_sapling(&fixture)?;
     capture_canonical_fixture_replay_plan(
         fixture.directory.path(),
         &checkpoint_source,
@@ -1065,7 +1198,7 @@ async fn canonical_fixture_checkpoint_capture_rejects_disconnected_segment_bound
 }
 
 #[test]
-fn fixture_v2_requires_exact_contract_identity() -> Result<()> {
+fn fixture_v3_requires_exact_contract_identity() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut missing_identity = serde_json::to_value(&fixture.manifest)?;
     missing_identity
@@ -1077,7 +1210,7 @@ fn fixture_v2_requires_exact_contract_identity() -> Result<()> {
         serde_json::to_vec_pretty(&missing_identity)?,
     )?;
     let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
-        return Err(eyre!("fixture v2 contract identity must be mandatory"));
+        return Err(eyre!("fixture v3 contract identity must be mandatory"));
     };
     assert!(error.to_string().contains("contract_identity"));
 
@@ -1089,7 +1222,7 @@ fn fixture_v2_requires_exact_contract_identity() -> Result<()> {
     )?;
     let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
         return Err(eyre!(
-            "fixture v2 must reject an unrecognized contract identity"
+            "fixture v3 must reject an unrecognized contract identity"
         ));
     };
     assert!(error.to_string().contains("fixture contract identity"));
@@ -1097,7 +1230,7 @@ fn fixture_v2_requires_exact_contract_identity() -> Result<()> {
 }
 
 #[test]
-fn fixture_v2_rejects_unknown_manifest_fields() -> Result<()> {
+fn fixture_v3_rejects_unknown_manifest_fields() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut unknown_field = serde_json::to_value(&fixture.manifest)?;
     unknown_field
@@ -1112,9 +1245,124 @@ fn fixture_v2_rejects_unknown_manifest_fields() -> Result<()> {
         serde_json::to_vec_pretty(&unknown_field)?,
     )?;
     let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
-        return Err(eyre!("fixture v2 must reject unknown manifest fields"));
+        return Err(eyre!("fixture v3 must reject unknown manifest fields"));
     };
     assert!(error.to_string().contains("unknown field"));
+    Ok(())
+}
+
+#[test]
+fn fixture_v3_rejects_format_v2_without_compatibility_decoding() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let mut encoded = serde_json::to_value(&fixture.manifest)?;
+    encoded["fixture_format_version"] = serde_json::json!(2);
+    std::fs::write(
+        fixture.directory.path().join("manifest.json"),
+        serde_json::to_vec_pretty(&encoded)?,
+    )?;
+
+    let error = FixtureManifest::read(fixture.directory.path())
+        .err()
+        .ok_or_else(|| eyre!("fixture format v2 must be rejected"))?;
+
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported fixture format version 2")
+    );
+    Ok(())
+}
+
+#[test]
+fn fixture_v3_requires_an_exact_completing_block_hash() -> Result<()> {
+    let mut fixture = write_regtest_fixture()?;
+    let completing_block = BlockId::new(fixture.block.height, fixture.block.hash);
+    fixture.manifest.subtree_roots.sapling = vec![subtree_root_record(0, 0x51, completing_block)];
+    let mut encoded = serde_json::to_value(&fixture.manifest)?;
+    encoded["subtree_roots"]["sapling"][0]["completing_block"]
+        .as_object_mut()
+        .ok_or_else(|| eyre!("completing block must encode as an object"))?
+        .remove("hash_hex");
+    std::fs::write(
+        fixture.directory.path().join("manifest.json"),
+        serde_json::to_vec_pretty(&encoded)?,
+    )?;
+
+    let error = FixtureManifest::read(fixture.directory.path())
+        .err()
+        .ok_or_else(|| eyre!("a subtree root without a completion hash must be rejected"))?;
+
+    assert!(error.to_string().contains("hash_hex"));
+    Ok(())
+}
+
+#[test]
+fn fixture_source_rejects_an_in_range_completing_block_hash_mismatch() -> Result<()> {
+    let mut fixture = write_regtest_fixture()?;
+    let completing_block = BlockId::new(fixture.block.height, BlockHash::from_bytes([0x9a; 32]));
+    fixture.manifest.subtree_roots.sapling = vec![subtree_root_record(0, 0x51, completing_block)];
+
+    let error = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)
+        .err()
+        .ok_or_else(|| eyre!("an in-range completion hash mismatch must be rejected"))?;
+
+    assert!(
+        error
+            .to_string()
+            .contains("completing block hash differs from captured block")
+    );
+    Ok(())
+}
+
+#[test]
+fn fixture_v3_rejects_invalid_subtree_root_prefix_shape() -> Result<()> {
+    let fixture = write_regtest_fixture()?;
+    let completing_block = BlockId::new(fixture.block.height, fixture.block.hash);
+    let root = subtree_root_record(0, 0x51, completing_block);
+
+    let mut wrong_protocol = fixture.manifest.clone();
+    wrong_protocol.subtree_roots.sapling = vec![CapturedSubtreeRoot {
+        protocol: ShieldedProtocol::Orchard.rpc_pool_name().to_owned(),
+        ..root.clone()
+    }];
+    let error = wrong_protocol
+        .write(fixture.directory.path())
+        .err()
+        .ok_or_else(|| eyre!("a wrong-protocol subtree root must be rejected"))?;
+    assert!(error.to_string().contains("claims protocol"));
+
+    let mut noncontiguous = fixture.manifest.clone();
+    noncontiguous.subtree_roots.sapling = vec![CapturedSubtreeRoot {
+        index: 1,
+        ..root.clone()
+    }];
+    let error = noncontiguous
+        .write(fixture.directory.path())
+        .err()
+        .ok_or_else(|| eyre!("a non-contiguous subtree root must be rejected"))?;
+    assert!(error.to_string().contains("has index 1, expected 0"));
+
+    let mut duplicate = fixture.manifest.clone();
+    duplicate.subtree_roots.sapling = vec![root.clone(), root.clone()];
+    let error = duplicate
+        .write(fixture.directory.path())
+        .err()
+        .ok_or_else(|| eyre!("a duplicate subtree-root index must be rejected"))?;
+    assert!(error.to_string().contains("has index 0, expected 1"));
+
+    let mut after_tip = fixture.manifest;
+    after_tip.subtree_roots.sapling = vec![CapturedSubtreeRoot {
+        completing_block: CapturedBlockId {
+            height: after_tip.to_height.saturating_add(1),
+            hash_hex: "42".repeat(32),
+        },
+        ..root
+    }];
+    let error = after_tip
+        .write(fixture.directory.path())
+        .err()
+        .ok_or_else(|| eyre!("a completion after the fixture tip must be rejected"))?;
+    assert!(error.to_string().contains("after fixture tip"));
     Ok(())
 }
 
@@ -1306,8 +1554,9 @@ async fn fixture_source_splits_oversized_multi_block_responses() -> Result<()> {
 #[tokio::test]
 async fn fixture_source_serves_complete_exact_subtree_root_ranges() -> Result<()> {
     let mut fixture = write_regtest_fixture()?;
+    let completing_block = BlockId::new(fixture.block.height, fixture.block.hash);
     fixture.manifest.subtree_roots.sapling = (0..=5)
-        .map(|index| subtree_root_record(index, 0x11))
+        .map(|index| subtree_root_record(index, 0x11, completing_block))
         .collect();
     let source = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
     let range = SubtreeRootRange::new(
@@ -1335,8 +1584,9 @@ async fn fixture_source_serves_complete_exact_subtree_root_ranges() -> Result<()
 #[tokio::test]
 async fn fixture_source_rejects_short_missing_or_disconnected_exact_subtree_ranges() -> Result<()> {
     let mut fixture = write_regtest_fixture()?;
+    let completing_block = BlockId::new(fixture.block.height, fixture.block.hash);
     fixture.manifest.subtree_roots.sapling = (0..=5)
-        .map(|index| subtree_root_record(index, 0x11))
+        .map(|index| subtree_root_record(index, 0x11, completing_block))
         .collect();
     let source = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
     let short_range = SubtreeRootRange::new(
@@ -1367,28 +1617,16 @@ async fn fixture_source_rejects_short_missing_or_disconnected_exact_subtree_rang
         }) if start_index == SubtreeRootIndex::new(6)
     ));
 
-    fixture.manifest.subtree_roots.sapling[5] = subtree_root_record(6, 0x33);
-    let disconnected_source = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)?;
-    let disconnected_range = SubtreeRootRange::new(
-        ShieldedProtocol::Sapling,
-        SubtreeRootIndex::new(4),
-        NonZeroU32::new(2).ok_or_else(|| eyre!("two must be non-zero"))?,
-    );
-    assert!(matches!(
-        disconnected_source
-            .fetch_subtree_root_range(disconnected_range)
-            .await,
-        Err(SourceError::SubtreeRootsUnavailable {
-            protocol: ShieldedProtocol::Sapling,
-            start_index,
-            ..
-        }) if start_index == SubtreeRootIndex::new(4)
-    ));
+    fixture.manifest.subtree_roots.sapling[5] = subtree_root_record(6, 0x33, completing_block);
+    let error = FixtureNodeSource::open(fixture.directory.path(), &fixture.manifest)
+        .err()
+        .ok_or_else(|| eyre!("a non-contiguous captured subtree-root prefix must be rejected"))?;
+    assert!(error.to_string().contains("has index 6, expected 5"));
     Ok(())
 }
 
 #[test]
-fn fixture_v2_requires_digest_evidence() -> Result<()> {
+fn fixture_v3_requires_digest_evidence() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut missing_digest_evidence = serde_json::to_value(&fixture.manifest)?;
     missing_digest_evidence
@@ -1400,7 +1638,7 @@ fn fixture_v2_requires_digest_evidence() -> Result<()> {
         serde_json::to_vec_pretty(&missing_digest_evidence)?,
     )?;
     let Err(error) = FixtureManifest::read(fixture.directory.path()) else {
-        return Err(eyre!("fixture v2 digest evidence must be mandatory"));
+        return Err(eyre!("fixture v3 digest evidence must be mandatory"));
     };
     assert!(
         error
@@ -1411,7 +1649,7 @@ fn fixture_v2_requires_digest_evidence() -> Result<()> {
 }
 
 #[test]
-fn fixture_v2_rejects_inconsistent_counts() -> Result<()> {
+fn fixture_v3_rejects_inconsistent_counts() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut inconsistent_digest_count = fixture.manifest.clone();
     inconsistent_digest_count
@@ -1442,7 +1680,7 @@ fn fixture_v2_rejects_inconsistent_counts() -> Result<()> {
 }
 
 #[test]
-fn fixture_v2_rejects_unknown_digest_version() -> Result<()> {
+fn fixture_v3_rejects_unknown_digest_version() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut unknown_digest_version = fixture.manifest;
     unknown_digest_version
@@ -1467,7 +1705,7 @@ fn fixture_v2_rejects_unknown_digest_version() -> Result<()> {
 }
 
 #[test]
-fn fixture_v2_rejects_uppercase_sequence_digest_hex() -> Result<()> {
+fn fixture_v3_rejects_uppercase_sequence_digest_hex() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut uppercase_sequence_digest = fixture.manifest;
     uppercase_sequence_digest

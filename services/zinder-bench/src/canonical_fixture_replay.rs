@@ -22,7 +22,7 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalPipelineLimits, CanonicalSourceLoadOutcome,
-    load_fresh_canonical,
+    load_fresh_canonical_blocks,
 };
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
@@ -40,7 +40,7 @@ use crate::{
     fixture::{FixtureManifest, FixtureNodeSource, read_segment_blocks},
 };
 
-/// Digest-bound checkpoint sidecar written beside a format-2 fixture manifest.
+/// Digest-bound checkpoint sidecar written beside a format-3 fixture manifest.
 pub const CANONICAL_FIXTURE_REPLAY_PLAN_FILE_NAME: &str = "canonical-replay-plan.json";
 const CANONICAL_FIXTURE_REPLAY_PLAN_TEMP_FILE_NAME: &str = "canonical-replay-plan.json.tmp";
 const CANONICAL_FIXTURE_REPLAY_PLAN_CONTRACT_IDENTITY: &str = "canonical-fixture-replay-plan";
@@ -56,7 +56,7 @@ pub struct CanonicalFixtureReplayPlan {
     pub contract_identity: String,
     /// Sidecar format version.
     pub format_version: u32,
-    /// SHA-256 identity of the exact format-2 fixture manifest.
+    /// SHA-256 identity of the exact format-3 fixture manifest.
     pub fixture_manifest_sha256: String,
     /// Fingerprint algorithm used for the captured activation table.
     pub network_upgrade_activations_fingerprint_version: u16,
@@ -649,7 +649,7 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
     admitted: AdmittedCanonicalFixtureReplay,
     source: &S,
 ) -> Result<CanonicalFixtureRocksDbReplayOutcome, BenchError> {
-    let canonical_load = load_fresh_canonical(
+    let block_load = load_fresh_canonical_blocks(
         admitted.builder,
         source,
         &CanonicalConstructionConfig {
@@ -659,6 +659,27 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         },
     )
     .await?;
+    let mut builder = block_load.builder;
+    let subtree_root_evidence =
+        builder.load_complete_subtree_root_prefix(admitted.manifest.subtree_root_artifacts()?)?;
+    let fixed_tip = builder.build_plan().build_tip();
+    let source_tip_checkpoint = tokio::time::timeout(
+        config.request_timeout,
+        source.fetch_chain_checkpoint(fixed_tip.height, &admitted.activations),
+    )
+    .await
+    .map_err(|_| {
+        BenchError::fixture_format(format!(
+            "canonical fixture fixed-tip checkpoint request exceeded {:?}",
+            config.request_timeout
+        ))
+    })??;
+    builder.confirm_source_tip_checkpoint(&source_tip_checkpoint)?;
+    let canonical_load = CanonicalSourceLoadOutcome {
+        builder,
+        block_evidence: block_load.evidence,
+        subtree_root_evidence,
+    };
     authenticate_canonical_fixture_load(
         &canonical_load,
         &admitted.manifest,

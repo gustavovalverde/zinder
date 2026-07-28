@@ -20,8 +20,8 @@ use super::{
         create_fresh_directory, initialize_store_identity, validate_resource_budget,
     },
     subtree_load::{
-        CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence, load_subtree_roots,
-        required_subtree_root_ranges,
+        CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence,
+        load_complete_subtree_root_prefix, load_subtree_roots, required_subtree_root_ranges,
     },
 };
 
@@ -226,6 +226,36 @@ impl RocksDbCanonicalBuilder {
             .as_ref()
             .ok_or(CanonicalStoreError::CanonicalBlocksNotLoaded)?;
         let loaded = load_subtree_roots(
+            &self.bounded_open.db,
+            &self.build_plan,
+            block_evidence,
+            subtree_roots,
+        )?;
+        self.subtree_root_evidence = Some(loaded.evidence);
+        self.trusted_fresh_subtree_family_evidence = Some(loaded.family_evidence);
+        Ok(loaded.evidence)
+    }
+
+    /// Loads a caller-authenticated complete subtree-root prefix for a fresh build.
+    ///
+    /// Every protocol must cover exactly index zero through the completed count
+    /// at the fixed tip. Roots completed before retained history carry their
+    /// exact source-authenticated block identity; the store preserves that
+    /// identity but does not claim to authenticate a block header it does not
+    /// retain. Completion blocks inside retained history are checked against
+    /// the retained canonical header before any rows are written.
+    pub fn load_complete_subtree_root_prefix(
+        &mut self,
+        subtree_roots: impl IntoIterator<Item = zinder_core::SubtreeRootArtifact>,
+    ) -> Result<CanonicalSubtreeRootLoadEvidence, CanonicalStoreError> {
+        if self.subtree_root_evidence.is_some() {
+            return Err(CanonicalStoreError::SubtreeRootLoadAlreadyLoaded);
+        }
+        let block_evidence = self
+            .canonical_block_evidence
+            .as_ref()
+            .ok_or(CanonicalStoreError::CanonicalBlocksNotLoaded)?;
+        let loaded = load_complete_subtree_root_prefix(
             &self.bounded_open.db,
             &self.build_plan,
             block_evidence,
@@ -594,7 +624,7 @@ mod tests {
 
         assert_ready_construction_manifest_binding(&store_path, &published)?;
         let manifest =
-            fs::read_to_string(store_path.join("canonical-construction-manifest.v3.json"))?;
+            fs::read_to_string(store_path.join("canonical-construction-manifest.v4.json"))?;
         assert!(manifest.contains("\"evidence_provenance\":\"cold-certification\""));
 
         assert_eq!(published.ready_evidence().visible_epoch.value(), 1);
@@ -845,7 +875,7 @@ mod tests {
                 .contains("zinder_store_canonical_publication_family_scan")
         );
         let manifest =
-            fs::read_to_string(store_path.join("canonical-construction-manifest.v3.json"))?;
+            fs::read_to_string(store_path.join("canonical-construction-manifest.v4.json"))?;
         assert!(manifest.contains("\"evidence_provenance\":\"trusted-fresh-writer\""));
         assert_eq!(published.ready_evidence().visible_block_count, 2);
         assert_eq!(
@@ -876,7 +906,7 @@ mod tests {
         let binding = published.ready_evidence().construction_manifest_sha256;
         drop(published);
 
-        let manifest_path = store_path.join("canonical-construction-manifest.v3.json");
+        let manifest_path = store_path.join("canonical-construction-manifest.v4.json");
         std::fs::remove_file(&manifest_path)?;
         std::fs::write(
             store_path.join("canonical-construction-manifest.v1.json"),
@@ -897,7 +927,7 @@ mod tests {
         assert!(
             missing
                 .to_string()
-                .contains("canonical-construction-manifest.v3.json")
+                .contains("canonical-construction-manifest.v4.json")
         );
 
         std::fs::write(&manifest_path, b"{}")?;
@@ -2609,7 +2639,7 @@ mod tests {
         );
         assert!(
             store_path
-                .join("canonical-construction-manifest.v3.json")
+                .join("canonical-construction-manifest.v4.json")
                 .is_file()
         );
         let manifest_binding =
