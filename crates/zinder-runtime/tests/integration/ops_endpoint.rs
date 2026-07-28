@@ -4,7 +4,10 @@ use eyre::Result;
 use http_body_util::BodyExt;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::net::TcpListener;
-use zinder_runtime::{OpsServer, OpsServerError, Readiness, ReadinessState, spawn_ops_endpoint};
+use zinder_runtime::{
+    OpsServer, OpsServerError, Readiness, ReadinessState, RuntimeService,
+    install_metrics_recorder_for_service, spawn_ops_endpoint,
+};
 
 async fn get_json(listen_addr: SocketAddr, path: &str) -> Result<(u16, serde_json::Value)> {
     let client = Client::builder(TokioExecutor::new()).build_http::<String>();
@@ -35,6 +38,9 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listen_addr: SocketAddr = listener.local_addr()?;
     drop(listener);
+
+    install_metrics_recorder_for_service(RuntimeService::Query, "0.0.0", "zcash-regtest")?;
+    metrics::counter!("zinder_runtime_metrics_emitted_before_ops_spawn_total").increment(7);
 
     let readiness = Readiness::new(ReadinessState::ready(Some(7)));
     let server_handle = spawn_ops_endpoint(
@@ -116,6 +122,12 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
     );
     assert!(
         metrics_text.contains("zinder_readiness_replica_lag_chain_epochs"),
+        "{metrics_text}"
+    );
+    assert!(
+        metrics_text
+            .lines()
+            .any(|line| line == "zinder_runtime_metrics_emitted_before_ops_spawn_total 7"),
         "{metrics_text}"
     );
 

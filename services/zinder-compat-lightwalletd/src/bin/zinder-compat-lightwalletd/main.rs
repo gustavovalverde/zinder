@@ -9,8 +9,9 @@ use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
 };
 use zinder_runtime::{
-    Readiness, RuntimeService, StartupPhase, TrafficReadinessInterceptor,
-    cancel_on_terminating_signal, install_tracing_subscriber, spawn_ops_endpoint_for,
+    OpsServerError, Readiness, RuntimeService, StartupPhase, TrafficReadinessInterceptor,
+    cancel_on_terminating_signal, install_metrics_recorder_for_service, install_tracing_subscriber,
+    spawn_ops_endpoint_for,
 };
 use zinder_source::{
     DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
@@ -124,6 +125,14 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             return Err(error);
         }
     };
+    if lightwalletd_config.ops_listen_addr.is_some() {
+        install_metrics_recorder_for_service(
+            RuntimeService::CompatLightwalletd,
+            env!("CARGO_PKG_VERSION"),
+            encode_zinder_native_chain_name(lightwalletd_config.network),
+        )
+        .map_err(OpsServerError::from)?;
+    }
     let readiness = Readiness::default();
     let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
     let start_api_phase = StartupPhase::StartApi.start();

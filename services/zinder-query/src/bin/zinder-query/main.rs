@@ -12,8 +12,8 @@ use zinder_query::{
 };
 use zinder_runtime::{
     OpsEndpointHandle, OpsServerError, Readiness, RuntimeService, StartupPhase,
-    TrafficReadinessInterceptor, cancel_on_terminating_signal, install_tracing_subscriber,
-    spawn_ops_endpoint_for,
+    TrafficReadinessInterceptor, cancel_on_terminating_signal,
+    install_metrics_recorder_for_service, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
@@ -122,6 +122,15 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             return Err(error);
         }
     };
+
+    if query_config.ops_listen_addr.is_some() {
+        install_metrics_recorder_for_service(
+            RuntimeService::Query,
+            env!("CARGO_PKG_VERSION"),
+            encode_zinder_native_chain_name(query_config.network),
+        )
+        .map_err(OpsServerError::from)?;
+    }
 
     let readiness = Readiness::default();
     let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
