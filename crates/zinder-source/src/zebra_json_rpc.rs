@@ -135,7 +135,7 @@ pub struct ZebraJsonRpcSource {
     client: ResilientClient<HttpClient>,
     max_response_bytes: NonZeroU64,
     broadcast_timeout: Option<Duration>,
-    cached_capabilities: Arc<Mutex<NodeCapabilities>>,
+    admitted_capabilities: Arc<Mutex<Option<NodeCapabilities>>>,
     health_config: Option<NodeHealthConfig>,
     ready_http_client: Option<ZebraReadyClient>,
 }
@@ -403,7 +403,7 @@ impl ZebraJsonRpcSource {
 
         let probed_capabilities =
             with_readiness_probe_capability(json_rpc_capabilities, self.health_config.is_some());
-        *self.cached_capabilities.lock() = probed_capabilities;
+        *self.admitted_capabilities.lock() = Some(probed_capabilities);
         Ok(probed_capabilities)
     }
 
@@ -476,7 +476,7 @@ impl ZebraJsonRpcSource {
             client,
             max_response_bytes,
             broadcast_timeout,
-            cached_capabilities: Arc::new(Mutex::new(default_zebra_capabilities())),
+            admitted_capabilities: Arc::new(Mutex::new(None)),
             health_config: None,
             ready_http_client: None,
         })
@@ -499,9 +499,12 @@ impl ZebraJsonRpcSource {
             .as_ref()
             .map(|config| ZebraReadyClient::new(config.poll_interval));
         self.health_config = health_config;
-        let mut cache = self.cached_capabilities.lock();
-        *cache = with_readiness_probe_capability(*cache, self.health_config.is_some());
-        drop(cache);
+        let mut admitted = self.admitted_capabilities.lock();
+        if let Some(capabilities) = admitted.as_mut() {
+            *capabilities =
+                with_readiness_probe_capability(*capabilities, self.health_config.is_some());
+        }
+        drop(admitted);
         self
     }
 
@@ -922,7 +925,20 @@ impl ZebraJsonRpcSource {
 #[async_trait]
 impl NodeSource for ZebraJsonRpcSource {
     fn capabilities(&self) -> NodeCapabilities {
-        *self.cached_capabilities.lock()
+        self.admitted_capabilities.lock().unwrap_or_else(|| {
+            with_readiness_probe_capability(
+                default_zebra_capabilities(),
+                self.health_config.is_some(),
+            )
+        })
+    }
+
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        *self.admitted_capabilities.lock()
+    }
+
+    fn network(&self) -> Option<Network> {
+        Some(self.network)
     }
 
     async fn fetch_chain_segment(

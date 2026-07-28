@@ -15,11 +15,11 @@ use zinder_ingest::{
     CanonicalControlGrpcAdapter, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
     CanonicalRunOverrides, CanonicalWriterConfig, ConventionalFeeDistributionBackfillConfig,
     ConventionalFeeDistributionBackfillContext, DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
-    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, HistoricalWorkGate, IngestError, LiveMempoolOwner,
-    MaterializedViewReplayConfig, MaterializedViewTailer, MempoolIngestSettings, NodeSourceKind,
-    TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
-    canonical_control_channel, classify_phase, mempool_ready_channel,
-    open_primary_materialized_view_store, run_canonical_writer_with_control,
+    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, HistoricalWorkGate, IngestError,
+    IngestNodeComposition, LiveMempoolOwner, MaterializedViewReplayConfig, MaterializedViewTailer,
+    MempoolIngestSettings, NodeSourceKind, TransactionComponentBackfillConfig,
+    TransactionComponentBackfillContext, canonical_control_channel, classify_phase,
+    mempool_ready_channel, open_primary_materialized_view_store, run_canonical_writer_with_control,
     run_live_mempool_owner, run_mempool_retention, seed_backfill_owned_consumer_cursors,
     spawn_conventional_fee_distribution_backfill_task,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
@@ -288,18 +288,6 @@ async fn run_ingest(
     load_config_phase.complete();
     let readiness = Readiness::default();
     let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle = spawn_ops_endpoint_for(
-        RuntimeService::Ingest,
-        command_config.ops_listen_addr,
-        env!("CARGO_PKG_VERSION"),
-        encode_zinder_native_chain_name(command_config.runtime_config.node.network),
-        readiness.clone(),
-        Arc::from(zinder_proto::capabilities::always_on_capability_strings(
-            zinder_proto::capabilities::CapabilitySurface::Ingest,
-        )),
-    )
-    .await?;
-
     let connect_node_phase = StartupPhase::ConnectNode.start();
     let source = zebra_json_rpc_source_for_target(
         command_config.runtime_config.node_source,
@@ -313,6 +301,18 @@ async fn run_ingest(
         .await
         .map_err(IngestError::from)?;
     check_schema_phase.complete();
+    let node_composition = IngestNodeComposition::new(Arc::new(source.clone()))?;
+    let advertised_capabilities = node_composition.advertised_capabilities();
+    let endpoint_network = node_composition.network();
+    let ops_handle = spawn_ops_endpoint_for(
+        RuntimeService::Ingest,
+        command_config.ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(endpoint_network),
+        readiness.clone(),
+        Arc::clone(&advertised_capabilities),
+    )
+    .await?;
 
     let recover_state_phase = StartupPhase::RecoverState.start();
     resolve_wallet_serving_modifiers(&mut command_config);
@@ -355,6 +355,7 @@ async fn run_ingest(
         &command_config,
         &source,
         &readiness,
+        node_composition,
         &worker_cancel,
         &mut writer_config,
     );
@@ -393,10 +394,16 @@ struct CanonicalControlTasks {
     server_completed: bool,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "This composition root wires the control listener and its exact writer-owned tasks in one fail-closed lifecycle."
+)]
 fn spawn_canonical_control_tasks(
     command_config: &IngestCommandConfig,
     source: &ZebraJsonRpcSource,
     readiness: &Readiness,
+    node_composition: IngestNodeComposition,
     cancel: &CancellationToken,
     writer_config: &mut CanonicalWriterConfig,
 ) -> CanonicalControlTasks {
@@ -447,12 +454,10 @@ fn spawn_canonical_control_tasks(
                 .ingest_control_checkpoint_bearer_token
                 .clone(),
         );
-        let node_source: Arc<dyn NodeSource> = Arc::new(source.clone());
         let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
-            command_config.runtime_config.node.network,
             canonical_control_handle,
             mempool_owner,
-            node_source,
+            node_composition,
             readiness.clone(),
         )
         .with_bearer_token(command_config.ingest_control_bearer_token.clone());

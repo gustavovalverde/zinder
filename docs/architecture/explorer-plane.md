@@ -62,9 +62,30 @@ The same service also owns `BlockSummariesInRange`, `BlockDetail`, `Search`, `Tr
 
 ## Transaction detail shape
 
-`ExplorerQuery.TransactionDetail` resolves one transaction at an epoch-pinned wallet location. In the deployed composition, `WalletQuery.Transaction` supplies the mined or mempool location and retained raw transaction bytes. The explorer parses those bytes through the same `TransactionPublicFactSet` parser ingest uses and rejects a transaction-id mismatch. Mined inputs combine intrinsic outpoints with values projected by `TransactionFeesConsumer`; scripts remain absent when no retained canonical parent fact is configured. Mined outputs carry exact intrinsic values and scripts, while `TransparentOutpointSpendConsumer` supplies canonical `spent_by` relations only after its state and historical coverage match the complete requested epoch. A missing or stale projection fails closed rather than turning unknown spent state into “unspent.” Mempool rows expose intrinsic inputs and outputs without claiming canonical parent resolution, canonical spent state, or paid fees.
+`ExplorerQuery.TransactionDetail` can be admitted only when the exact wallet
+endpoint advertises both `wallet.read.transaction_by_id_v2` and
+`wallet.read.transaction_bytes_v1`, and the explorer materialized-view store
+contains the transaction-fee and transparent-outpoint-spend consumers. The
+current release `WalletServingQuery` advertises neither native transaction
+capability, so the release explorer omits
+`explorer.transaction.detail_v4`; a direct call returns `UNIMPLEMENTED` before
+request decoding or any dependency access. Retaining transaction blobs or
+attaching a canonical secondary cannot manufacture the missing wallet
+contract. A later release may admit the method only after its real native
+composition owns both capabilities.
 
-Library compositions that provide a canonical secondary retain the deeper enrichment path: the handler reads `TransactionFactsArtifact`, batch-loads unique retained parent facts, and may recover input values and scripts when projection rows are partial. Reverse-spend lookup remains epoch-pinned and bounded. Standard-address decoding is an edge concern, shielded values are not implied, and readers never write either store.
+When admitted, `WalletQuery.Transaction` supplies the mined or mempool
+location and retained raw transaction bytes. The explorer parses those bytes
+through the same `TransactionPublicFactSet` parser ingest uses and rejects a
+transaction-id mismatch. Mined inputs combine intrinsic outpoints with values
+projected by `TransactionFeesConsumer`; scripts remain absent. Mined outputs
+carry exact intrinsic values and scripts, while
+`TransparentOutpointSpendConsumer` supplies canonical `spent_by` relations
+only after its state and historical coverage match the complete requested
+epoch. A missing or stale projection fails closed rather than turning unknown
+spent state into “unspent.” A canonical secondary is not an alternative
+transaction-fact provider; it is consulted only when the separately
+advertised intrinsic-value-balances field capability is present.
 
 `TransactionFeesConsumer` materializes `paid_fee_zat` only when every
 transparent prevout resolves and the canonical privacy shape is
@@ -73,19 +94,16 @@ is a transfer between pools, not a provable fee; shielded and unclassified rows
 therefore retain resolved input values but leave `paid_fee_zat` absent.
 
 An incompatible transaction-fee consumer layout requires a fresh
-materialized-view store rebuilt from canonical history. Every read requires an independently
-classified privacy shape and suppresses a paid-fee value unless that shape is
-`TransparentOnly`. When a canonical secondary is configured, retained parent
-rows reconstruct fee input values when a fee row is missing or partial.
-Transaction detail uses one epoch-pinned canonical reader and one parent-fact
-batch for both public prevout enrichment and fee recovery, then merges projected
-and recovered values by input index so neither source can erase an available
-value. Recent-transaction pages apply the same
-merge only to transparent-only rows that still lack a proven fee, using two
-bounded batched canonical reads for at most the request's 1,024 rows. Readers
-never write materialized-view rows.
+materialized-view store rebuilt from canonical history. Every detail read
+requires an independently classified privacy shape and suppresses a paid-fee
+value unless that shape is `TransparentOnly`. Missing or partial fee rows stay
+unknown; the handler does not fall back to canonical parent-fact reads.
+Readers never write materialized-view rows.
 
-Mempool transactions retain their location semantics. Mempool rows expose transaction-intrinsic transparent facts from their transient payload, but do not claim canonical parent resolution, canonical spent state, or actual paid fees.
+Mempool transactions retain their location semantics. Mempool rows expose
+transaction-intrinsic transparent facts from their transient payload, but do
+not claim canonical parent resolution, canonical spent state, or actual paid
+fees.
 
 The response composes parsed intrinsic facts with a durable reverse-spend relation. A spender remains visible beyond the first request batch, while epoch-pinned reads report the same outpoint as unspent before its spending epoch and spent afterwards.
 
@@ -286,11 +304,14 @@ are absent, and transactions whose complete component shape is unavailable
 are reported separately rather than silently omitted.
 
 The response carries `ExplorerFreshness` and independent contiguous coverage.
-The capability is advertised only after materialized-view coverage exists. A range is
-complete only when its start is covered and the materialized view reaches the visible
-tip or its time boundary. Full UTC days use aggregate rows; clipped boundary
-days scan retained per-block contributions. This keeps 365-day reads bounded
-by daily rows while preserving exact rolling-cutoff semantics.
+The capability is fixed at startup when the exact consumer exists in the
+admitted materialized-view manifest. A request made before the needed range is
+covered returns the typed materialization outcome; coverage never rewrites the
+endpoint contract. A range is complete only when its start is covered and the
+materialized view reaches the visible tip or its time boundary. Full UTC days
+use aggregate rows; clipped boundary days scan retained per-block
+contributions. This keeps 365-day reads bounded by daily rows while preserving
+exact rolling-cutoff semantics.
 
 ## Value pool summary
 
@@ -341,31 +362,31 @@ The totals count every unspent transparent output, including non-standard and pr
 
 ## Capability namespace
 
-The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:
+The explorer plane uses the `explorer.*` capability prefix. The protocol
+registry owns each identifier, stable order, surface, and owner method. A
+finalized explorer adapter selects a subset from concrete startup composition;
+the registry contains no runtime policy.
 
-| Capability | Owner method | Always-on? |
-| ---------- | ------------ | ---------- |
-| `explorer.server_info_v1` | `ExplorerQuery.ServerInfo` | Yes |
-| `explorer.transaction.detail_v4` | `ExplorerQuery.TransactionDetail` | When the wallet endpoint and explorer materialized-view store are configured |
-| `explorer.block.summary_v1` | `ExplorerQuery.BlockSummariesInRange` + `BlockDetail` summary part | When the block-summary consumer is built and caught up |
-| `explorer.block.production_series_v2` | `ExplorerQuery.BlockProductionSeries` | When the block-summary consumer and canonical secondary store are available |
-| `explorer.block.production_time_range_v1` | `ExplorerQuery.BlockProductionInTimeRange` | When the time index has contiguous height-domain coverage through its materialized-view tip |
-| `explorer.block.detail_v1` | `ExplorerQuery.BlockDetail` per-tx rows | When the block-detail consumer is built and caught up |
-| `explorer.block.activity_distribution_v1` | `ExplorerQuery.BlockActivityDistribution` | When the block-summary consumer and wallet endpoint are available |
-| `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint is configured |
-| `explorer.transparent_address.activity_v2` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint plus explorer activity and ranking consumers are available, and the ranking has an active complete generation |
-| `explorer.transparent_address.deltas_v1` | `ExplorerQuery.TransparentAddressDeltas` | When the wallet endpoint is configured |
-| `explorer.transparent_address.ranking_v1` | `ExplorerQuery.TransparentAddressRanking` | When the ranking consumer has an active generation and the wallet endpoint is configured |
-| `explorer.mempool.summary_v1` | `ExplorerQuery.MempoolSummary` | When the wallet endpoint is configured |
-| `explorer.mempool.snapshot_v1` | `ExplorerQuery.MempoolSnapshot` | When the wallet endpoint is configured |
-| `explorer.mempool.activity_v1` | `ExplorerQuery.MempoolActivity` | When the wallet endpoint is configured |
-| `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | When the wallet endpoint is configured |
-| `explorer.fee.conventional_distribution_v1` | `ExplorerQuery.ConventionalFeeDistribution` | When the conventional-fee materialized view has contiguous coverage and the wallet endpoint is configured |
-| `explorer.fee.paid_distribution_v1` | `ExplorerQuery.PaidFeeDistribution` | When the paid-fee materialized view has coverage and the wallet endpoint is configured |
-| `explorer.value_pool.summary_v1` | `ExplorerQuery.ValuePoolSummary` | When the wallet endpoint is configured and `WalletQuery.ChainValuePoolsAtTip` is available |
-| `explorer.transaction.component_summary_v2` | `ExplorerQuery.TransactionComponentSummary` | When the transaction-component consumer and wallet endpoint are available |
-| `explorer.utxo_set.summary_v1` | `ExplorerQuery.UtxoSetSummary` | When the wallet endpoint is configured |
-| `explorer.search_v1` | `ExplorerQuery.Search` | When the wallet endpoint is configured |
+| Contract | Immutable admission evidence |
+| -------- | ---------------------------- |
+| `explorer.server_info_v1` | Installed handler |
+| `explorer.transaction.detail_v4` | Exact fee and transparent-outpoint-spend consumers plus admitted wallet transaction and raw-byte capabilities |
+| `explorer.block.production_series_v2` | Canonical secondary plus exact block-summary consumer |
+| `explorer.block.production_time_range_v1` | Canonical secondary plus exact block-time, block-summary, and paid-fee consumers |
+| `explorer.commitment_root.search_v1` | Canonical secondary, exact commitment-root consumer, and admitted Sapling activation evidence |
+| `explorer.transparent_address.activity_v2` | Exact activity and ranking consumers plus either a canonical epoch source or admitted wallet visible-tip capability |
+| `explorer.value_pool.summary_v1` | Admitted wallet chain-value-pools capability |
+| `explorer.utxo_set.summary_v1` | Admitted wallet UTXO-summary capability |
+
+Materializing, partial, and fully covered consumer states all advertise the
+same structurally supported methods. Their mutable state is returned as
+freshness, coverage, or a typed request error. The current registry rows for
+`BlockSummariesInRange`, `MempoolSummary`, `OverviewSnapshot`, and
+`TransparentAddressDeltas` have no installed production handler contract and
+are therefore omitted even when every dependency capability is present.
+Optional field capabilities are retained only when the same endpoint admits at
+least one method that carries the field, and every carrier suppresses the
+field and its supporting read when the field capability is absent.
 
 The naming follows `explorer.<noun>.<capability>_v{N}`. The noun is a domain category; the capability is the operation. New methods add new capability strings; wire-shape changes ship as `_vN` increments.
 
@@ -411,19 +432,34 @@ secondary_path = "/var/lib/zinder/explorer-secondary"
 listen_addr = "127.0.0.1:9068"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
 wallet_query_endpoint = "https://zinder.example:9102"   # optional native WalletQuery gRPC adapter
+wallet_query_bearer_token_path = "/run/secrets/zinder-wallet-query-token"
 
 [explorer.freshness]
 max_lag_blocks = 16              # response carries UNAVAILABLE_STALE beyond this
 warn_lag_blocks = 4              # readiness cause flips at this threshold
 ```
 
-When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The explorer's `wallet_query_endpoint` config points to an optional deployment that embeds the native `WalletQuery` adapter for its wallet-composed reads (transaction detail, block views, search, mempool activity, and value pools).
+When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint
+enforces the same shared-secret bearer-token interceptor as `IngestControl` per
+[ADR-0006](../adrs/0006-ingest-control-transport-security.md).
+`wallet_query_bearer_token_path` is the separate outbound credential presented
+to the configured wallet endpoint. Explorer authenticates and calls
+`WalletQuery.ServerInfo` during startup, validates network and contract
+revision, then freezes the returned capability set before binding either
+listener. Unreachable, unauthenticated, wrong-network, and malformed discovery
+responses fail startup rather than producing a partially admitted process.
+
+The optional `[node]` section supplies network-upgrade activation evidence and
+upstream freshness observations. If it is absent, activation-dependent methods
+are omitted. If it is present, activation discovery is a startup requirement;
+an unreachable node or a response without Sapling fails startup.
 
 Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-specific fields, plus the shared `ZINDER_OPS__*` prefix for the universal operational endpoint:
 
 - `ZINDER_EXPLORER__LISTEN_ADDR`
 - `ZINDER_EXPLORER__BEARER_TOKEN_PATH`
 - `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT`
+- `ZINDER_EXPLORER__WALLET_QUERY_BEARER_TOKEN_PATH`
 - `ZINDER_STORAGE__PATH`
 - `ZINDER_STORAGE__SECONDARY_PATH`
 - `ZINDER_OPS__LISTEN_ADDR` (shared with every Zinder binary; default `127.0.0.1:9069` for the explorer)
@@ -435,7 +471,9 @@ The explorer plane fails independently from canonical state.
 - An explorer service crash does not stop `zinder-ingest`. Ingest continues writing canonical artifacts and ChainEvents.
 - An explorer service crash does not stop a separately deployed native `WalletQuery` adapter. Its wallet primitives, including `WalletQuery.TransparentAddressBalance`, remain independent of explorer state: the balance reads the canonical unspent-output index and overlays live mempool data through the configured `IngestControl` endpoint.
 - An explorer materialized view becoming inconsistent does not corrupt canonical state. Operators drop the materialized-view store and rebuild from retained canonical events. When the materialized-view store is absent, `zinder-explorer` starts with materialized-view-backed capabilities omitted.
-- Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
+- Explorer health and materialization state flow through `/readyz` and typed
+  request outcomes. They never mutate the frozen `ExplorerQuery.ServerInfo`
+  contract or propagate to the wallet plane's readiness.
 
 ## Cursor expiry contract
 
@@ -500,13 +538,14 @@ post-catch-up state. The response returns the exact read fence and coverage.
 Opaque cursors bind both the filter and fence, and a supplied stale fence fails
 with `FAILED_PRECONDITION`.
 
-Capability advertisement follows live materialized-view state. Capability v1
-is available when the materialized view and its `WalletQuery` dependency are
-online. Capability v2 is advertised only when contiguous coverage starts at
-height 1 and reaches the current materialized-view tip with the same hash.
-Exact totals are omitted unless that condition holds; when returned, their
-scope is `FULL_HISTORY`. Adapters that walk multiple pages or cache totals must
-carry the fence through every request and include it in cache identity.
+Both transaction-history versions are advertised when the exact history
+consumer and admitted wallet visible-tip dependency are composed. Coverage
+does not select between them. A request against materializing or partial state
+returns the typed materialization result; exact totals are omitted unless
+coverage starts at height 1 and reaches the materialized-view tip with the same
+hash. When returned, their scope is `FULL_HISTORY`. Adapters that walk multiple
+pages or cache totals must carry the fence through every request and include it
+in cache identity.
 
 ## Cross-references
 

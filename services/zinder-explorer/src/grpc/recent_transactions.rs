@@ -45,18 +45,30 @@ const ROW_KEY_LEN: usize = 8;
 pub(crate) type RecentTransactionsStream =
     Pin<Box<dyn Stream<Item = Result<RecentTransactionsChunk, Status>> + Send + 'static>>;
 
+/// Composed dependencies and admitted fields for one recent-transactions page.
+pub(crate) struct RecentTransactionsContext<'store> {
+    pub(crate) materialized_view_store: &'store MaterializedViewStore,
+    pub(crate) chain_store: Option<&'store SecondaryChainStore>,
+    pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
+    pub(crate) include_transaction_fees: bool,
+}
+
 /// Executes one `ExplorerQuery.RecentTransactions` request.
 #[allow(
     clippy::too_many_lines,
     reason = "the streaming handler keeps admission, hydration, and response construction together"
 )]
 pub(crate) async fn query_recent_transactions(
-    materialized_view_store: &MaterializedViewStore,
-    chain_store: Option<&SecondaryChainStore>,
+    context: RecentTransactionsContext<'_>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<RecentTransactionsRequest>,
 ) -> Result<Response<RecentTransactionsStream>, Status> {
+    let RecentTransactionsContext {
+        materialized_view_store,
+        chain_store,
+        upstream_observation_cache,
+        include_transaction_fees,
+    } = context;
     let inner = request.into_inner();
     let max_entries = clamp_max_entries(
         inner.max_entries,
@@ -117,12 +129,16 @@ pub(crate) async fn query_recent_transactions(
         .ok_or_else(|| {
             ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
-    join_paid_fees(
-        materialized_view_store,
-        chain_store,
-        &chain_epoch,
-        &mut entries,
-    )?;
+    if include_transaction_fees {
+        join_paid_fees(
+            materialized_view_store,
+            chain_store,
+            &chain_epoch,
+            &mut entries,
+        )?;
+    } else {
+        suppress_paid_fees(&mut entries);
+    }
     let cursor = last_key.map_or_else(Vec::new, |key| key.to_vec());
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
@@ -141,6 +157,12 @@ pub(crate) async fn query_recent_transactions(
     };
     let stream = tokio_stream::iter(std::iter::once(Ok(chunk)));
     Ok(Response::new(Box::pin(stream)))
+}
+
+fn suppress_paid_fees(entries: &mut [RecentTransactionEntry]) {
+    for entry in entries {
+        entry.paid_fee_zat = None;
+    }
 }
 
 /// Hydrates `entries[*].paid_fee_zat` from the `transaction_fees` materialized view
@@ -249,4 +271,21 @@ fn resolve_missing_transparent_fees(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unadvertised_recent_fees_are_removed_from_decoded_rows() {
+        let mut entries = vec![RecentTransactionEntry {
+            paid_fee_zat: Some(1),
+            ..RecentTransactionEntry::default()
+        }];
+
+        suppress_paid_fees(&mut entries);
+
+        assert_eq!(entries[0].paid_fee_zat, None);
+    }
 }

@@ -884,20 +884,40 @@ pub(crate) async fn query_block_detail(
     }))
 }
 
+/// Composed dependencies and admitted optional fields for one block page.
+pub(crate) struct BlockTransactionsContext<'store> {
+    pub(crate) chain_store: &'store SecondaryChainStore,
+    pub(crate) materialized_view_store: &'store MaterializedViewStore,
+    pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
+    pub(crate) include_fee_projected_input_values: bool,
+    pub(crate) include_final_note_commitment_roots: bool,
+}
+
 pub(crate) async fn query_block_transactions(
-    chain_store: &SecondaryChainStore,
-    materialized_view_store: &MaterializedViewStore,
+    context: BlockTransactionsContext<'_>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    upstream_observation_cache: &UpstreamObservationCache,
     request: Request<BlockDetailRequest>,
 ) -> Result<Response<BlockTransactionsResponse>, Status> {
+    let BlockTransactionsContext {
+        chain_store,
+        materialized_view_store,
+        upstream_observation_cache,
+        include_fee_projected_input_values,
+        include_final_note_commitment_roots,
+    } = context;
     let inner = request.into_inner();
     let materialized =
         read_materialized_block_view(materialized_view_store, wallet_client, &inner).await?;
-    let transactions =
-        read_block_transaction_rows(chain_store, materialized_view_store, &materialized)?;
-    let final_note_commitment_roots =
-        read_block_final_note_commitment_roots(chain_store, &materialized)?;
+    let transactions = read_block_transaction_rows(
+        chain_store,
+        materialized_view_store,
+        &materialized,
+        include_fee_projected_input_values,
+    )?;
+    let final_note_commitment_roots = read_admitted_block_final_note_commitment_roots(
+        include_final_note_commitment_roots,
+        || read_block_final_note_commitment_roots(chain_store, &materialized),
+    )?;
 
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
@@ -916,6 +936,17 @@ pub(crate) async fn query_block_transactions(
         transactions,
         final_note_commitment_roots,
     }))
+}
+
+fn read_admitted_block_final_note_commitment_roots(
+    include_final_note_commitment_roots: bool,
+    read: impl FnOnce() -> Result<Option<BlockFinalNoteCommitmentRoots>, Status>,
+) -> Result<Option<BlockFinalNoteCommitmentRoots>, Status> {
+    if include_final_note_commitment_roots {
+        read()
+    } else {
+        Ok(None)
+    }
 }
 
 fn read_block_final_note_commitment_roots(
@@ -947,6 +978,7 @@ fn read_block_transaction_rows(
     chain_store: &SecondaryChainStore,
     materialized_view_store: &MaterializedViewStore,
     materialized: &MaterializedBlockView,
+    include_fee_projected_input_values: bool,
 ) -> Result<Vec<BlockTransaction>, Status> {
     chain_store
         .try_catch_up()
@@ -972,20 +1004,24 @@ fn read_block_transaction_rows(
     let parent_transactions = reader
         .transaction_facts_by_ids(&parent_ids)
         .map_err(|error| status_from_store_error(&error))?;
-    let fee_lookup_targets = artifacts_by_id
-        .iter()
-        .filter_map(|(transaction_id, artifact)| {
-            artifact
-                .as_ref()
-                .filter(|artifact| !artifact.public_facts.is_coinbase)
-                .map(|artifact| (*transaction_id, artifact.public_facts.privacy_shape))
-        })
-        .collect::<Vec<_>>();
-    let fee_records = zinder_materialized_views::TransactionFeesConsumer::read_fees_records_many(
-        materialized_view_store,
-        &fee_lookup_targets,
-    )
-    .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    let fee_records = if include_fee_projected_input_values {
+        let fee_lookup_targets = artifacts_by_id
+            .iter()
+            .filter_map(|(transaction_id, artifact)| {
+                artifact
+                    .as_ref()
+                    .filter(|artifact| !artifact.public_facts.is_coinbase)
+                    .map(|artifact| (*transaction_id, artifact.public_facts.privacy_shape))
+            })
+            .collect::<Vec<_>>();
+        zinder_materialized_views::TransactionFeesConsumer::read_fees_records_many(
+            materialized_view_store,
+            &fee_lookup_targets,
+        )
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+    } else {
+        HashMap::new()
+    };
     encode_block_transaction_rows(
         materialized,
         transaction_ids,
@@ -1147,14 +1183,15 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        attach_coinbase_summaries, block_production_time_coverage,
+        MaterializedBlockView, attach_coinbase_summaries, block_production_time_coverage,
         block_production_time_read_fence, decode_and_validate_block_production_cursor_request,
-        encode_block_production_cursor, join_block_production_points,
+        encode_block_production_cursor, encode_block_transaction_rows,
+        join_block_production_points, read_admitted_block_final_note_commitment_roots,
     };
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpochId, TransactionFactsArtifact,
         TransactionId, TransactionLocation, TransactionVersion, TransparentAddressScriptHash,
-        TransparentOutputFact,
+        TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
         wire::{
             encode_height_key_ascending, encode_internal_block_hash, encode_rpc_block_hash_hex,
             encode_rpc_transaction_id_hex,
@@ -1164,7 +1201,8 @@ mod tests {
         BlockProductionTimeBackfillCoverage, BlockProductionTimeCursor, MaterializedViewState,
     };
     use zinder_proto::v1::explorer::{
-        BlockProductionInTimeRangeRequest, BlockProductionPoint, BlockSummary, BlockSummaryRecord,
+        BlockFinalNoteCommitmentRoots, BlockProductionInTimeRangeRequest, BlockProductionPoint,
+        BlockSummary, BlockSummaryRecord, TransactionFeesRecord, TransparentInputValueRecord,
     };
     use zinder_testkit::synthetic_transaction_public_facts;
 
@@ -1226,6 +1264,89 @@ mod tests {
         let unavailable_artifacts = HashMap::from([(transaction_id, None)]);
         attach_coinbase_summaries(&mut points, &[record], &unavailable_artifacts)?;
         assert!(points[0].coinbase.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn unadvertised_final_note_roots_skip_storage_and_remain_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage_read = std::cell::Cell::new(false);
+        let roots = read_admitted_block_final_note_commitment_roots(false, || {
+            storage_read.set(true);
+            Ok(Some(BlockFinalNoteCommitmentRoots::default()))
+        })?;
+
+        assert_eq!(roots, None);
+        assert!(!storage_read.get());
+        Ok(())
+    }
+
+    #[test]
+    fn block_fee_capability_only_controls_materialized_prevout_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let transaction_id = TransactionId::from_bytes([9; 32]);
+        let parent_transaction_id = TransactionId::from_bytes([7; 32]);
+        let transaction = TransactionFactsArtifact::new(
+            TransactionLocation::new(
+                transaction_id,
+                BlockHeight::new(1),
+                BlockHash::from_bytes([8; 32]),
+                1,
+            ),
+            synthetic_transaction_public_facts(transaction_id, 64),
+        )
+        .with_transparent_facts(
+            vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::new(parent_transaction_id, 3),
+            )],
+            Vec::new(),
+        );
+        let materialized = MaterializedBlockView {
+            summary: BlockSummary::default(),
+            transaction_ids: vec![encode_rpc_transaction_id_hex(transaction_id)],
+            chain_epoch: zinder_proto::v1::wallet::ChainEpoch::default(),
+        };
+        let artifacts = HashMap::from([(transaction_id, Some(transaction))]);
+        let parents = HashMap::from([(parent_transaction_id, None)]);
+
+        let without_fee_projection = encode_block_transaction_rows(
+            &materialized,
+            vec![transaction_id],
+            &artifacts,
+            &parents,
+            &HashMap::new(),
+        )?;
+        assert_eq!(
+            without_fee_projection[0].transparent_inputs[0].value_zat,
+            None,
+        );
+
+        let fee_records = HashMap::from([(
+            transaction_id,
+            TransactionFeesRecord {
+                transparent_inputs: vec![TransparentInputValueRecord {
+                    input_index: 0,
+                    value_zat: Some(42_000),
+                }],
+                ..TransactionFeesRecord::default()
+            },
+        )]);
+        let with_fee_projection = encode_block_transaction_rows(
+            &materialized,
+            vec![transaction_id],
+            &artifacts,
+            &parents,
+            &fee_records,
+        )?;
+        assert_eq!(
+            with_fee_projection[0].transparent_inputs[0].value_zat,
+            Some(42_000),
+        );
+        assert_eq!(
+            with_fee_projection[0].transparent_inputs[0].script_pub_key,
+            None,
+        );
         Ok(())
     }
 

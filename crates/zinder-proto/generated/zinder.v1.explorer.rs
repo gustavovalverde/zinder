@@ -198,9 +198,9 @@ pub struct TransactionPublicFacts {
 /// Storage-only per-input transparent prevout value materialized by
 /// `TransactionFeesConsumer`.
 ///
-/// This record deliberately excludes the prevout script: fee materialized-view rows
-/// need only the value, while `TransactionDetail` resolves the complete prevout
-/// from retained canonical parent facts at request time.
+/// This record deliberately excludes the prevout script: fee materialized-view
+/// rows need only the value. The current `TransactionDetail` composition leaves
+/// input scripts absent.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentInputValueRecord {
     #[prost(uint32, tag = "1")]
@@ -210,12 +210,13 @@ pub struct TransparentInputValueRecord {
 }
 /// One ordered transparent input carried by `TransactionDetail`.
 ///
-/// `spent_outpoint` identifies the output consumed by this input. `value_zat`
-/// and `script_pub_key` are independently optional: retained parent facts can
-/// recover both, while a persisted fee row may preserve the value
-/// after the parent script is unavailable. Absence must not be interpreted as a
-/// zero value or an empty script. Shielded spends are not represented because
-/// their values and receivers are encrypted by protocol.
+/// `spent_outpoint` identifies the output consumed by this input and is parsed
+/// from the transaction bytes supplied by the admitted wallet dependency.
+/// `value_zat` is populated only when the transaction-fee materialized view
+/// preserved that prevout value. The current composition leaves
+/// `script_pub_key` absent. Absence must not be interpreted as a zero value or
+/// an empty script. Shielded spends are not represented because their values
+/// and receivers are encrypted by protocol.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentInput {
     #[prost(uint32, tag = "1")]
@@ -259,37 +260,37 @@ pub struct TransactionDetailRequest {
 }
 /// `ExplorerQuery.TransactionDetail` response.
 ///
-/// Carries the cross-cutting freshness envelope plus the parsed public
-/// facts, the shared transaction-location discriminator, and raw
-/// transaction bytes so consumers can keep parsed and raw forms together
-/// (per the PRD's user story 16).
+/// Carries the cross-cutting freshness envelope, parsed public facts, and the
+/// shared transaction-location discriminator. The service parses transaction
+/// bytes supplied by its admitted wallet dependency; this response does not
+/// carry those raw bytes.
 ///
 /// `location` is the same `zinder.v1.wallet.TransactionLocation` oneof
 /// `WalletQuery.Transaction` returns, so a consumer writes one match shape
 /// for both surfaces.
 ///
-/// `transparent_inputs` is populated for mined transactions from retained raw
-/// bytes plus projected fee rows. Each entry combines input identity and
-/// optional prevout resolution so callers do not have to correlate parallel
-/// arrays. Library compositions with a canonical secondary may merge values and
-/// scripts recovered from retained parent facts. `prevout_resolution_status`
-/// and `paid_fee_zat` remain fee materialized-view fields advertised by
-/// `EXPLORER_TRANSACTION_FEES_V1`.
+/// `transparent_inputs` is parsed from the wallet-supplied transaction bytes.
+/// Each entry combines input identity with an optional prevout value from the
+/// transaction-fee materialized view, so callers do not have to correlate
+/// parallel arrays. Input scripts are absent in the current composition.
+/// `prevout_resolution_status` and `paid_fee_zat` are fee materialized-view
+/// fields advertised by `EXPLORER_TRANSACTION_FEES_V1`.
 /// `paid_fee_zat` additionally requires `facts.privacy_shape ==  TRANSPARENT_ONLY`; shielded and unclassified transactions omit it because
 /// canonical facts do not retain the value balances needed to prove their
 /// actual fee. Consumers fall back to
 /// `TransactionPublicFacts.counts.zip317_conventional_fee_zat` when absent.
 ///
 /// `transparent_inputs` and `transparent_outputs` are ordered public facts for
-/// mined and mempool transactions. Mined inputs may carry retained parent values
-/// and scripts; mempool inputs carry their transaction-local index and outpoint
-/// without implying prevout resolution. Outputs always carry their intrinsic
-/// value and script. Only mined outputs may carry a canonical `spent_by` relation;
-/// mempool-spend state remains a separate wallet-plane relation. Addresses remain
-/// an edge concern derived from standard scripts; Zinder returns scriptPubKey bytes.
+/// mined and mempool transactions. Mined inputs may carry fee-projection
+/// prevout values; mempool inputs carry their transaction-local index and
+/// outpoint without implying prevout resolution. Input scripts are absent.
+/// Outputs always carry their intrinsic value and script. Only mined outputs
+/// may carry a canonical `spent_by` relation; mempool-spend state remains a
+/// separate wallet-plane relation. Addresses remain an edge concern derived
+/// from standard scripts; Zinder returns output scriptPubKey bytes.
 ///
 /// `intrinsic_value_balances` is populated only for mined transactions when
-/// the canonical artifact or retained transaction blob is available at the
+/// the admitted canonical secondary carries the transaction artifact at the
 /// response's pinned chain epoch. Absence is distinct from an all-zero balance.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransactionDetailResponse {
@@ -725,8 +726,10 @@ pub struct BlockTransaction {
     /// Transparent inputs in ascending input-index order. Each entry identifies
     /// the spent outpoint and independently carries its retained value and
     /// scriptPubKey when the parent transaction fact is available. Missing parent
-    /// facts remain absent, never zero or an empty script. Address decoding stays
-    /// at the product edge.
+    /// facts remain absent, never zero or an empty script. When the explorer
+    /// advertises `explorer.transaction.fees_v1`, a materialized fee record may
+    /// preserve the input value after the parent script becomes unavailable.
+    /// Address decoding stays at the product edge.
     #[prost(message, repeated, tag = "6")]
     pub transparent_inputs: ::prost::alloc::vec::Vec<TransparentInput>,
 }
@@ -744,10 +747,11 @@ pub struct BlockTransactionsResponse {
     pub summary: ::core::option::Option<BlockSummary>,
     #[prost(message, repeated, tag = "3")]
     pub transactions: ::prost::alloc::vec::Vec<BlockTransaction>,
-    /// Final post-block note-commitment-tree roots when the canonical artifact is
-    /// available for this height. Individual roots remain absent before their
-    /// protocol activates; an absent enclosing message means this height has not
-    /// yet been enriched.
+    /// Final post-block note-commitment-tree roots when the explorer advertises
+    /// `explorer.block.final_note_commitment_roots_v1` and the canonical artifact
+    /// is available for this height. Individual roots remain absent before their
+    /// protocol activates; an absent enclosing message means either the field
+    /// capability is unavailable or this height has not yet been enriched.
     #[prost(message, optional, tag = "4")]
     pub final_note_commitment_roots: ::core::option::Option<
         BlockFinalNoteCommitmentRoots,
@@ -1072,12 +1076,16 @@ pub struct CommitmentRootSearchResponse {
     pub matches: ::prost::alloc::vec::Vec<CommitmentRootMatch>,
     #[prost(message, optional, tag = "3")]
     pub coverage: ::core::option::Option<CommitmentRootSearchCoverage>,
-    /// Retained displaced blocks whose final root matches the request. Each row
-    /// supplies the hash accepted by `DisplacedBlockDetail`; coinbase and product
-    /// metadata remain on that dedicated RPC.
+    /// Retained displaced blocks whose final root matches the request. Present
+    /// only when the explorer advertises
+    /// `explorer.commitment_root.displaced_matches_v1`. Each row supplies the hash
+    /// accepted by `DisplacedBlockDetail`; coinbase and product metadata remain
+    /// on that dedicated RPC.
     #[prost(message, repeated, tag = "4")]
     pub displaced_matches: ::prost::alloc::vec::Vec<CommitmentRootMatch>,
     /// Coverage for `displaced_matches`, independent from canonical `coverage`.
+    /// Absent unless the explorer advertises
+    /// `explorer.commitment_root.displaced_matches_v1`.
     #[prost(message, optional, tag = "5")]
     pub displaced_coverage: ::core::option::Option<
         CommitmentRootSearchDisplacedCoverage,
@@ -1226,10 +1234,10 @@ pub struct MempoolActivityEntry {
     /// populated.
     #[prost(uint64, tag = "6")]
     pub zip317_conventional_fee_zat: u64,
-    /// Actual paid fee, in zatoshis. Populated when the explorer advertises
-    /// `EXPLORER_TRANSACTION_FEES_V1` and the wallet plane's mempool prevout
-    /// index resolved every transparent input for this entry. Absent
-    /// otherwise; consumers fall back to `zip317_conventional_fee_zat`.
+    /// Actual paid fee, in zatoshis. The current explorer composition has no
+    /// admitted mempool-prevout provider and leaves this field absent. A future
+    /// composition needs a response-specific capability before populating it;
+    /// consumers fall back to `zip317_conventional_fee_zat`.
     #[prost(uint64, optional, tag = "7")]
     pub paid_fee_zat: ::core::option::Option<u64>,
     /// ZIP-317 logical-action count for this entry. The fee floor formula's
@@ -2528,11 +2536,12 @@ pub struct TransparentAddressActivityRecord {
 /// Per-transaction record materialized by `TransactionFeesConsumer`.
 ///
 /// Storage-only: never returned directly on the wire. The
-/// `TransactionDetail` handler reads this record and projects the values
-/// onto `TransactionDetailResponse`; the `RecentTransactions` handler reads
-/// it to populate the per-entry `paid_fee_zat`. One record per non-
-/// coinbase transaction the consumer has indexed; the key is the canonical
-/// 32-byte transaction id.
+/// explorer handlers read this record only when the endpoint advertises
+/// `explorer.transaction.fees_v1`. It supplies paid-fee fields for transaction
+/// detail, history, and recent rows, plus input-value fallback for transaction
+/// detail and block-transaction rows whose retained parent fact is unavailable.
+/// One record exists per non-coinbase transaction the consumer has indexed; the
+/// key is the canonical 32-byte transaction id.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransactionFeesRecord {
     /// Paid fee in zatoshis (`sum(transparent_input_value) -  sum(transparent_output_value)`). Set only for fully resolved
@@ -2584,7 +2593,8 @@ pub struct RecentTransactionsChunk {
 ///
 /// Denormalized to keep a recent-transactions panel renderable from one
 /// streaming RPC. `zip317_conventional_fee_zat` is unset for coinbase rows;
-/// `paid_fee_zat` is set only when every transparent prevout was resolved.
+/// `paid_fee_zat` is set only when the explorer advertises
+/// `explorer.transaction.fees_v1` and every transparent prevout was resolved.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RecentTransactionEntry {
     /// Canonical transaction id in RPC byte order (64 lowercase hex characters).
@@ -2607,6 +2617,8 @@ pub struct RecentTransactionEntry {
     pub size_bytes: u32,
     #[prost(uint64, optional, tag = "9")]
     pub zip317_conventional_fee_zat: ::core::option::Option<u64>,
+    /// Actual paid fee when the endpoint advertises
+    /// `explorer.transaction.fees_v1` and the fee projection resolved it.
     #[prost(uint64, optional, tag = "10")]
     pub paid_fee_zat: ::core::option::Option<u64>,
     /// ZIP-317 logical-action count before applying the fee layer's grace floor.
@@ -2760,6 +2772,8 @@ pub struct TransactionHistoryEntry {
     pub size_bytes: u32,
     #[prost(uint64, optional, tag = "9")]
     pub zip317_conventional_fee_zat: ::core::option::Option<u64>,
+    /// Actual paid fee when the endpoint advertises
+    /// `explorer.transaction.fees_v1` and the fee projection resolved it.
     #[prost(uint64, optional, tag = "10")]
     pub paid_fee_zat: ::core::option::Option<u64>,
     /// ZIP-317 logical-action count for the transaction. Always set,

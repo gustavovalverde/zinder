@@ -13,9 +13,7 @@ use zinder_core::wire::{
     decode_height_key_descending, decode_in_block_position, decode_rpc_block_hash_hex,
     decode_rpc_transaction_id_hex, encode_internal_transaction_id, encode_rpc_block_hash_hex,
 };
-use zinder_core::{
-    BlockHash, BlockHeight, ChainEpochId, PrivacyShape, TransactionId, TransactionLocation,
-};
+use zinder_core::{BlockHeight, PrivacyShape, TransactionId, TransactionLocation};
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_HISTORY_V2;
 use zinder_proto::v1::explorer::{
     ShieldedProtocol, TransactionFeesRecord, TransactionHistoryCountScope,
@@ -53,26 +51,6 @@ pub(crate) enum TransactionHistoryMaterializedViewReadiness {
 }
 
 impl TransactionHistoryMaterializedViewReadiness {
-    pub(crate) const fn is_available(self) -> bool {
-        matches!(self, Self::Available(_))
-    }
-
-    pub(crate) fn is_complete_at(
-        self,
-        canonical_position: Option<(ChainEpochId, BlockHeight, BlockHash)>,
-    ) -> bool {
-        matches!(
-            self,
-            Self::Available(state)
-                if full_history_coverage(state)
-                    && canonical_position == Some((
-                        state.chain_epoch_id,
-                        state.tip_height,
-                        state.tip_hash,
-                    ))
-        )
-    }
-
     pub(crate) fn require_available(
         self,
     ) -> Result<(), TransactionHistoryMaterializedViewReadError> {
@@ -201,6 +179,8 @@ pub(crate) struct TransactionHistoryContext<'store> {
     pub(crate) materialized_view_store: Option<&'store MaterializedViewStore>,
     pub(crate) chain_store: Option<&'store SecondaryChainStore>,
     pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
+    pub(crate) include_transaction_fees: bool,
+    pub(crate) include_intrinsic_value_balances: bool,
 }
 
 /// Executes one `ExplorerQuery.TransactionHistory` request.
@@ -228,6 +208,7 @@ pub(crate) async fn transaction_history(
         request_fence: inner.read_fence,
         start: inner.start,
         include_total_count: inner.include_total_count,
+        include_transaction_fees: context.include_transaction_fees,
     };
     let snapshot_reader = Arc::clone(&context.materialized_view_reader);
     let snapshot_result =
@@ -245,17 +226,26 @@ pub(crate) async fn transaction_history(
     )
     .await?;
     let mut page = snapshot_read.page;
-    resolve_missing_transparent_fees(
-        context.chain_store,
-        &chain_epoch,
-        &snapshot_read.projected_fee_records,
+    suppress_unadvertised_history_fields(
         &mut page.entries,
-    )?;
-    join_transaction_intrinsic_value_balances(
-        context.chain_store,
-        &chain_epoch,
-        &mut page.entries,
-    )?;
+        context.include_transaction_fees,
+        context.include_intrinsic_value_balances,
+    );
+    if context.include_transaction_fees {
+        resolve_missing_transparent_fees(
+            context.chain_store,
+            &chain_epoch,
+            &snapshot_read.projected_fee_records,
+            &mut page.entries,
+        )?;
+    }
+    if context.include_intrinsic_value_balances {
+        join_transaction_intrinsic_value_balances(
+            context.chain_store,
+            &chain_epoch,
+            &mut page.entries,
+        )?;
+    }
     let freshness = attach_upstream_observation(
         context.upstream_observation_cache,
         build_explorer_freshness(
@@ -300,6 +290,21 @@ pub(crate) async fn transaction_history(
     Ok(Response::new(response))
 }
 
+fn suppress_unadvertised_history_fields(
+    entries: &mut [TransactionHistoryEntry],
+    include_transaction_fees: bool,
+    include_intrinsic_value_balances: bool,
+) {
+    for entry in entries {
+        if !include_transaction_fees {
+            entry.paid_fee_zat = None;
+        }
+        if !include_intrinsic_value_balances {
+            entry.intrinsic_value_balances = None;
+        }
+    }
+}
+
 async fn resolve_transaction_history_chain_epoch(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     materialized_view_state: MaterializedViewState,
@@ -334,6 +339,7 @@ pub(crate) struct TransactionHistorySnapshotRequest {
     request_fence: Option<TransactionHistoryReadFence>,
     start: Option<transaction_history_request::Start>,
     include_total_count: bool,
+    include_transaction_fees: bool,
 }
 
 pub(crate) struct TransactionHistorySnapshotRead {
@@ -371,7 +377,11 @@ fn read_transaction_history_snapshot(
         anchor.as_ref(),
         &request.filter,
     )?;
-    let projected_fee_records = join_projected_paid_fees(&snapshot, &mut page.entries)?;
+    let projected_fee_records = if request.include_transaction_fees {
+        join_projected_paid_fees(&snapshot, &mut page.entries)?
+    } else {
+        HashMap::new()
+    };
     let total_matching_transactions = (request.include_total_count
         && full_history_coverage(materialized_view_state))
     .then(|| transaction_history_total_count(&snapshot, &request.filter))
@@ -1257,7 +1267,23 @@ mod tests {
     }
 
     #[test]
-    fn typed_readiness_distinguishes_omitted_materializing_and_verified_states()
+    fn unadvertised_history_fields_are_removed_from_decoded_rows() {
+        let mut entries = vec![TransactionHistoryEntry {
+            paid_fee_zat: Some(1),
+            intrinsic_value_balances: Some(
+                zinder_proto::v1::explorer::TransactionIntrinsicValueBalances::default(),
+            ),
+            ..TransactionHistoryEntry::default()
+        }];
+
+        suppress_unadvertised_history_fields(&mut entries, false, false);
+
+        assert_eq!(entries[0].paid_fee_zat, None);
+        assert_eq!(entries[0].intrinsic_value_balances, None);
+    }
+
+    #[test]
+    fn structural_history_reader_reports_typed_materialization_outcomes()
     -> Result<(), Box<dyn std::error::Error>> {
         let wallet_path = tempdir()?;
         let wallet_store = MaterializedViewStore::open_with_materialized_view_preset(
@@ -1282,6 +1308,19 @@ mod tests {
             explorer_reader.readiness()?,
             TransactionHistoryMaterializedViewReadiness::Materializing
         );
+        let snapshot_request = TransactionHistorySnapshotRequest {
+            page_size: 1,
+            direction: TransactionHistoryDirection::Older,
+            filter: HistoryFilter::try_from(TransactionHistoryFilter::default())?,
+            request_fence: None,
+            start: None,
+            include_total_count: false,
+            include_transaction_fees: false,
+        };
+        assert!(matches!(
+            explorer_reader.read_snapshot(&snapshot_request),
+            Err(TransactionHistoryMaterializedViewReadError::Materializing)
+        ));
 
         let partial_state = MaterializedViewState {
             chain_epoch_id: ChainEpochId::new(7),
@@ -1291,34 +1330,16 @@ mod tests {
             coverage: None,
         };
         explorer_store.put_consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME, partial_state)?;
-        let readiness = explorer_reader.readiness()?;
-        assert!(readiness.is_available());
-        assert!(!readiness.is_complete_at(Some((
-            partial_state.chain_epoch_id,
-            partial_state.tip_height,
-            partial_state.tip_hash,
-        ))));
+        assert_eq!(
+            explorer_reader.readiness()?,
+            TransactionHistoryMaterializedViewReadiness::Available(partial_state)
+        );
+        let partial_read = explorer_reader.read_snapshot(&snapshot_request)?;
+        assert_eq!(partial_read.materialized_view_state, partial_state);
+        assert!(partial_read.page.entries.is_empty());
 
-        let checkpoint_state = MaterializedViewState {
+        let full_state = MaterializedViewState {
             revision: 2,
-            coverage: Some(MaterializedViewCoverage {
-                complete_from_height: BlockHeight::new(8),
-                complete_through_height: partial_state.tip_height,
-                complete_through_hash: partial_state.tip_hash,
-            }),
-            ..partial_state
-        };
-        explorer_store.put_consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME, checkpoint_state)?;
-        let readiness = explorer_reader.readiness()?;
-        assert!(readiness.is_available());
-        assert!(!readiness.is_complete_at(Some((
-            checkpoint_state.chain_epoch_id,
-            checkpoint_state.tip_height,
-            checkpoint_state.tip_hash,
-        ))));
-
-        let complete_state = MaterializedViewState {
-            revision: 3,
             coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(1),
                 complete_through_height: partial_state.tip_height,
@@ -1326,14 +1347,14 @@ mod tests {
             }),
             ..partial_state
         };
-        explorer_store.put_consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME, complete_state)?;
-        let readiness = explorer_reader.readiness()?;
-        assert!(readiness.is_available());
-        assert!(readiness.is_complete_at(Some((
-            complete_state.chain_epoch_id,
-            complete_state.tip_height,
-            complete_state.tip_hash,
-        ))));
+        explorer_store.put_consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME, full_state)?;
+        assert_eq!(
+            explorer_reader.readiness()?,
+            TransactionHistoryMaterializedViewReadiness::Available(full_state)
+        );
+        let full_read = explorer_reader.read_snapshot(&snapshot_request)?;
+        assert_eq!(full_read.materialized_view_state, full_state);
+        assert!(full_read.page.entries.is_empty());
         Ok(())
     }
 

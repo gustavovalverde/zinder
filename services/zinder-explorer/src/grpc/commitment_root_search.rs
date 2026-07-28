@@ -35,14 +35,27 @@ const MAX_MATCHES: u32 = 100;
 const MAX_CANDIDATES_SCANNED: usize = 1_024;
 const MAX_RECENT_COVERAGE_ROWS: usize = 10_000;
 
+/// Composed dependencies and admitted fields for one root search.
+pub(crate) struct CommitmentRootSearchContext<'store> {
+    pub(crate) materialized_view_store: &'store MaterializedViewStore,
+    pub(crate) canonical_store: &'store SecondaryChainStore,
+    pub(crate) activations: &'store NetworkUpgradeActivations,
+    pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
+    pub(crate) include_displaced_root_results: bool,
+}
+
 /// Executes one canonical final-root search.
 pub(crate) async fn query_commitment_root_search(
-    materialized_view_store: &MaterializedViewStore,
-    canonical_store: &SecondaryChainStore,
-    activations: &NetworkUpgradeActivations,
-    upstream_observation_cache: &UpstreamObservationCache,
+    context: CommitmentRootSearchContext<'_>,
     request: Request<CommitmentRootSearchRequest>,
 ) -> Result<Response<CommitmentRootSearchResponse>, Status> {
+    let CommitmentRootSearchContext {
+        materialized_view_store,
+        canonical_store,
+        activations,
+        upstream_observation_cache,
+        include_displaced_root_results,
+    } = context;
     let request = request.into_inner();
     let root_bytes: [u8; 32] = request.root.as_slice().try_into().map_err(|_| {
         ExplorerError::invalid_request("commitment root must contain exactly 32 bytes")
@@ -67,18 +80,22 @@ pub(crate) async fn query_commitment_root_search(
             ExplorerError::internal("network upgrade activations do not include Sapling")
         })?;
     let matches = canonical_root_matches(materialized_view_store, &reader, root, max_matches)?;
-    let displaced_matches = displaced_root_matches(&reader, root, max_matches)?;
+    let (displaced_matches, displaced_coverage) =
+        read_admitted_displaced_root_results(include_displaced_root_results, || {
+            let matches = displaced_root_matches(&reader, root, max_matches)?;
+            let coverage = displaced_root_search_coverage(
+                reader
+                    .displaced_root_archive_coverage()
+                    .map_err(|error| ExplorerError::internal(error.to_string()))?,
+            );
+            Ok((matches, coverage))
+        })?;
     let coverage = commitment_root_search_coverage(
         materialized_view_store,
         chain_epoch,
         canonical_history_bounds,
         sapling_activation_height,
     )?;
-    let displaced_coverage = displaced_root_search_coverage(
-        reader
-            .displaced_root_archive_coverage()
-            .map_err(|error| ExplorerError::internal(error.to_string()))?,
-    );
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
@@ -94,8 +111,32 @@ pub(crate) async fn query_commitment_root_search(
         matches,
         coverage: Some(coverage),
         displaced_matches,
-        displaced_coverage: Some(displaced_coverage),
+        displaced_coverage,
     }))
+}
+
+fn read_admitted_displaced_root_results(
+    include_displaced_root_results: bool,
+    read: impl FnOnce() -> Result<
+        (
+            Vec<CommitmentRootMatch>,
+            CommitmentRootSearchDisplacedCoverage,
+        ),
+        Status,
+    >,
+) -> Result<
+    (
+        Vec<CommitmentRootMatch>,
+        Option<CommitmentRootSearchDisplacedCoverage>,
+    ),
+    Status,
+> {
+    if include_displaced_root_results {
+        let (matches, coverage) = read()?;
+        Ok((matches, Some(coverage)))
+    } else {
+        Ok((Vec::new(), None))
+    }
 }
 
 fn canonical_root_matches(
@@ -387,6 +428,21 @@ fn wire_protocol(protocol: CoreProtocol) -> Result<ShieldedProtocol, Status> {
 mod tests {
     use super::*;
     use zinder_core::{BlockHash, BlockId, CanonicalHistoryBoundsError};
+
+    #[test]
+    fn unadvertised_displaced_results_skip_storage_and_remain_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage_read = std::cell::Cell::new(false);
+        let (matches, coverage) = read_admitted_displaced_root_results(false, || {
+            storage_read.set(true);
+            Ok((Vec::new(), CommitmentRootSearchDisplacedCoverage::default()))
+        })?;
+
+        assert!(matches.is_empty());
+        assert_eq!(coverage, None);
+        assert!(!storage_read.get());
+        Ok(())
+    }
 
     #[test]
     fn checkpoint_before_sapling_preserves_complete_commitment_root_domain()

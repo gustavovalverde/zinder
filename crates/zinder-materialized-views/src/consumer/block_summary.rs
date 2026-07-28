@@ -4,8 +4,8 @@
 //! consumer-owned `block_summary` column family per
 //! [Explorer plane §Block view shape](../../../../../docs/architecture/explorer-plane.md#block-view-shape).
 //!
-//! Capability strings advertised when the view is wired and the cursor has
-//! caught up: [`EXPLORER_BLOCK_SUMMARY_V1`] and [`EXPLORER_BLOCK_DETAIL_V1`].
+//! Endpoint capability derivation uses this consumer's stable identity; the
+//! consumer does not own or advertise protocol contracts.
 
 use prost::Message as _;
 use zinder_core::wire::{
@@ -15,9 +15,6 @@ use zinder_core::wire::{
 use zinder_core::{
     BlockHash, BlockHeight, CanonicalBlockFacts, CanonicalTransactionFacts,
     TransactionFactsArtifact, TransactionPublicFacts, TransparentOutputFact,
-};
-use zinder_proto::capabilities::{
-    EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1,
 };
 use zinder_proto::v1::explorer::{BlockSummary, BlockSummaryRecord};
 
@@ -36,13 +33,6 @@ pub const BLOCK_SUMMARY_COLUMN_FAMILY: &str = "block_summary";
 /// Stable consumer name persisted in the SDK cursor table.
 pub const BLOCK_SUMMARY_CONSUMER_NAME: MaterializedViewConsumerName =
     MaterializedViewConsumerName::from_static("block_summary");
-
-/// Capability strings the consumer's read surface lights up once caught up.
-pub const BLOCK_SUMMARY_CAPABILITIES: &[&str] = &[
-    EXPLORER_BLOCK_SUMMARY_V1,
-    EXPLORER_BLOCK_DETAIL_V1,
-    EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1,
-];
 
 /// On-disk schema declaration for the block-summary materialized-view consumer.
 pub const BLOCK_SUMMARY_SCHEMA: MaterializedViewConsumerSchema =

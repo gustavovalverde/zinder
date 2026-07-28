@@ -1006,6 +1006,13 @@ impl MaterializedViewStore {
             .any(|schema| schema.name == consumer_name)
     }
 
+    /// Iterates the exact consumer identities declared when this store opened.
+    pub fn declared_consumer_names(
+        &self,
+    ) -> impl Iterator<Item = MaterializedViewConsumerName> + '_ {
+        self.consumers.iter().map(|schema| schema.name)
+    }
+
     /// Returns the closed product workload represented by this store's
     /// selected consumer identities.
     ///

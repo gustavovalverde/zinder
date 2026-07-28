@@ -1143,6 +1143,10 @@ impl NodeSource for FixtureNodeSource {
         self.capabilities
     }
 
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        Some(self.capabilities)
+    }
+
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.read_block_task(height)?
             .await

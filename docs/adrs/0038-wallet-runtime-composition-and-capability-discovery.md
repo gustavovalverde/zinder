@@ -142,6 +142,76 @@ Pair rotation may advance the canonical fence but must preserve retention and
 every other input to the immutable endpoint contract. A candidate that changes
 those inputs is not published.
 
+## Explorer and ingest endpoint composition
+
+The same support-versus-readiness rule applies to the other native endpoints
+without introducing a shared runtime-policy framework.
+
+`ExplorerQueryGrpcAdapter::builder` finalizes an explorer endpoint
+asynchronously. When `explorer.wallet_query_endpoint` is configured, startup
+connects through the shared authenticated transport and calls
+`WalletQuery.ServerInfo` before either the explorer gRPC listener or its
+operational endpoint is bound. Admission verifies the configured network,
+minimum contract revision, the wallet discovery capability, and well-formed
+capability identifiers. Authentication failures, unreachable endpoints, and
+the bounded admission timeout are process-start failures. The finalized
+adapter retains the admitted channel and normalized capability strings; it
+does not reconnect lazily to decide support.
+
+Explorer support is derived from the concrete composition:
+
+- exact materialized-view consumer identities in the admitted store manifest;
+- presence of the admitted canonical secondary where a method reads canonical
+  artifacts;
+- an admitted network-upgrade table, including Sapling evidence for
+  commitment-root search; and
+- all required capabilities advertised by the admitted wallet endpoint.
+
+Configuring `[node]` makes activation discovery a startup requirement. An
+unconfigured node deliberately omits activation-dependent explorer methods; a
+configured node that cannot be reached or does not report Sapling fails
+startup. Materialization progress, coverage, replica lag, and the current
+chain epoch remain request outcomes and freshness data, never capability
+inputs. Field capabilities are retained only alongside an admitted carrier
+method and are checked again where the optional field is emitted.
+
+`ExplorerEndpointMetadata` contains only descriptive endpoint identity. The
+finalized adapter owns one immutable capability allocation shared verbatim by
+`ExplorerQuery.ServerInfo` and the operational endpoint.
+
+After startup admission, the ingest runtime moves the admitted node source
+into one `IngestNodeComposition`. Construction freezes endpoint capability
+identifiers and the network identity from that same source. A source with no
+network identity or only optimistic pre-probe capability defaults is rejected,
+so a caller cannot pair a source with an independently constructed capability
+or endpoint-network claim.
+`ingest.control.chain_value_pools_at_tip_v1`, for example, exists only when
+the owned source advertises `ChainValuePools`; the remaining ingest methods
+follow their concrete installed handlers. The same immutable allocation is
+cloned into `IngestControl.ServerInfo` and the operational endpoint. There is
+no protocol-wide advertise-policy enum and no caller-supplied readiness
+projection.
+
+`ExplorerQuery.TransactionDetail` has one production transaction-fact path
+regardless of whether the explorer also composes a canonical secondary for
+other methods. It requires `WalletQuery.Transaction` plus retained raw
+transaction bytes, parses those bytes through the shared source parser, and
+uses the exact fee and transparent-spend materialized-view consumers for
+optional joins. The former canonical-facts plus
+`WalletQuery.TransparentSpendsByOutpoint` alternative is removed because no
+release composition used it. A canonical secondary remains an independent
+field dependency for intrinsic value balances and for other explorer
+methods.
+
+The current release `WalletServingQuery` does not advertise either native
+transaction lookup or transaction-byte capability. Consequently the current
+release explorer omits `explorer.transaction.detail_v4`, even when its wallet
+store retains transaction blobs and the explorer has a canonical secondary.
+A direct call returns `UNIMPLEMENTED` before request parsing or dependency
+access. This is an intentional structural omission until a real native
+production composition owns both required capabilities; tests must not create
+a broader synthetic wallet profile and call it production proof.
+
 ## Consumer admission and certification
 
 Native consumers such as Zallet own the exact capability requirements for each

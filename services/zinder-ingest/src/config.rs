@@ -196,6 +196,9 @@ pub(crate) enum IngestConfigError {
     Ingest(#[from] IngestError),
 
     #[error(transparent)]
+    NodeComposition(#[from] zinder_ingest::IngestNodeCompositionError),
+
+    #[error(transparent)]
     CanonicalWriter(#[from] zinder_ingest::CanonicalWriterError),
 
     #[error(transparent)]

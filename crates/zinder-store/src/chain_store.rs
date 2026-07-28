@@ -898,6 +898,15 @@ impl SecondaryChainStore {
         Ok(Self { store })
     }
 
+    /// Returns the network explicitly admitted while opening this secondary.
+    ///
+    /// `None` means the caller opened a network-agnostic reader and therefore
+    /// has no immutable network identity suitable for endpoint composition.
+    #[must_use]
+    pub fn network(&self) -> Option<Network> {
+        self.store.options.network
+    }
+
     /// Reads the persisted raw-blob retention signal.
     ///
     /// Returns [`RawBlobRetention::None`] only for an empty store without a

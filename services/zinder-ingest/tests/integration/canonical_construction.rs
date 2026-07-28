@@ -68,6 +68,10 @@ impl NodeSource for SingleBlockSource {
         NodeCapabilities::default()
     }
 
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        Some(self.capabilities())
+    }
+
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.request_count.fetch_add(1, Ordering::Relaxed);
         if height == self.block.height {

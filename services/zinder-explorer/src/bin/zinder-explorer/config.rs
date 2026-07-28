@@ -6,11 +6,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    BearerToken, BearerTokenError, ConfigError, ConfigLoader, NetworkSection, NetworkToml,
-    OpsSection, OpsServerError, OpsToml, ResolvedSecondaryStorage, RuntimeService,
-    SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
+    BearerToken, BearerTokenError, ConfigError, ConfigLoader, InvalidZinderGrpcEndpoint,
+    NetworkSection, NetworkToml, OpsSection, OpsServerError, OpsToml, ResolvedSecondaryStorage,
+    RuntimeService, SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
     guard_optional_serving_bind, guard_serving_bind, load_bearer_token, parse_socket_addr,
     require_field, resolve_allow_public_bind, resolve_ops_listen_addr, resolve_secondary_storage,
+    validate_zinder_grpc_endpoint,
 };
 use zinder_source::{NodeSection, NodeTarget};
 
@@ -30,9 +31,13 @@ pub(crate) struct ExplorerConfig {
     /// (transaction detail, block views, search, mempool activity). An empty
     /// string omits the explorer capabilities that compose wallet reads.
     pub(crate) wallet_query_endpoint: Option<String>,
-    /// Resolved upstream node target. `None` when the operator did not
-    /// configure `[node]`; the upstream-observation probe stays unspawned
-    /// and every `ExplorerFreshness.chain_view.upstream_tip` field is unset.
+    pub(crate) wallet_query_bearer_token_path: Option<PathBuf>,
+    pub(crate) wallet_query_bearer_token: Option<BearerToken>,
+    /// Resolved upstream node target used for activation admission and
+    /// freshness observation. `None` when the operator did not configure
+    /// `[node]`; activation-dependent capabilities are omitted, the
+    /// observation probe stays unspawned, and every
+    /// `ExplorerFreshness.chain_view.upstream_tip` field is unset.
     pub(crate) node: Option<NodeTarget>,
 }
 
@@ -46,6 +51,7 @@ pub(crate) struct ExplorerConfigOverrides {
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) bearer_token_path: Option<PathBuf>,
     pub(crate) wallet_query_endpoint: Option<String>,
+    pub(crate) wallet_query_bearer_token_path: Option<PathBuf>,
 }
 
 /// Error returned while resolving explorer configuration or running the binary.
@@ -72,11 +78,26 @@ pub(crate) enum ExplorerConfigError {
     #[error("invalid explorer bearer token: {0}")]
     BearerToken(#[from] BearerTokenError),
 
+    #[error("invalid wallet-query bearer token: {0}")]
+    WalletQueryBearerToken(#[source] BearerTokenError),
+
+    #[error(transparent)]
+    InvalidWalletQueryEndpoint(#[from] InvalidZinderGrpcEndpoint),
+
+    #[error("explorer.wallet_query_bearer_token_path requires explorer.wallet_query_endpoint")]
+    WalletQueryBearerTokenWithoutEndpoint,
+
+    #[error(transparent)]
+    EndpointAdmission(#[from] zinder_explorer::ExplorerEndpointAdmissionError),
+
     #[error("invalid [node] configuration: {0}")]
     Node(#[from] zinder_source::NodeConfigError),
 
     #[error("failed to build upstream node source: {0}")]
     NodeSource(#[from] zinder_source::SourceError),
+
+    #[error("node-advertised network-upgrade activations do not include Sapling")]
+    MissingSaplingActivation,
 }
 
 /// Loads and validates explorer configuration from defaults, file, environment, and CLI overrides.
@@ -117,6 +138,10 @@ pub(crate) fn load_explorer_config(
             "explorer.wallet_query_endpoint",
             overrides.wallet_query_endpoint,
         )?
+        .with_override_path_if(
+            "explorer.wallet_query_bearer_token_path",
+            overrides.wallet_query_bearer_token_path,
+        )?
         .load()?;
     resolve_explorer_config(raw)
 }
@@ -145,6 +170,7 @@ struct ExplorerSection {
     listen_addr: Option<String>,
     bearer_token_path: Option<PathBuf>,
     wallet_query_endpoint: Option<String>,
+    wallet_query_bearer_token_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -162,6 +188,8 @@ struct ExplorerToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     bearer_token_path: Option<String>,
     wallet_query_endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet_query_bearer_token_path: Option<String>,
 }
 
 impl ExplorerConfigToml {
@@ -178,6 +206,10 @@ impl ExplorerConfigToml {
                     .as_ref()
                     .map(|path| path.display().to_string()),
                 wallet_query_endpoint: config.wallet_query_endpoint.clone().unwrap_or_default(),
+                wallet_query_bearer_token_path: config
+                    .wallet_query_bearer_token_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
             },
         }
     }
@@ -198,6 +230,18 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
         .explorer
         .wallet_query_endpoint
         .filter(|endpoint| !endpoint.is_empty());
+    if let Some(endpoint) = wallet_query_endpoint.as_deref() {
+        validate_zinder_grpc_endpoint(endpoint)?;
+    }
+    let wallet_query_bearer_token_path = raw.explorer.wallet_query_bearer_token_path;
+    if wallet_query_bearer_token_path.is_some() && wallet_query_endpoint.is_none() {
+        return Err(ExplorerConfigError::WalletQueryBearerTokenWithoutEndpoint);
+    }
+    let wallet_query_bearer_token = wallet_query_bearer_token_path
+        .as_deref()
+        .map(BearerToken::from_file)
+        .transpose()
+        .map_err(ExplorerConfigError::WalletQueryBearerToken)?;
     let node = NodeTarget::resolve_optional(network, raw.node)?;
     Ok(ExplorerConfig {
         network,
@@ -208,6 +252,8 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
         bearer_token_path,
         bearer_token,
         wallet_query_endpoint,
+        wallet_query_bearer_token_path,
+        wallet_query_bearer_token,
         node,
     })
 }

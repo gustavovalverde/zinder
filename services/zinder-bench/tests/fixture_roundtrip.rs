@@ -116,6 +116,10 @@ impl NodeSource for CheckpointSource {
         NodeCapabilities::default()
     }
 
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        Some(self.capabilities())
+    }
+
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         Err(SourceError::BlockUnavailable {
             height,

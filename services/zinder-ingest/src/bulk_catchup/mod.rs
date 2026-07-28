@@ -2776,6 +2776,10 @@ mod tests {
             ZebraJsonRpcSource::baseline_capabilities()
         }
 
+        fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+            Some(self.capabilities())
+        }
+
         async fn fetch_chain_segment(
             &self,
             limits: SourceChainSegmentLimits,
@@ -2836,6 +2840,10 @@ mod tests {
     impl NodeSource for SplitHeadSegmentSource {
         fn capabilities(&self) -> NodeCapabilities {
             ZebraJsonRpcSource::baseline_capabilities()
+        }
+
+        fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+            Some(self.capabilities())
         }
 
         async fn fetch_chain_segment(
@@ -2904,6 +2912,10 @@ mod tests {
             ZebraJsonRpcSource::baseline_capabilities()
         }
 
+        fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+            Some(self.capabilities())
+        }
+
         async fn fetch_chain_segment(
             &self,
             limits: SourceChainSegmentLimits,
@@ -2954,6 +2966,10 @@ mod tests {
     impl NodeSource for FlakyNodeSource {
         fn capabilities(&self) -> NodeCapabilities {
             self.delegate.capabilities()
+        }
+
+        fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+            self.delegate.admitted_capabilities()
         }
 
         async fn fetch_chain_segment(
@@ -3030,6 +3046,10 @@ mod tests {
             self.delegate.capabilities()
         }
 
+        fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+            self.delegate.admitted_capabilities()
+        }
+
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
             self.delegate.fetch_block_at(height).await
         }
@@ -3068,6 +3088,10 @@ mod tests {
     impl NodeSource for TestNodeSource {
         fn capabilities(&self) -> NodeCapabilities {
             ZebraJsonRpcSource::baseline_capabilities()
+        }
+
+        fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+            Some(self.capabilities())
         }
 
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

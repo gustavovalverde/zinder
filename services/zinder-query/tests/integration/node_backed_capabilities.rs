@@ -458,6 +458,10 @@ impl NodeSource for ProbedValuePoolSource {
         self.capabilities
     }
 
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        Some(self.capabilities)
+    }
+
     async fn fetch_block_at(&self, _height: BlockHeight) -> Result<SourceBlock, SourceError> {
         Err(SourceError::NodeUnavailable {
             reason: "node-backed capability test does not fetch blocks".to_owned(),

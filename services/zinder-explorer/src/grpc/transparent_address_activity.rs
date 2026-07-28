@@ -70,7 +70,7 @@ pub(crate) struct TransparentAddressActivityContext<'store> {
 
 pub(crate) async fn query_transparent_address_activity(
     context: TransparentAddressActivityContext<'_>,
-    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    wallet_client: Option<&mut WalletQueryClient<AuthenticatedChannel>>,
     request: Request<TransparentAddressActivityRequest>,
 ) -> Result<Response<TransparentAddressActivityResponse>, Status> {
     let TransparentAddressActivityContext {
@@ -145,7 +145,7 @@ pub(crate) async fn query_transparent_address_activity(
 
 async fn resolve_activity_chain_epoch(
     canonical_store: Option<&SecondaryChainStore>,
-    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    wallet_client: Option<&mut WalletQueryClient<AuthenticatedChannel>>,
     at_epoch_id: Option<u64>,
 ) -> Result<wallet::ChainEpoch, Status> {
     if let Some(canonical_store) = canonical_store {
@@ -164,6 +164,11 @@ async fn resolve_activity_chain_epoch(
     }
 
     wallet_client
+        .ok_or_else(|| {
+            ExplorerError::internal(
+                "transparent address activity lacks both canonical and WalletQuery epoch sources",
+            )
+        })?
         .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id }))
         .await?
         .into_inner()

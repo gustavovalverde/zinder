@@ -335,6 +335,10 @@ impl NodeSource for FixtureCheckpointSource {
         NodeCapabilities::new([NodeCapability::TreeState]).unwrap_or_default()
     }
 
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        Some(self.capabilities())
+    }
+
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
         self.fetched_heights.lock().push(height);
 

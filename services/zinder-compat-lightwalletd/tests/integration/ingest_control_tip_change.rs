@@ -18,7 +18,7 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
-    CanonicalWriterConfig, LiveMempoolOwner, canonical_control_channel,
+    CanonicalWriterConfig, IngestNodeComposition, LiveMempoolOwner, canonical_control_channel,
     run_canonical_writer_with_control,
 };
 use zinder_proto::v1::ingest::{WriterStatusRequest, ingest_control_client::IngestControlClient};
@@ -81,11 +81,11 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
+    let node_composition = IngestNodeComposition::new(Arc::new(source.clone()))?;
     let adapter = CanonicalIngestControlGrpcAdapter::new(
-        Network::ZcashRegtest,
         canonical.clone(),
         LiveMempoolOwner::default(),
-        Arc::new(source.clone()),
+        node_composition,
         readiness,
     );
     let server_cancel = cancel.clone();
@@ -237,6 +237,14 @@ impl MutableTipSource {
 impl NodeSource for MutableTipSource {
     fn capabilities(&self) -> NodeCapabilities {
         NodeCapabilities::default()
+    }
+
+    fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
+        Some(self.capabilities())
+    }
+
+    fn network(&self) -> Option<Network> {
+        Some(Network::ZcashRegtest)
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
