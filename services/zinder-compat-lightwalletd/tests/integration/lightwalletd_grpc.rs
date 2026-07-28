@@ -34,11 +34,12 @@ use zinder_proto::compat::lightwalletd::{
 };
 
 use zinder_query::{
-    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange, FullBlock,
-    FullBlockStream, QueryError, RawTransaction, SettledTipBlock, SubtreeRoots, Transaction,
-    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    VisibleTipBlock, WalletQuery, WalletQueryApi,
+    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
+    DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, QueryError, RawTransaction,
+    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, VisibleTipBlock, WalletQuery,
+    WalletQueryApi,
 };
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEventStreamFamily,
@@ -329,6 +330,79 @@ async fn get_block_range_methods_serve_genesis_when_artifacts_are_retained() -> 
     Ok(())
 }
 
+/// lightwalletd puts no width bound on `BlockRange`, and the Zcash SDK clients
+/// pointed at this surface rely on that. A window wider than one store read
+/// must stream in full instead of failing the call.
+#[tokio::test]
+async fn get_block_range_streams_windows_wider_than_one_store_read() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
+    let visible_tip_height = BlockHeight::new(2500);
+    let recorder = EpochPinRecorder::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        Arc::new(sample_regtest_upgrade_activations()),
+    ))
+    .with_synthetic_compact_blocks_to(visible_tip_height);
+    let adapter = LightwalletdGrpcAdapter::new(
+        recorder.clone(),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+
+    let request = |start: u64, end: u64| lightwalletd::BlockRange {
+        start: Some(lightwalletd::BlockId {
+            height: start,
+            hash: Vec::new(),
+        }),
+        end: Some(lightwalletd::BlockId {
+            height: end,
+            hash: Vec::new(),
+        }),
+        pool_types: Vec::new(),
+    };
+
+    let ascending = collect_stream(
+        adapter
+            .get_block_range(Request::new(request(1, 2500)))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    assert_eq!(
+        ascending
+            .iter()
+            .map(|block| block.height)
+            .collect::<Vec<_>>(),
+        (1..=2500).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        recorder.recorded_compact_block_ranges(),
+        vec![
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1000)),
+            BlockHeightRange::inclusive(BlockHeight::new(1001), BlockHeight::new(2000)),
+            BlockHeightRange::inclusive(BlockHeight::new(2001), BlockHeight::new(2500)),
+        ],
+        "each store read must stay within the compact-block range cap"
+    );
+
+    let descending = collect_stream(
+        adapter
+            .get_block_range(Request::new(request(2500, 1)))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    assert_eq!(
+        descending
+            .iter()
+            .map(|block| block.height)
+            .collect::<Vec<_>>(),
+        (1..=2500).rev().collect::<Vec<_>>(),
+        "descending windows must stay monotonic across chunk edges"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_block_range_rejects_malformed_requests_before_streaming() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
@@ -594,7 +668,9 @@ async fn get_subtree_roots_serves_non_empty_orchard_and_ironwood() -> eyre::Resu
 struct EpochPinRecorder<Inner> {
     inner: Inner,
     recorded_epoch_ids: Arc<Mutex<Vec<Option<ChainEpochId>>>>,
+    recorded_compact_block_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
     transparent_address_balance: Option<TransparentAddressBalance>,
+    synthetic_visible_tip_height: Option<BlockHeight>,
 }
 
 impl<Inner> EpochPinRecorder<Inner> {
@@ -602,7 +678,9 @@ impl<Inner> EpochPinRecorder<Inner> {
         Self {
             inner,
             recorded_epoch_ids: Arc::new(Mutex::new(Vec::new())),
+            recorded_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
             transparent_address_balance: None,
+            synthetic_visible_tip_height: None,
         }
     }
 
@@ -614,6 +692,14 @@ impl<Inner> EpochPinRecorder<Inner> {
         self
     }
 
+    /// Reports `visible_tip_height` as the visible tip and answers every
+    /// compact-block range from synthetic blocks, so a test can span more
+    /// heights than a store fixture holds.
+    fn with_synthetic_compact_blocks_to(mut self, visible_tip_height: BlockHeight) -> Self {
+        self.synthetic_visible_tip_height = Some(visible_tip_height);
+        self
+    }
+
     fn record(&self, at_epoch_id: Option<ChainEpochId>) {
         self.recorded_epoch_ids.lock().push(at_epoch_id);
     }
@@ -621,6 +707,28 @@ impl<Inner> EpochPinRecorder<Inner> {
     fn recorded_epoch_ids(&self) -> Vec<Option<ChainEpochId>> {
         self.recorded_epoch_ids.lock().clone()
     }
+
+    fn recorded_compact_block_ranges(&self) -> Vec<BlockHeightRange> {
+        self.recorded_compact_block_ranges.lock().clone()
+    }
+}
+
+fn synthetic_compact_block(height: BlockHeight) -> CompactBlockArtifact {
+    let block_hash = |height: u32| {
+        let mut bytes = [0_u8; 32];
+        bytes[..4].copy_from_slice(&height.to_le_bytes());
+        BlockHash::from_bytes(bytes)
+    };
+    CompactBlockArtifact::empty(
+        BlockId::new(height, block_hash(height.value())),
+        block_hash(height.value().saturating_sub(1)),
+        0,
+        CompactChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
+    )
 }
 
 #[async_trait]
@@ -633,7 +741,12 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<VisibleTipBlock, QueryError> {
-        self.inner.visible_tip_block(at_epoch_id).await
+        let mut visible_tip_block = self.inner.visible_tip_block(at_epoch_id).await?;
+        if let Some(height) = self.synthetic_visible_tip_height {
+            visible_tip_block.height = height;
+            visible_tip_block.chain_epoch.visible_tip_height = height;
+        }
+        Ok(visible_tip_block)
     }
 
     async fn settled_tip_block(
@@ -679,6 +792,23 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError> {
         self.record(at_epoch_id);
+        self.recorded_compact_block_ranges.lock().push(block_range);
+        if self.synthetic_visible_tip_height.is_some() {
+            let requested = block_range.into_iter().len();
+            let maximum =
+                usize::try_from(DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()).unwrap_or(usize::MAX);
+            if requested > maximum {
+                return Err(QueryError::CompactBlockRangeTooLarge { requested, maximum });
+            }
+            return Ok(CompactBlockRange {
+                chain_epoch: self.visible_tip_block(at_epoch_id).await?.chain_epoch,
+                block_range,
+                compact_blocks: block_range
+                    .into_iter()
+                    .map(synthetic_compact_block)
+                    .collect(),
+            });
+        }
         self.inner
             .compact_blocks_in_range(block_range, at_epoch_id)
             .await

@@ -11,7 +11,7 @@ groups:
           description: "{{ $labels.service }} has not been scrapeable for 30 seconds."
 
       - alert: ZinderServiceNotReady
-        expr: zinder_readiness_state{cause!~"^(ready|cursor_at_risk)$"} == 1
+        expr: zinder_readiness_state{cause!~"^(ready|cursor_at_risk|serving_pair_stale)$"} == 1
         for: 1m
         labels:
           severity: warning
@@ -27,6 +27,18 @@ groups:
         annotations:
           summary: "Zinder readiness warning"
           description: "{{ $labels.service }} reports traffic-safe readiness warning {{ $labels.cause }}."
+
+      # The cause clears itself once storage.serving_pair_staleness_ceiling_ms
+      # passes, so this window must stay well inside the shortest ceiling an
+      # operator would configure.
+      - alert: ZinderServingPairStale
+        expr: zinder_readiness_state{cause=~"^serving_pair_stale$"} == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zinder wallet-serving pair is stale"
+          description: "{{ $labels.service }} is answering from the pair the writer last attested; it stops admitting traffic when the staleness ceiling passes."
 
       - alert: ZinderReplicaLag
         expr: max by (service) (zinder_readiness_replica_lag_chain_epochs) > 0

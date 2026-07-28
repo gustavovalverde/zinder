@@ -121,6 +121,20 @@ pub enum ReadinessCause {
         /// Chain-epoch distance between the writer and this secondary reader.
         lag_chain_epochs: u64,
     },
+    /// A wallet-serving reader cannot refresh or re-match its published pair,
+    /// but that pair is still exactly what the writer last attested and is
+    /// within its staleness ceiling.
+    ///
+    /// Traffic stays admitted: the served chain view is a real admitted fence,
+    /// only an older one. Crossing the ceiling replaces this warning with the
+    /// fail-closed cause the underlying failure raises on its own.
+    ServingPairStale {
+        /// Chain-epoch distance between the writer and the published pair at
+        /// the last successful writer-status fetch.
+        lag_chain_epochs: u64,
+        /// Seconds since the writer last attested the published pair.
+        staleness_seconds: u64,
+    },
     /// The private ingest writer-status RPC cannot be reached.
     WriterStatusUnavailable,
     /// Retained event history is approaching the configured cursor-expiry window.
@@ -290,6 +304,7 @@ impl ReadinessCause {
         "schema_mismatch",
         "reorg_window_exceeded",
         "replica_lagging",
+        "serving_pair_stale",
         "writer_status_unavailable",
         "cursor_at_risk",
         "shutting_down",
@@ -309,6 +324,7 @@ impl ReadinessCause {
             Self::SchemaMismatch => "schema_mismatch",
             Self::ReorgWindowExceeded { .. } => "reorg_window_exceeded",
             Self::ReplicaLagging { .. } => "replica_lagging",
+            Self::ServingPairStale { .. } => "serving_pair_stale",
             Self::WriterStatusUnavailable => "writer_status_unavailable",
             Self::CursorAtRisk { .. } => "cursor_at_risk",
             Self::ShuttingDown => "shutting_down",
@@ -335,6 +351,7 @@ impl ReadinessCause {
             | Self::SchemaMismatch
             | Self::ReorgWindowExceeded { .. }
             | Self::ReplicaLagging { .. }
+            | Self::ServingPairStale { .. }
             | Self::WriterStatusUnavailable
             | Self::CursorAtRisk { .. }
             | Self::ShuttingDown
@@ -349,7 +366,10 @@ impl ReadinessCause {
     /// fail while the service can still safely serve requests.
     #[must_use]
     pub const fn permits_traffic(&self) -> bool {
-        matches!(self, Self::Ready | Self::CursorAtRisk { .. })
+        matches!(
+            self,
+            Self::Ready | Self::CursorAtRisk { .. } | Self::ServingPairStale { .. }
+        )
     }
 
     const fn preserves_observed_target(&self) -> bool {
@@ -712,6 +732,28 @@ impl ReadinessState {
         }
     }
 
+    /// Returns a stale-serving-pair warning for wallet-serving readers.
+    ///
+    /// `current_height` carries the visible tip of the published pair, which
+    /// is the chain view the reader keeps answering from while the warning is
+    /// active.
+    #[must_use]
+    pub const fn serving_pair_stale(
+        lag_chain_epochs: u64,
+        staleness_seconds: u64,
+        current_height: Option<u32>,
+    ) -> Self {
+        Self {
+            cause: ReadinessCause::ServingPairStale {
+                lag_chain_epochs,
+                staleness_seconds,
+            },
+            current_height,
+            target_height: None,
+            phase: None,
+        }
+    }
+
     /// Returns a cursor-at-risk state for event retention.
     #[must_use]
     pub const fn cursor_at_risk(
@@ -775,6 +817,7 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
             ReadinessCause::SchemaMismatch => Self::SchemaMismatch,
             ReadinessCause::ReorgWindowExceeded { .. } => Self::ReorgWindowExceeded,
             ReadinessCause::ReplicaLagging { .. } => Self::ReplicaLagging,
+            ReadinessCause::ServingPairStale { .. } => Self::ServingPairStale,
             ReadinessCause::WriterStatusUnavailable => Self::WriterStatusUnavailable,
             ReadinessCause::CursorAtRisk { .. } => Self::CursorAtRisk,
             ReadinessCause::ShuttingDown => Self::ShuttingDown,
@@ -823,6 +866,15 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
                     },
                 )
             }
+            ReadinessCause::ServingPairStale {
+                lag_chain_epochs,
+                staleness_seconds,
+            } => ops_proto::readiness_cause_detail::Payload::ServingPairStale(
+                ops_proto::ServingPairStaleDetail {
+                    lag_chain_epochs: *lag_chain_epochs,
+                    staleness_seconds: *staleness_seconds,
+                },
+            ),
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours,
                 retention_hours,
@@ -909,12 +961,55 @@ mod tests {
         readiness.set(ReadinessState::cursor_at_risk(145, 168, Some(100)));
         interceptor.call(Request::new(()))?;
 
+        readiness.set(ReadinessState::serving_pair_stale(2, 42, Some(100)));
+        interceptor.call(Request::new(()))?;
+
         readiness.set(ReadinessState::replica_lagging(3, Some(100)));
         let blocked = interceptor
             .call(Request::new(()))
             .err()
             .ok_or("replica lag readiness must reject new traffic")?;
         assert_eq!(blocked.code(), tonic::Code::Unavailable);
+
+        readiness.set(ReadinessState::not_ready(ReadinessCause::SchemaMismatch));
+        let blocked = interceptor
+            .call(Request::new(()))
+            .err()
+            .ok_or("schema mismatch readiness must reject new traffic")?;
+        assert_eq!(blocked.code(), tonic::Code::Unavailable);
+        Ok(())
+    }
+
+    #[test]
+    fn serving_pair_stale_admits_traffic_and_carries_lag_and_staleness()
+    -> Result<(), serde_json::Error> {
+        let readiness = Readiness::new(ReadinessState::serving_pair_stale(7, 42, Some(100)));
+        let report = readiness.report();
+        assert!(report.is_ready);
+        assert_eq!(report.current_height, Some(100));
+        assert_eq!(report.cause.metric_label(), "serving_pair_stale");
+
+        let rendered = serde_json::to_value(&report)?;
+        let cause = &rendered["cause"]["serving_pair_stale"];
+        assert_eq!(cause["lag_chain_epochs"], 7);
+        assert_eq!(cause["staleness_seconds"], 42);
+
+        let proto = ops_proto::ReadinessReport::from(&report);
+        assert_eq!(
+            proto.cause,
+            ops_proto::ReadinessCause::ServingPairStale as i32
+        );
+        let Some(detail) = proto.detail else {
+            unreachable!("ServingPairStale must carry detail")
+        };
+        let Some(payload) = detail.payload else {
+            unreachable!("detail must carry a payload")
+        };
+        let ops_proto::readiness_cause_detail::Payload::ServingPairStale(payload) = payload else {
+            unreachable!("expected ServingPairStale payload variant")
+        };
+        assert_eq!(payload.lag_chain_epochs, 7);
+        assert_eq!(payload.staleness_seconds, 42);
         Ok(())
     }
 
@@ -1156,6 +1251,10 @@ mod tests {
             ReadinessCause::ReplicaLagging {
                 lag_chain_epochs: 0,
             },
+            ReadinessCause::ServingPairStale {
+                lag_chain_epochs: 0,
+                staleness_seconds: 0,
+            },
             ReadinessCause::WriterStatusUnavailable,
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours: 0,
@@ -1201,6 +1300,7 @@ mod tests {
                 ops_proto::ReadinessCause::ReorgWindowExceeded
             }
             ReadinessCause::ReplicaLagging { .. } => ops_proto::ReadinessCause::ReplicaLagging,
+            ReadinessCause::ServingPairStale { .. } => ops_proto::ReadinessCause::ServingPairStale,
             ReadinessCause::WriterStatusUnavailable => {
                 ops_proto::ReadinessCause::WriterStatusUnavailable
             }
@@ -1241,6 +1341,10 @@ mod tests {
             },
             ReadinessCause::ReplicaLagging {
                 lag_chain_epochs: 0,
+            },
+            ReadinessCause::ServingPairStale {
+                lag_chain_epochs: 0,
+                staleness_seconds: 0,
             },
             ReadinessCause::WriterStatusUnavailable,
             ReadinessCause::CursorAtRisk {

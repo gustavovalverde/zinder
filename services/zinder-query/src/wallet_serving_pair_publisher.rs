@@ -68,6 +68,10 @@ pub struct WalletServingPairConfig {
     pub convergence_attempts: NonZeroU8,
     /// Writer lag tolerated before readiness fails.
     pub replica_lag_threshold_chain_epochs: u64,
+    /// Longest a published pair keeps admitting traffic after the last writer
+    /// attestation. Past it the transient warning gives way to the fail-closed
+    /// cause the failure would otherwise have raised.
+    pub serving_pair_staleness_ceiling: Duration,
 }
 
 /// Slot captured once by each request before it reads canonical or wallet data.
@@ -158,6 +162,18 @@ pub struct WalletServingPairPublisher {
     serving_pair_slot: Option<WalletServingPairSlot>,
     generations: [SecondaryGeneration; SECONDARY_GENERATION_COUNT],
     published_generation: Option<usize>,
+    /// Trailing reference to the pair swapped out of the slot.
+    ///
+    /// Holding it makes the publisher the last owner of every retired pair,
+    /// so the direct-I/O `RocksDB` close never runs on a request task's
+    /// reactor thread. Only one pair is ever retained: reusing a generation
+    /// requires its lease to have drained, which cannot happen while this
+    /// reference is alive.
+    retired_pair: Option<Arc<WalletServingReadPair>>,
+    /// Instant of the last writer attestation of the published pair.
+    attested_at: Instant,
+    /// Writer lag observed at the last successful writer-status fetch.
+    observed_lag_chain_epochs: u64,
 }
 
 impl WalletServingPairPublisher {
@@ -181,6 +197,9 @@ impl WalletServingPairPublisher {
             serving_pair_slot: None,
             generations,
             published_generation: None,
+            retired_pair: None,
+            attested_at: Instant::now(),
+            observed_lag_chain_epochs: 0,
         };
         publisher.prepare_candidate(0).await?;
         publisher.converge_and_publish(0).await?;
@@ -216,6 +235,7 @@ impl WalletServingPairPublisher {
     }
 
     async fn refresh_once(&mut self) -> Result<(), WalletServingPairError> {
+        self.reap_retired_pair().await;
         let serving_pair_slot = self
             .serving_pair_slot
             .as_ref()
@@ -232,6 +252,30 @@ impl WalletServingPairPublisher {
             return Ok(());
         }
         self.converge_and_publish(generation).await
+    }
+
+    /// Closes the retired pair's `RocksDB` handles on the blocking pool.
+    ///
+    /// Closing a direct-I/O instance is expensive, so the drop that actually
+    /// runs the destructors is moved off the reactor. The pair stays open
+    /// until the last request that captured it has released it; that is the
+    /// same condition [`Self::prepare_candidate`] already waits on before
+    /// reopening the generation.
+    async fn reap_retired_pair(&mut self) {
+        let Some(retired_pair) = self.retired_pair.take() else {
+            return;
+        };
+        if Arc::strong_count(&retired_pair) > 1 {
+            self.retired_pair = Some(retired_pair);
+            return;
+        }
+        let started_at = Instant::now();
+        let teardown = tokio::task::spawn_blocking(move || drop(retired_pair)).await;
+        metrics::histogram!(
+            "zinder_wallet_serving_pair_publisher_teardown_duration_seconds",
+            "status" => if teardown.is_ok() { "ok" } else { "error" }
+        )
+        .record(started_at.elapsed());
     }
 
     fn inactive_generation(&self) -> usize {
@@ -428,11 +472,13 @@ impl WalletServingPairPublisher {
             WalletServingReadPair::new(canonical, wallet)
                 .map_err(WalletServingPairError::PairPublication)?,
         );
-        publish_serving_pair(&mut self.serving_pair_slot, Arc::clone(&pair));
+        self.retired_pair = publish_serving_pair(&mut self.serving_pair_slot, Arc::clone(&pair));
         self.generations[generation].state = SecondaryGenerationState::Published {
             lease: GenerationLease::new(&pair),
         };
         self.published_generation = Some(generation);
+        self.attested_at = Instant::now();
+        self.observed_lag_chain_epochs = 0;
         let visible_height = Some(pair.canonical_fence().visible_tip().height.value());
         self.readiness.set(ReadinessState::ready(visible_height));
         metrics::counter!("zinder_wallet_serving_pair_publisher_publications_total").increment(1);
@@ -449,7 +495,7 @@ impl WalletServingPairPublisher {
     }
 
     fn update_active_readiness(
-        &self,
+        &mut self,
         active_pair: &WalletServingReadPair,
         writer_status: &CanonicalWriterStatusResponse,
     ) -> Result<ActiveWriterRelation, WalletServingPairError> {
@@ -470,14 +516,19 @@ impl WalletServingPairPublisher {
                 return Err(WalletServingPairError::WriterFenceMismatch);
             }
             record_replica_lag(0);
+            self.attested_at = Instant::now();
+            self.observed_lag_chain_epochs = 0;
             self.readiness.set(ReadinessState::ready(visible_height));
             return Ok(ActiveWriterRelation::Exact);
         }
         let lag = writer_fence.chain_epoch_id.saturating_sub(active_epoch);
         record_replica_lag(lag);
+        self.observed_lag_chain_epochs = lag;
         if lag > self.config.replica_lag_threshold_chain_epochs {
-            self.readiness
-                .set(ReadinessState::replica_lagging(lag, visible_height));
+            self.readiness.set(
+                self.stale_serving_pair_readiness(visible_height)
+                    .unwrap_or_else(|| ReadinessState::replica_lagging(lag, visible_height)),
+            );
         } else {
             self.readiness.set(ReadinessState::ready_with_target(
                 visible_height,
@@ -485,6 +536,22 @@ impl WalletServingPairPublisher {
             ));
         }
         Ok(ActiveWriterRelation::Behind)
+    }
+
+    /// Returns the traffic-permitting stale-pair state while the published
+    /// pair is still within the staleness ceiling.
+    ///
+    /// `None` once the ceiling passes, so the caller falls back to the
+    /// fail-closed cause and the service stops admitting traffic.
+    fn stale_serving_pair_readiness(&self, visible_height: Option<u32>) -> Option<ReadinessState> {
+        let staleness = self.attested_at.elapsed();
+        (staleness < self.config.serving_pair_staleness_ceiling).then(|| {
+            ReadinessState::serving_pair_stale(
+                self.observed_lag_chain_epochs,
+                staleness.as_secs(),
+                visible_height,
+            )
+        })
     }
 
     fn record_refresh_failure(&self, error: &WalletServingPairError) {
@@ -496,16 +563,22 @@ impl WalletServingPairPublisher {
                 .height
                 .value()
         });
-        if let Some(cause) = refresh_failure_not_ready_cause(error) {
-            self.readiness.set(ReadinessState::not_ready(cause));
-        } else {
-            self.readiness.set(ReadinessState::replica_lagging(
-                self.config
-                    .replica_lag_threshold_chain_epochs
-                    .saturating_add(1),
-                visible_height,
-            ));
-        }
+        let admitted_while_stale = refresh_failure_retains_attested_pair(error)
+            .then(|| self.stale_serving_pair_readiness(visible_height))
+            .flatten();
+        self.readiness.set(admitted_while_stale.unwrap_or_else(|| {
+            refresh_failure_not_ready_cause(error).map_or_else(
+                || {
+                    ReadinessState::replica_lagging(
+                        self.config
+                            .replica_lag_threshold_chain_epochs
+                            .saturating_add(1),
+                        visible_height,
+                    )
+                },
+                ReadinessState::not_ready,
+            )
+        }));
         metrics::counter!(
             "zinder_wallet_serving_pair_publisher_refresh_total",
             "status" => "error",
@@ -578,17 +651,18 @@ impl<T: ?Sized> GenerationLease<T> {
 
 /// Publishes a fully admitted immutable reader pair without affecting any
 /// request that already captured the prior pair from the slot.
+///
+/// Returns the retired pair so the publisher, rather than whichever task
+/// happens to finish last, decides where its handles close.
 fn publish_serving_pair<T: Send + Sync + 'static>(
     slot: &mut Option<Arc<ArcSwap<T>>>,
     pair: Arc<T>,
-) -> Arc<ArcSwap<T>> {
-    if let Some(slot) = slot {
-        slot.store(pair);
-        Arc::clone(slot)
+) -> Option<Arc<T>> {
+    if let Some(published_slot) = slot {
+        Some(published_slot.swap(pair))
     } else {
-        let published_slot = Arc::new(ArcSwap::from(pair));
-        *slot = Some(Arc::clone(&published_slot));
-        published_slot
+        *slot = Some(Arc::new(ArcSwap::from(pair)));
+        None
     }
 }
 
@@ -690,8 +764,28 @@ fn record_replica_lag(lag_chain_epochs: u64) {
     metrics::gauge!("zinder_wallet_serving_pair_publisher_replica_lag_chain_epochs").set(lag);
 }
 
+/// Returns whether a refresh failure leaves the published pair exactly as the
+/// writer last attested it.
+///
+/// Only lag and control-plane transport failures qualify: they describe the
+/// candidate generation or the status RPC, never the published pair. Every
+/// failure that impugns the pair itself, its schema, or the slot holding it is
+/// excluded, so those keep failing closed the moment they occur.
+fn refresh_failure_retains_attested_pair(error: &WalletServingPairError) -> bool {
+    matches!(
+        error,
+        WalletServingPairError::WriterStatusConnect(_)
+            | WalletServingPairError::WriterStatusRpc(_)
+            | WalletServingPairError::ConvergenceTimedOut {
+                last_outcome: WalletServingConvergence::ReplicaBehind
+                    | WalletServingConvergence::ProjectionBehind,
+            }
+    )
+}
+
 /// Returns the fail-closed readiness cause for a refresh error. `None` is
-/// reserved for a normally typed replica-behind outcome.
+/// reserved for the convergence-lag outcomes, which the caller reports as
+/// replica lag rather than as a storage failure.
 fn refresh_failure_not_ready_cause(error: &WalletServingPairError) -> Option<ReadinessCause> {
     match error {
         WalletServingPairError::WriterStatusConnect(_)
@@ -704,12 +798,10 @@ fn refresh_failure_not_ready_cause(error: &WalletServingPairError) -> Option<Rea
             last_outcome: WalletServingConvergence::SchemaOrFenceMismatch,
         } => Some(ReadinessCause::SchemaMismatch),
         WalletServingPairError::ConvergenceTimedOut {
-            last_outcome: WalletServingConvergence::ReplicaBehind,
+            last_outcome:
+                WalletServingConvergence::ReplicaBehind | WalletServingConvergence::ProjectionBehind,
         } => None,
-        WalletServingPairError::ConvergenceTimedOut {
-            last_outcome: WalletServingConvergence::ProjectionBehind,
-        }
-        | WalletServingPairError::Canonical(_)
+        WalletServingPairError::Canonical(_)
         | WalletServingPairError::Wallet(_)
         | WalletServingPairError::SecondaryGenerationDirectoryCreate { .. }
         | WalletServingPairError::CandidateTask(_)
@@ -817,7 +909,7 @@ mod tests {
         GenerationLease, SecondaryGenerationState, WalletServingConvergence,
         WalletServingPairConfig, WalletServingPairError, WalletServingPairPublisher,
         classify_pair_admission, publish_serving_pair, refresh_failure_not_ready_cause,
-        writer_status_matches_source,
+        refresh_failure_retains_attested_pair, writer_status_matches_source,
     };
     use crate::{
         ServerInfoSettings, WalletCapabilityProfile, WalletQueryApi, WalletQueryGrpcAdapter,
@@ -866,7 +958,8 @@ mod tests {
     }
 
     #[test]
-    fn atomic_publication_keeps_a_retired_generation_until_every_request_arc_drains() {
+    fn atomic_publication_hands_the_retired_generation_to_the_publisher()
+    -> Result<(), Box<dyn std::error::Error>> {
         let published_pair = Arc::new(());
         let lease = GenerationLease::new(&published_pair);
         let initial_slot = Arc::new(ArcSwap::from(Arc::clone(&published_pair)));
@@ -874,18 +967,26 @@ mod tests {
         let mut slot = Some(initial_slot);
         let replacement_pair = Arc::new(());
 
-        let active_slot = publish_serving_pair(&mut slot, Arc::clone(&replacement_pair));
-        let active_pair = active_slot.load_full();
-        assert!(Arc::ptr_eq(&active_pair, &replacement_pair));
+        let retired_pair = publish_serving_pair(&mut slot, Arc::clone(&replacement_pair));
+        let Some(active_slot) = slot.as_ref() else {
+            return Err("publication must leave an active slot".into());
+        };
+        assert!(Arc::ptr_eq(&active_slot.load_full(), &replacement_pair));
+        let Some(retired_pair) = retired_pair else {
+            return Err("publication must yield the retired pair".into());
+        };
+        assert!(Arc::ptr_eq(&retired_pair, &published_pair));
 
-        // This simulates ArcSwap replacing the published pair. The old
-        // request retains a strong Arc, so its secondary paths are not safe
-        // to reopen or delete yet.
+        // Every other owner releasing the retired pair still leaves its
+        // secondary paths open: the publisher holds the trailing reference,
+        // so no request task can be the one that closes them.
         drop(published_pair);
+        drop(in_flight_request);
         assert!(!lease.is_reusable());
 
-        drop(in_flight_request);
+        drop(retired_pair);
         assert!(lease.is_reusable());
+        Ok(())
     }
 
     #[test]
@@ -896,6 +997,128 @@ mod tests {
             }),
             Some(zinder_runtime::ReadinessCause::SchemaMismatch)
         );
+    }
+
+    #[test]
+    fn only_lag_and_control_plane_failures_keep_the_attested_pair_serving() {
+        for transient in [
+            WalletServingPairError::WriterStatusRpc(Status::unavailable("writer status")),
+            WalletServingPairError::ConvergenceTimedOut {
+                last_outcome: WalletServingConvergence::ReplicaBehind,
+            },
+            WalletServingPairError::ConvergenceTimedOut {
+                last_outcome: WalletServingConvergence::ProjectionBehind,
+            },
+        ] {
+            assert!(
+                refresh_failure_retains_attested_pair(&transient),
+                "{transient} must keep the attested pair serving"
+            );
+            assert!(
+                !matches!(
+                    refresh_failure_not_ready_cause(&transient),
+                    Some(zinder_runtime::ReadinessCause::StorageUnavailable)
+                ),
+                "{transient} keeps serving, so it must not be classed as a storage failure"
+            );
+        }
+
+        for fail_closed in [
+            WalletServingPairError::WriterFenceMismatch,
+            WalletServingPairError::WriterStatusInvalid,
+            WalletServingPairError::ConvergenceTimedOut {
+                last_outcome: WalletServingConvergence::SchemaOrFenceMismatch,
+            },
+            WalletServingPairError::PairSlotUnavailable,
+            WalletServingPairError::CandidateUnavailable { generation: 0 },
+        ] {
+            assert!(
+                !refresh_failure_retains_attested_pair(&fail_closed),
+                "{fail_closed} must never keep admitting traffic"
+            );
+            let cause = refresh_failure_not_ready_cause(&fail_closed);
+            let Some(cause) = cause else {
+                unreachable!("{fail_closed} must resolve to a fail-closed cause")
+            };
+            assert!(
+                !cause.permits_traffic(),
+                "{fail_closed} resolved to traffic-permitting {cause:?}"
+            );
+        }
+    }
+
+    /// The configured ceiling, not the lag threshold alone, decides how long a
+    /// reader may answer from a fence the writer has moved past.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn over_threshold_lag_stops_admitting_traffic_at_the_configured_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let staleness_ceiling = Duration::from_millis(200);
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        let canonical_primary =
+            build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+        build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_task = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        server_cancel.cancelled_owned(),
+                    )
+                    .await
+            }
+        });
+
+        let readiness = zinder_runtime::Readiness::default();
+        let mut config = wallet_serving_pair_config(
+            canonical_primary_path.clone(),
+            temporary.path().join("canonical-secondaries"),
+            wallet_primary_path.clone(),
+            temporary.path().join("wallet-secondaries"),
+            Arc::new(activations.clone()),
+        )?;
+        config.serving_pair_staleness_ceiling = staleness_ceiling;
+        let (mut publisher, slot) =
+            WalletServingPairPublisher::bootstrap(config, readiness.clone(), &endpoint, None)
+                .await?;
+
+        let pair = slot.load_full();
+        let mut lagging_status = writer_status_for_store(&canonical_primary);
+        let Some(lagging_fence) = lagging_status.fence.as_mut() else {
+            return Err("writer status fixture must carry a fence".into());
+        };
+        lagging_fence.chain_epoch_id = lagging_fence.chain_epoch_id.saturating_add(64);
+
+        publisher.update_active_readiness(&pair, &lagging_status)?;
+        let stale = readiness.report();
+        assert!(stale.is_ready);
+        assert_eq!(stale.cause.metric_label(), "serving_pair_stale");
+
+        tokio::time::sleep(staleness_ceiling).await;
+        publisher.update_active_readiness(&pair, &lagging_status)?;
+        let lagging = readiness.report();
+        assert!(!lagging.is_ready);
+        assert_eq!(lagging.cause.metric_label(), "replica_lagging");
+
+        cancel.cancel();
+        server_task.await??;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1300,6 +1523,8 @@ mod tests {
         );
 
         drop(old_pair);
+        assert_eq!(published_generation_is_reusable(&publisher, 0), Some(false));
+        publisher.reap_retired_pair().await;
         assert_eq!(published_generation_is_reusable(&publisher, 0), Some(true));
         drop(live_chain_events);
         drop(resumed_chain_events);
@@ -1401,6 +1626,7 @@ mod tests {
                 .and_then(std::num::NonZeroU8::new)
                 .ok_or("wallet-serving pair convergence attempts must be non-zero")?,
             replica_lag_threshold_chain_epochs: 4,
+            serving_pair_staleness_ceiling: Duration::from_mins(5),
         })
     }
 

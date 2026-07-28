@@ -21,6 +21,7 @@ use crate::{
 const DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS: u64 = 4;
+const DEFAULT_SERVING_PAIR_STALENESS_CEILING_MS: u64 = 300_000;
 
 /// Raw role-scoped `rocksdb` sub-section.
 ///
@@ -150,6 +151,11 @@ pub struct CanonicalSecondaryStorageSection {
     /// Replica-lag threshold in chain epochs. Crossing this threshold
     /// flips readiness to [`crate::ReadinessCause::ReplicaLagging`].
     pub secondary_replica_lag_threshold_chain_epochs: Option<u64>,
+    /// Longest a wallet-serving pair keeps admitting traffic in milliseconds
+    /// after the last writer attestation. Crossing it replaces
+    /// [`crate::ReadinessCause::ServingPairStale`] with the fail-closed cause
+    /// of the failure that stopped the refresh.
+    pub serving_pair_staleness_ceiling_ms: Option<u64>,
     /// Canonical store role budget.
     pub canonical: StorageRoleSection,
 }
@@ -186,6 +192,9 @@ pub struct ResolvedCanonicalSecondaryStorage {
     pub initial_catchup_timeout: Duration,
     /// Replica-lag threshold in chain epochs.
     pub secondary_replica_lag_threshold_chain_epochs: u64,
+    /// Longest a wallet-serving pair keeps admitting traffic after the last
+    /// writer attestation.
+    pub serving_pair_staleness_ceiling: Duration,
     /// Bounded `RocksDB` resource budget for the canonical store.
     pub canonical_rocksdb_budget: RocksDbResourceBudget,
 }
@@ -323,9 +332,11 @@ pub fn resolve_secondary_storage(
     })
 }
 
-/// Validates and resolves a [`CanonicalSecondaryStorageSection`], applying
-/// per-field defaults for `secondary_catchup_interval_ms` and
-/// `secondary_replica_lag_threshold_chain_epochs`.
+/// Validates and resolves a [`CanonicalSecondaryStorageSection`].
+///
+/// Applies per-field defaults for `secondary_catchup_interval_ms`,
+/// `secondary_replica_lag_threshold_chain_epochs`, and
+/// `serving_pair_staleness_ceiling_ms`.
 pub fn resolve_canonical_secondary_storage(
     section: CanonicalSecondaryStorageSection,
 ) -> Result<ResolvedCanonicalSecondaryStorage, ConfigError> {
@@ -354,6 +365,14 @@ pub fn resolve_canonical_secondary_storage(
     let secondary_replica_lag_threshold_chain_epochs = section
         .secondary_replica_lag_threshold_chain_epochs
         .unwrap_or(DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS);
+    let serving_pair_staleness_ceiling_ms = section
+        .serving_pair_staleness_ceiling_ms
+        .unwrap_or(DEFAULT_SERVING_PAIR_STALENESS_CEILING_MS);
+    if serving_pair_staleness_ceiling_ms == 0 {
+        return Err(ConfigError::invalid(
+            "storage.serving_pair_staleness_ceiling_ms must be greater than zero",
+        ));
+    }
     let canonical_rocksdb_budget =
         resolve_canonical_reader_rocksdb_budget(section.canonical.rocksdb)?;
     Ok(ResolvedCanonicalSecondaryStorage {
@@ -362,6 +381,7 @@ pub fn resolve_canonical_secondary_storage(
         secondary_catchup_interval: Duration::from_millis(catchup_ms),
         initial_catchup_timeout: Duration::from_millis(initial_catchup_timeout_ms),
         secondary_replica_lag_threshold_chain_epochs,
+        serving_pair_staleness_ceiling: Duration::from_millis(serving_pair_staleness_ceiling_ms),
         canonical_rocksdb_budget,
     })
 }
@@ -477,6 +497,8 @@ pub struct CanonicalSecondaryStorageToml {
     pub initial_catchup_timeout_ms: u64,
     /// Replica-lag threshold in chain epochs.
     pub secondary_replica_lag_threshold_chain_epochs: u64,
+    /// Serving-pair staleness ceiling in milliseconds.
+    pub serving_pair_staleness_ceiling_ms: u64,
     /// Canonical store role projection.
     pub canonical: StorageRoleToml,
 }
@@ -495,6 +517,9 @@ impl CanonicalSecondaryStorageToml {
             initial_catchup_timeout_ms: duration_as_millis_u64(resolved.initial_catchup_timeout),
             secondary_replica_lag_threshold_chain_epochs: resolved
                 .secondary_replica_lag_threshold_chain_epochs,
+            serving_pair_staleness_ceiling_ms: duration_as_millis_u64(
+                resolved.serving_pair_staleness_ceiling,
+            ),
             canonical: StorageRoleToml::from_resolved(resolved.canonical_rocksdb_budget),
         }
     }
@@ -585,12 +610,43 @@ mod tests {
             resolved.secondary_catchup_interval,
             Duration::from_millis(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS)
         );
+        assert_eq!(
+            resolved.serving_pair_staleness_ceiling,
+            Duration::from_millis(DEFAULT_SERVING_PAIR_STALENESS_CEILING_MS)
+        );
         // max_open_files override (128) wins over the container-derived value.
         assert_eq!(resolved.canonical_rocksdb_budget.max_open_files, 128);
         // block_cache_bytes has no override, so it takes the container-derived value.
         assert_eq!(
             resolved.canonical_rocksdb_budget.block_cache_bytes,
             crate::canonical_reader_block_cache_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_secondary_storage_rejects_a_zero_staleness_ceiling() {
+        let resolved = resolve_canonical_secondary_storage(CanonicalSecondaryStorageSection {
+            path: Some(PathBuf::from("/tmp/store")),
+            secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
+            serving_pair_staleness_ceiling_ms: Some(0),
+            ..CanonicalSecondaryStorageSection::default()
+        });
+        assert!(matches!(resolved, Err(ConfigError::Invalid { .. })));
+    }
+
+    #[test]
+    fn canonical_secondary_storage_applies_a_staleness_ceiling_override() -> Result<(), ConfigError>
+    {
+        let resolved = resolve_canonical_secondary_storage(CanonicalSecondaryStorageSection {
+            path: Some(PathBuf::from("/tmp/store")),
+            secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
+            serving_pair_staleness_ceiling_ms: Some(30_000),
+            ..CanonicalSecondaryStorageSection::default()
+        })?;
+        assert_eq!(
+            resolved.serving_pair_staleness_ceiling,
+            Duration::from_secs(30)
         );
         Ok(())
     }

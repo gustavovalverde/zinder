@@ -35,10 +35,11 @@ use zinder_wallet_projection::{
 
 use crate::{
     ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
-    FullBlock, FullBlockStream, QueryError, RawTransaction, SettledTipBlock, SubtreeRoots,
-    Transaction, TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    VisibleTipBlock, WalletQueryApi, WalletServingReadPair,
+    DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, QueryError, RawTransaction,
+    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, VisibleTipBlock, WalletQueryApi,
+    WalletServingReadPair, join_blocking, validate_block_range,
 };
 
 const WALLET_READ_PAGE_SIZE: NonZeroU16 = NonZeroU16::MAX;
@@ -358,6 +359,11 @@ mod tests {
 /// epoch. The `WalletQueryApi` contract permits retained historical epochs,
 /// but it does not guarantee them; this secondary composition reports
 /// [`QueryError::ChainEpochPinUnavailable`] for every other epoch.
+///
+/// Every method captures its pair on the async side and then runs the whole
+/// store read on the blocking pool. The secondaries use direct I/O, so a cache
+/// miss is a synchronous `pread`; keeping one on a reactor thread would stall
+/// the ops listener and the gRPC connection drivers sharing that runtime.
 #[derive(Clone)]
 pub struct WalletServingQuery<Broadcaster> {
     serving_pair_slot: Arc<ArcSwap<WalletServingReadPair>>,
@@ -474,12 +480,15 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<VisibleTipBlock, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        Ok(VisibleTipBlock {
-            height: chain_epoch.visible_tip_height,
-            block_hash: chain_epoch.visible_tip_hash,
-            chain_epoch,
-        })
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            Ok(VisibleTipBlock {
+                height: chain_epoch.visible_tip_height,
+                block_hash: chain_epoch.visible_tip_hash,
+                chain_epoch,
+            })
+        }))
+        .await
     }
 
     async fn settled_tip_block(
@@ -487,12 +496,15 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SettledTipBlock, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        Ok(SettledTipBlock {
-            height: chain_epoch.settled_tip_height,
-            block_hash: chain_epoch.settled_tip_hash,
-            chain_epoch,
-        })
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            Ok(SettledTipBlock {
+                height: chain_epoch.settled_tip_height,
+                block_hash: chain_epoch.settled_tip_hash,
+                chain_epoch,
+            })
+        }))
+        .await
     }
 
     async fn block_id_by_selector(
@@ -501,8 +513,11 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockIdAtEpoch, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)
+        }))
+        .await
     }
 
     async fn block_header_by_selector(
@@ -511,17 +526,20 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderAtEpoch, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        let resolved = Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)?;
-        let block_header = pair
-            .canonical()
-            .block_header_at(resolved.block_id.height)?
-            .ok_or(QueryError::BlockNotInBestChain)?
-            .into_header();
-        Ok(BlockHeaderAtEpoch {
-            chain_epoch,
-            block_header,
-        })
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            let resolved = Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)?;
+            let block_header = pair
+                .canonical()
+                .block_header_at(resolved.block_id.height)?
+                .ok_or(QueryError::BlockNotInBestChain)?
+                .into_header();
+            Ok(BlockHeaderAtEpoch {
+                chain_epoch,
+                block_header,
+            })
+        }))
+        .await
     }
 
     async fn compact_block_at(
@@ -530,15 +548,18 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlock, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        let compact_block = pair
-            .canonical()
-            .compact_block_at(height)?
-            .ok_or_else(|| artifact_unavailable(ArtifactFamily::CompactBlock, height))?;
-        Ok(CompactBlock {
-            chain_epoch,
-            compact_block,
-        })
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            let compact_block = pair
+                .canonical()
+                .compact_block_at(height)?
+                .ok_or_else(|| artifact_unavailable(ArtifactFamily::CompactBlock, height))?;
+            Ok(CompactBlock {
+                chain_epoch,
+                compact_block,
+            })
+        }))
+        .await
     }
 
     async fn compact_blocks_in_range(
@@ -546,20 +567,18 @@ where
         block_range: zinder_core::BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError> {
+        validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        if block_range.start > block_range.end {
-            return Err(QueryError::InvalidBlockRange {
-                start_height: block_range.start,
-                end_height: block_range.end,
-            });
-        }
-        let compact_blocks = pair.canonical().compact_blocks_in_range(block_range)?;
-        Ok(CompactBlockRange {
-            chain_epoch,
-            block_range,
-            compact_blocks,
-        })
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            let compact_blocks = pair.canonical().compact_blocks_in_range(block_range)?;
+            Ok(CompactBlockRange {
+                chain_epoch,
+                block_range,
+                compact_blocks,
+            })
+        }))
+        .await
     }
 
     async fn full_block_at(
@@ -584,40 +603,43 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        // READY admission requires the construction manifest's transaction-location
-        // and transaction-blob row counts to equal the authenticated source count;
-        // live append and replacement update both families in the canonical atomic
-        // batch. Under that admitted coverage contract, absence is a real miss.
-        let Some(location) = pair.canonical().transaction_location(transaction_id)? else {
-            return Ok(TransactionStatus {
+        let network_upgrade_activations = Arc::clone(&self.network_upgrade_activations);
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            // READY admission requires the construction manifest's transaction-location
+            // and transaction-blob row counts to equal the authenticated source count;
+            // live append and replacement update both families in the canonical atomic
+            // batch. Under that admitted coverage contract, absence is a real miss.
+            let Some(location) = pair.canonical().transaction_location(transaction_id)? else {
+                return Ok(TransactionStatus {
+                    chain_epoch,
+                    status: TxStatus::NotFound,
+                });
+            };
+            let header = pair
+                .canonical()
+                .block_header_at(location.block_height)?
+                .ok_or(QueryError::BlockNotInBestChain)?;
+            let raw_transaction_bytes = pair
+                .canonical()
+                .transaction_blob(location)?
+                .map(|blob| blob.raw_transaction_bytes);
+            let chain_context = MinedTransactionChainContext::from_response_epoch(
+                &chain_epoch,
+                location.block_height,
+                network_upgrade_activations.consensus_branch_id_at(location.block_height),
+                header.block_time,
+            );
+            Ok(TransactionStatus {
                 chain_epoch,
-                status: TxStatus::NotFound,
-            });
-        };
-        let header = pair
-            .canonical()
-            .block_header_at(location.block_height)?
-            .ok_or(QueryError::BlockNotInBestChain)?;
-        let raw_transaction_bytes = pair
-            .canonical()
-            .transaction_blob(location)?
-            .map(|blob| blob.raw_transaction_bytes);
-        let chain_context = MinedTransactionChainContext::from_response_epoch(
-            &chain_epoch,
-            location.block_height,
-            self.network_upgrade_activations
-                .consensus_branch_id_at(location.block_height),
-            header.block_time,
-        );
-        Ok(TransactionStatus {
-            chain_epoch,
-            status: TxStatus::Mined(MinedTransaction::new(
-                location,
-                chain_context,
-                raw_transaction_bytes,
-            )),
-        })
+                status: TxStatus::Mined(MinedTransaction::new(
+                    location,
+                    chain_context,
+                    raw_transaction_bytes,
+                )),
+            })
+        }))
+        .await
     }
 
     async fn transaction_at_block_index(
@@ -635,25 +657,28 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<RawTransaction, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        let location = pair
-            .canonical()
-            .transaction_location(transaction_id)?
-            .ok_or_else(|| QueryError::ArtifactUnavailable {
-                family: ArtifactFamily::TransactionLocation,
-                key: ArtifactKey::TransactionId(transaction_id),
-            })?;
-        let transaction = pair
-            .canonical()
-            .transaction_blob(location)?
-            .ok_or_else(|| QueryError::ArtifactUnavailable {
-                family: ArtifactFamily::TransactionBlob,
-                key: ArtifactKey::TransactionId(transaction_id),
-            })?;
-        Ok(RawTransaction {
-            chain_epoch,
-            transaction,
-        })
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            let location = pair
+                .canonical()
+                .transaction_location(transaction_id)?
+                .ok_or_else(|| QueryError::ArtifactUnavailable {
+                    family: ArtifactFamily::TransactionLocation,
+                    key: ArtifactKey::TransactionId(transaction_id),
+                })?;
+            let transaction = pair
+                .canonical()
+                .transaction_blob(location)?
+                .ok_or_else(|| QueryError::ArtifactUnavailable {
+                    family: ArtifactFamily::TransactionBlob,
+                    key: ArtifactKey::TransactionId(transaction_id),
+                })?;
+            Ok(RawTransaction {
+                chain_epoch,
+                transaction,
+            })
+        }))
+        .await
     }
 
     async fn transparent_outputs_by_outpoint(
@@ -686,85 +711,91 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        let mut outputs = Vec::new();
-        let mut after: Option<WalletAddressUnspentOutputKey> = None;
-        loop {
-            let page = pair.wallet().address_unspent_outputs_page_from_height(
-                request.address_script_hash,
-                request.start_height,
-                after,
-                WALLET_READ_PAGE_SIZE,
-            )?;
-            outputs.extend(page.outputs.into_iter().map(|output| {
-                TransparentUnspentOutput::new(
-                    output.address_script_hash,
-                    output.script_pub_key,
-                    output.outpoint,
-                    output.value_zat,
-                    output.created_at.block.height,
-                    output.created_at.block.hash,
-                )
-            }));
-            let Some(next) = page.next_page_after else {
-                break;
-            };
-            after = Some(next);
-        }
-        Ok(TransparentAddressUnspentOutputs {
-            chain_epoch,
-            outputs,
-        })
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            let mut outputs = Vec::new();
+            let mut after: Option<WalletAddressUnspentOutputKey> = None;
+            loop {
+                let page = pair.wallet().address_unspent_outputs_page_from_height(
+                    request.address_script_hash,
+                    request.start_height,
+                    after,
+                    WALLET_READ_PAGE_SIZE,
+                )?;
+                outputs.extend(page.outputs.into_iter().map(|output| {
+                    TransparentUnspentOutput::new(
+                        output.address_script_hash,
+                        output.script_pub_key,
+                        output.outpoint,
+                        output.value_zat,
+                        output.created_at.block.height,
+                        output.created_at.block.hash,
+                    )
+                }));
+                let Some(next) = page.next_page_after else {
+                    break;
+                };
+                after = Some(next);
+            }
+            Ok(TransparentAddressUnspentOutputs {
+                chain_epoch,
+                outputs,
+            })
+        }))
+        .await
     }
 
     async fn transparent_address_tx_ids_in_range(
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
     ) -> Result<TransparentAddressTxIds, QueryError> {
-        let pair = self.capture_pair();
         if request.descending {
             return Err(QueryError::MaterializedViewUnavailable {
                 capability: "descending canonical transparent history",
             });
         }
-        let chain_epoch = Self::chain_epoch(&pair, None)?;
-        let after = request
-            .from_cursor
-            .as_ref()
-            .map(|cursor| TransparentHistoryCursor::resume(cursor, pair.wallet_source()))
-            .transpose()?;
-        if let Some(after) = after {
-            validate_transparent_history_cursor_key(after, &request)?;
-        }
-        let page_size =
-            NonZeroU16::new(u16::try_from(request.max_entries.get()).unwrap_or(u16::MAX))
-                .unwrap_or(NonZeroU16::MAX);
-        let page = pair.wallet().address_transaction_history_range_page(
-            request.address_script_hash,
-            BlockHeightRange::inclusive(request.start_height, request.end_height),
-            after,
-            page_size,
-        )?;
-        let artifacts = page
-            .transactions
-            .into_iter()
-            .map(|row| {
-                TransparentAddressTxIndexArtifact::new(
-                    request.address_script_hash,
-                    row.key.block_height(),
-                    row.key.tx_index_in_block(),
-                    row.transaction_id,
-                    row.block_hash,
-                )
+        let pair = self.capture_pair();
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, None)?;
+            let after = request
+                .from_cursor
+                .as_ref()
+                .map(|cursor| TransparentHistoryCursor::resume(cursor, pair.wallet_source()))
+                .transpose()?;
+            if let Some(after) = after {
+                validate_transparent_history_cursor_key(after, &request)?;
+            }
+            let page_size =
+                NonZeroU16::new(u16::try_from(request.max_entries.get()).unwrap_or(u16::MAX))
+                    .unwrap_or(NonZeroU16::MAX);
+            let page = pair.wallet().address_transaction_history_range_page(
+                request.address_script_hash,
+                BlockHeightRange::inclusive(request.start_height, request.end_height),
+                after,
+                page_size,
+            )?;
+            let artifacts = page
+                .transactions
+                .into_iter()
+                .map(|row| {
+                    TransparentAddressTxIndexArtifact::new(
+                        request.address_script_hash,
+                        row.key.block_height(),
+                        row.key.tx_index_in_block(),
+                        row.transaction_id,
+                        row.block_hash,
+                    )
+                })
+                .collect();
+            Ok(TransparentAddressTxIds {
+                chain_epoch,
+                artifacts,
+                next_cursor: page
+                    .next_page_after
+                    .map(|key| TransparentHistoryCursor::issue(pair.wallet_source(), key)),
             })
-            .collect();
-        Ok(TransparentAddressTxIds {
-            chain_epoch,
-            artifacts,
-            next_cursor: page
-                .next_page_after
-                .map(|key| TransparentHistoryCursor::issue(pair.wallet_source(), key)),
-        })
+        }))
+        .await
     }
 
     async fn transparent_address_balance(
@@ -773,24 +804,28 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressBalance, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        if addresses.is_empty() {
-            return Err(QueryError::TransparentBalanceAddressCountExceeded {
-                requested: 0,
-                maximum: crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
-            });
-        }
-        let addresses: HashSet<_> = addresses.into_iter().collect();
-        let mut confirmed_zat = 0_u64;
-        for address in &addresses {
-            confirmed_zat = confirmed_zat.saturating_add(pair.wallet().address_balance(*address)?);
-        }
-        Ok(TransparentAddressBalance {
-            confirmed_zat,
-            unconfirmed_delta_zat: 0,
-            address_count: u32::try_from(addresses.len()).unwrap_or(u32::MAX),
-            chain_epoch,
-        })
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            if addresses.is_empty() {
+                return Err(QueryError::TransparentBalanceAddressCountExceeded {
+                    requested: 0,
+                    maximum: crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+                });
+            }
+            let addresses: HashSet<_> = addresses.into_iter().collect();
+            let mut confirmed_zat = 0_u64;
+            for address in &addresses {
+                confirmed_zat =
+                    confirmed_zat.saturating_add(pair.wallet().address_balance(*address)?);
+            }
+            Ok(TransparentAddressBalance {
+                confirmed_zat,
+                unconfirmed_delta_zat: 0,
+                address_count: u32::try_from(addresses.len()).unwrap_or(u32::MAX),
+                chain_epoch,
+            })
+        }))
+        .await
     }
 
     async fn transparent_utxo_set_summary(
@@ -807,25 +842,42 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        let checkpoint = pair
-            .canonical()
-            .tree_state_checkpoint_at_or_before(height)?;
-        if let Some(checkpoint) =
-            checkpoint.filter(|checkpoint| checkpoint.block_id.height == height)
-        {
-            return tree_state_from_checkpoint(chain_epoch, &checkpoint);
-        }
-        let block_header = pair
-            .canonical()
-            .block_header_at(height)?
-            .ok_or(QueryError::BlockNotInBestChain)?;
-        let block_id = BlockId::new(height, block_header.block_hash);
-        let block_time_seconds =
-            u32::try_from(block_header.block_time).map_err(|_| QueryError::ArtifactCorrupt {
-                family: ArtifactFamily::BlockHeader,
-                reason: "canonical block time is outside the u32 range".to_owned(),
+        let resolved = join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            let checkpoint = pair
+                .canonical()
+                .tree_state_checkpoint_at_or_before(height)?;
+            if let Some(checkpoint) =
+                checkpoint.filter(|checkpoint| checkpoint.block_id.height == height)
+            {
+                return tree_state_from_checkpoint(chain_epoch, &checkpoint)
+                    .map(ResolvedTreeState::Checkpoint);
+            }
+            let block_header = pair
+                .canonical()
+                .block_header_at(height)?
+                .ok_or(QueryError::BlockNotInBestChain)?;
+            let block_time_seconds = u32::try_from(block_header.block_time).map_err(|_| {
+                QueryError::ArtifactCorrupt {
+                    family: ArtifactFamily::BlockHeader,
+                    reason: "canonical block time is outside the u32 range".to_owned(),
+                }
             })?;
+            Ok(ResolvedTreeState::UpstreamFill {
+                chain_epoch,
+                block_id: BlockId::new(height, block_header.block_hash),
+                block_time_seconds,
+            })
+        }))
+        .await?;
+        let (chain_epoch, block_id, block_time_seconds) = match resolved {
+            ResolvedTreeState::Checkpoint(tree_state) => return Ok(tree_state),
+            ResolvedTreeState::UpstreamFill {
+                chain_epoch,
+                block_id,
+                block_time_seconds,
+            } => (chain_epoch, block_id, block_time_seconds),
+        };
         let upstream = self
             .tree_state_upstream
             .as_ref()
@@ -859,14 +911,17 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        let checkpoint = pair
-            .canonical()
-            .tree_state_checkpoint_at_or_before(chain_epoch.visible_tip_height)?
-            .ok_or_else(|| {
-                artifact_unavailable(ArtifactFamily::TreeState, chain_epoch.visible_tip_height)
-            })?;
-        tree_state_from_checkpoint(chain_epoch, &checkpoint)
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            let checkpoint = pair
+                .canonical()
+                .tree_state_checkpoint_at_or_before(chain_epoch.visible_tip_height)?
+                .ok_or_else(|| {
+                    artifact_unavailable(ArtifactFamily::TreeState, chain_epoch.visible_tip_height)
+                })?;
+            tree_state_from_checkpoint(chain_epoch, &checkpoint)
+        }))
+        .await
     }
 
     async fn subtree_roots(
@@ -875,41 +930,45 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SubtreeRoots, QueryError> {
         let pair = self.capture_pair();
-        let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-        let completed_subtree_count = chain_epoch
-            .tip_metadata
-            .completed_subtree_count(subtree_root_range.protocol);
-        if subtree_root_range.start_index.value() >= completed_subtree_count {
-            return Ok(SubtreeRoots {
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            let completed_subtree_count = chain_epoch
+                .tip_metadata
+                .completed_subtree_count(subtree_root_range.protocol);
+            if subtree_root_range.start_index.value() >= completed_subtree_count {
+                return Ok(SubtreeRoots {
+                    chain_epoch,
+                    protocol: subtree_root_range.protocol,
+                    start_index: subtree_root_range.start_index,
+                    subtree_roots: Vec::new(),
+                });
+            }
+            let available_entries = completed_subtree_count
+                .saturating_sub(subtree_root_range.start_index.value())
+                .min(subtree_root_range.max_entries.get());
+            let available_entries = NonZeroU32::new(available_entries).ok_or_else(|| {
+                QueryError::ArtifactUnavailable {
+                    family: ArtifactFamily::SubtreeRoot,
+                    key: ArtifactKey::SubtreeRootIndex {
+                        protocol: subtree_root_range.protocol,
+                        index: subtree_root_range.start_index,
+                    },
+                }
+            })?;
+            let available_range = zinder_core::SubtreeRootRange::new(
+                subtree_root_range.protocol,
+                subtree_root_range.start_index,
+                available_entries,
+            );
+            let subtree_roots = pair.canonical().subtree_roots(available_range)?;
+            Ok(SubtreeRoots {
                 chain_epoch,
                 protocol: subtree_root_range.protocol,
                 start_index: subtree_root_range.start_index,
-                subtree_roots: Vec::new(),
-            });
-        }
-        let available_entries = completed_subtree_count
-            .saturating_sub(subtree_root_range.start_index.value())
-            .min(subtree_root_range.max_entries.get());
-        let available_entries =
-            NonZeroU32::new(available_entries).ok_or_else(|| QueryError::ArtifactUnavailable {
-                family: ArtifactFamily::SubtreeRoot,
-                key: ArtifactKey::SubtreeRootIndex {
-                    protocol: subtree_root_range.protocol,
-                    index: subtree_root_range.start_index,
-                },
-            })?;
-        let available_range = zinder_core::SubtreeRootRange::new(
-            subtree_root_range.protocol,
-            subtree_root_range.start_index,
-            available_entries,
-        );
-        let subtree_roots = pair.canonical().subtree_roots(available_range)?;
-        Ok(SubtreeRoots {
-            chain_epoch,
-            protocol: subtree_root_range.protocol,
-            start_index: subtree_root_range.start_index,
-            subtree_roots,
-        })
+                subtree_roots,
+            })
+        }))
+        .await
     }
 
     async fn chain_events(
@@ -918,15 +977,18 @@ where
         family: ChainEventStreamFamily,
     ) -> Result<ChainEvents, QueryError> {
         let pair = self.capture_pair();
-        let event_envelopes = pair
-            .canonical()
-            .wallet_chain_event_history(ChainEventHistoryRequest::new_for_family(
-                from_cursor.as_ref(),
-                family,
-                crate::DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
-            ))
-            .map_err(map_canonical_chain_event_error)?;
-        Ok(ChainEvents { event_envelopes })
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let event_envelopes = pair
+                .canonical()
+                .wallet_chain_event_history(ChainEventHistoryRequest::new_for_family(
+                    from_cursor.as_ref(),
+                    family,
+                    crate::DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
+                ))
+                .map_err(map_canonical_chain_event_error)?;
+            Ok(ChainEvents { event_envelopes })
+        }))
+        .await
     }
 
     async fn resolve_chain_events_start(
@@ -935,9 +997,12 @@ where
         requested_family: ChainEventStreamFamily,
     ) -> Result<ChainEventStreamResume, QueryError> {
         let pair = self.capture_pair();
-        pair.canonical()
-            .resolve_wallet_chain_event_stream_start(&start, requested_family)
-            .map_err(map_canonical_chain_event_error)
+        join_blocking(tokio::task::spawn_blocking(move || {
+            pair.canonical()
+                .resolve_wallet_chain_event_stream_start(&start, requested_family)
+                .map_err(map_canonical_chain_event_error)
+        }))
+        .await
     }
 
     async fn broadcast_transaction(
@@ -992,6 +1057,24 @@ fn artifact_unavailable(family: ArtifactFamily, height: BlockHeight) -> QueryErr
         family,
         key: ArtifactKey::BlockHeight(height),
     }
+}
+
+/// Outcome of the canonical half of a tree-state read.
+///
+/// A sparse height resolves its payload from the node, so the canonical reads
+/// that identify the block finish before the request leaves the blocking pool.
+enum ResolvedTreeState {
+    /// The canonical store held a checkpoint at the exact requested height.
+    Checkpoint(TreeState),
+    /// The block is canonical but its payload must come from the node.
+    UpstreamFill {
+        /// Epoch the canonical reads were pinned to.
+        chain_epoch: ChainEpoch,
+        /// Canonical identity the node response must match.
+        block_id: BlockId,
+        /// Canonical block time the node response must match.
+        block_time_seconds: u32,
+    },
 }
 
 fn tree_state_from_checkpoint(

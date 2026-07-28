@@ -187,6 +187,9 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             replica_lag_threshold_chain_epochs: lightwalletd_config
                 .storage
                 .secondary_replica_lag_threshold_chain_epochs,
+            serving_pair_staleness_ceiling: lightwalletd_config
+                .storage
+                .serving_pair_staleness_ceiling,
         },
         readiness.clone(),
         &lightwalletd_config.ingest_control_addr,

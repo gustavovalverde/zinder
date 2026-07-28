@@ -401,6 +401,7 @@ fn readiness_sync_lag_blocks(cause: &crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::SchemaMismatch
         | crate::ReadinessCause::ReorgWindowExceeded { .. }
         | crate::ReadinessCause::ReplicaLagging { .. }
+        | crate::ReadinessCause::ServingPairStale { .. }
         | crate::ReadinessCause::WriterStatusUnavailable
         | crate::ReadinessCause::CursorAtRisk { .. }
         | crate::ReadinessCause::ShuttingDown
@@ -410,7 +411,10 @@ fn readiness_sync_lag_blocks(cause: &crate::ReadinessCause) -> f64 {
 
 fn readiness_replica_lag_chain_epochs(cause: &crate::ReadinessCause) -> f64 {
     match cause {
-        crate::ReadinessCause::ReplicaLagging { lag_chain_epochs } => u64_to_f64(*lag_chain_epochs),
+        crate::ReadinessCause::ReplicaLagging { lag_chain_epochs }
+        | crate::ReadinessCause::ServingPairStale {
+            lag_chain_epochs, ..
+        } => u64_to_f64(*lag_chain_epochs),
         crate::ReadinessCause::Starting
         | crate::ReadinessCause::Syncing { .. }
         | crate::ReadinessCause::Ready

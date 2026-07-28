@@ -214,6 +214,7 @@ The smoke should produce samples for:
 - `zinder_ingest_writer_status_request_total`
 - `zinder_compat_lightwalletd_wallet_serving_pair_publisher_publications_total`
 - `zinder_compat_lightwalletd_wallet_serving_pair_publisher_convergence_total`
+- `zinder_compat_lightwalletd_wallet_serving_pair_publisher_teardown_duration_seconds`
 - `zinder_compat_lightwalletd_wallet_serving_pair_publisher_replica_lag_chain_epochs`
 - `zinder_compat_lightwalletd_writer_status_total`
 - `zinder_store_read_duration_seconds_count`
@@ -238,6 +239,7 @@ local rules cover:
 - scrape targets down
 - traffic-blocking readiness causes
 - traffic-safe readiness warnings
+- a wallet-serving pair serving past its last writer attestation
 - secondary replica lag
 - node RPC errors
 - wallet-query p95 above 250ms

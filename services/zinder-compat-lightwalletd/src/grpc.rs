@@ -4,8 +4,9 @@ use std::{num::NonZeroU32, pin::Pin, sync::Arc};
 
 use arc_swap::ArcSwap;
 use serde_json::Value;
+use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
-use tokio_stream::{self as stream};
+use tokio_stream::{self as stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::wire::WireDecodeError;
@@ -27,9 +28,9 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingReadPair,
-    address_lookup_to_script_hash, status_from_query_error,
+    DEFAULT_MAX_COMPACT_BLOCK_RANGE, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
+    WalletQueryApi, WalletServingReadPair, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
 use zinder_store::MempoolEvent;
@@ -54,6 +55,9 @@ pub const DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS: NonZeroU32 = NonZeroU32::MIN.s
 pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 /// Page size used to drain the native mempool snapshot for lightwalletd.
 const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
+/// Blocks a slow `GetBlockRange` client can stall behind, on top of the chunk
+/// the producer is currently walking.
+const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
 const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
 
@@ -440,7 +444,7 @@ fn lightwalletd_balance_value_zat(
 #[tonic::async_trait]
 impl<QueryApi> compact_tx_streamer_server::CompactTxStreamer for LightwalletdGrpcAdapter<QueryApi>
 where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
     async fn get_latest_block(
         &self,
@@ -494,17 +498,19 @@ where
         let pool_selection = pool_selection_from_request(&block_range_request.pool_types)?;
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
         reject_future_block_height(block_range.end, chain_view.visible_tip_height)?;
-        let compact_block_range = self
-            .query_api
-            .compact_blocks_in_range(block_range, Some(chain_view.epoch_id))
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
-        Ok(Response::new(stream_compact_blocks(
-            compact_block_range.compact_blocks,
-            is_descending,
-            pool_selection,
-            CompactBlockPayloadMode::Full,
-        )))
+        Ok(Response::new(
+            stream_compact_block_range(
+                self.query_api.clone(),
+                block_range,
+                CompactBlockWindow {
+                    at_epoch_id: chain_view.epoch_id,
+                    is_descending,
+                    pool_selection,
+                    payload_mode: CompactBlockPayloadMode::Full,
+                },
+            )
+            .await?,
+        ))
     }
 
     type GetBlockRangeNullifiersStream = GrpcStream<lightwalletd::CompactBlock>;
@@ -517,17 +523,19 @@ where
         let block_range_request = request.into_inner();
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
         reject_future_block_height(block_range.end, chain_view.visible_tip_height)?;
-        let compact_block_range = self
-            .query_api
-            .compact_blocks_in_range(block_range, Some(chain_view.epoch_id))
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
-        Ok(Response::new(stream_compact_blocks(
-            compact_block_range.compact_blocks,
-            is_descending,
-            CompactBlockPoolSelection::shielded(),
-            CompactBlockPayloadMode::NullifiersOnly,
-        )))
+        Ok(Response::new(
+            stream_compact_block_range(
+                self.query_api.clone(),
+                block_range,
+                CompactBlockWindow {
+                    at_epoch_id: chain_view.epoch_id,
+                    is_descending,
+                    pool_selection: CompactBlockPoolSelection::shielded(),
+                    payload_mode: CompactBlockPayloadMode::NullifiersOnly,
+                },
+            )
+            .await?,
+        ))
     }
 
     async fn get_transaction(
@@ -900,22 +908,147 @@ fn stream_items<T: Send + 'static>(items: Vec<T>) -> GrpcStream<T> {
     Box::pin(stream::iter(items.into_iter().map(Ok)))
 }
 
-fn stream_compact_blocks(
-    compact_blocks: Vec<CompactBlockArtifact>,
+/// How one `BlockRange` handler reads and shapes its window.
+#[derive(Clone, Copy)]
+struct CompactBlockWindow {
+    /// Chain epoch every chunk read is pinned to.
+    at_epoch_id: ChainEpochId,
+    /// Whether the client asked for heights high to low.
     is_descending: bool,
+    /// Pools the emitted blocks retain.
     pool_selection: CompactBlockPoolSelection,
+    /// Payload depth the emitted blocks retain.
     payload_mode: CompactBlockPayloadMode,
-) -> GrpcStream<lightwalletd::CompactBlock> {
-    let compact_blocks: Box<dyn Iterator<Item = CompactBlockArtifact> + Send> = if is_descending {
-        Box::new(compact_blocks.into_iter().rev())
-    } else {
-        Box::new(compact_blocks.into_iter())
-    };
+}
 
-    Box::pin(stream::iter(compact_blocks.map(move |compact_block| {
-        compact_block_to_lightwalletd(&compact_block)
-            .map(|compact_block| prune_compact_block(compact_block, pool_selection, payload_mode))
-    })))
+/// Streams a compact-block window the client asked for in one call.
+///
+/// lightwalletd puts no width bound on `BlockRange`, while each store read is
+/// capped at [`DEFAULT_MAX_COMPACT_BLOCK_RANGE`]. The window is split into
+/// capped chunks read in wire order, so an arbitrarily wide request streams
+/// while at most one chunk is materialized at a time.
+///
+/// The first chunk is read before the response, so an unreadable window fails
+/// the call rather than a stream the client has already opened.
+async fn stream_compact_block_range<QueryApi>(
+    query_api: QueryApi,
+    block_range: BlockHeightRange,
+    window: CompactBlockWindow,
+) -> Result<GrpcStream<lightwalletd::CompactBlock>, Status>
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    let chunks = compact_block_range_chunks(block_range, window.is_descending);
+    let Some((first_chunk, remaining_chunks)) = chunks.split_first() else {
+        return Ok(Box::pin(stream::empty()));
+    };
+    let first_blocks =
+        read_compact_block_chunk(&query_api, *first_chunk, window.at_epoch_id).await?;
+    let first_messages = encode_compact_block_chunk(first_blocks, window);
+    if remaining_chunks.is_empty() {
+        return Ok(Box::pin(stream::iter(first_messages)));
+    }
+
+    let (message_sender, message_receiver) = mpsc::channel(COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY);
+    tokio::spawn(drive_compact_block_range(
+        query_api,
+        remaining_chunks.to_vec(),
+        window,
+        message_sender,
+    ));
+    Ok(Box::pin(
+        stream::iter(first_messages).chain(ReceiverStream::new(message_receiver)),
+    ))
+}
+
+/// Splits a compact-block window into capped chunks ordered as the wire
+/// expects them, so the emitted heights stay monotonic across chunk edges.
+fn compact_block_range_chunks(
+    block_range: BlockHeightRange,
+    is_descending: bool,
+) -> Vec<BlockHeightRange> {
+    let last_height = block_range.end.value();
+    let mut chunks = Vec::new();
+    let mut chunk_start = block_range.start.value();
+    loop {
+        let chunk_end = chunk_start
+            .saturating_add(DEFAULT_MAX_COMPACT_BLOCK_RANGE.get().saturating_sub(1))
+            .min(last_height);
+        chunks.push(BlockHeightRange::inclusive(
+            BlockHeight::new(chunk_start),
+            BlockHeight::new(chunk_end),
+        ));
+        if chunk_end >= last_height {
+            break;
+        }
+        chunk_start = chunk_end.saturating_add(1);
+    }
+    if is_descending {
+        chunks.reverse();
+    }
+    chunks
+}
+
+/// Reads every chunk after the first and forwards its blocks to the sink.
+///
+/// A read failure or an unencodable block ends the stream with that status;
+/// a client that stops draining ends the walk on the next send.
+async fn drive_compact_block_range<QueryApi>(
+    query_api: QueryApi,
+    chunks: Vec<BlockHeightRange>,
+    window: CompactBlockWindow,
+    message_sender: mpsc::Sender<Result<lightwalletd::CompactBlock, Status>>,
+) where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    for chunk in chunks {
+        let compact_blocks =
+            match read_compact_block_chunk(&query_api, chunk, window.at_epoch_id).await {
+                Ok(compact_blocks) => compact_blocks,
+                Err(status) => {
+                    let _ = message_sender.send(Err(status)).await;
+                    return;
+                }
+            };
+        for message in encode_compact_block_chunk(compact_blocks, window) {
+            let is_terminal = message.is_err();
+            if message_sender.send(message).await.is_err() || is_terminal {
+                return;
+            }
+        }
+    }
+}
+
+async fn read_compact_block_chunk<QueryApi>(
+    query_api: &QueryApi,
+    chunk: BlockHeightRange,
+    at_epoch_id: ChainEpochId,
+) -> Result<Vec<CompactBlockArtifact>, Status>
+where
+    QueryApi: WalletQueryApi + Send + Sync,
+{
+    query_api
+        .compact_blocks_in_range(chunk, Some(at_epoch_id))
+        .await
+        .map(|compact_block_range| compact_block_range.compact_blocks)
+        .map_err(|error| status_from_query_error(&error))
+}
+
+fn encode_compact_block_chunk(
+    mut compact_blocks: Vec<CompactBlockArtifact>,
+    window: CompactBlockWindow,
+) -> Vec<Result<lightwalletd::CompactBlock, Status>> {
+    if window.is_descending {
+        compact_blocks.reverse();
+    }
+    compact_blocks
+        .iter()
+        .map(|compact_block| {
+            compact_block_to_lightwalletd(compact_block).map(|compact_block| {
+                prune_compact_block(compact_block, window.pool_selection, window.payload_mode)
+            })
+        })
+        .collect()
 }
 
 fn compact_block_to_lightwalletd(

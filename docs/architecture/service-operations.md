@@ -35,15 +35,19 @@ version and commit appear in the `zinder_build_info` metric and native
 | `schema_mismatch` | Persisted identity or schema differs from the binary. |
 | `reorg_window_exceeded` | A replacement crosses the persisted reorg policy. |
 | `replica_lagging` | A RocksDB secondary exceeds the admitted epoch lag. |
+| `serving_pair_stale` | A wallet-serving reader cannot refresh its published pair, which is still within its staleness ceiling. |
 | `writer_status_unavailable` | A trusted reader cannot reach the writer control API. |
 | `cursor_at_risk` | Canonical event retention is approaching an active cursor. |
 | `shutting_down` | New traffic has been drained for termination. |
 
+`ready`, `cursor_at_risk`, and `serving_pair_stale` admit traffic; every other
+cause refuses it.
+
 Payload-bearing causes include structured detail. `node_unavailable` carries a
 bounded failure class, sanitized reason, consecutive-failure count, and outage
 duration. `upstream_not_ready` carries source heights, verification progress,
-and the health-probe source. Reorg, replica, and canonical-retention causes
-carry the numeric boundary that failed.
+and the health-probe source. Reorg, replica, serving-pair, and
+canonical-retention causes carry the numeric boundary that failed.
 
 Readiness detail is operational data, not a place for raw node responses,
 authorization material, filesystem paths, transaction identifiers, or other
@@ -77,6 +81,19 @@ Compatibility is ready only while `WalletServingPairPublisher` can reach writer
 status, catch canonical and wallet secondaries up, and publish a pair that
 passes exact-fence admission. Traffic uses a readiness interceptor, so a
 process that has drained readiness does not accept new gRPC requests.
+
+Writer-status transport failures and replica or projection lag report
+`serving_pair_stale` and keep serving the published pair, because that pair is
+still exactly what the writer attested. `storage.serving_pair_staleness_ceiling_ms`
+bounds how long that lasts, measured from the last writer attestation and
+defaulting to five minutes; past it the underlying cause takes over and traffic
+stops. A writer fence that disagrees with the pair, a schema mismatch, and an
+absent pair slot fail closed immediately: the reader would otherwise present a
+chain view the system of record no longer attests.
+
+The ceiling governs admission on its own. `storage.secondary_replica_lag_threshold_chain_epochs`
+decides when lag stops being routine and becomes a reported warning, not how
+long a warned reader may keep answering.
 
 ## Startup and shutdown
 
@@ -151,9 +168,10 @@ labels.
 ### Compatibility reader
 
 Compatibility metrics report writer-status availability, catch-up duration,
-pair convergence attempts, published generation, replica lag, pair admission
-failure, and wallet-serving pair replacement. gRPC request metrics remain separate from
-pair-maintenance metrics.
+retired-pair teardown duration, pair convergence attempts, published
+generation, replica lag, pair admission failure, and wallet-serving pair
+replacement. gRPC request metrics remain separate from pair-maintenance
+metrics.
 
 ### RocksDB
 

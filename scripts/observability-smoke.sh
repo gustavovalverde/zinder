@@ -79,8 +79,8 @@ EVIDENCE_SAMPLE_INDEX=0
 SUSPENDED_PROJECTOR_PID=""
 INVALIDATED_REORG_HASH=""
 REGTEST_MUTATION_PREFLIGHT_COMPLETE=0
-TRAFFIC_READY_READINESS_CAUSES='^(ready|cursor_at_risk)$'
-READINESS_WARNING_CAUSES='^cursor_at_risk$'
+TRAFFIC_READY_READINESS_CAUSES='^(ready|cursor_at_risk|serving_pair_stale)$'
+READINESS_WARNING_CAUSES='^(cursor_at_risk|serving_pair_stale)$'
 
 log() {
   printf '[zinder-observability] %s\n' "$*"

@@ -52,6 +52,10 @@ enum ReadinessCause {
   // `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
   // See ADR-0015.
   READINESS_CAUSE_UPSTREAM_NOT_READY = 16;
+  // A wallet-serving reader cannot refresh or match its published canonical
+  // and wallet pair, but the pair is still within its staleness ceiling and
+  // remains exactly what the writer last attested, so it keeps serving.
+  READINESS_CAUSE_SERVING_PAIR_STALE = 17;
 
 }
 
@@ -87,6 +91,7 @@ message ReadinessCauseDetail {
     CursorAtRiskDetail cursor_at_risk = 5;
     NodeUnavailableDetail node_unavailable = 8;
     UpstreamNotReadyDetail upstream_not_ready = 9;
+    ServingPairStaleDetail serving_pair_stale = 10;
   }
 }
 
@@ -122,6 +127,20 @@ message CursorAtRiskDetail {
   uint64 oldest_retained_age_hours = 1;
   // Configured retention window, rounded down to whole hours.
   uint64 retention_hours = 2;
+}
+
+// Detail for READINESS_CAUSE_SERVING_PAIR_STALE.
+//
+// Carries the two numbers that bound continued serving: how far the writer
+// has moved past the published pair, and how long the pair has gone without
+// a writer attestation. The reader stops admitting traffic once the staleness
+// crosses its configured ceiling.
+message ServingPairStaleDetail {
+  // Chain-epoch distance between the writer and the published pair at the
+  // last successful writer-status fetch.
+  uint64 lag_chain_epochs = 1;
+  // Seconds since the writer last attested the published pair.
+  uint64 staleness_seconds = 2;
 }
 
 // Detail for READINESS_CAUSE_NODE_UNAVAILABLE.
