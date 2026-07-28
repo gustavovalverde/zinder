@@ -41,6 +41,9 @@ deploy/
 !deploy/single-container/nginx.conf
 !deploy/capture-container-resource-evidence.sh
 !deploy/canonical-runtime-entrypoint
+!deploy/wallet-serving-runtime-entrypoint
+!deploy/config/railway-wallet-serving/
+!deploy/config/railway-wallet-serving/**
 
 # Test outputs.
 **/test-results/
