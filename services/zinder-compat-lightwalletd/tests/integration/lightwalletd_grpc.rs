@@ -629,6 +629,12 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         self.inner.native_endpoint_capabilities()
     }
 
+    fn canonical_construction_manifest_binding(
+        &self,
+    ) -> Option<zinder_store::CanonicalConstructionManifestBinding> {
+        self.inner.canonical_construction_manifest_binding()
+    }
+
     fn upstream_node_capabilities(&self) -> Option<&zinder_query::UpstreamNodeCapabilities> {
         self.inner.upstream_node_capabilities()
     }

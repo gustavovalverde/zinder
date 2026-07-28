@@ -605,7 +605,7 @@ async fn tree_state_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<
 }
 
 #[tokio::test]
-async fn zebra_json_rpc_advertises_transaction_broadcast() -> eyre::Result<()> {
+async fn zebra_json_rpc_has_no_admitted_capabilities_before_probe() -> eyre::Result<()> {
     let source = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
         "http://127.0.0.1:18232",
@@ -613,25 +613,7 @@ async fn zebra_json_rpc_advertises_transaction_broadcast() -> eyre::Result<()> {
         Duration::from_secs(5),
     )?;
 
-    assert!(
-        source
-            .capabilities()
-            .supports(NodeCapability::TransactionBroadcast)
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn zebra_json_rpc_advertises_subtree_roots() -> eyre::Result<()> {
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        "http://127.0.0.1:18232",
-        NodeAuth::None,
-        Duration::from_secs(5),
-    )?;
-
-    assert!(source.capabilities().supports(NodeCapability::SubtreeRoots));
+    assert_eq!(source.admitted_capabilities(), None);
 
     Ok(())
 }
@@ -1087,7 +1069,7 @@ async fn probe_capabilities_parses_openrpc_method_list() -> eyre::Result<()> {
     assert!(probed.supports(NodeCapability::SubtreeRoots));
     assert!(probed.supports(NodeCapability::TransactionBroadcast));
     assert!(probed.supports(NodeCapability::ChainValuePools));
-    assert_eq!(source.capabilities(), probed);
+    assert_eq!(source.admitted_capabilities(), Some(probed));
 
     Ok(())
 }
@@ -1817,12 +1799,6 @@ async fn fetch_block_value_pool_balances_binds_exact_block_and_preserves_pool_or
         ]
     })))])?;
     let source = regtest_source(&server)?;
-    assert!(
-        source
-            .capabilities()
-            .supports(NodeCapability::BlockValuePoolBalances)
-    );
-
     let balances = source.fetch_block_value_pool_balances(block_id).await?;
 
     assert_eq!(balances.block_id, block_id);
@@ -1839,11 +1815,6 @@ async fn fetch_block_value_pool_balances_binds_exact_block_and_preserves_pool_or
     assert!(!balances.pools[1].monitored);
     assert_eq!(balances.pools[1].value_zat, None);
     assert_eq!(balances.pools[2].value_zat, Some(33));
-    assert!(
-        source
-            .capabilities()
-            .supports(NodeCapability::BlockValuePoolBalances)
-    );
     assert_eq!(
         server.requests_for("getblock")?[0].params,
         json!([block_hash_hex, 1])
@@ -1915,11 +1886,6 @@ async fn fetch_block_value_pool_balances_rejects_invalid_pool_entries() -> eyre:
             source.fetch_block_value_pool_balances(block_id).await,
             Err(SourceError::SourceProtocolMismatch { .. })
         ));
-        assert!(
-            source
-                .capabilities()
-                .supports(NodeCapability::BlockValuePoolBalances)
-        );
     }
 
     Ok(())

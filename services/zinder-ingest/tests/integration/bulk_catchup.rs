@@ -331,12 +331,8 @@ fn assert_current_artifact_schema(chain_epoch: zinder_core::ChainEpoch) {
 
 #[async_trait]
 impl NodeSource for FixtureCheckpointSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities::new([NodeCapability::TreeState]).unwrap_or_default()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-        Some(self.capabilities())
+        NodeCapabilities::new([NodeCapability::TreeState]).ok()
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

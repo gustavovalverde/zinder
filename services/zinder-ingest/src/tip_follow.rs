@@ -918,7 +918,7 @@ where
         retry_state,
     )
     .await?;
-    populate_tip_follow_tree_state_artifacts(config, source, &mut batch).await;
+    populate_tip_follow_tree_state_artifacts(config, source, &mut batch).await?;
     let chain_epoch_id = next_chain_epoch_id_from(current_chain_epoch.as_ref())?;
     let chain_epoch = chain_epoch_for_tip_commit(
         config.node.network,
@@ -934,11 +934,15 @@ async fn populate_tip_follow_tree_state_artifacts<Source>(
     config: &TipFollowConfig,
     source: &Source,
     batch: &mut CanonicalBatch,
-) where
+) -> Result<(), IngestError>
+where
     Source: NodeSource,
 {
-    if !source.capabilities().supports(NodeCapability::TreeState) {
-        return;
+    let admitted_capabilities = source
+        .admitted_capabilities()
+        .ok_or(IngestError::NodeCapabilitiesNotAdmitted)?;
+    if !admitted_capabilities.supports(NodeCapability::TreeState) {
+        return Ok(());
     }
 
     // Stride checkpoints across the batch using the same cadence as
@@ -989,6 +993,7 @@ async fn populate_tip_follow_tree_state_artifacts<Source>(
             ));
         }
     }
+    Ok(())
 }
 
 fn chain_epoch_for_tip_commit(
@@ -1096,7 +1101,7 @@ mod tests {
     use zinder_runtime::{IngestPhase, ReadinessCause};
     use zinder_source::{
         ChainTipNotification, ChainTipNotificationStream, NodeCapabilities, SourceBlockHeader,
-        SourceError, SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState, ZebraJsonRpcSource,
+        SourceError, SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState,
     };
     use zinder_store::ChainStoreOptions;
 
@@ -1190,7 +1195,7 @@ mod tests {
             batch.absorb(position_canonical_block(prepared, &mut running_tree_sizes)?)?;
         }
 
-        populate_tip_follow_tree_state_artifacts(&config, &source, &mut batch).await;
+        populate_tip_follow_tree_state_artifacts(&config, &source, &mut batch).await?;
 
         assert_eq!(batch.final_note_commitment_roots.len(), 3);
         assert_eq!(batch.tree_states.len(), 1);
@@ -1711,12 +1716,15 @@ mod tests {
 
     #[async_trait]
     impl NodeSource for TestNodeSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            ZebraJsonRpcSource::baseline_capabilities()
-        }
-
         fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-            Some(self.capabilities())
+            NodeCapabilities::new([
+                NodeCapability::BestChainBlocks,
+                NodeCapability::SourceChainSegments,
+                NodeCapability::TipId,
+                NodeCapability::TreeState,
+                NodeCapability::SubtreeRoots,
+            ])
+            .ok()
         }
 
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

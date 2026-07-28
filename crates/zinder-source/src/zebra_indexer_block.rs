@@ -177,10 +177,6 @@ impl ZebraIndexerBlockSource {
 
 #[async_trait]
 impl NodeSource for ZebraIndexerBlockSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.control_plane.capabilities()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
         self.control_plane.admitted_capabilities()
     }

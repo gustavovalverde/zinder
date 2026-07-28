@@ -29,10 +29,19 @@ const TEST_REORG_DEPTH: u32 = 100;
 pub struct WalletServingStoreFixture {
     canonical_reader: Option<RocksDbCanonicalSecondary>,
     wallet_reader: Option<RocksDbWalletSecondary>,
-    _temporary_directory: TempDir,
+    temporary_directory: TempDir,
 }
 
 impl WalletServingStoreFixture {
+    /// Returns the production canonical-primary path owned by this fixture.
+    ///
+    /// The fixture must remain alive while another test component opens a
+    /// colocated store derived from this path.
+    #[must_use]
+    pub fn canonical_primary_path(&self) -> std::path::PathBuf {
+        self.temporary_directory.path().join("canonical-primary")
+    }
+
     /// Builds READY primaries from `chain_fixture` and opens immutable secondaries.
     ///
     /// # Errors
@@ -127,7 +136,7 @@ impl WalletServingStoreFixture {
         Ok(Self {
             canonical_reader: Some(canonical_reader),
             wallet_reader: Some(wallet_reader),
-            _temporary_directory: temporary_directory,
+            temporary_directory,
         })
     }
 
@@ -252,7 +261,7 @@ impl WalletServingStoreFixture {
         Ok(Self {
             canonical_reader: Some(canonical_reader),
             wallet_reader: Some(wallet_reader),
-            _temporary_directory: temporary_directory,
+            temporary_directory,
         })
     }
 

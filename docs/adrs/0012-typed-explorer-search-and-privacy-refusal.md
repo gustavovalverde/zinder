@@ -43,7 +43,7 @@ The classifier runs locally. It may confirm public block, transaction, and trans
 
 - Clients can distinguish absent public history from non-public history and render each honestly.
 - Search remains bounded: classification is proportional to input length, with only public candidates eligible for point lookups.
-- The `explorer.search.v1` capability does not require a materialized-view store.
+- The `explorer.search_v1` capability does not require a materialized-view store.
 - Metrics count classifications by candidate kind without recording sensitive input values.
 
 ## Alternatives Considered

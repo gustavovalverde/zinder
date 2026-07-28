@@ -1941,6 +1941,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            zinder_core::Network::ZcashRegtest,
             MaterializedViewStoreOptions {
                 consumers: &[TRANSACTION_COMPONENT_SUMMARY_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),

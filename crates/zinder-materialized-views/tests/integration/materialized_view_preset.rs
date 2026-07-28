@@ -2,6 +2,7 @@
 
 use eyre::Result;
 use tempfile::TempDir;
+use zinder_core::Network;
 use zinder_materialized_views::{
     BLOCK_SUMMARY_COLUMN_FAMILY, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
     MaterializedViewPreset, MaterializedViewStore, MaterializedViewStoreError,
@@ -31,6 +32,7 @@ fn wallet_preset_persists_only_wallet_materialized_view_schemas() -> Result<()> 
     {
         let store = MaterializedViewStore::open_with_materialized_view_preset(
             primary.path(),
+            Network::ZcashRegtest,
             MaterializedViewPreset::Wallet,
             options(),
         )?;
@@ -46,6 +48,7 @@ fn wallet_preset_persists_only_wallet_materialized_view_schemas() -> Result<()> 
     MaterializedViewStore::open_secondary_with_materialized_view_preset(
         primary.path(),
         secondary.path(),
+        Network::ZcashRegtest,
         MaterializedViewPreset::Wallet,
         options(),
     )?;
@@ -59,27 +62,61 @@ fn persisted_workload_detection_distinguishes_wallet_explorer_and_missing_paths(
     let missing = TempDir::new()?;
     MaterializedViewStore::open_with_materialized_view_preset(
         wallet.path(),
+        Network::ZcashRegtest,
         MaterializedViewPreset::Wallet,
         options(),
     )?;
     MaterializedViewStore::open_with_materialized_view_preset(
         explorer.path(),
+        Network::ZcashRegtest,
         MaterializedViewPreset::Explorer,
         options(),
     )?;
 
     assert_eq!(
-        MaterializedViewStore::detect_materialized_view_preset_at_path(wallet.path())?,
+        MaterializedViewStore::detect_materialized_view_preset_at_path(
+            wallet.path(),
+            Network::ZcashRegtest,
+        )?,
         Some(MaterializedViewPreset::Wallet)
     );
     assert_eq!(
-        MaterializedViewStore::detect_materialized_view_preset_at_path(explorer.path())?,
+        MaterializedViewStore::detect_materialized_view_preset_at_path(
+            explorer.path(),
+            Network::ZcashRegtest,
+        )?,
         Some(MaterializedViewPreset::Explorer)
     );
     assert_eq!(
-        MaterializedViewStore::detect_materialized_view_preset_at_path(missing.path())?,
+        MaterializedViewStore::detect_materialized_view_preset_at_path(
+            missing.path(),
+            Network::ZcashRegtest,
+        )?,
         None
     );
+    Ok(())
+}
+
+#[test]
+fn persisted_workload_detection_rejects_a_different_network() -> Result<()> {
+    let directory = TempDir::new()?;
+    MaterializedViewStore::open_with_materialized_view_preset(
+        directory.path(),
+        Network::ZcashRegtest,
+        MaterializedViewPreset::Explorer,
+        options(),
+    )?;
+
+    assert!(matches!(
+        MaterializedViewStore::detect_materialized_view_preset_at_path(
+            directory.path(),
+            Network::ZcashTestnet,
+        ),
+        Err(MaterializedViewStoreError::NetworkMismatch {
+            expected: Network::ZcashTestnet,
+            observed: Network::ZcashRegtest,
+        })
+    ));
     Ok(())
 }
 
@@ -89,6 +126,7 @@ fn changing_a_persisted_materialized_view_preset_fails_before_manifest_mutation(
     {
         MaterializedViewStore::open_with_materialized_view_preset(
             primary.path(),
+            Network::ZcashRegtest,
             MaterializedViewPreset::Wallet,
             options(),
         )?;
@@ -98,6 +136,7 @@ fn changing_a_persisted_materialized_view_preset_fails_before_manifest_mutation(
 
     let outcome = MaterializedViewStore::open_with_materialized_view_preset(
         primary.path(),
+        Network::ZcashRegtest,
         MaterializedViewPreset::Explorer,
         options(),
     );
@@ -115,6 +154,7 @@ fn changing_a_persisted_materialized_view_preset_fails_before_manifest_mutation(
 
     let store = MaterializedViewStore::open_with_materialized_view_preset(
         primary.path(),
+        Network::ZcashRegtest,
         MaterializedViewPreset::Wallet,
         options(),
     )?;
@@ -132,6 +172,7 @@ fn reducing_explorer_to_wallet_fails_before_column_family_mutation() -> Result<(
     {
         MaterializedViewStore::open_with_materialized_view_preset(
             primary.path(),
+            Network::ZcashRegtest,
             MaterializedViewPreset::Explorer,
             options(),
         )?;
@@ -141,6 +182,7 @@ fn reducing_explorer_to_wallet_fails_before_column_family_mutation() -> Result<(
 
     let outcome = MaterializedViewStore::open_with_materialized_view_preset(
         primary.path(),
+        Network::ZcashRegtest,
         MaterializedViewPreset::Wallet,
         options(),
     );
@@ -164,6 +206,7 @@ fn explorer_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()
     {
         let store = MaterializedViewStore::open(
             primary.path(),
+            Network::ZcashRegtest,
             MaterializedViewStoreOptions {
                 consumers: &[FOREIGN_SCHEMA],
                 ..options()
@@ -175,7 +218,10 @@ fn explorer_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()
     let column_families_before =
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
 
-    let outcome = MaterializedViewStore::detect_materialized_view_preset_at_path(primary.path());
+    let outcome = MaterializedViewStore::detect_materialized_view_preset_at_path(
+        primary.path(),
+        Network::ZcashRegtest,
+    );
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ConsumerNotDeclared {
@@ -189,6 +235,7 @@ fn explorer_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()
 
     let store = MaterializedViewStore::open(
         primary.path(),
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             consumers: &[FOREIGN_SCHEMA],
             ..options()

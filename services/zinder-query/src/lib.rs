@@ -14,12 +14,12 @@ use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
     MAX_RAW_TRANSACTION_BYTES, MAX_SUBTREE_ROOTS_PER_REQUEST, MinedTransaction,
-    MinedTransactionChainContext, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionBlobArtifact,
-    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
-    TransparentOutputEntry, TransparentOutputsByOutpointResponse, TransparentSpendEntry,
-    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    MinedTransactionChainContext, Network, NetworkUpgradeActivations, RawTransactionBytes,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
+    TransactionBlobArtifact, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentOutPoint, TransparentOutputEntry, TransparentOutputsByOutpointResponse,
+    TransparentSpendEntry, TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, TxStatus,
 };
 use zinder_materialized_views::{
@@ -35,9 +35,9 @@ use zinder_proto::capabilities::{
 use zinder_source::{SourceError, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
     AddressOutputIndexPageRequest, ArtifactFamily, BlockHashLookup, ChainEpochReadApi,
-    ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
-    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EventStreamStartPosition, StoreError,
-    StreamCursorTokenV1,
+    CanonicalConstructionManifestBinding, ChainEventEnvelope, ChainEventHistoryRequest,
+    ChainEventStreamFamily, ChainEventStreamResume, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
+    EventStreamStartPosition, StoreError, StreamCursorTokenV1,
 };
 
 mod grpc;
@@ -83,6 +83,15 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Returns the immutable structural capability set derived when this query
     /// was composed and admitted.
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;
+
+    /// Returns the admitted canonical construction backing row-serving methods.
+    ///
+    /// Generic query adapters that cannot prove a canonical serving-pair
+    /// lineage return `None`; composition roots requiring row authority must
+    /// reject that absence before reading rows.
+    fn canonical_construction_manifest_binding(
+        &self,
+    ) -> Option<CanonicalConstructionManifestBinding>;
 
     /// Returns the diagnostic capability snapshot from the exact upstream
     /// source handle installed in this query, when one exists.
@@ -476,9 +485,14 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
     pub fn with_materialized_view_store(
         mut self,
         materialized_view_store: MaterializedViewStore,
-    ) -> Self {
+    ) -> Result<Self, QueryError> {
+        let expected = self.network_upgrade_activations.network();
+        let observed = materialized_view_store.network();
+        if observed != expected {
+            return Err(QueryError::MaterializedViewStoreNetworkMismatch { expected, observed });
+        }
         self.materialized_view_store = Some(materialized_view_store);
-        self
+        Ok(self)
     }
 
     /// Attaches the upstream node used to fill tree states at heights without a
@@ -515,6 +529,12 @@ where
 {
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
         &self.native_endpoint_capabilities
+    }
+
+    fn canonical_construction_manifest_binding(
+        &self,
+    ) -> Option<CanonicalConstructionManifestBinding> {
+        None
     }
 
     fn upstream_node_capabilities(&self) -> Option<&UpstreamNodeCapabilities> {
@@ -1091,8 +1111,11 @@ where
             materialized_view_store.try_catch_up()?;
             let snapshot = materialized_view_store.read_snapshot();
             let materialized_fence = snapshot
-                .get_chain_event_cursor(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME)?;
-            if materialized_fence.as_deref()
+                .chain_event_checkpoint(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME)?;
+            if materialized_fence
+                .map(|checkpoint| checkpoint.cursor())
+                .map(|cursor| cursor.as_bytes().to_vec())
+                .as_deref()
                 != canonical_fence
                     .as_ref()
                     .map(zinder_store::StreamCursorTokenV1::as_bytes)
@@ -1941,11 +1964,18 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
         Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
         Some(QueryError::EndpointCapabilityUnavailable { .. }) => "endpoint_capability_unavailable",
+        Some(QueryError::NodeCapabilitiesNotAdmitted) => "node_capabilities_not_admitted",
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
         Some(QueryError::Store(_)) => "store",
         Some(QueryError::MaterializedViewStore(_)) => "materialized_view_store",
+        Some(QueryError::MaterializedViewStoreNetworkMismatch { .. }) => {
+            "materialized_view_store_network_mismatch"
+        }
+        Some(QueryError::CanonicalActivationsFingerprintMismatch) => {
+            "canonical_activations_fingerprint_mismatch"
+        }
         Some(QueryError::WalletProjectionRead { .. }) => "wallet_projection_read",
         Some(QueryError::CanonicalStore(_)) => "canonical_store",
         Some(QueryError::WalletStore(_)) => "wallet_store",
@@ -2444,6 +2474,21 @@ pub enum QueryError {
     #[error(transparent)]
     MaterializedViewStore(#[from] zinder_materialized_views::MaterializedViewStoreError),
 
+    /// Materialized-view storage belongs to a different network than the query.
+    #[error(
+        "materialized-view store network mismatch: expected {expected:?}, observed {observed:?}"
+    )]
+    MaterializedViewStoreNetworkMismatch {
+        /// Network selected by the query's admitted activation table.
+        expected: Network,
+        /// Immutable network authenticated by the materialized-view store.
+        observed: Network,
+    },
+
+    /// Wallet query activation evidence disagrees with its canonical pair.
+    #[error("network-upgrade activation table does not match the admitted canonical construction")]
+    CanonicalActivationsFingerprintMismatch,
+
     /// Typed wallet-projection backend returned a storage failure.
     #[error("wallet projection read failed: {source}")]
     WalletProjectionRead {
@@ -2463,6 +2508,10 @@ pub enum QueryError {
     /// Upstream node operation failed.
     #[error(transparent)]
     Node(#[from] SourceError),
+
+    /// A node-backed query was composed before capability admission.
+    #[error("node capabilities have not been admitted")]
+    NodeCapabilitiesNotAdmitted,
 }
 
 impl zinder_proto::BoundaryError for QueryError {
@@ -2508,6 +2557,11 @@ impl zinder_proto::BoundaryError for QueryError {
                 ErrorReason::NodeCapabilityMissing
             }
             Self::Node(_) => ErrorReason::NodeUnavailable,
+            Self::NodeCapabilitiesNotAdmitted => ErrorReason::NodeCapabilityMissing,
+            Self::MaterializedViewStoreNetworkMismatch { .. } => {
+                ErrorReason::ChainEpochNetworkMismatch
+            }
+            Self::CanonicalActivationsFingerprintMismatch => ErrorReason::SchemaMismatch,
             Self::MaterializedViewStore(_)
             | Self::Store(_)
             | Self::WalletProjectionRead { .. }

@@ -65,25 +65,6 @@ pub enum UpstreamTransactionLookup {
     NotFound,
 }
 
-/// Default capability set assumed for Zebra JSON-RPC sources.
-///
-/// Used until [`ZebraJsonRpcSource::probe_capabilities`] runs. Operators
-/// should treat this as a baseline; the probed value is the source of truth
-/// at runtime.
-fn default_zebra_capabilities() -> NodeCapabilities {
-    NodeCapabilities::from_trusted([
-        NodeCapability::JsonRpc,
-        NodeCapability::BestChainBlocks,
-        NodeCapability::SourceChainSegments,
-        NodeCapability::TipId,
-        NodeCapability::TreeState,
-        NodeCapability::SubtreeRoots,
-        NodeCapability::TransactionBroadcast,
-        NodeCapability::ChainValuePools,
-        NodeCapability::BlockValuePoolBalances,
-    ])
-}
-
 /// Returns `capabilities` with [`NodeCapability::ReadinessProbe`] added when
 /// `enabled` is true, or with it cleared otherwise.
 ///
@@ -172,17 +153,6 @@ impl ZebraJsonRpcSource {
     #[must_use]
     pub const fn network(&self) -> Network {
         self.network
-    }
-
-    /// Returns the static baseline capability set Zebra JSON-RPC sources
-    /// are assumed to support before runtime discovery runs.
-    ///
-    /// Production code should prefer [`ZebraJsonRpcSource::probe_capabilities`]
-    /// (which writes the discovered set into the per-source cache); this
-    /// constant exists for tests and for compile-time defaults.
-    #[must_use]
-    pub fn baseline_capabilities() -> NodeCapabilities {
-        default_zebra_capabilities()
     }
 
     /// Fetches the next source-chain update after `cursor`.
@@ -382,8 +352,8 @@ impl ZebraJsonRpcSource {
     }
 
     /// Probes the node's `rpc.discover` (`OpenRPC`) endpoint and updates
-    /// the cached capability set returned by
-    /// [`NodeSource::capabilities`].
+    /// the admitted capability set returned by
+    /// [`NodeSource::admitted_capabilities`].
     ///
     /// On probe success, the cache reflects the methods the node
     /// advertises plus [`NodeCapability::JsonRpc`] and
@@ -924,15 +894,6 @@ impl ZebraJsonRpcSource {
 
 #[async_trait]
 impl NodeSource for ZebraJsonRpcSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.admitted_capabilities.lock().unwrap_or_else(|| {
-            with_readiness_probe_capability(
-                default_zebra_capabilities(),
-                self.health_config.is_some(),
-            )
-        })
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
         *self.admitted_capabilities.lock()
     }
@@ -2484,14 +2445,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_capabilities_omit_readiness_probe() {
-        assert!(
-            !ZebraJsonRpcSource::baseline_capabilities().supports(NodeCapability::ReadinessProbe)
-        );
-    }
-
-    #[test]
-    fn with_health_config_grants_readiness_probe_capability() -> Result<(), SourceError> {
+    fn health_config_does_not_admit_capabilities_without_probe() -> Result<(), SourceError> {
         let source = ZebraJsonRpcSource::new(
             Network::ZcashRegtest,
             "http://127.0.0.1:18232",
@@ -2504,11 +2458,7 @@ mod tests {
             0.999,
             10,
         )));
-        assert!(
-            source
-                .capabilities()
-                .supports(NodeCapability::ReadinessProbe)
-        );
+        assert_eq!(source.admitted_capabilities(), None);
         Ok(())
     }
 
@@ -2607,7 +2557,8 @@ mod tests {
     }
 
     #[test]
-    fn with_health_config_clears_readiness_probe_when_unset() -> Result<(), SourceError> {
+    fn removing_health_config_does_not_admit_capabilities_without_probe() -> Result<(), SourceError>
+    {
         let source = ZebraJsonRpcSource::new(
             Network::ZcashRegtest,
             "http://127.0.0.1:18232",
@@ -2621,11 +2572,7 @@ mod tests {
             10,
         )))
         .with_health_config(None);
-        assert!(
-            !source
-                .capabilities()
-                .supports(NodeCapability::ReadinessProbe)
-        );
+        assert_eq!(source.admitted_capabilities(), None);
         Ok(())
     }
 }

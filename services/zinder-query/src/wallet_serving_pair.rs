@@ -9,9 +9,9 @@ use zinder_core::{
     TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
 };
 use zinder_store::{
-    CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention,
-    RocksDbCanonicalSecondary,
+    CanonicalEventFence, CanonicalStoreConstructionIdentity, CanonicalStoreError,
+    ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
+    EventStreamStartPosition, RawBlobRetention, RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -29,6 +29,9 @@ use crate::QueryError;
 /// Implementations must never catch up or otherwise mutate their observed
 /// fence while a caller holds the same instance in a [`WalletServingReadPair`].
 pub trait CanonicalReader: Send + Sync + 'static {
+    /// Returns the exact construction identity admitted by this reader.
+    fn construction_identity(&self) -> CanonicalStoreConstructionIdentity;
+
     /// Returns the persisted raw-blob retention authenticated at admission.
     fn raw_blob_retention(&self) -> RawBlobRetention;
 
@@ -208,6 +211,10 @@ pub enum WalletServingAdmissionError {
 macro_rules! impl_canonical_read {
     ($store:ty) => {
         impl CanonicalReader for $store {
+            fn construction_identity(&self) -> CanonicalStoreConstructionIdentity {
+                self.construction_identity()
+            }
+
             fn raw_blob_retention(&self) -> RawBlobRetention {
                 self.raw_blob_retention()
             }
@@ -388,6 +395,7 @@ pub struct WalletServingReadPair {
     canonical: Arc<dyn CanonicalReader>,
     wallet: Arc<dyn WalletProjectionReader>,
     canonical_fence: CanonicalEventFence,
+    canonical_construction_identity: CanonicalStoreConstructionIdentity,
     wallet_source: WalletCanonicalSourceIdentity,
 }
 
@@ -401,6 +409,7 @@ impl WalletServingReadPair {
             .map_err(|error| pair_admission_query_error(&error))?;
         Ok(Self {
             canonical_fence: canonical.event_fence(),
+            canonical_construction_identity: canonical.construction_identity(),
             wallet_source: WalletCanonicalSourceIdentity::from_ready_evidence(
                 wallet.ready_evidence(),
             ),
@@ -479,6 +488,12 @@ impl WalletServingReadPair {
         self.canonical_fence
     }
 
+    /// Returns the exact canonical construction admitted for this pair.
+    #[must_use]
+    pub const fn canonical_construction_identity(&self) -> CanonicalStoreConstructionIdentity {
+        self.canonical_construction_identity
+    }
+
     /// Returns the exact wallet source admitted for this pair.
     #[must_use]
     pub const fn wallet_source(&self) -> WalletCanonicalSourceIdentity {
@@ -491,6 +506,10 @@ impl fmt::Debug for WalletServingReadPair {
         formatter
             .debug_struct("WalletServingReadPair")
             .field("canonical_fence", &self.canonical_fence)
+            .field(
+                "canonical_construction_identity",
+                &self.canonical_construction_identity,
+            )
             .field("wallet_source", &self.wallet_source)
             .finish_non_exhaustive()
     }

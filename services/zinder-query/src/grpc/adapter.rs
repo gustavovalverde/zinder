@@ -90,6 +90,7 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
             metadata,
             query_api.native_endpoint_capabilities(),
             query_api.upstream_node_capabilities(),
+            query_api.canonical_construction_manifest_binding(),
         );
         Self {
             query_api,
@@ -116,6 +117,7 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
             metadata,
             query_api.native_endpoint_capabilities(),
             query_api.upstream_node_capabilities(),
+            query_api.canonical_construction_manifest_binding(),
         );
         Self {
             query_api,

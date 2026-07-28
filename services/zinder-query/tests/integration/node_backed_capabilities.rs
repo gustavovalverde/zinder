@@ -248,7 +248,8 @@ fn node_backed_composition_requires_tip_liveness_capability() -> eyre::Result<()
 }
 
 #[tokio::test]
-async fn probed_tree_and_broadcast_capabilities_are_advertised_and_invokable() -> eyre::Result<()> {
+async fn admitted_tree_and_broadcast_capabilities_are_advertised_and_invokable() -> eyre::Result<()>
+{
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
@@ -433,7 +434,7 @@ fn serving_query_from_chain(
         Arc::new(canonical),
         Arc::new(wallet),
     )?);
-    let query = WalletServingQuery::from_probed_node_source(
+    let query = WalletServingQuery::from_admitted_node_source(
         WalletServingPairSlot::new(pair),
         source,
         Arc::clone(activations),
@@ -454,10 +455,6 @@ struct ProbedValuePoolSource {
 
 #[async_trait]
 impl NodeSource for ProbedValuePoolSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.capabilities
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
         Some(self.capabilities)
     }

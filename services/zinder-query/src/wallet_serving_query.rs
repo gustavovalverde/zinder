@@ -395,14 +395,14 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
     /// Every [`WalletQueryApi`] method captures one `Arc` from this slot before
     /// reading. A publisher can therefore atomically replace the pair without
     /// changing the canonical or wallet reader observed by an in-flight request.
-    #[must_use]
     pub fn from_serving_pair_slot(
         serving_pair_slot: WalletServingPairSlot,
         broadcaster: Broadcaster,
         network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    ) -> Self {
+    ) -> Result<Self, QueryError> {
+        require_matching_activation_identity(&serving_pair_slot, &network_upgrade_activations)?;
         let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
-        Self {
+        Ok(Self {
             serving_pair_slot,
             broadcaster,
             network_upgrade_activations,
@@ -412,7 +412,7 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
                 zinder_source::NodeCapabilities::default(),
             ),
             upstream_node_capabilities: None,
-        }
+        })
     }
 
     fn capture_pair(&self) -> Arc<WalletServingReadPair> {
@@ -474,15 +474,18 @@ impl<Source> WalletServingQuery<Source>
 where
     Source: Clone + NodeSource + TransactionBroadcaster + TreeStateUpstream,
 {
-    /// Builds the release query from the exact node-source handle whose
-    /// successful capability probe is installed as broadcaster and tree-state
-    /// and chain-value-pool provider.
-    pub fn from_probed_node_source(
+    /// Builds a node-backed query from the exact admitted source handle
+    /// installed as broadcaster, tree-state provider, and chain-value-pool
+    /// provider.
+    pub fn from_admitted_node_source(
         serving_pair_slot: WalletServingPairSlot,
         source: Source,
         network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     ) -> Result<Self, QueryError> {
-        let node_capabilities = source.capabilities();
+        require_matching_activation_identity(&serving_pair_slot, &network_upgrade_activations)?;
+        let node_capabilities = source
+            .admitted_capabilities()
+            .ok_or(QueryError::NodeCapabilitiesNotAdmitted)?;
         if !node_capabilities.supports(NodeCapability::OpenRpcDiscovery) {
             return Err(QueryError::Node(
                 zinder_source::SourceError::NodeCapabilityMissing {
@@ -513,11 +516,26 @@ where
             network_upgrade_activations,
             tree_state_upstream: Some(tree_state_upstream),
             native_endpoint_capabilities,
-            upstream_node_capabilities: Some(UpstreamNodeCapabilities::from_probed(
+            upstream_node_capabilities: Some(UpstreamNodeCapabilities::from_admitted(
                 node_capabilities,
             )),
         })
     }
+}
+
+fn require_matching_activation_identity(
+    serving_pair_slot: &WalletServingPairSlot,
+    activations: &NetworkUpgradeActivations,
+) -> Result<(), QueryError> {
+    let expected = serving_pair_slot
+        .capture()
+        .canonical_construction_identity()
+        .network_upgrade_activations_fingerprint();
+    let observed = activations.fingerprint(expected.version());
+    if observed != expected {
+        return Err(QueryError::CanonicalActivationsFingerprintMismatch);
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -527,6 +545,17 @@ where
 {
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
         &self.native_endpoint_capabilities
+    }
+
+    fn canonical_construction_manifest_binding(
+        &self,
+    ) -> Option<zinder_store::CanonicalConstructionManifestBinding> {
+        Some(
+            self.serving_pair_slot
+                .capture()
+                .canonical_construction_identity()
+                .construction_manifest_binding(),
+        )
     }
 
     fn upstream_node_capabilities(&self) -> Option<&UpstreamNodeCapabilities> {

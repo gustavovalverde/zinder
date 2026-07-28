@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, path::Path};
 
 use thiserror::Error;
 use zinder_core::{
-    BlockHeight, TransparentSpendFact,
+    BlockHeight, Network, TransparentSpendFact,
     wire::{encode_height_key_ascending, encode_outpoint_key},
 };
 use zinder_materialized_views::{
@@ -32,9 +32,11 @@ pub enum MaterializedViewFixtureError {
 /// Returns [`MaterializedViewFixtureError`] when the materialized-view store cannot be opened.
 pub fn open_test_materialized_view_store_for_canonical(
     canonical_path: &Path,
+    network: Network,
 ) -> Result<MaterializedViewStore, MaterializedViewFixtureError> {
     Ok(MaterializedViewStore::open(
         MaterializedViewStore::path_for_canonical(canonical_path),
+        network,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),

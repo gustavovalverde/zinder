@@ -150,8 +150,11 @@ batch as the cursor and materialized-view-state transition.
 ## Query exposure
 
 `zinder-explorer` exposes materialized views through `ExplorerQuery` and
-advertises a capability only when its dependencies and coverage support the
-method. An unavailable materialized-view store maps to the stable
+admits a capability only when the concrete composition contains the exact
+installed consumers and other structural providers required by the method.
+Mutable backfill coverage is checked at request time and returned in-band or
+mapped to a typed materialization error; it never rewrites the endpoint's
+frozen capability set. An unavailable materialized-view store maps to the stable
 `MATERIALIZED_VIEW_UNAVAILABLE` vocabulary. Missing data is never translated
 into zero, an empty complete result, or canonical absence.
 

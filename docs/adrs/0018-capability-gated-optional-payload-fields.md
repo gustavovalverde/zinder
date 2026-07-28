@@ -15,32 +15,33 @@ upstream state the operator may or may not have wired:
   raw transaction bytes retained by the admitted wallet endpoint; a canonical
   secondary is not an alternative transaction-fact provider. The current
   release wallet endpoint does not advertise the two required transaction
-  capabilities, so the release explorer omits TransactionDetail entirely.
+  capabilities, so an operator-built explorer binary paired with that wallet
+  endpoint omits TransactionDetail entirely.
 - `TransparentAddressActivityEntry.net_value_zat` requires resolved prevout
   evidence in the admitted activity projection; the row materializes either
   way.
 - `TransactionHistoryEntry.zip317_conventional_fee_zat` is unset for
   coinbase rows; non-coinbase rows always carry a value.
 
-We need one convention for "this field is present when capability X is
-online (or some equivalent precondition holds), absent otherwise" that
-consumers can branch on without inferring from sentinel values like
-zero.
+We need one convention for "this endpoint structurally supports field X, while
+the field's value may still be legitimately absent for a particular row" that
+consumers can use without inferring support or missing evidence from sentinel
+values like zero.
 
 ## Decision
 
 Optional payload fields paired with named capability strings are the
 convention. Specifically:
 
-1. The proto field is `optional <scalar>` (proto3 explicit-presence) or
-   `repeated <message>` (empty means absent). Sentinels like zero or
-   empty bytes are never overloaded to mean "absent"; proto3
-   field-presence handles that for us.
+1. A singular value whose absence is meaningful uses proto3 explicit presence
+   (`optional <scalar>` or an optional message). An empty repeated field is a
+   legitimate empty collection, not a generic presence signal; its companion
+   capability describes structural support. Sentinels like zero or empty bytes
+   are never overloaded to mean missing evidence.
 
-2. When a field's absence has multiple causes a reader might want to
-   distinguish ("the upstream is offline" vs "this particular row
-   could not be resolved"), the message carries a companion enum
-   alongside the optional value. The current example is
+2. When a supported field's row-level absence has multiple causes a reader
+   might want to distinguish, the message carries a companion enum alongside
+   the optional value. The current example is
    `TransparentAddressActivityRecord.prevout_resolution_status`
    (`Resolved | Partial | Unavailable | Unspecified`), which is set on
    every row so the handler renders a chip rather than guessing.
@@ -50,12 +51,15 @@ convention. Specifically:
    ordering, and method association; it does not decide whether a running
    endpoint supports the field.
 
-4. The handler returns the field as `None` / empty whenever the
-   underlying upstream is unavailable, and the field is fully populated
-   when present. The handler never emits the field with a partial
-   sentinel: never `paid_fee_zat = 0` to mean "unresolved", never
-   `net_value_zat = 0` to mean "we only saw one side of the
-   transaction".
+4. Structural dependency absence omits the method or field capability and
+   suppresses both the optional field and its supporting read. Row-level
+   missing evidence leaves the optional field absent and uses its companion
+   status where the response defines one. A transient failure of an admitted
+   dependency is a typed request error, never structural omission or row-level
+   absence. When that dependency belongs to the runtime's readiness contract,
+   its owning health projection also makes readiness false. The handler never
+   emits a partial sentinel: never `paid_fee_zat = 0` to mean "unresolved",
+   never `net_value_zat = 0` to mean "we only saw one side of the transaction".
 
 5. Each service derives one immutable endpoint capability set after all
    dependencies have been admitted and before it binds gRPC or operational
@@ -82,10 +86,10 @@ convention. Specifically:
 | ----- | ---------- | ---------------------- |
 | `TransactionDetailResponse.paid_fee_zat` | `explorer.transaction.fees_v1` | `prevout_resolution_status` |
 | `TransactionDetailResponse.transparent_inputs[].value_zat` | `explorer.transaction.fees_v1` | (status on the parent) |
-| `TransparentAddressActivityRecord.net_value_zat` | `explorer.transparent_address.activity_v1` | `prevout_resolution_status` on the record |
+| `TransparentAddressActivityRecord.net_value_zat` | `explorer.transparent_address.activity_v2` | `prevout_resolution_status` on the record |
 | `RecentTransactionEntry.zip317_conventional_fee_zat` | `explorer.transaction.recent_v1` | (none; `is_coinbase = true` explains absence) |
 | `RecentTransactionEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not provable from retained facts") |
-| `TransactionHistoryEntry.zip317_conventional_fee_zat` | `explorer.transaction.history_v1` | (none; `is_coinbase = true` explains absence) |
+| `TransactionHistoryEntry.zip317_conventional_fee_zat` | `explorer.transaction.history_v2` | (none; `is_coinbase = true` explains absence) |
 | `TransactionHistoryEntry.intrinsic_value_balances` | `explorer.transaction.intrinsic_value_balances_v1` | (none; absence remains unknown and never means all-zero balances) |
 | `TransactionDetailResponse.intrinsic_value_balances` | `explorer.transaction.intrinsic_value_balances_v1` | (none; absence remains unknown and never means all-zero balances) |
 | `TransactionHistoryEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not provable from retained facts") |
@@ -133,15 +137,16 @@ coverage continue to report the mutable range in-band.
 - Consumers branch on proto field presence (`response.paid_fee_zat
   .is_some()`) and on the capability list returned by
   `ServerInfo.capabilities`, never on sentinel comparisons. The capability
-  means the fee projection and transparent-input resolution are online; it
-  does not promise an actual fee for shielded or unclassified transactions.
+  means the endpoint structurally admits the fee projection and
+  transparent-input resolution; it does not promise an actual fee for
+  shielded or unclassified transactions.
 - Adding a new field of this shape requires three diff sites in the
   same change: the proto, the capability constant + uniqueness/coverage
   tests, and the handler that populates it. When the field needs a
   status companion, the record gains a fourth diff site.
-- Operators see in `/healthz` and `ExplorerQuery.ServerInfo` which
-  optional fields are populated on their deployment, since the
-  capability list mirrors the proto-field decisions.
+- Operators see in `/healthz` and `ExplorerQuery.ServerInfo` which optional
+  fields the endpoint may populate, since the capability list mirrors the
+  structural proto-field decisions.
 - Adding a field capability requires its exact structural evidence, carrier
   methods, emission guard, negative composition proof where one exists, and a
   current production consumer. Readiness flags and generic capability-policy

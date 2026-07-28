@@ -89,10 +89,6 @@ impl ParityNodeSource {
 
 #[async_trait]
 impl NodeSource for ParityNodeSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.capabilities
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
         Some(self.capabilities)
     }
@@ -216,7 +212,7 @@ fn build_transparent_address_adapter(
         serving_pair_slot.clone(),
         MockTransactionBroadcaster::broadcast_disabled(),
         Arc::clone(&fixture.activations),
-    );
+    )?;
     Ok(
         LightwalletdGrpcAdapter::new(query, Arc::clone(&fixture.activations))
             .with_serving_pair_slot(serving_pair_slot)
@@ -253,7 +249,7 @@ async fn open_remote_chain_index(chain_fixture: &ChainFixture) -> eyre::Result<R
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let wallet_query =
-        WalletServingQuery::from_probed_node_source(serving_pair_slot, node_source, activations)?;
+        WalletServingQuery::from_admitted_node_source(serving_pair_slot, node_source, activations)?;
     let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

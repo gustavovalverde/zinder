@@ -104,7 +104,7 @@ async fn remote_chain_index_returns_typed_network_upgrade_activations() -> eyre:
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let wallet_query =
-        WalletServingQuery::from_serving_pair_slot(serving_pair_slot, (), activations);
+        WalletServingQuery::from_serving_pair_slot(serving_pair_slot, (), activations)?;
     let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
         wallet_query,
         WalletEndpointMetadata::default(),

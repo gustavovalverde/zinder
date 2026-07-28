@@ -239,13 +239,16 @@ pub(crate) async fn transaction_history(
             &mut page.entries,
         )?;
     }
-    if context.include_intrinsic_value_balances {
-        join_transaction_intrinsic_value_balances(
-            context.chain_store,
-            &chain_epoch,
-            &mut page.entries,
-        )?;
-    }
+    join_admitted_transaction_intrinsic_value_balances(
+        context.include_intrinsic_value_balances,
+        || {
+            join_transaction_intrinsic_value_balances(
+                context.chain_store,
+                &chain_epoch,
+                &mut page.entries,
+            )
+        },
+    )?;
     let freshness = attach_upstream_observation(
         context.upstream_observation_cache,
         build_explorer_freshness(
@@ -747,7 +750,7 @@ pub(super) fn decode_history_entry(
     payload: &[u8],
 ) -> Result<TransactionHistoryEntry, Status> {
     let (block_height, transaction_index) = decode_history_key(key)?;
-    let mut entry = TransactionHistoryEntry::decode(payload)
+    let entry = TransactionHistoryEntry::decode(payload)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     if entry.block_height != block_height.value() {
         return Err(ExplorerError::internal(
@@ -755,7 +758,7 @@ pub(super) fn decode_history_entry(
         )
         .into());
     }
-    if entry.transaction_index != 0 && entry.transaction_index != transaction_index {
+    if entry.transaction_index != transaction_index {
         return Err(ExplorerError::internal(
             "transaction-history row index does not match its key",
         )
@@ -763,7 +766,6 @@ pub(super) fn decode_history_entry(
     }
     decode_rpc_block_hash_hex(&entry.block_hash)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    entry.transaction_index = transaction_index;
     Ok(entry)
 }
 
@@ -1195,6 +1197,17 @@ fn resolve_missing_transparent_fees(
     Ok(())
 }
 
+/// Executes the canonical intrinsic-balance join only for an admitted field.
+fn join_admitted_transaction_intrinsic_value_balances(
+    include_intrinsic_value_balances: bool,
+    join: impl FnOnce() -> Result<(), Status>,
+) -> Result<(), Status> {
+    if include_intrinsic_value_balances {
+        join()?;
+    }
+    Ok(())
+}
+
 /// Hydrates transaction-intrinsic shielded value balances from the canonical
 /// store at the response's wallet-pinned chain epoch.
 ///
@@ -1250,6 +1263,7 @@ fn join_transaction_intrinsic_value_balances(
 
 #[cfg(test)]
 mod tests {
+    use prost::Message as _;
     use tempfile::tempdir;
     use zinder_core::{BlockHash, ChainEpochId};
     use zinder_materialized_views::{
@@ -1283,11 +1297,24 @@ mod tests {
     }
 
     #[test]
+    fn unadvertised_intrinsic_balances_skip_the_canonical_join() {
+        let mut canonical_join_attempted = false;
+        let outcome = join_admitted_transaction_intrinsic_value_balances(false, || {
+            canonical_join_attempted = true;
+            Err(Status::internal("canonical join must not run"))
+        });
+
+        assert!(outcome.is_ok());
+        assert!(!canonical_join_attempted);
+    }
+
+    #[test]
     fn structural_history_reader_reports_typed_materialization_outcomes()
     -> Result<(), Box<dyn std::error::Error>> {
         let wallet_path = tempdir()?;
         let wallet_store = MaterializedViewStore::open_with_materialized_view_preset(
             wallet_path.path(),
+            zinder_core::Network::ZcashRegtest,
             MaterializedViewPreset::Wallet,
             test_options(),
         )?;
@@ -1300,6 +1327,7 @@ mod tests {
         let explorer_path = tempdir()?;
         let explorer_store = MaterializedViewStore::open_with_materialized_view_preset(
             explorer_path.path(),
+            zinder_core::Network::ZcashRegtest,
             MaterializedViewPreset::Explorer,
             test_options(),
         )?;
@@ -1365,6 +1393,38 @@ mod tests {
             block_hash: "00".repeat(32),
             ..TransactionHistoryEntry::default()
         }
+    }
+
+    #[test]
+    fn history_entry_decoder_accepts_matching_key_and_payload_transaction_indices()
+    -> Result<(), Status> {
+        let key = TransactionHistoryConsumer::key_for_row(BlockHeight::new(42), 7);
+        let expected_entry = history_entry(42, 7);
+        let payload = expected_entry.encode_to_vec();
+
+        let decoded_entry = decode_history_entry(&key, &payload)?;
+
+        assert_eq!(decoded_entry, expected_entry);
+        Ok(())
+    }
+
+    #[test]
+    fn history_entry_decoder_rejects_zero_payload_index_for_nonzero_key_index() {
+        let key = TransactionHistoryConsumer::key_for_row(BlockHeight::new(42), 7);
+        let payload = history_entry(42, 0).encode_to_vec();
+
+        let decode_outcome = decode_history_entry(&key, &payload);
+
+        assert!(
+            matches!(
+                decode_outcome,
+                Err(ref status)
+                    if status.code() == tonic::Code::Internal
+                        && status.message()
+                            == "transaction-history row index does not match its key"
+            ),
+            "{decode_outcome:?}"
+        );
     }
 
     #[test]

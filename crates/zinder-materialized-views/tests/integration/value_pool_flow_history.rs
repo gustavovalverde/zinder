@@ -3,7 +3,7 @@ use std::{collections::HashMap, error::Error, sync::Arc};
 use rust_rocksdb::WriteBatch;
 use tempfile::tempdir;
 use zinder_core::{
-    BlockHash, BlockHeight, LockTime, PrivacyShape, TransactionComponentCounts,
+    BlockHash, BlockHeight, LockTime, Network, PrivacyShape, TransactionComponentCounts,
     TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalances,
     TransactionLocation, TransactionPublicFacts, TransactionVersion,
 };
@@ -88,6 +88,7 @@ fn open_store() -> TestResult<(tempfile::TempDir, MaterializedViewStore)> {
     let tempdir = tempdir()?;
     let store = MaterializedViewStore::open(
         tempdir.path(),
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[VALUE_POOL_FLOW_HISTORY_SCHEMA],
@@ -430,6 +431,7 @@ fn lifecycle_persists_coverage_without_advancing_cursor_and_rewinds_tail() -> Te
 
     let store = MaterializedViewStore::open(
         tempdir.path(),
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[VALUE_POOL_FLOW_HISTORY_SCHEMA],

@@ -56,7 +56,7 @@ async fn canonical_block_contexts_carry_header_transaction_and_intrinsic_facts()
 -> Result<(), Box<dyn Error>> {
     let harness = CanonicalHarness::genesis_complete().await?;
     let activations = sample_regtest_upgrade_activations();
-    let mut reader = CanonicalBlockContextReader::new(harness.secondary(), &activations);
+    let mut reader = CanonicalBlockContextReader::new(harness.secondary(), &activations)?;
 
     let contexts = reader.read_block_commit_contexts(chain_range())?;
 
@@ -109,6 +109,35 @@ async fn canonical_block_contexts_carry_header_transaction_and_intrinsic_facts()
 }
 
 #[tokio::test]
+async fn canonical_block_context_rejects_activation_network_mismatch() -> Result<(), Box<dyn Error>>
+{
+    let harness = CanonicalHarness::genesis_complete().await?;
+    let activations = NetworkUpgradeActivations::empty(Network::ZcashTestnet);
+
+    assert!(matches!(
+        CanonicalBlockContextReader::new(harness.secondary(), &activations),
+        Err(IngestError::CanonicalActivationsNetworkMismatch {
+            canonical: Network::ZcashRegtest,
+            activations: Network::ZcashTestnet,
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_block_context_rejects_same_network_activation_fingerprint_mismatch()
+-> Result<(), Box<dyn Error>> {
+    let harness = CanonicalHarness::genesis_complete().await?;
+    let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+
+    assert!(matches!(
+        CanonicalBlockContextReader::new(harness.secondary(), &activations),
+        Err(IngestError::CanonicalActivationsFingerprintMismatch { .. })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn derived_final_note_commitment_roots_match_independent_accumulation()
 -> Result<(), Box<dyn Error>> {
     let harness = CanonicalHarness::genesis_complete().await?;
@@ -130,7 +159,7 @@ async fn derived_final_note_commitment_roots_match_independent_accumulation()
         orchard_root_at(ORCHARD_BLOCK_HEIGHT)
     );
 
-    let mut sequential = CanonicalBlockContextReader::new(harness.secondary(), &activations);
+    let mut sequential = CanonicalBlockContextReader::new(harness.secondary(), &activations)?;
     let contexts = sequential.read_block_commit_contexts(chain_range())?;
     for (height, roots) in &expected {
         let context = contexts
@@ -139,7 +168,7 @@ async fn derived_final_note_commitment_roots_match_independent_accumulation()
         assert_eq!(context.final_note_commitment_roots.as_ref(), Some(roots));
     }
 
-    let mut reseeding = CanonicalBlockContextReader::new(harness.secondary(), &activations);
+    let mut reseeding = CanonicalBlockContextReader::new(harness.secondary(), &activations)?;
     let tail = BlockHeightRange::inclusive(
         BlockHeight::new(SPENDING_BLOCK_HEIGHT),
         BlockHeight::new(CHAIN_TIP_HEIGHT),
@@ -171,7 +200,7 @@ async fn cross_block_transparent_spends_resolve_from_the_producing_block()
         .get(1)
         .ok_or("the spending block must carry a second transaction")?;
 
-    let mut whole_range = CanonicalBlockContextReader::new(harness.secondary(), &activations);
+    let mut whole_range = CanonicalBlockContextReader::new(harness.secondary(), &activations)?;
     let contexts = whole_range.read_block_commit_contexts(chain_range())?;
     let spends = contexts
         .get(&BlockHeight::new(SPENDING_BLOCK_HEIGHT))
@@ -199,7 +228,7 @@ async fn cross_block_transparent_spends_resolve_from_the_producing_block()
     assert_eq!(spend.spent_block_height, BlockHeight::new(1));
     assert_eq!(spend.spent_block_hash, produced.hash);
 
-    let mut single_block = CanonicalBlockContextReader::new(harness.secondary(), &activations);
+    let mut single_block = CanonicalBlockContextReader::new(harness.secondary(), &activations)?;
     let spending_only = single_block.read_block_commit_contexts(BlockHeightRange::inclusive(
         BlockHeight::new(SPENDING_BLOCK_HEIGHT),
         BlockHeight::new(SPENDING_BLOCK_HEIGHT),
@@ -218,7 +247,7 @@ async fn unresolvable_transparent_prevouts_fail_hydration() -> Result<(), Box<dy
     let fabricated = TransactionId::from_bytes([0x5c; 32]);
     let harness = CanonicalHarness::spending(TransparentOutPoint::new(fabricated, 0)).await?;
     let activations = sample_regtest_upgrade_activations();
-    let mut reader = CanonicalBlockContextReader::new(harness.secondary(), &activations);
+    let mut reader = CanonicalBlockContextReader::new(harness.secondary(), &activations)?;
 
     let error = reader
         .read_block_commit_contexts(chain_range())
@@ -390,12 +419,8 @@ struct StaticChainSource {
 
 #[async_trait]
 impl NodeSource for StaticChainSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities::default()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-        Some(self.capabilities())
+        Some(NodeCapabilities::default())
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

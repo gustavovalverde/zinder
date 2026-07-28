@@ -24,7 +24,7 @@ use tonic::transport::Server;
 use zinder_core::{BlockHeight, Network};
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
-    CanonicalPipelineLimits, CanonicalWriterConfig, IngestNodeComposition, LiveMempoolOwner,
+    CanonicalPipelineLimits, CanonicalWriterConfig, IngestControlNodeComposition, LiveMempoolOwner,
     canonical_control_channel, run_canonical_writer_with_control,
 };
 use zinder_proto::v1::{
@@ -120,7 +120,7 @@ async fn canonical_writer_publishes_visible_reorg_for_invalidated_zebra_suffix()
     let server_cancel = cancel.clone();
     source.probe_capabilities().await?;
     let node_source: Arc<dyn NodeSource> = Arc::new(source.clone());
-    let node_composition = IngestNodeComposition::new(node_source)?;
+    let node_composition = IngestControlNodeComposition::new(node_source)?;
     let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
         canonical,
         LiveMempoolOwner::default(),

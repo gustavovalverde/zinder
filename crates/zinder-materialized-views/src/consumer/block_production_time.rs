@@ -15,7 +15,7 @@ use zinder_core::wire::{
 use zinder_core::{BlockHash, BlockHeight};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockCheckpoint,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockProjection,
     MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
     MaterializedViewConsumerSchema,
 };
@@ -671,9 +671,9 @@ impl BlockKeyedConsumer for BlockProductionTimeConsumer {
         Ok(())
     }
 
-    fn stage_chain_event_checkpoint(
+    fn stage_block_projection_state(
         &mut self,
-        checkpoint: MaterializedViewBlockCheckpoint<'_>,
+        checkpoint: MaterializedViewBlockProjection<'_>,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
         let tip_height = checkpoint
@@ -1374,6 +1374,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            zinder_core::Network::ZcashRegtest,
             MaterializedViewStoreOptions {
                 consumers: &[BLOCK_PRODUCTION_TIME_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),

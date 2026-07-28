@@ -27,14 +27,18 @@ use zinder_proto::v1::ingest::{
     CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
     canonical_control_client::CanonicalControlClient,
 };
+use zinder_proto::wire::{
+    CanonicalConstructionManifestBindingDecodeError,
+    decode_canonical_construction_manifest_binding,
+};
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, NodeUnavailableDetail, Readiness,
     ReadinessCause, ReadinessState, UpstreamHealth, UpstreamNotReadyDetail, connect_zinder_grpc,
 };
 use zinder_source::{NodeCapability, NodeSource, SourceError, UpstreamHealthSnapshot};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    CanonicalConstructionManifestBinding, CanonicalReorgPolicy, CanonicalStoreError,
+    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
@@ -239,7 +243,10 @@ where
             cancel.cancelled().await;
         }));
     }
-    if !source.capabilities().supports(NodeCapability::TipId) {
+    let admitted_capabilities = source
+        .admitted_capabilities()
+        .ok_or(crate::QueryError::NodeCapabilitiesNotAdmitted)?;
+    if !admitted_capabilities.supports(NodeCapability::TipId) {
         return Err(crate::QueryError::Node(
             SourceError::NodeCapabilityMissing {
                 capability: NodeCapability::TipId,
@@ -373,6 +380,21 @@ pub enum WalletServingPairError {
     /// Writer status did not contain an exact, usable canonical fence.
     #[error("canonical writer-status response did not contain a valid fence")]
     WriterStatusInvalid,
+    /// Writer status omitted the immutable construction binding.
+    #[error("canonical writer-status response omitted its construction-manifest binding")]
+    WriterConstructionBindingMissing,
+    /// Writer status carried a malformed construction binding.
+    #[error("canonical writer-status construction-manifest binding is malformed")]
+    WriterConstructionBindingMalformed {
+        /// Strict protocol-shape failure.
+        #[source]
+        source: CanonicalConstructionManifestBindingDecodeError,
+    },
+    /// Writer status names a different canonical construction than the reader.
+    #[error(
+        "canonical writer-status construction-manifest binding disagrees with the admitted canonical secondary"
+    )]
+    WriterConstructionBindingMismatch,
     /// Writer status disagreed with a same-epoch pair, indicating a fence or
     /// primary-path replacement inconsistency rather than normal lag.
     #[error("canonical writer-status fence disagrees with the serving pair")]
@@ -594,6 +616,7 @@ impl WalletServingPairPublisher {
                 Ok(()) => {
                     let source = self.candidate_wallet_source(generation)?;
                     let writer_status = self.writer_status.fetch().await?;
+                    self.validate_candidate_writer_binding(generation, &writer_status)?;
                     if writer_status_matches_source(&writer_status, source, self.config.network) {
                         self.publish_candidate(generation)?;
                         return Ok(());
@@ -689,6 +712,24 @@ impl WalletServingPairPublisher {
         ))
     }
 
+    fn validate_candidate_writer_binding(
+        &self,
+        generation: usize,
+        writer_status: &CanonicalWriterStatusResponse,
+    ) -> Result<(), WalletServingPairError> {
+        let SecondaryGenerationState::Candidate { candidate } = &self.generations[generation].state
+        else {
+            return Err(WalletServingPairError::CandidateUnavailable { generation });
+        };
+        validate_writer_construction_binding(
+            writer_status,
+            candidate
+                .canonical
+                .construction_identity()
+                .construction_manifest_binding(),
+        )
+    }
+
     fn publish_candidate(&mut self, generation: usize) -> Result<(), WalletServingPairError> {
         let state = std::mem::replace(
             &mut self.generations[generation].state,
@@ -733,6 +774,12 @@ impl WalletServingPairPublisher {
         active_pair: &WalletServingReadPair,
         writer_status: &CanonicalWriterStatusResponse,
     ) -> Result<ActiveWriterRelation, WalletServingPairError> {
+        validate_writer_construction_binding(
+            writer_status,
+            active_pair
+                .canonical_construction_identity()
+                .construction_manifest_binding(),
+        )?;
         let Some(writer_fence) = writer_status.fence.as_ref() else {
             return Err(WalletServingPairError::WriterStatusInvalid);
         };
@@ -941,6 +988,23 @@ fn writer_status_matches_source(
         && fence.canonical_sequence_digest == source.source_sequence_digest().as_bytes()
 }
 
+fn validate_writer_construction_binding(
+    status: &CanonicalWriterStatusResponse,
+    expected: CanonicalConstructionManifestBinding,
+) -> Result<(), WalletServingPairError> {
+    let binding = status
+        .canonical_construction_manifest_binding
+        .as_ref()
+        .ok_or(WalletServingPairError::WriterConstructionBindingMissing)?;
+    let observed = decode_canonical_construction_manifest_binding(binding).map_err(|source| {
+        WalletServingPairError::WriterConstructionBindingMalformed { source }
+    })?;
+    if observed.format_version() != expected.version || observed.sha256() != expected.sha256 {
+        return Err(WalletServingPairError::WriterConstructionBindingMismatch);
+    }
+    Ok(())
+}
+
 fn record_pair_convergence(outcome: WalletServingConvergence) {
     metrics::counter!(
         "zinder_wallet_serving_pair_publisher_convergence_total",
@@ -967,6 +1031,9 @@ fn refresh_failure_not_ready_cause(error: &WalletServingPairError) -> Option<Rea
             Some(ReadinessCause::WriterStatusUnavailable)
         }
         WalletServingPairError::WriterStatusInvalid
+        | WalletServingPairError::WriterConstructionBindingMissing
+        | WalletServingPairError::WriterConstructionBindingMalformed { .. }
+        | WalletServingPairError::WriterConstructionBindingMismatch
         | WalletServingPairError::WriterFenceMismatch
         | WalletServingPairError::ConvergenceTimedOut {
             last_outcome: WalletServingConvergence::SchemaOrFenceMismatch,
@@ -999,6 +1066,15 @@ fn wallet_serving_pair_error_class(error: &WalletServingPairError) -> &'static s
         WalletServingPairError::WriterStatusConnect(_) => "writer_status_connect",
         WalletServingPairError::WriterStatusRpc(_) => "writer_status_rpc",
         WalletServingPairError::WriterStatusInvalid => "writer_status_invalid",
+        WalletServingPairError::WriterConstructionBindingMissing => {
+            "writer_construction_binding_missing"
+        }
+        WalletServingPairError::WriterConstructionBindingMalformed { .. } => {
+            "writer_construction_binding_malformed"
+        }
+        WalletServingPairError::WriterConstructionBindingMismatch => {
+            "writer_construction_binding_mismatch"
+        }
         WalletServingPairError::WriterFenceMismatch => "writer_fence_mismatch",
         WalletServingPairError::CandidateTask(_) => "candidate_task",
         WalletServingPairError::PairSlotUnavailable => "pair_slot_unavailable",
@@ -1075,18 +1151,22 @@ mod tests {
             },
             wallet::{self, wallet_query_client::WalletQueryClient},
         },
+        wire::{
+            CanonicalConstructionManifestBindingFields,
+            encode_canonical_construction_manifest_binding,
+        },
     };
     use zinder_source::{
         NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError,
         UpstreamHealthSnapshot,
     };
     use zinder_store::{
-        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
-        CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
-        CanonicalStoreBuildPlan, CanonicalStoreWorkload, EventStreamStartPosition,
-        RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-        RocksDbCanonicalStore, RocksDbResourceBudget, StreamCursorTokenV1,
-        event_stream_start_message,
+        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalConstructionManifestBinding,
+        CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalLiveAppend,
+        CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreWorkload,
+        EventStreamStartPosition, RawBlobRetention, RocksDbCanonicalBuilder,
+        RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+        StreamCursorTokenV1, event_stream_start_message,
     };
     use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionSourcePosition};
     use zinder_wallet_rocksdb::{
@@ -1097,7 +1177,8 @@ mod tests {
         GenerationLease, SecondaryGenerationState, WalletServingConvergence,
         WalletServingPairConfig, WalletServingPairError, WalletServingPairPublisher,
         WalletServingReadiness, classify_pair_admission, refresh_failure_not_ready_cause,
-        spawn_wallet_node_readiness_probe, writer_status_matches_source,
+        spawn_wallet_node_readiness_probe, validate_writer_construction_binding,
+        writer_status_matches_source,
     };
     use crate::{
         NativeWalletEndpointCapabilities, WalletEndpointMetadata, WalletQueryApi,
@@ -1174,9 +1255,12 @@ mod tests {
     async fn wallet_node_probe_drains_and_recovers_without_changing_capabilities()
     -> Result<(), Box<dyn std::error::Error>> {
         let source = MutableHealthSource::new()?;
+        let admitted_node_capabilities = source
+            .admitted_capabilities()
+            .ok_or("mutable health source capabilities were not admitted")?;
         let capabilities = NativeWalletEndpointCapabilities::for_wallet_serving_pair(
             RawBlobRetention::Transactions,
-            source.capabilities(),
+            admitted_node_capabilities,
         );
         let admitted_capabilities = capabilities.clone();
         let runtime = zinder_runtime::Readiness::default();
@@ -1272,10 +1356,6 @@ mod tests {
 
     #[async_trait]
     impl NodeSource for MutableHealthSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            self.capabilities
-        }
-
         fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
             Some(self.capabilities)
         }
@@ -1338,6 +1418,30 @@ mod tests {
         }
 
         assert!(!writer_status_matches_source(
+            &status,
+            source,
+            Network::ZcashRegtest,
+        ));
+    }
+
+    #[test]
+    fn same_fence_with_a_different_construction_binding_is_rejected() {
+        let source = source_identity(3, 0x33);
+        let mut status = writer_status(source);
+        let expected = CanonicalConstructionManifestBinding {
+            version: 1,
+            sha256: [0x7a; 32],
+        };
+        status.canonical_construction_manifest_binding =
+            Some(encode_canonical_construction_manifest_binding(
+                CanonicalConstructionManifestBindingFields::new(1, [0x44; 32]),
+            ));
+
+        assert!(matches!(
+            validate_writer_construction_binding(&status, expected),
+            Err(WalletServingPairError::WriterConstructionBindingMismatch)
+        ));
+        assert!(writer_status_matches_source(
             &status,
             source,
             Network::ZcashRegtest,
@@ -1658,7 +1762,7 @@ mod tests {
             !advertised
                 .iter()
                 .any(|capability| capability == WALLET_READ_TREE_STATE_AT_HEIGHT_V2),
-            "tree-state fill must not be advertised without a probed upstream provider"
+            "tree-state fill must not be advertised without an admitted upstream provider"
         );
         let compact_at = wallet_client
             .compact_block(wallet::CompactBlockRequest {
@@ -1932,6 +2036,11 @@ mod tests {
                 canonical_sequence_digest: source.source_sequence_digest().as_bytes().to_vec(),
             }),
             oldest_retained_event_sequence: 1,
+            canonical_construction_manifest_binding: Some(
+                encode_canonical_construction_manifest_binding(
+                    CanonicalConstructionManifestBindingFields::new(1, [0x7a; 32]),
+                ),
+            ),
         }
     }
 
@@ -2097,10 +2206,10 @@ mod tests {
     }
 
     fn writer_status_for_store(store: &RocksDbCanonicalStore) -> CanonicalWriterStatusResponse {
-        writer_status_for_fence(store.event_fence())
-    }
-
-    fn writer_status_for_fence(fence: CanonicalEventFence) -> CanonicalWriterStatusResponse {
+        let fence = store.event_fence();
+        let binding = store
+            .construction_identity()
+            .construction_manifest_binding();
         CanonicalWriterStatusResponse {
             network_name: encode_zinder_native_chain_name(Network::ZcashRegtest).to_owned(),
             fence: Some(CanonicalWriterFence {
@@ -2112,6 +2221,14 @@ mod tests {
                 canonical_sequence_digest: fence.sequence_digest().as_bytes().to_vec(),
             }),
             oldest_retained_event_sequence: 1,
+            canonical_construction_manifest_binding: Some(
+                encode_canonical_construction_manifest_binding(
+                    CanonicalConstructionManifestBindingFields::new(
+                        binding.version,
+                        binding.sha256,
+                    ),
+                ),
+            ),
         }
     }
 

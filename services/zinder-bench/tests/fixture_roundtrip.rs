@@ -110,12 +110,8 @@ impl CheckpointSource {
 
 #[async_trait]
 impl NodeSource for CheckpointSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities::default()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-        Some(self.capabilities())
+        Some(NodeCapabilities::default())
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
@@ -558,7 +554,12 @@ async fn canonical_fixture_source_serves_only_the_admitted_boundary_checkpoints(
             .await?,
         fixed_tip
     );
-    assert!(!source.capabilities().supports(NodeCapability::TreeState));
+    assert!(
+        !source
+            .admitted_capabilities()
+            .ok_or("canonical fixture capabilities were not admitted")?
+            .supports(NodeCapability::TreeState)
+    );
     assert!(matches!(
         source.fetch_tree_state_for_block(fixed_tip.block_id).await,
         Err(SourceError::NodeCapabilityMissing {

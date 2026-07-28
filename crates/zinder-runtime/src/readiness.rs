@@ -123,6 +123,8 @@ pub enum ReadinessCause {
     },
     /// The private ingest writer-status RPC cannot be reached.
     WriterStatusUnavailable,
+    /// The admitted native wallet-query dependency cannot serve its frozen contract.
+    WalletQueryUnavailable,
     /// Retained event history is approaching the configured cursor-expiry window.
     CursorAtRisk {
         /// Age of the oldest retained event, rounded down to whole hours.
@@ -291,6 +293,7 @@ impl ReadinessCause {
         "reorg_window_exceeded",
         "replica_lagging",
         "writer_status_unavailable",
+        "wallet_query_unavailable",
         "cursor_at_risk",
         "shutting_down",
         "upstream_not_ready",
@@ -310,6 +313,7 @@ impl ReadinessCause {
             Self::ReorgWindowExceeded { .. } => "reorg_window_exceeded",
             Self::ReplicaLagging { .. } => "replica_lagging",
             Self::WriterStatusUnavailable => "writer_status_unavailable",
+            Self::WalletQueryUnavailable => "wallet_query_unavailable",
             Self::CursorAtRisk { .. } => "cursor_at_risk",
             Self::ShuttingDown => "shutting_down",
             Self::UpstreamNotReady(_) => "upstream_not_ready",
@@ -336,6 +340,7 @@ impl ReadinessCause {
             | Self::ReorgWindowExceeded { .. }
             | Self::ReplicaLagging { .. }
             | Self::WriterStatusUnavailable
+            | Self::WalletQueryUnavailable
             | Self::CursorAtRisk { .. }
             | Self::ShuttingDown
             | Self::UpstreamNotReady(_) => None,
@@ -776,6 +781,7 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
             ReadinessCause::ReorgWindowExceeded { .. } => Self::ReorgWindowExceeded,
             ReadinessCause::ReplicaLagging { .. } => Self::ReplicaLagging,
             ReadinessCause::WriterStatusUnavailable => Self::WriterStatusUnavailable,
+            ReadinessCause::WalletQueryUnavailable => Self::WalletQueryUnavailable,
             ReadinessCause::CursorAtRisk { .. } => Self::CursorAtRisk,
             ReadinessCause::ShuttingDown => Self::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => Self::UpstreamNotReady,
@@ -852,6 +858,7 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
             | ReadinessCause::StorageUnavailable
             | ReadinessCause::SchemaMismatch
             | ReadinessCause::WriterStatusUnavailable
+            | ReadinessCause::WalletQueryUnavailable
             | ReadinessCause::ShuttingDown => return None,
         };
         Some(ops_proto::ReadinessCauseDetail {
@@ -1157,6 +1164,7 @@ mod tests {
                 lag_chain_epochs: 0,
             },
             ReadinessCause::WriterStatusUnavailable,
+            ReadinessCause::WalletQueryUnavailable,
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,
@@ -1204,6 +1212,9 @@ mod tests {
             ReadinessCause::WriterStatusUnavailable => {
                 ops_proto::ReadinessCause::WriterStatusUnavailable
             }
+            ReadinessCause::WalletQueryUnavailable => {
+                ops_proto::ReadinessCause::WalletQueryUnavailable
+            }
             ReadinessCause::CursorAtRisk { .. } => ops_proto::ReadinessCause::CursorAtRisk,
             ReadinessCause::ShuttingDown => ops_proto::ReadinessCause::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => ops_proto::ReadinessCause::UpstreamNotReady,
@@ -1243,6 +1254,7 @@ mod tests {
                 lag_chain_epochs: 0,
             },
             ReadinessCause::WriterStatusUnavailable,
+            ReadinessCause::WalletQueryUnavailable,
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,

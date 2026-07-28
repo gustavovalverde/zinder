@@ -189,6 +189,14 @@ pub(crate) fn decide_recovery(
         | IngestError::TransparentOutputOutputMissing { .. }
         | IngestError::UnsupportedShieldedProtocol { .. }
         | IngestError::EmptyCanonicalBatch
+        | IngestError::NodeCapabilitiesNotAdmitted
+        | IngestError::CanonicalActivationsNetworkMismatch { .. }
+        | IngestError::CanonicalActivationsFingerprintMismatch { .. }
+        | IngestError::MaterializedViewCanonicalNetworkMismatch { .. }
+        | IngestError::MaterializedViewCanonicalActivationsFingerprintMismatch { .. }
+        | IngestError::MaterializedViewCanonicalConstructionBindingMismatch { .. }
+        | IngestError::MaterializedViewCheckpointExpired { .. }
+        | IngestError::MaterializedViewCheckpointFenceMismatch { .. }
         | IngestError::BulkCatchupProducedNoCommit
         | IngestError::BulkCatchupInsideReorgWindowRequiresOverride { .. }
         | IngestError::BulkCatchupRequiresContiguousTipMetadata { .. }
@@ -324,6 +332,17 @@ mod tests {
         };
         assert_eq!(
             decide_recovery(&error, SourceRecoveryBackoff::FAST_FOR_TESTS),
+            SourceRecoveryDecision::Exit,
+        );
+    }
+
+    #[test]
+    fn unadmitted_node_composition_exits_the_loop() {
+        assert_eq!(
+            decide_recovery(
+                &IngestError::NodeCapabilitiesNotAdmitted,
+                SourceRecoveryBackoff::FAST_FOR_TESTS,
+            ),
             SourceRecoveryDecision::Exit,
         );
     }

@@ -211,7 +211,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     );
     open_storage_phase.complete();
 
-    let wallet_query = zinder_query::WalletServingQuery::from_probed_node_source(
+    let wallet_query = zinder_query::WalletServingQuery::from_admitted_node_source(
         serving_pair_slot.clone(),
         broadcaster_source.clone(),
         network_upgrade_activations.clone(),

@@ -16,11 +16,12 @@ use zinder_runtime::{
     OpsServer, Readiness, ReadinessState, cancel_on_terminating_signal,
     host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint,
 };
+use zinder_proto::wire::decode_canonical_construction_manifest_binding;
 use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
-    CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalReorgPolicy,
-    CanonicalRetainedEvent, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
-    RocksDbCanonicalSecondary,
+    CanonicalConstructionManifestBinding, CanonicalEventCursor, CanonicalEventFence,
+    CanonicalEventHistoryRequest, CanonicalReorgPolicy, CanonicalRetainedEvent,
+    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
@@ -275,6 +276,9 @@ async fn run_owned_projector(
                 match admit_resumed_following(
                     &mut canonical_control,
                     wallet_source,
+                    canonical
+                        .construction_identity()
+                        .construction_manifest_binding(),
                     config.lease_duration,
                 )
                 .await?
@@ -430,6 +434,9 @@ async fn run_owned_projector(
                         &canonical_lease,
                         expected_wallet_source,
                         network,
+                        canonical
+                            .construction_identity()
+                            .construction_manifest_binding(),
                     )
                     .inspect_err(|_| {
                         tracing::error!(
@@ -1258,9 +1265,11 @@ enum ResumedFollowingRetentionPlan {
 async fn admit_resumed_following(
     control: &mut CanonicalWriterControlClient,
     source: WalletCanonicalSourceIdentity,
+    construction_binding: CanonicalConstructionManifestBinding,
     lease_duration: Duration,
 ) -> Result<ResumedFollowingAdmission, ProjectorError> {
     let initial_status = control.writer_status().await?;
+    require_writer_construction_binding(&initial_status, construction_binding)?;
     match classify_resumed_following_retention(
         source,
         initial_status.oldest_retained_event_sequence,
@@ -1277,6 +1286,7 @@ async fn admit_resumed_following(
                     Err(error) => error,
                 };
             let refreshed_status = control.writer_status().await?;
+            require_writer_construction_binding(&refreshed_status, construction_binding)?;
             match classify_resumed_following_retention(
                 source,
                 refreshed_status.oldest_retained_event_sequence,
@@ -1451,9 +1461,13 @@ fn require_pre_promotion_follower_admission(
     lease: &CanonicalRetentionLease,
     expected: WalletCanonicalSourceIdentity,
     network: zinder_core::Network,
+    construction_binding: CanonicalConstructionManifestBinding,
 ) -> Result<(), zinder_wallet_rocksdb::RocksDbWalletError> {
     let expected_position = expected.source_position();
     let expected_cursor = expected_position.event_cursor.as_bytes();
+    if require_writer_construction_binding(&status, construction_binding).is_err() {
+        return Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled);
+    }
     let Some(fence) = status.fence else {
         return Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled);
     };
@@ -1476,7 +1490,13 @@ async fn converge_on_writer_fence(
         canonical.try_catch_up()?;
         let ready = canonical.ready_evidence();
         let status = control.writer_status().await?;
-        if writer_status_matches(status, &ready, canonical.network()) {
+        require_writer_construction_binding(
+            &status,
+            canonical
+                .construction_identity()
+                .construction_manifest_binding(),
+        )?;
+        if writer_status_matches(&status, &ready, canonical.network()) {
             return Ok(ready);
         }
         tokio::time::sleep(CANONICAL_FENCE_CONVERGENCE_DELAY).await;
@@ -1485,7 +1505,7 @@ async fn converge_on_writer_fence(
 }
 
 fn writer_status_matches(
-    status: zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
     ready: &CanonicalStoreReadyEvidence,
     network: zinder_core::Network,
 ) -> bool {
@@ -1493,11 +1513,11 @@ fn writer_status_matches(
 }
 
 fn writer_status_matches_source(
-    status: zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
     expected: WalletCanonicalSourceIdentity,
     network: zinder_core::Network,
 ) -> bool {
-    let Some(fence) = status.fence else {
+    let Some(fence) = status.fence.as_ref() else {
         return false;
     };
     let source_position = expected.source_position();
@@ -1508,6 +1528,24 @@ fn writer_status_matches_source(
         && fence.visible_tip_hash == source_position.tip.hash.as_bytes()
         && fence.visible_block_count == expected.source_sequence_digest().block_count()
         && fence.canonical_sequence_digest == expected.source_sequence_digest().as_bytes()
+}
+
+fn require_writer_construction_binding(
+    status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    expected: CanonicalConstructionManifestBinding,
+) -> Result<(), ProjectorError> {
+    let message = status
+        .canonical_construction_manifest_binding
+        .as_ref()
+        .ok_or(ProjectorError::CanonicalConstructionBindingMissing)?;
+    let observed =
+        decode_canonical_construction_manifest_binding(message).map_err(|source| {
+            ProjectorError::CanonicalConstructionBindingMalformed { source }
+        })?;
+    if observed.format_version() != expected.version || observed.sha256() != expected.sha256 {
+        return Err(ProjectorError::CanonicalConstructionBindingMismatch);
+    }
+    Ok(())
 }
 
 fn canonical_source_identity(ready: &CanonicalStoreReadyEvidence) -> WalletCanonicalSourceIdentity {
@@ -1977,13 +2015,19 @@ mod tests {
         require_built_wallet_source, require_pre_promotion_follower_admission,
         require_retention_lease_anchor, settled_tip_for_transition, writer_status_matches_source,
     };
-    use zinder_proto::v1::ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse};
+    use zinder_proto::{
+        v1::ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse},
+        wire::{
+            CanonicalConstructionManifestBindingFields,
+            encode_canonical_construction_manifest_binding,
+        },
+    };
     use zinder_store::{
-        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventHistoryRequest,
-        CanonicalLiveAppend, CanonicalLiveReplacement, CanonicalReorgPolicy,
-        CanonicalReplacementBlock, CanonicalStoreBuildPlan, CanonicalStoreWorkload,
-        RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-        RocksDbResourceBudget,
+        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalConstructionManifestBinding,
+        CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalLiveReplacement,
+        CanonicalReorgPolicy, CanonicalReplacementBlock, CanonicalStoreBuildPlan,
+        CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
+        RocksDbCanonicalSecondary, RocksDbResourceBudget,
     };
 
     #[test]
@@ -2182,6 +2226,7 @@ mod tests {
                 &retention_lease(expected),
                 expected,
                 test_network(),
+                construction_binding(),
             )
             .is_ok()
         );
@@ -2203,6 +2248,7 @@ mod tests {
                 &retention_lease(expected),
                 expected,
                 test_network(),
+                construction_binding(),
             )
             .is_ok()
         );
@@ -2217,6 +2263,7 @@ mod tests {
                 &retention_lease(expected),
                 expected,
                 test_network(),
+                construction_binding(),
             ),
             Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled)
         ));
@@ -2232,6 +2279,7 @@ mod tests {
                 &retention_lease(source_identity(2, 2)),
                 expected,
                 test_network(),
+                construction_binding(),
             ),
             Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled)
         ));
@@ -2246,9 +2294,30 @@ mod tests {
         }
 
         assert!(!writer_status_matches_source(
-            status,
+            &status,
             expected,
             test_network(),
+        ));
+    }
+
+    #[test]
+    fn pre_promotion_admission_refuses_a_different_construction_binding() {
+        let expected = source_identity(1, 1);
+        let mut status = writer_status(expected);
+        status.canonical_construction_manifest_binding =
+            Some(encode_canonical_construction_manifest_binding(
+                CanonicalConstructionManifestBindingFields::new(1, [0x99; 32]),
+            ));
+
+        assert!(matches!(
+            require_pre_promotion_follower_admission(
+                status,
+                &retention_lease(expected),
+                expected,
+                test_network(),
+                construction_binding(),
+            ),
+            Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled)
         ));
     }
 
@@ -2519,6 +2588,21 @@ mod tests {
                 canonical_sequence_digest: identity.source_sequence_digest().as_bytes().to_vec(),
             }),
             oldest_retained_event_sequence: 1,
+            canonical_construction_manifest_binding: Some(
+                encode_canonical_construction_manifest_binding(
+                    CanonicalConstructionManifestBindingFields::new(
+                        construction_binding().version,
+                        construction_binding().sha256,
+                    ),
+                ),
+            ),
+        }
+    }
+
+    const fn construction_binding() -> CanonicalConstructionManifestBinding {
+        CanonicalConstructionManifestBinding {
+            version: 1,
+            sha256: [0x42; 32],
         }
     }
 

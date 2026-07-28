@@ -164,10 +164,6 @@ impl<S> NodeSource for FixtureAuthenticatedBlockSource<S>
 where
     S: NodeSource,
 {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.fixture_source.capabilities()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
         self.fixture_source.admitted_capabilities()
     }
@@ -318,10 +314,6 @@ impl CanonicalFixtureNodeSource {
 
 #[async_trait]
 impl NodeSource for CanonicalFixtureNodeSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.fixture_source.capabilities()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
         self.fixture_source.admitted_capabilities()
     }

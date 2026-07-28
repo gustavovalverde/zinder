@@ -450,16 +450,18 @@ message BlockSummaryRecord {
 // `ExplorerQuery.BlockSummariesInRange` request.
 //
 // Returns one `BlockSummary` per canonical block in
-// `[start_height, end_height]` inclusive, ordered by ascending height.
+// `[start_height, end_height]` inclusive, ordered by ascending height. The
+// server derives the exact epoch fence from verified block-summary
+// materialized-view state; callers cannot supply an independent epoch pin.
 message BlockSummariesInRangeRequest {
+  reserved 3;
+  reserved "at_epoch_id";
+
   // First block height to return (inclusive).
   uint32 start_height = 1;
 
   // Last block height to return (inclusive).
   uint32 end_height = 2;
-
-  // Optional chain-epoch id pin for snapshot consistency with concurrent reads.
-  optional uint64 at_epoch_id = 3;
 }
 
 // `ExplorerQuery.BlockSummariesInRange` response.
@@ -1085,20 +1087,19 @@ message TransactionVersionCount {
 }
 
 // `ExplorerQuery.MempoolSummary` request.
-//
-// Optionally pins the read to a specific chain epoch so the response
-// stays consistent with concurrent reads.
 message MempoolSummaryRequest {
-  optional uint64 at_epoch_id = 1;
+  reserved 1;
+  reserved "at_epoch_id";
 }
 
 // `ExplorerQuery.MempoolSummary` response.
 //
-// Aggregates the current mempool snapshot into a single page-friendly
-// shape: total counts, byte size, privacy-shape distribution, version
-// distribution, and freshness extremes. The handler parses every entry
-// via `zinder_source::parse_transaction_public_facts` so the shape and
-// version classifiers stay in lockstep with `TransactionDetail`.
+// Walks every page of one identity-stable current mempool snapshot and
+// aggregates it into a single page-friendly shape: total counts, byte size,
+// privacy-shape distribution, version distribution, and freshness extremes.
+// The handler parses every entry via
+// `zinder_source::parse_transaction_public_facts` so the shape and version
+// classifiers stay in lockstep with `TransactionDetail`.
 message MempoolSummaryResponse {
   ExplorerFreshness freshness = 1;
 
@@ -1886,7 +1887,7 @@ service ExplorerQuery {
 
   // Returns one `BlockSummary` per canonical block in the requested
   // height range, ordered by ascending height. Capability:
-  // `explorer.block.summary_v1`.
+  // `explorer.block.summary_v2`.
   rpc BlockSummariesInRange(BlockSummariesInRangeRequest)
       returns (BlockSummariesInRangeResponse);
 
@@ -1942,10 +1943,10 @@ service ExplorerQuery {
   rpc CommitmentRootSearch(CommitmentRootSearchRequest)
       returns (CommitmentRootSearchResponse);
 
-  // Aggregates the current mempool snapshot into a single explorer-shaped
-  // response: total counts, byte size, privacy-shape distribution,
-  // version distribution, and freshness extremes. Capability:
-  // `explorer.mempool.summary_v1`.
+  // Walks one complete identity-stable mempool snapshot and aggregates it into
+  // a single explorer-shaped response: total counts, byte size, privacy-shape
+  // distribution, version distribution, and freshness extremes. Capability:
+  // `explorer.mempool.summary_v2`.
   rpc MempoolSummary(MempoolSummaryRequest) returns (MempoolSummaryResponse);
 
   // Returns aggregate facts and one page from the same observed mempool
@@ -2075,16 +2076,18 @@ service ExplorerQuery {
   rpc RecentTransactions(RecentTransactionsRequest)
       returns (stream RecentTransactionsChunk);
 
-  // Returns one filtered, newest-first page of canonical transaction history.
-  // Capability: `explorer.transaction.history_v1`.
+  // Returns one filtered, newest-first page of canonical transaction history
+  // under an exact read fence and verified coverage. Capability:
+  // `explorer.transaction.history_v2`.
   rpc TransactionHistory(TransactionHistoryRequest)
       returns (TransactionHistoryResponse);
 
-  // Returns one coherent point-in-time bundle of every field a consumer
-  // needs to render an overview dashboard. The handler anchors the bundle
-  // on a single `WalletQuery.VisibleTipBlock` tip and reads every other field
-  // from the materialized-view store in one pass, so all fields share one
-  // `ExplorerFreshness` and one snapshot identity. This avoids a per-card
+  // Returns one coherent point-in-time bundle of every field a consumer needs
+  // to render an overview dashboard. The handler requires exact block-summary
+  // and transaction-history coverage, anchors the bundle on one
+  // `WalletQuery.VisibleTipBlock` tip, verifies complete mempool and value-pool
+  // observations against it, and reads all materialized fields from one store
+  // snapshot. This avoids a per-card
   // fan-out (`MempoolSummary` + `FeeSummary` + `ValuePoolSummary` +
   // `BlockSummariesInRange` + `RecentTransactions` + `MempoolEventCounts`),
   // which cannot guarantee tip coherence across calls. Capability:
@@ -2970,13 +2973,14 @@ message OverviewSnapshotRequest {
 
 // `ExplorerQuery.OverviewSnapshot` response.
 //
-// All present sub-fields are read against the snapshot identified by
-// `freshness.chain_view.chain_epoch`; the bundle never spans two tips. Optional
-// fields whose wallet capability is structurally unavailable are identified in
-// `freshness.unavailable`. The handler reads the wallet tip once and every
-// materialized-view field once, in one pass, then assembles the single
-// freshness envelope. Consumers compare the chain epoch's `chain_epoch_id` and
-// `visible_tip` across responses to detect snapshot boundary crosses.
+// Every sub-field is required and read against the snapshot identified by
+// `freshness.chain_view.chain_epoch`; the bundle never spans two tips. Startup
+// omits this method unless the complete wallet and materialized-view
+// composition is admitted. The handler verifies the wallet tip, complete
+// mempool observation, value pools, and exact common block/history
+// materialized-view coverage, then reads every materialized-view field once
+// from one store snapshot. Any identity or coverage mismatch fails the whole
+// request.
 message OverviewSnapshotResponse {
   // Cross-cutting envelope (field tag 1 per ADR-0011). Single freshness
   // for the entire bundle.
@@ -2988,10 +2992,8 @@ message OverviewSnapshotResponse {
   // Set to zero when the upstream has no committed blocks.
   int64 tip_block_time_unix_seconds = 2;
 
-  // Mempool snapshot (counts and freshness extremes) at the bundle's
-  // observation instant. Absent when the wallet query structurally lacks
-  // `wallet.snapshot.mempool_v3`; `freshness.unavailable` then contains the
-  // field path `mempool`.
+  // Complete mempool snapshot aggregate (counts and freshness extremes) at the
+  // bundle's observation instant.
   OverviewMempool mempool = 3;
 
   // Rolling counts of mempool events over a sliding window ending at the
@@ -3002,12 +3004,10 @@ message OverviewSnapshotResponse {
   // the snapshot's tip.
   OverviewFeeSummary fee_summary = 5;
 
-  // Chain-wide value pool totals at the snapshot's tip. Preserves
-  // upstream order so unknown future pools flow through without a wire
-  // shape change. When the wallet query structurally lacks
-  // `wallet.read.chain_value_pools_at_tip_v1`, this list is empty and
-  // `freshness.unavailable` contains the field path `value_pools`, which
-  // distinguishes unavailable data from an observed empty list.
+  // Chain-wide value pool totals at the snapshot's tip. Preserves upstream
+  // order so unknown future pools flow through without a wire shape change. An
+  // empty list means the admitted upstream observation contained no pools; it
+  // never means the wallet capability was absent.
   repeated zinder.v1.wallet.ChainValuePool value_pools = 6;
 
   // Top-K block summaries ending at the snapshot's tip, ordered by

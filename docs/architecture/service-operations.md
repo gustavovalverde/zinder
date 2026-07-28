@@ -36,6 +36,7 @@ version and commit appear in the `zinder_build_info` metric and native
 | `reorg_window_exceeded` | A replacement crosses the persisted reorg policy. |
 | `replica_lagging` | A RocksDB secondary exceeds the admitted epoch lag. |
 | `writer_status_unavailable` | A trusted reader cannot reach the writer control API. |
+| `wallet_query_unavailable` | An admitted native WalletQuery dependency cannot currently serve the network and capabilities frozen at startup. |
 | `cursor_at_risk` | Canonical event retention is approaching an active cursor. |
 | `shutting_down` | New traffic has been drained for termination. |
 
@@ -87,6 +88,20 @@ structural capability discovery. Any node-backed composition must admit
 configuration surprise. The serving-pair publisher and node-readiness probe
 are supervised with the gRPC server; an unexpected exit drains readiness and
 terminates the runtime.
+
+### Explorer query
+
+Explorer query derives one immutable capability set before binding. When that
+composition admits a native WalletQuery dependency, a supervised probe calls
+`ServerInfo` over the same authenticated channel. A failed or readiness-gated
+RPC, a response below the compiled minimum Wallet contract revision, or a
+replacement endpoint whose network or capabilities differ from the admitted
+contract report `wallet_query_unavailable`. A matching response at or above
+the minimum revision restores readiness without changing the Explorer
+capability set. While that cause is active, the runtime
+traffic gate rejects every new Explorer gRPC request with `UNAVAILABLE`,
+including `ServerInfo` and local-only methods. `/healthz` continues to report
+the frozen capability allocation unchanged.
 
 ### Lightwalletd compatibility
 

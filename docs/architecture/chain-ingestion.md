@@ -115,6 +115,17 @@ The release writer uses these sections:
 - `[retention]` controls canonical and mempool event windows; and
 - `[ingest_control]` configures the private authenticated control listener.
 
+The resolved `[ingest_control]` section enables its loopback listener by
+default, including when the section is absent. Setting
+`ingest_control.listen_addr` to an empty string explicitly disables the
+endpoint; that composition advertises no ingest-control capabilities on its
+operational surface. For an enabled endpoint, startup derives the control
+contract from the admitted node source and pre-binds the control listener
+before the operational endpoint or writer tasks start. The proven listener and
+node composition are then moved into the serving task; a bind failure is a
+typed startup error and cannot leave an ops-only or writer-only process
+running.
+
 `ingest.phase_classification` remains available to the diagnostic `probe`
 command and the artifact-oriented ingestion library. It does not choose between
 two release binaries or require an operator handoff.

@@ -34,10 +34,10 @@ mod value_pool_flow;
 mod value_pool_summary;
 
 pub use adapter::{
-    ExplorerEndpointMetadata, ExplorerQueryGrpcAdapter, ExplorerQueryGrpcAdapterBuilder,
-    describe_request_metrics,
+    ExplorerEndpointMetadata, ExplorerQueryEndpointComposition, ExplorerQueryGrpcAdapter,
+    ExplorerQueryGrpcAdapterBuilder, describe_request_metrics,
 };
-pub use endpoint_admission::ExplorerEndpointAdmissionError;
+pub use endpoint_admission::{ExplorerEndpointAdmissionError, ExplorerWalletQueryHealthError};
 
 fn require_matching_chain_epoch(
     expected: zinder_core::ChainEpoch,

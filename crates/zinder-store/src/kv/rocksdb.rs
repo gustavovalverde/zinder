@@ -89,6 +89,13 @@ enum RocksDbOpenPosture {
 }
 
 impl RocksDbOpenPosture {
+    const fn effective_max_wal_bytes(self, resource_budget: RocksDbResourceBudget) -> Option<u64> {
+        match self {
+            Self::Primary => Some(resource_budget.max_wal_bytes),
+            Self::Secondary => None,
+        }
+    }
+
     const fn effective_max_background_jobs(
         self,
         resource_budget: RocksDbResourceBudget,
@@ -994,8 +1001,14 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
         metrics::gauge!("zinder_store_wal_bytes", "store_role" => store_role)
             .set(u64_to_f64(wal_bytes));
     }
-    metrics::gauge!("zinder_store_wal_bytes_limit", "store_role" => store_role)
-        .set(u64_to_f64(inputs.resource_budget.max_wal_bytes));
+    if let Some(max_wal_bytes) = inputs
+        .store_role
+        .open_posture()
+        .effective_max_wal_bytes(inputs.resource_budget)
+    {
+        metrics::gauge!("zinder_store_wal_bytes_limit", "store_role" => store_role)
+            .set(u64_to_f64(max_wal_bytes));
+    }
     if let Some(max_background_jobs) = inputs
         .store_role
         .open_posture()
@@ -2188,6 +2201,56 @@ mod tests {
                 role.open_posture().effective_max_background_jobs(budget),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn wal_bytes_limit_is_effective_only_for_primary_posture() {
+        let expected_max_wal_bytes = 12_582_912;
+        let mut budget = RocksDbResourceBudget::for_local_tests();
+        budget.max_wal_bytes = expected_max_wal_bytes;
+
+        let primary_open = RocksDbOpenRole::Primary {
+            path: Path::new("primary"),
+        };
+        let existing_primary_open = RocksDbOpenRole::ExistingPrimary {
+            path: Path::new("primary"),
+        };
+        let secondary_open = RocksDbOpenRole::Secondary {
+            primary_path: Path::new("primary"),
+            secondary_path: Path::new("secondary"),
+        };
+        assert_eq!(
+            primary_open.open_posture().effective_max_wal_bytes(budget),
+            Some(expected_max_wal_bytes)
+        );
+        assert_eq!(
+            existing_primary_open
+                .open_posture()
+                .effective_max_wal_bytes(budget),
+            Some(expected_max_wal_bytes)
+        );
+        assert_eq!(
+            secondary_open
+                .open_posture()
+                .effective_max_wal_bytes(budget),
+            None
+        );
+
+        for role in [
+            StoreRole::CanonicalPrimary,
+            StoreRole::MaterializedViewPrimary,
+        ] {
+            assert_eq!(
+                role.open_posture().effective_max_wal_bytes(budget),
+                Some(expected_max_wal_bytes)
+            );
+        }
+        for role in [
+            StoreRole::CanonicalSecondary,
+            StoreRole::MaterializedViewSecondary,
+        ] {
+            assert_eq!(role.open_posture().effective_max_wal_bytes(budget), None);
         }
     }
 

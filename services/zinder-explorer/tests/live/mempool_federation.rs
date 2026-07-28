@@ -17,7 +17,7 @@ use zinder_core::Network;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_explorer::{ExplorerEndpointMetadata, ExplorerQueryGrpcAdapter};
 use zinder_proto::capabilities::{
-    EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MEMPOOL_SUMMARY_V1,
+    EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MEMPOOL_SUMMARY_V2,
 };
 use zinder_proto::v1::explorer::{
     MempoolActivityRequest, MempoolActivityResponse, MempoolSnapshotRequest,
@@ -156,7 +156,7 @@ impl MempoolFixture {
     async fn summary(&self) -> Result<MempoolSummaryResponse> {
         let response = ExplorerQueryService::mempool_summary(
             &self.explorer_adapter,
-            Request::new(MempoolSummaryRequest { at_epoch_id: None }),
+            Request::new(MempoolSummaryRequest {}),
         )
         .await?
         .into_inner();
@@ -210,7 +210,7 @@ fn assert_summary_freshness(response: &MempoolSummaryResponse) -> Result<()> {
         .freshness
         .as_ref()
         .ok_or_else(|| eyre!("MempoolSummary response missing freshness"))?;
-    assert_eq!(freshness.capability_version, EXPLORER_MEMPOOL_SUMMARY_V1);
+    assert_eq!(freshness.capability_version, EXPLORER_MEMPOOL_SUMMARY_V2);
     assert!(
         freshness
             .chain_view

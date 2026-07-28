@@ -1004,10 +1004,6 @@ fn split_fixture_height_range(
 
 #[async_trait]
 impl NodeSource for FixtureNodeSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.capabilities
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
         Some(self.capabilities)
     }

@@ -122,6 +122,7 @@ async fn explorer_query_server_info_reports_the_exact_materialized_view_manifest
     let secondary_path = temporary.path().join("secondary");
     let _primary = MaterializedViewStore::open(
         &primary_path,
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[BLOCK_SUMMARY_SCHEMA],
@@ -131,6 +132,7 @@ async fn explorer_query_server_info_reports_the_exact_materialized_view_manifest
     let secondary = MaterializedViewStore::open_secondary(
         primary_path,
         secondary_path,
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[BLOCK_SUMMARY_SCHEMA],
@@ -159,6 +161,7 @@ async fn explorer_query_server_info_reports_the_exact_materialized_view_manifest
         common.materialized_view_identities,
         vec![BLOCK_SUMMARY_CONSUMER_NAME.as_str().to_owned()]
     );
+    assert_eq!(common.materialized_view_preset, "explorer");
     Ok(())
 }
 
@@ -334,13 +337,13 @@ async fn endpoint_admission_rejects_an_activation_table_from_another_network() -
 }
 
 #[tokio::test]
-async fn release_wallet_composition_omits_transaction_detail_until_it_owns_the_required_contract()
+async fn wallet_serving_composition_omits_transaction_detail_until_it_owns_the_required_contract()
 -> Result<()> {
     let retained_chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
         .extend_blocks(1);
     let (_wallet_store, wallet_addr, wallet_handle) =
-        spawn_release_wallet_query_server(&retained_chain).await?;
+        spawn_wallet_serving_query_server(&retained_chain).await?;
     let materialized_view_store = seeded_block_summary_materialized_view_store(&retained_chain)?;
     let canonical_store_fixture =
         StoreFixture::with_chain_committed(&retained_chain, ChainEpochId::new(1))?;
@@ -348,7 +351,7 @@ async fn release_wallet_composition_omits_transaction_detail_until_it_owns_the_r
         canonical_store_fixture.tempdir_path(),
         canonical_store_fixture
             .tempdir_path()
-            .join("transaction-detail-release-secondary"),
+            .join("transaction-detail-binary-secondary"),
         ChainStoreOptions::for_local_tests(),
     )?;
     canonical_store.try_catch_up()?;
@@ -1159,6 +1162,7 @@ fn seeded_reorg_history_materialized_view_store(
 ) -> Result<SeededMaterializedViewStore> {
     let primary_materialized_view_store = zinder_ingest::open_primary_materialized_view_store(
         store_fixture.tempdir_path(),
+        Network::ZcashRegtest,
         zinder_materialized_views::MaterializedViewPreset::Explorer,
         zinder_store::RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1172,6 +1176,7 @@ fn seeded_reorg_history_materialized_view_store(
     let materialized_view_store = MaterializedViewStore::open_secondary(
         MaterializedViewStore::path_for_canonical(store_fixture.tempdir_path()),
         materialized_view_secondary_tempdir.path(),
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
@@ -1300,12 +1305,8 @@ impl StubUpstreamSource {
 
 #[async_trait]
 impl NodeSource for StubUpstreamSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities::default()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-        Some(self.capabilities())
+        Some(NodeCapabilities::default())
     }
 
     async fn fetch_block_at(&self, _height: BlockHeight) -> Result<SourceBlock, SourceError> {
@@ -1358,7 +1359,7 @@ async fn spawn_wallet_query_server_with_bearer_token(
     Ok((store_fixture, addr, handle))
 }
 
-async fn spawn_release_wallet_query_server(
+async fn spawn_wallet_serving_query_server(
     chain_fixture: &ChainFixture,
 ) -> Result<(WalletServingStoreFixture, SocketAddr, ServerHandle)> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
@@ -1401,6 +1402,7 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
     let secondary_path = tempdir.path().join("materialized-view-secondary");
     let primary_store = MaterializedViewStore::open(
         &primary_path,
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
@@ -1412,6 +1414,7 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
     let secondary_store = MaterializedViewStore::open_secondary(
         &primary_path,
         &secondary_path,
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),

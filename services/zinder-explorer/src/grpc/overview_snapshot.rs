@@ -16,37 +16,31 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message as _;
-use tonic::{Code, Request, Response, Status};
-use tonic_types::StatusExt as _;
-use zinder_core::{
-    BlockHeight, explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
-    wire::encode_height_key_ascending,
-};
+use tonic::{Request, Response, Status};
+use zinder_core::{BlockHeight, Network, wire::encode_height_key_ascending};
 use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MaterializedViewStore,
+    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
+    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreReadSnapshot,
     MempoolEventCountsConsumer, TRANSACTION_HISTORY_COLUMN_FAMILY,
+    TRANSACTION_HISTORY_CONSUMER_NAME,
 };
-use zinder_proto::ZINDER_ERROR_DOMAIN;
-use zinder_proto::capabilities::{
-    EXPLORER_OVERVIEW_SNAPSHOT_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
-    WALLET_SNAPSHOT_MEMPOOL_V3,
-};
+use zinder_proto::capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1;
 use zinder_proto::v1::explorer::{
-    BlockSummary, BlockSummaryRecord, OverviewFeeSummary, OverviewMempool, OverviewMempoolEvents,
-    OverviewSnapshotRequest, OverviewSnapshotResponse, TransactionHistoryEntry, UnavailableField,
-    UnavailableReason,
+    BlockSummary, BlockSummaryRecord, ExplorerFreshness, OverviewFeeSummary, OverviewMempool,
+    OverviewMempoolEvents, OverviewSnapshotRequest, OverviewSnapshotResponse,
+    TransactionHistoryEntry,
 };
-use zinder_proto::v1::ops::ErrorReason;
 use zinder_proto::v1::wallet::{
-    self, ChainValuePoolsAtTipRequest, MempoolSnapshotRequest, VisibleTipBlockRequest,
+    self, ChainValuePoolsAtTipRequest, VisibleTipBlockRequest,
     wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
 
 use super::error::ExplorerError;
 use super::freshness::{
-    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness_from_snapshot,
 };
+use super::mempool::{CompleteMempoolObservation, fetch_complete_mempool_observation};
 use super::transaction_history::decode_history_entry;
 
 /// Range cap on `recent_blocks_limit`.
@@ -77,73 +71,84 @@ const MAX_FEE_SUMMARY_BLOCK_COUNT: u32 = 256;
 /// Server default when `fee_summary_block_count == 0`.
 const DEFAULT_FEE_SUMMARY_BLOCK_COUNT: u32 = 50;
 
-/// Cap on entries the bundle's mempool aggregation hydrates from the
-/// wallet `MempoolSnapshot`. Mirrors the cap in the per-feature mempool
-/// handlers.
-const MAX_MEMPOOL_SNAPSHOT_ENTRIES: u32 = 4_096;
-
-/// Field path for an unavailable Overview mempool snapshot.
-const MEMPOOL_FIELD_PATH: &str = "mempool";
-/// Field path for unavailable Overview chain value pools.
-const VALUE_POOLS_FIELD_PATH: &str = "value_pools";
-
 /// Executes one `ExplorerQuery.OverviewSnapshot` request.
 pub(crate) async fn query_overview_snapshot(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    network: Network,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<OverviewSnapshotRequest>,
 ) -> Result<Response<OverviewSnapshotResponse>, Status> {
     let limits = RequestLimits::from_request(request.into_inner());
-    let anchor = anchor_to_wallet_tip(wallet_client).await?;
-    let block_records =
-        read_block_summary_records(materialized_view_store, anchor.tip_height, &limits)?;
-    let recent_blocks =
-        collect_recent_blocks(&block_records, limits.recent_blocks, anchor.tip_height);
-    let fee_summary = aggregate_fee_summary(&block_records, limits.fee_summary_blocks);
-    let tip_block_time_unix_seconds = recent_blocks
-        .first()
-        .map_or(0, |summary| summary.block_time_unix_seconds);
-    let recent_transactions =
-        read_recent_transactions(materialized_view_store, limits.recent_transactions)?;
-    let mempool_events =
-        read_mempool_event_counts(materialized_view_store, limits.mempool_window_seconds)?;
-    let mempool = aggregate_mempool_summary(wallet_client).await?;
-    let available_value_pools = read_value_pools(wallet_client).await?;
-    let mut freshness = build_explorer_freshness(
-        Some(materialized_view_store),
-        EXPLORER_OVERVIEW_SNAPSHOT_V1,
-        Some(anchor.chain_epoch),
-        0,
-    )?;
-    if mempool.is_none() {
-        freshness
-            .unavailable
-            .push(build_wallet_capability_unavailable_field(
-                MEMPOOL_FIELD_PATH,
-            ));
-    }
-    let value_pools = if let Some(value_pools) = available_value_pools {
-        value_pools
-    } else {
-        freshness
-            .unavailable
-            .push(build_wallet_capability_unavailable_field(
-                VALUE_POOLS_FIELD_PATH,
-            ));
-        Vec::new()
+    let candidate = read_overview_state(materialized_view_store)?;
+    let anchor = anchor_to_wallet_tip(wallet_client, candidate.block_summary).await?;
+    let mempool_observation = fetch_complete_mempool_observation(wallet_client, network).await?;
+    require_mempool_identity(&anchor.chain_epoch, &mempool_observation)?;
+    let value_pool_response = wallet_client
+        .chain_value_pools_at_tip(Request::new(ChainValuePoolsAtTipRequest {}))
+        .await?
+        .into_inner();
+    require_value_pool_identity(&anchor.chain_epoch, &value_pool_response)?;
+
+    let rows = {
+        let snapshot = materialized_view_store.read_snapshot();
+        let final_state = read_overview_state_snapshot(&snapshot)?;
+        require_unchanged_overview_state(candidate, final_state)?;
+        let block_records = read_block_summary_records_snapshot(
+            &snapshot,
+            anchor.tip_height,
+            &limits,
+            final_state.block_summary,
+        )?;
+        let recent_blocks =
+            collect_recent_blocks(&block_records, limits.recent_blocks, anchor.tip_height);
+        let fee_summary = aggregate_fee_summary(&block_records, limits.fee_summary_blocks);
+        let tip_block_time_unix_seconds = recent_blocks
+            .first()
+            .map_or(0, |summary| summary.block_time_unix_seconds);
+        let recent_transactions = read_recent_transactions_snapshot(
+            &snapshot,
+            limits.recent_transactions,
+            final_state.transaction_history,
+        )?;
+        let mempool_events =
+            read_mempool_event_counts_snapshot(&snapshot, limits.mempool_window_seconds)?;
+        let freshness = build_explorer_freshness_from_snapshot(
+            &snapshot,
+            EXPLORER_OVERVIEW_SNAPSHOT_V1,
+            Some(anchor.chain_epoch),
+            mempool_observation.snapshot_age_millis,
+        )?;
+        drop(snapshot);
+        OverviewSnapshotRows {
+            freshness,
+            tip_block_time_unix_seconds,
+            mempool_events,
+            fee_summary,
+            recent_blocks,
+            recent_transactions,
+        }
     };
-    let freshness = attach_upstream_observation(upstream_observation_cache, freshness).await;
+    let freshness = attach_upstream_observation(upstream_observation_cache, rows.freshness).await;
     Ok(Response::new(OverviewSnapshotResponse {
         freshness: Some(freshness),
-        tip_block_time_unix_seconds,
-        mempool,
-        mempool_events: Some(mempool_events),
-        fee_summary: Some(fee_summary),
-        value_pools,
-        recent_blocks,
-        recent_transactions,
+        tip_block_time_unix_seconds: rows.tip_block_time_unix_seconds,
+        mempool: Some(overview_mempool(&mempool_observation)),
+        mempool_events: Some(rows.mempool_events),
+        fee_summary: Some(rows.fee_summary),
+        value_pools: value_pool_response.pools,
+        recent_blocks: rows.recent_blocks,
+        recent_transactions: rows.recent_transactions,
     }))
+}
+
+struct OverviewSnapshotRows {
+    freshness: ExplorerFreshness,
+    tip_block_time_unix_seconds: i64,
+    mempool_events: OverviewMempoolEvents,
+    fee_summary: OverviewFeeSummary,
+    recent_blocks: Vec<BlockSummary>,
+    recent_transactions: Vec<TransactionHistoryEntry>,
 }
 
 /// Server-clamped request limits derived from the caller's inputs.
@@ -196,53 +201,213 @@ struct WalletAnchor {
     tip_height: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OverviewMaterializedViewState {
+    block_summary: MaterializedViewState,
+    transaction_history: MaterializedViewState,
+}
+
+fn read_overview_state(
+    store: &MaterializedViewStore,
+) -> Result<OverviewMaterializedViewState, Status> {
+    let block_summary = store
+        .consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+        .ok_or_else(|| {
+            ExplorerError::not_materialized("overview block-summary state is unavailable")
+        })?;
+    let transaction_history = store
+        .consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+        .ok_or_else(|| {
+            ExplorerError::not_materialized("overview transaction-history state is unavailable")
+        })?;
+    validate_overview_state(block_summary, transaction_history)
+}
+
+fn read_overview_state_snapshot(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+) -> Result<OverviewMaterializedViewState, Status> {
+    let block_summary = snapshot
+        .consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+        .ok_or_else(|| {
+            ExplorerError::not_materialized("overview block-summary state is unavailable")
+        })?;
+    let transaction_history = snapshot
+        .consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+        .ok_or_else(|| {
+            ExplorerError::not_materialized("overview transaction-history state is unavailable")
+        })?;
+    validate_overview_state(block_summary, transaction_history)
+}
+
+fn validate_overview_state(
+    block_summary: MaterializedViewState,
+    transaction_history: MaterializedViewState,
+) -> Result<OverviewMaterializedViewState, Status> {
+    let block_coverage = complete_overview_coverage("block-summary", block_summary)?;
+    let history_coverage = complete_overview_coverage("transaction-history", transaction_history)?;
+    if block_summary.chain_epoch_id != transaction_history.chain_epoch_id
+        || block_summary.tip_height != transaction_history.tip_height
+        || block_summary.tip_hash != transaction_history.tip_hash
+        || block_coverage != history_coverage
+    {
+        return Err(ExplorerError::unsatisfied_precondition(
+            "overview block-summary and transaction-history states do not share one chain fence",
+        )
+        .into());
+    }
+    Ok(OverviewMaterializedViewState {
+        block_summary,
+        transaction_history,
+    })
+}
+
+fn require_unchanged_overview_state(
+    candidate: OverviewMaterializedViewState,
+    final_state: OverviewMaterializedViewState,
+) -> Result<(), Status> {
+    if final_state != candidate {
+        return Err(ExplorerError::unsatisfied_precondition(
+            "overview materialized-view state changed while wallet observations were collected",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn complete_overview_coverage(
+    consumer: &str,
+    state: MaterializedViewState,
+) -> Result<zinder_materialized_views::MaterializedViewCoverage, Status> {
+    let coverage = state.coverage.ok_or_else(|| {
+        ExplorerError::not_materialized(format!(
+            "overview {consumer} coverage has not been verified"
+        ))
+    })?;
+    if coverage.complete_through_height != state.tip_height
+        || coverage.complete_through_hash != state.tip_hash
+    {
+        return Err(ExplorerError::not_materialized(format!(
+            "overview {consumer} coverage is not complete through its indexed tip"
+        ))
+        .into());
+    }
+    Ok(coverage)
+}
+
 async fn anchor_to_wallet_tip(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    state: MaterializedViewState,
 ) -> Result<WalletAnchor, Status> {
     let response = wallet_client
-        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id: None }))
+        .visible_tip_block(Request::new(VisibleTipBlockRequest {
+            at_epoch_id: Some(state.chain_epoch_id.value()),
+        }))
         .await?
         .into_inner();
     let chain_epoch = response
         .chain_view
-        .clone()
-        .and_then(|chain_view| chain_view.chain_epoch)
+        .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
         .ok_or_else(|| {
             ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
-    let tip_height = response
-        .visible_tip_block
-        .ok_or_else(|| {
-            ExplorerError::internal("VisibleTipBlockResponse.visible_tip_block missing")
-        })?
-        .height;
+    let epoch_tip = chain_epoch.visible_tip.as_ref().ok_or_else(|| {
+        ExplorerError::internal("VisibleTipBlockResponse chain epoch visible_tip missing")
+    })?;
+    let response_tip = response.visible_tip_block.as_ref().ok_or_else(|| {
+        ExplorerError::internal("VisibleTipBlockResponse.visible_tip_block missing")
+    })?;
+    let expected_hash = zinder_core::wire::encode_rpc_block_hash_hex(state.tip_hash);
+    if chain_epoch.chain_epoch_id != state.chain_epoch_id.value()
+        || epoch_tip.height != state.tip_height.value()
+        || epoch_tip.hash != expected_hash
+        || response_tip.height != epoch_tip.height
+        || response_tip.block_hash != epoch_tip.hash
+    {
+        return Err(ExplorerError::unsatisfied_precondition(
+            "wallet visible-tip identity does not match the overview materialized-view state",
+        )
+        .into());
+    }
     Ok(WalletAnchor {
-        chain_epoch,
-        tip_height,
+        chain_epoch: chain_epoch.clone(),
+        tip_height: epoch_tip.height,
     })
 }
 
-fn read_block_summary_records(
-    materialized_view_store: &MaterializedViewStore,
+fn read_block_summary_records_snapshot(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     canonical_tip_height: u32,
     limits: &RequestLimits,
+    state: MaterializedViewState,
 ) -> Result<Vec<BlockSummaryRecord>, Status> {
     let window = limits.block_window_count();
+    let coverage = complete_overview_coverage("block-summary", state)?;
     let start_height = canonical_tip_height.saturating_sub(window.saturating_sub(1));
-    let start_key = encode_height_key_ascending(BlockHeight::new(start_height));
-    let end_key = encode_height_key_ascending(BlockHeight::new(canonical_tip_height));
-    let cap = usize::try_from(window).unwrap_or(MAX_FEE_SUMMARY_BLOCK_COUNT as usize);
-    let entries = materialized_view_store
-        .range_iterate_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &start_key, &end_key, cap)
+    require_overview_block_window_coverage(coverage, start_height, canonical_tip_height)?;
+    let heights = (start_height..=canonical_tip_height).collect::<Vec<_>>();
+    let keys = heights
+        .iter()
+        .map(|height| encode_height_key_ascending(BlockHeight::new(*height)))
+        .collect::<Vec<_>>();
+    let payloads = snapshot
+        .multi_get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &keys)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let mut records = Vec::with_capacity(entries.len());
-    for (_, payload) in entries {
+    let mut records = Vec::with_capacity(payloads.len());
+    for (expected_height, payload) in heights.into_iter().zip(payloads) {
+        let payload = payload.ok_or_else(|| {
+            ExplorerError::not_materialized(format!(
+                "overview BlockSummary is not materialized for height {expected_height}"
+            ))
+        })?;
         let record = BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
             ExplorerError::internal(format!("BlockSummaryRecord decode failed: {error}"))
         })?;
+        let summary = record
+            .summary
+            .as_ref()
+            .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing"))?;
+        if summary.block_height != expected_height {
+            return Err(ExplorerError::internal(format!(
+                "overview BlockSummaryRecord at height {expected_height} carries height {}",
+                summary.block_height
+            ))
+            .into());
+        }
+        if expected_height == state.tip_height.value()
+            && summary.block_hash != zinder_core::wire::encode_rpc_block_hash_hex(state.tip_hash)
+        {
+            return Err(ExplorerError::unsatisfied_precondition(
+                "overview block-summary tip row does not match its materialized-view state",
+            )
+            .into());
+        }
         records.push(record);
     }
     Ok(records)
+}
+
+fn require_overview_block_window_coverage(
+    coverage: zinder_materialized_views::MaterializedViewCoverage,
+    start_height: u32,
+    end_height: u32,
+) -> Result<(), Status> {
+    if coverage.complete_from_height > BlockHeight::new(start_height)
+        || coverage.complete_through_height < BlockHeight::new(end_height)
+    {
+        return Err(ExplorerError::not_materialized(format!(
+            "overview block-summary coverage {}..={} does not include requested window \
+             {start_height}..={end_height}",
+            coverage.complete_from_height.value(),
+            coverage.complete_through_height.value(),
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn collect_recent_blocks(
@@ -301,25 +466,37 @@ fn aggregate_fee_summary(records: &[BlockSummaryRecord], limit: u32) -> Overview
     }
 }
 
-fn read_recent_transactions(
-    materialized_view_store: &MaterializedViewStore,
+fn read_recent_transactions_snapshot(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     limit: u32,
+    state: MaterializedViewState,
 ) -> Result<Vec<TransactionHistoryEntry>, Status> {
+    let coverage = complete_overview_coverage("transaction-history", state)?;
     let start_key = [0u8; zinder_materialized_views::TRANSACTION_HISTORY_KEY_LEN];
     let end_key = [0xFFu8; zinder_materialized_views::TRANSACTION_HISTORY_KEY_LEN];
     let cap = usize::try_from(limit).unwrap_or(MAX_RECENT_TRANSACTIONS_LIMIT as usize);
-    let rows = materialized_view_store
+    let rows = snapshot
         .range_iterate_consumer(TRANSACTION_HISTORY_COLUMN_FAMILY, &start_key, &end_key, cap)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let mut entries = Vec::with_capacity(rows.len());
     for (key, payload) in rows {
-        entries.push(decode_history_entry(&key, &payload)?);
+        let entry = decode_history_entry(&key, &payload)?;
+        if entry.block_height > state.tip_height.value() {
+            return Err(ExplorerError::unsatisfied_precondition(
+                "overview transaction-history row is newer than its materialized-view state",
+            )
+            .into());
+        }
+        if entry.block_height < coverage.complete_from_height.value() {
+            break;
+        }
+        entries.push(entry);
     }
     Ok(entries)
 }
 
-fn read_mempool_event_counts(
-    materialized_view_store: &MaterializedViewStore,
+fn read_mempool_event_counts_snapshot(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     window_seconds: u32,
 ) -> Result<OverviewMempoolEvents, Status> {
     let now_seconds = current_unix_seconds();
@@ -327,7 +504,7 @@ fn read_mempool_event_counts(
     let start_key = MempoolEventCountsConsumer::key_for_second(window_start);
     let end_key = MempoolEventCountsConsumer::key_for_second(now_seconds);
     let cap = usize::try_from(window_seconds).unwrap_or(MAX_MEMPOOL_WINDOW_SECONDS as usize);
-    let entries = materialized_view_store
+    let entries = snapshot
         .range_iterate_consumer(
             MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
             &start_key,
@@ -354,122 +531,79 @@ fn read_mempool_event_counts(
     })
 }
 
-async fn aggregate_mempool_summary(
-    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-) -> Result<Option<OverviewMempool>, Status> {
-    // Mempool is an optional Overview field. Structural absence is
-    // represented through the response freshness envelope; transient
-    // transport failures still fail the request.
-    let snapshot = match wallet_client
-        .mempool_snapshot(Request::new(MempoolSnapshotRequest {
-            max_entries: MAX_MEMPOOL_SNAPSHOT_ENTRIES,
-            from_cursor: Vec::new(),
-        }))
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        Err(status) if is_endpoint_capability_unavailable(&status, WALLET_SNAPSHOT_MEMPOOL_V3) => {
-            return Ok(None);
-        }
-        Err(status) => return Err(status),
-    };
-    let now_millis = current_unix_millis();
-    let mut transaction_count: u32 = 0;
-    let mut total_size_bytes: u64 = 0;
-    let mut oldest_first_seen: Option<u64> = None;
-    let mut newest_first_seen: Option<u64> = None;
-    for entry in &snapshot.entries {
-        transaction_count = transaction_count.saturating_add(1);
-        let entry_size = u64::try_from(entry.raw_transaction_bytes.len()).unwrap_or(u64::MAX);
-        total_size_bytes = total_size_bytes.saturating_add(entry_size);
-        oldest_first_seen = Some(
-            oldest_first_seen.map_or(entry.first_seen_unix_millis, |prior| {
-                prior.min(entry.first_seen_unix_millis)
-            }),
-        );
-        newest_first_seen = Some(
-            newest_first_seen.map_or(entry.first_seen_unix_millis, |prior| {
-                prior.max(entry.first_seen_unix_millis)
-            }),
-        );
-    }
-    Ok(Some(OverviewMempool {
-        transaction_count,
-        total_size_bytes,
-        oldest_entry_age_millis: oldest_first_seen
-            .map_or(0, |seen| now_millis.saturating_sub(seen)),
-        newest_entry_age_millis: newest_first_seen
-            .map_or(0, |seen| now_millis.saturating_sub(seen)),
-    }))
-}
-
-async fn read_value_pools(
-    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-) -> Result<Option<Vec<wallet::ChainValuePool>>, Status> {
-    // Value pools are optional in the Overview bundle. An absent capability
-    // is distinguished from an observed empty pool list by
-    // `ExplorerFreshness.unavailable`.
-    match wallet_client
-        .chain_value_pools_at_tip(Request::new(ChainValuePoolsAtTipRequest {}))
-        .await
-    {
-        Ok(response) => Ok(Some(response.into_inner().pools)),
-        Err(status)
-            if is_endpoint_capability_unavailable(
-                &status,
-                WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(status) => Err(status),
+fn overview_mempool(observation: &CompleteMempoolObservation) -> OverviewMempool {
+    OverviewMempool {
+        transaction_count: observation.summary.transaction_count,
+        total_size_bytes: observation.summary.total_size_bytes,
+        oldest_entry_age_millis: observation.summary.oldest_entry_age_millis,
+        newest_entry_age_millis: observation.summary.newest_entry_age_millis,
     }
 }
 
-fn is_endpoint_capability_unavailable(status: &Status, capability: &str) -> bool {
-    if status.code() != Code::FailedPrecondition {
-        return false;
+fn require_matching_wallet_epoch(
+    expected: &wallet::ChainEpoch,
+    actual: &wallet::ChainEpoch,
+    observation: &str,
+) -> Result<(), Status> {
+    if actual != expected {
+        return Err(ExplorerError::unsatisfied_precondition(format!(
+            "{observation} chain epoch does not match the overview wallet anchor"
+        ))
+        .into());
     }
-
-    let details = status.get_error_details();
-    let has_matching_error_info = details.error_info().is_some_and(|error_info| {
-        error_info.domain == ZINDER_ERROR_DOMAIN
-            && error_info.reason == ErrorReason::EndpointCapabilityUnavailable.as_str_name()
-    });
-    if !has_matching_error_info {
-        return false;
-    }
-
-    details
-        .precondition_failure()
-        .is_some_and(|precondition_failure| {
-            matches!(precondition_failure.violations.as_slice(), [violation] if {
-                violation.r#type == ErrorReason::EndpointCapabilityUnavailable.as_str_name()
-                    && violation.subject == capability
-            })
-        })
+    Ok(())
 }
 
-fn build_wallet_capability_unavailable_field(field_path: &str) -> UnavailableField {
-    UnavailableField {
-        field_path: field_path.to_owned(),
-        reason: UnavailableReason::UnavailableUpstreamNotSupported as i32,
-        human_reason: WALLET_QUERY_CAPABILITY_NOT_SUPPORTED.to_owned(),
+fn require_mempool_identity(
+    expected_epoch: &wallet::ChainEpoch,
+    observation: &CompleteMempoolObservation,
+) -> Result<(), Status> {
+    require_matching_wallet_epoch(expected_epoch, &observation.chain_epoch, "mempool snapshot")?;
+    let expected_tip = expected_epoch
+        .visible_tip
+        .as_ref()
+        .ok_or_else(|| ExplorerError::internal("overview wallet anchor visible_tip missing"))?;
+    if observation.source_tip != *expected_tip {
+        return Err(ExplorerError::unsatisfied_precondition(
+            "mempool source_tip does not match the overview wallet anchor",
+        )
+        .into());
     }
+    Ok(())
+}
+
+fn require_value_pool_identity(
+    expected_epoch: &wallet::ChainEpoch,
+    response: &wallet::ChainValuePoolsAtTipResponse,
+) -> Result<(), Status> {
+    let actual_epoch = response
+        .chain_view
+        .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+        .ok_or_else(|| {
+            ExplorerError::internal("ChainValuePoolsAtTipResponse.chain_view.chain_epoch missing")
+        })?;
+    require_matching_wallet_epoch(expected_epoch, actual_epoch, "value-pool response")?;
+    let expected_tip = expected_epoch
+        .visible_tip
+        .as_ref()
+        .ok_or_else(|| ExplorerError::internal("overview wallet anchor visible_tip missing"))?;
+    let source_tip = response.source_tip.as_ref().ok_or_else(|| {
+        ExplorerError::internal("ChainValuePoolsAtTipResponse.source_tip missing")
+    })?;
+    if source_tip != expected_tip {
+        return Err(ExplorerError::unsatisfied_precondition(
+            "value-pool source_tip does not match the overview wallet anchor",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
-}
-
-fn current_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 const fn clamp(requested: u32, default: u32, min: u32, max: u32) -> u32 {
@@ -485,159 +619,319 @@ const fn clamp(requested: u32, default: u32, min: u32, max: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use tonic_types::{ErrorDetails, StatusExt as _};
+    use tempfile::tempdir;
+    use tonic::Code;
+    use zinder_core::{BlockHash, ChainEpochId};
+    use zinder_materialized_views::{
+        MaterializedViewCoverage, MaterializedViewPreset, MaterializedViewStoreOptions,
+        TransactionHistoryConsumer,
+    };
 
     use super::*;
 
-    fn status_with_capability_detail(
-        code: Code,
-        error_domain: &str,
-        error_reason: &str,
-        violation_type: &str,
-        capability: &str,
-    ) -> Status {
-        let mut details = ErrorDetails::with_precondition_failure_violation(
-            violation_type,
-            capability,
-            "test precondition",
-        );
-        details.set_error_info(error_reason, error_domain, HashMap::new());
-        Status::with_error_details(code, "test status", details)
+    fn state(
+        chain_epoch_id: u64,
+        tip_height: u32,
+        tip_hash: BlockHash,
+        complete_from_height: u32,
+        revision: u64,
+    ) -> MaterializedViewState {
+        MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(chain_epoch_id),
+            tip_height: BlockHeight::new(tip_height),
+            tip_hash,
+            revision,
+            coverage: Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(complete_from_height),
+                complete_through_height: BlockHeight::new(tip_height),
+                complete_through_hash: tip_hash,
+            }),
+        }
+    }
+
+    fn wallet_epoch(chain_epoch_id: u64, tip_height: u32, tip_hash: &str) -> wallet::ChainEpoch {
+        wallet::ChainEpoch {
+            chain_epoch_id,
+            visible_tip: Some(wallet::BlockTip {
+                height: tip_height,
+                hash: tip_hash.to_owned(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn complete_mempool_observation(
+        chain_epoch: wallet::ChainEpoch,
+        source_tip: wallet::BlockTip,
+    ) -> CompleteMempoolObservation {
+        CompleteMempoolObservation {
+            chain_epoch,
+            source_tip,
+            snapshot_age_millis: 0,
+            summary: zinder_proto::v1::explorer::MempoolSnapshotSummary::default(),
+        }
+    }
+
+    fn put_block_summary(
+        store: &MaterializedViewStore,
+        height: u32,
+        block_hash: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let record = BlockSummaryRecord {
+            summary: Some(BlockSummary {
+                block_height: height,
+                block_hash,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        record.encode(&mut payload)?;
+        store.put_consumer(
+            BLOCK_SUMMARY_COLUMN_FAMILY,
+            &encode_height_key_ascending(BlockHeight::new(height)),
+            &payload,
+        )?;
+        Ok(())
+    }
+
+    fn put_transaction_history_entry(
+        store: &MaterializedViewStore,
+        height: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let entry = TransactionHistoryEntry {
+            transaction_id: format!("{height:064x}"),
+            block_height: height,
+            block_hash: format!("{height:064x}"),
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        entry.encode(&mut payload)?;
+        store.put_consumer(
+            TRANSACTION_HISTORY_COLUMN_FAMILY,
+            &TransactionHistoryConsumer::key_for_row(BlockHeight::new(height), 0),
+            &payload,
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn endpoint_capability_unavailable_requires_exact_structured_details() {
-        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
-        let status = status_with_capability_detail(
-            Code::FailedPrecondition,
-            ZINDER_ERROR_DOMAIN,
-            endpoint_reason,
-            endpoint_reason,
-            WALLET_SNAPSHOT_MEMPOOL_V3,
+    fn request_limits_apply_defaults_and_server_bounds() {
+        let defaults = RequestLimits::from_request(OverviewSnapshotRequest::default());
+        assert_eq!(defaults.recent_blocks, DEFAULT_RECENT_BLOCKS_LIMIT);
+        assert_eq!(
+            defaults.recent_transactions,
+            DEFAULT_RECENT_TRANSACTIONS_LIMIT
         );
+        assert_eq!(
+            defaults.mempool_window_seconds,
+            DEFAULT_MEMPOOL_WINDOW_SECONDS
+        );
+        assert_eq!(defaults.fee_summary_blocks, DEFAULT_FEE_SUMMARY_BLOCK_COUNT);
 
-        assert!(is_endpoint_capability_unavailable(
-            &status,
-            WALLET_SNAPSHOT_MEMPOOL_V3
-        ));
+        let bounded = RequestLimits::from_request(OverviewSnapshotRequest {
+            recent_blocks_limit: u32::MAX,
+            recent_transactions_limit: u32::MAX,
+            mempool_window_seconds: 1,
+            fee_summary_block_count: u32::MAX,
+        });
+        assert_eq!(bounded.recent_blocks, MAX_RECENT_BLOCKS_LIMIT);
+        assert_eq!(bounded.recent_transactions, MAX_RECENT_TRANSACTIONS_LIMIT);
+        assert_eq!(bounded.mempool_window_seconds, MIN_MEMPOOL_WINDOW_SECONDS);
+        assert_eq!(bounded.fee_summary_blocks, MAX_FEE_SUMMARY_BLOCK_COUNT);
     }
 
     #[test]
-    fn transient_unavailable_is_not_structural_capability_absence() {
-        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
-        let status = status_with_capability_detail(
-            Code::Unavailable,
-            ZINDER_ERROR_DOMAIN,
-            endpoint_reason,
-            endpoint_reason,
-            WALLET_SNAPSHOT_MEMPOOL_V3,
-        );
-
-        assert!(!is_endpoint_capability_unavailable(
-            &status,
-            WALLET_SNAPSHOT_MEMPOOL_V3
-        ));
+    fn overview_rejects_unequal_consumer_coverage() -> Result<(), Box<dyn std::error::Error>> {
+        let tip_hash = BlockHash::from_bytes([0x33; 32]);
+        let error =
+            validate_overview_state(state(7, 20, tip_hash, 5, 3), state(7, 20, tip_hash, 6, 4))
+                .err()
+                .ok_or("unequal coverage must not form one overview fence")?;
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        Ok(())
     }
 
     #[test]
-    fn endpoint_capability_unavailable_requires_zinder_error_domain() {
-        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
-        let status = status_with_capability_detail(
-            Code::FailedPrecondition,
-            "foreign.example",
-            endpoint_reason,
-            endpoint_reason,
-            WALLET_SNAPSHOT_MEMPOOL_V3,
-        );
-
-        assert!(!is_endpoint_capability_unavailable(
-            &status,
-            WALLET_SNAPSHOT_MEMPOOL_V3
-        ));
+    fn overview_rejects_coverage_that_omits_the_requested_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let coverage = MaterializedViewCoverage {
+            complete_from_height: BlockHeight::new(10),
+            complete_through_height: BlockHeight::new(20),
+            complete_through_hash: BlockHash::from_bytes([0x33; 32]),
+        };
+        let error = require_overview_block_window_coverage(coverage, 5, 20)
+            .err()
+            .ok_or("partial requested windows must not be truncated")?;
+        assert_eq!(error.code(), Code::NotFound);
+        Ok(())
     }
 
     #[test]
-    fn endpoint_capability_unavailable_requires_matching_error_reason() {
-        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
-        let status = status_with_capability_detail(
-            Code::FailedPrecondition,
-            ZINDER_ERROR_DOMAIN,
-            ErrorReason::DependencyNotConfigured.as_str_name(),
-            endpoint_reason,
-            WALLET_SNAPSHOT_MEMPOOL_V3,
-        );
-
-        assert!(!is_endpoint_capability_unavailable(
-            &status,
-            WALLET_SNAPSHOT_MEMPOOL_V3
-        ));
+    fn overview_rejects_materialized_view_state_change() -> Result<(), Box<dyn std::error::Error>> {
+        let tip_hash = BlockHash::from_bytes([0x33; 32]);
+        let candidate = OverviewMaterializedViewState {
+            block_summary: state(7, 20, tip_hash, 5, 3),
+            transaction_history: state(7, 20, tip_hash, 5, 4),
+        };
+        let final_state = OverviewMaterializedViewState {
+            block_summary: state(7, 20, tip_hash, 5, 5),
+            ..candidate
+        };
+        let error = require_unchanged_overview_state(candidate, final_state)
+            .err()
+            .ok_or("revision changes must invalidate the optimistic fence")?;
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        Ok(())
     }
 
     #[test]
-    fn endpoint_capability_unavailable_requires_matching_precondition_type() {
-        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
-        let status = status_with_capability_detail(
-            Code::FailedPrecondition,
-            ZINDER_ERROR_DOMAIN,
-            endpoint_reason,
-            ErrorReason::DependencyNotConfigured.as_str_name(),
-            WALLET_SNAPSHOT_MEMPOOL_V3,
+    fn overview_rejects_mismatched_mempool_epoch_and_source_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let expected = wallet_epoch(7, 20, &"33".repeat(32));
+        let wrong_epoch = complete_mempool_observation(
+            wallet_epoch(8, 20, &"33".repeat(32)),
+            expected
+                .visible_tip
+                .clone()
+                .ok_or("test epoch has no visible tip")?,
+        );
+        assert_eq!(
+            require_mempool_identity(&expected, &wrong_epoch)
+                .err()
+                .ok_or("mempool epoch mismatch must fail")?
+                .code(),
+            Code::FailedPrecondition
         );
 
-        assert!(!is_endpoint_capability_unavailable(
-            &status,
-            WALLET_SNAPSHOT_MEMPOOL_V3
-        ));
+        let wrong_source = complete_mempool_observation(
+            expected.clone(),
+            wallet::BlockTip {
+                height: 19,
+                hash: "22".repeat(32),
+            },
+        );
+        assert_eq!(
+            require_mempool_identity(&expected, &wrong_source)
+                .err()
+                .ok_or("mempool source-tip mismatch must fail")?
+                .code(),
+            Code::FailedPrecondition
+        );
+        Ok(())
     }
 
     #[test]
-    fn endpoint_capability_unavailable_requires_exact_capability_subject() {
-        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
-        let status = status_with_capability_detail(
-            Code::FailedPrecondition,
-            ZINDER_ERROR_DOMAIN,
-            endpoint_reason,
-            endpoint_reason,
-            WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+    fn overview_rejects_mismatched_value_pool_epoch_and_source_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let expected = wallet_epoch(7, 20, &"33".repeat(32));
+        let wrong_epoch = wallet::ChainValuePoolsAtTipResponse {
+            chain_view: Some(wallet::ChainView {
+                chain_epoch: Some(wallet_epoch(8, 20, &"33".repeat(32))),
+                ..Default::default()
+            }),
+            source_tip: expected.visible_tip.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            require_value_pool_identity(&expected, &wrong_epoch)
+                .err()
+                .ok_or("value-pool epoch mismatch must fail")?
+                .code(),
+            Code::FailedPrecondition
         );
 
-        assert!(!is_endpoint_capability_unavailable(
-            &status,
-            WALLET_SNAPSHOT_MEMPOOL_V3
-        ));
+        let wrong_source = wallet::ChainValuePoolsAtTipResponse {
+            chain_view: Some(wallet::ChainView {
+                chain_epoch: Some(expected.clone()),
+                ..Default::default()
+            }),
+            source_tip: Some(wallet::BlockTip {
+                height: 19,
+                hash: "22".repeat(32),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            require_value_pool_identity(&expected, &wrong_source)
+                .err()
+                .ok_or("value-pool source-tip mismatch must fail")?
+                .code(),
+            Code::FailedPrecondition
+        );
+        Ok(())
     }
 
     #[test]
-    fn endpoint_capability_unavailable_rejects_composite_preconditions() {
-        let endpoint_reason = ErrorReason::EndpointCapabilityUnavailable.as_str_name();
-        let mut details = ErrorDetails::with_precondition_failure_violation(
-            endpoint_reason,
-            WALLET_SNAPSHOT_MEMPOOL_V3,
-            "test precondition",
-        );
-        details.add_precondition_failure_violation(
-            ErrorReason::DependencyNotConfigured.as_str_name(),
-            "unrelated dependency",
-            "unrelated precondition",
-        );
-        details.set_error_info(endpoint_reason, ZINDER_ERROR_DOMAIN, HashMap::new());
-        let status = Status::with_error_details(Code::FailedPrecondition, "test status", details);
+    fn overview_requires_exact_contiguous_block_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let store = MaterializedViewStore::open_with_materialized_view_preset(
+            directory.path(),
+            zinder_core::Network::ZcashRegtest,
+            MaterializedViewPreset::Explorer,
+            MaterializedViewStoreOptions::default(),
+        )?;
+        let tip_hash = BlockHash::from_bytes([0x33; 32]);
+        put_block_summary(&store, 1, "11".repeat(32))?;
+        put_block_summary(&store, 3, "33".repeat(32))?;
+        let limits = RequestLimits {
+            recent_blocks: 3,
+            recent_transactions: 1,
+            mempool_window_seconds: 60,
+            fee_summary_blocks: 3,
+        };
+        let materialized_state = state(7, 3, tip_hash, 1, 1);
 
-        assert!(!is_endpoint_capability_unavailable(
-            &status,
-            WALLET_SNAPSHOT_MEMPOOL_V3
-        ));
+        let snapshot = store.read_snapshot();
+        let error = read_block_summary_records_snapshot(&snapshot, 3, &limits, materialized_state)
+            .err()
+            .ok_or("a missing middle row must fail the complete window")?;
+        assert_eq!(error.code(), Code::NotFound);
+        drop(snapshot);
+
+        put_block_summary(&store, 2, "22".repeat(32))?;
+        let snapshot = store.read_snapshot();
+        let records =
+            read_block_summary_records_snapshot(&snapshot, 3, &limits, materialized_state)?;
+        drop(snapshot);
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| record.summary.as_ref())
+                .map(|summary| summary.block_height)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        Ok(())
     }
 
     #[test]
-    fn endpoint_capability_unavailable_requires_structured_details() {
-        let status = Status::failed_precondition("missing structured details");
+    fn overview_recent_transactions_stop_at_verified_coverage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let store = MaterializedViewStore::open_with_materialized_view_preset(
+            directory.path(),
+            zinder_core::Network::ZcashRegtest,
+            MaterializedViewPreset::Explorer,
+            MaterializedViewStoreOptions::default(),
+        )?;
+        for height in [8, 9, 10] {
+            put_transaction_history_entry(&store, height)?;
+        }
+        let tip_hash = BlockHash::from_bytes([0x33; 32]);
+        let materialized_state = state(7, 10, tip_hash, 9, 1);
 
-        assert!(!is_endpoint_capability_unavailable(
-            &status,
-            WALLET_SNAPSHOT_MEMPOOL_V3
-        ));
+        let snapshot = store.read_snapshot();
+        let entries = read_recent_transactions_snapshot(&snapshot, 3, materialized_state)?;
+        drop(snapshot);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.block_height)
+                .collect::<Vec<_>>(),
+            vec![10, 9],
+        );
+        Ok(())
     }
 }

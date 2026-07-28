@@ -179,10 +179,13 @@ pub const EXPLORER_TRANSACTION_DETAIL_V4: &str = "explorer.transaction.detail_v4
 /// The identifier names the summary shape (`block_height`, `block_hash`,
 /// `block_time_unix_seconds`, `transaction_count`, `previous_block_hash`).
 /// A runtime advertises it only when that endpoint installs the method and
-/// admits its exact dependencies; the protocol registry does not make that
-/// support decision. The companion [`EXPLORER_BLOCK_DETAIL_V1`] covers the
-/// per-block transaction-id list.
-pub const EXPLORER_BLOCK_SUMMARY_V1: &str = "explorer.block.summary_v1";
+/// admits the exact block-summary consumer plus wallet visible-tip dependency;
+/// the protocol registry does not make that support decision. Each request
+/// requires verified coverage, an exact wallet epoch/tip match, an unchanged
+/// materialized-view state, and every row in the requested range. The
+/// companion [`EXPLORER_BLOCK_DETAIL_V1`] covers the per-block transaction-id
+/// list.
+pub const EXPLORER_BLOCK_SUMMARY_V2: &str = "explorer.block.summary_v2";
 /// Capability advertised for `ExplorerQuery.BlockProductionSeries`.
 ///
 /// Signals that the explorer can join a bounded range of existing
@@ -200,9 +203,10 @@ pub const EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1: &str = "explorer.block.produc
 /// Capability advertised for `ExplorerQuery.BlockDetail`.
 ///
 /// Signals that the explorer plane materialized the per-block transaction
-/// id list alongside the summary fields. Coexists with
-/// [`EXPLORER_BLOCK_SUMMARY_V1`]; both are advertised together by the same
-/// `BlockSummaryConsumer` materialized view.
+/// id list alongside the summary fields. The `BlockSummaryConsumer` is
+/// necessary for both this capability and [`EXPLORER_BLOCK_SUMMARY_V2`], but
+/// their exact admitted wallet dependencies differ, so the endpoint does not
+/// necessarily advertise them together.
 pub const EXPLORER_BLOCK_DETAIL_V1: &str = "explorer.block.detail_v1";
 /// Capability advertised for `ExplorerQuery.BlockTransactions`.
 ///
@@ -232,8 +236,9 @@ pub const EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1: &str = "explorer.block.activi
 /// [ADR-0012](../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md).
 /// The classifier short-circuits shielded receivers and viewing keys
 /// into the typed `NotPubliclyIndexable` refusal arm before any storage
-/// read; gated on `wallet_query_endpoint.is_some()` because hash
-/// disambiguation routes through `WalletQuery`.
+/// read. Admission requires wallet visible-tip, block-id-selector, and
+/// transaction-lookup capabilities because hash disambiguation routes through
+/// `WalletQuery`.
 pub const EXPLORER_SEARCH_V1: &str = "explorer.search_v1";
 /// Capability advertised for `ExplorerQuery.CommitmentRootSearch`.
 ///
@@ -252,11 +257,12 @@ pub const EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1: &str =
     "explorer.commitment_root.displaced_matches_v1";
 /// Capability advertised for `ExplorerQuery.MempoolSummary`.
 ///
-/// Signals that the explorer plane aggregates the live mempool snapshot
-/// into the explorer-shaped page (total counts, privacy-shape and
-/// version distributions, freshness extremes) at request time. Composed
-/// from `WalletQuery.MempoolSnapshot`; no materialized-view consumer required.
-pub const EXPLORER_MEMPOOL_SUMMARY_V1: &str = "explorer.mempool.summary_v1";
+/// Signals that the explorer plane walks every page of one identity-stable
+/// live mempool snapshot and aggregates it into the explorer-shaped response
+/// (total counts, privacy-shape and version distributions, freshness extremes)
+/// with bounded memory. Composed from `WalletQuery.MempoolSnapshot`; no
+/// materialized-view consumer is required.
+pub const EXPLORER_MEMPOOL_SUMMARY_V2: &str = "explorer.mempool.summary_v2";
 /// Capability advertised for `ExplorerQuery.MempoolSnapshot`.
 ///
 /// Signals that the explorer derives one global summary and one requested page
@@ -412,15 +418,10 @@ pub const EXPLORER_TRANSACTION_FEES_V1: &str = "explorer.transaction.fees_v1";
 /// into the `recent_transactions` materialized-view column family and serves it as one
 /// streaming RPC.
 pub const EXPLORER_TRANSACTION_RECENT_V1: &str = "explorer.transaction.recent_v1";
-/// Capability advertised for `ExplorerQuery.TransactionHistory`.
-///
-/// Signals that the explorer plane serves bounded, filter-aware,
-/// bidirectional pages over its canonical transaction-history projection.
-pub const EXPLORER_TRANSACTION_HISTORY_V1: &str = "explorer.transaction.history_v1";
 /// Capability advertised for the additive read-fenced `ExplorerQuery.TransactionHistory` contract.
 ///
-/// The v2 capability preserves the v1 RPC and entry fields while adding a
-/// projection read fence, verified coverage, and count scope.
+/// The contract carries a projection read fence, verified coverage, and count
+/// scope.
 pub const EXPLORER_TRANSACTION_HISTORY_V2: &str = "explorer.transaction.history_v2";
 /// Field capability gating transaction-detail and transaction-history intrinsic balances.
 ///
@@ -458,15 +459,15 @@ pub const EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1: &str =
     "explorer.chain.displaced_block_detail_v1";
 /// Capability advertised for `ExplorerQuery.OverviewSnapshot`.
 ///
-/// Signals that the explorer plane composes a single coherent overview
-/// bundle — tip identity, mempool counts, fee summary, value pools,
-/// recent blocks, recent transactions, mempool event counts — in one
-/// read pass over the materialized-view store, sharing one `ExplorerFreshness`
-/// across every sub-field. Consumers that render a dashboard avoid the
-/// per-card fan-out (six independent RPCs whose freshness can diverge)
-/// in favor of this single RPC. Gated on `materialized_view_store` and
-/// `wallet_query_endpoint` both being online (same precondition as the
-/// materialized-view-backed cards the bundle composes).
+/// Signals that the explorer plane composes an all-or-nothing coherent
+/// overview bundle — tip identity, complete mempool counts, fee summary, value
+/// pools, recent blocks, recent transactions, and mempool event counts. The
+/// method requires exact block-summary, transaction-history, and
+/// mempool-event-count consumers plus wallet visible-tip, mempool-snapshot,
+/// and chain-value-pool capabilities. Block and history share one verified
+/// state and coverage; all materialized fields come from one store snapshot.
+/// Consumers that render a dashboard avoid the per-card fan-out (six
+/// independent RPCs whose freshness can diverge) in favor of this single RPC.
 pub const EXPLORER_OVERVIEW_SNAPSHOT_V1: &str = "explorer.overview.snapshot_v1";
 /// Capability advertised for `ExplorerQuery.MigrationOverview`.
 ///
@@ -755,7 +756,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         Some("zinder.v1.explorer.ExplorerQuery.TransactionDetail"),
     ),
     CapabilitySpec::new(
-        EXPLORER_BLOCK_SUMMARY_V1,
+        EXPLORER_BLOCK_SUMMARY_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.BlockSummariesInRange"),
     ),
@@ -805,7 +806,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         None,
     ),
     CapabilitySpec::new(
-        EXPLORER_MEMPOOL_SUMMARY_V1,
+        EXPLORER_MEMPOOL_SUMMARY_V2,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.MempoolSummary"),
     ),
@@ -933,11 +934,6 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_TRANSACTION_RECENT_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.RecentTransactions"),
-    ),
-    CapabilitySpec::new(
-        EXPLORER_TRANSACTION_HISTORY_V1,
-        CapabilitySurface::Explorer,
-        Some("zinder.v1.explorer.ExplorerQuery.TransactionHistory"),
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_HISTORY_V2,

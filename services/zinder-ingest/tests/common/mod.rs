@@ -70,6 +70,7 @@ pub(crate) fn test_materialized_view_store(
 ) -> Result<zinder_materialized_views::MaterializedViewStore> {
     Ok(zinder_materialized_views::MaterializedViewStore::open(
         zinder_materialized_views::MaterializedViewStore::path_for_canonical(storage_path),
+        zinder_core::Network::ZcashRegtest,
         zinder_materialized_views::MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[],

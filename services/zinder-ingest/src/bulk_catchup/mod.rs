@@ -822,7 +822,7 @@ mod tests {
     use zinder_source::{
         NodeCapabilities, NodeCapability, SourceBlock, SourceBlockHeader, SourceChainSegment,
         SourceChainSegmentLimits, SourceChainSegmentStats, SourceError, SourceSubtreeRoot,
-        SourceSubtreeRoots, SourceTreeState, ZebraJsonRpcSource,
+        SourceSubtreeRoots, SourceTreeState,
     };
     use zinder_store::{ChainEventHistoryRequest, StoreReadCaller};
     use zinder_testkit::completed_sapling_subtree_frontier;
@@ -2772,12 +2772,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeSource for DelayedSegmentSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            ZebraJsonRpcSource::baseline_capabilities()
-        }
-
         fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-            Some(self.capabilities())
+            NodeCapabilities::new([NodeCapability::SourceChainSegments, NodeCapability::TipId]).ok()
         }
 
         async fn fetch_chain_segment(
@@ -2838,12 +2834,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeSource for SplitHeadSegmentSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            ZebraJsonRpcSource::baseline_capabilities()
-        }
-
         fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-            Some(self.capabilities())
+            NodeCapabilities::new([NodeCapability::SourceChainSegments, NodeCapability::TipId]).ok()
         }
 
         async fn fetch_chain_segment(
@@ -2908,12 +2900,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeSource for RecordingSegmentSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            ZebraJsonRpcSource::baseline_capabilities()
-        }
-
         fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-            Some(self.capabilities())
+            NodeCapabilities::new([NodeCapability::SourceChainSegments, NodeCapability::TipId]).ok()
         }
 
         async fn fetch_chain_segment(
@@ -2964,10 +2952,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeSource for FlakyNodeSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            self.delegate.capabilities()
-        }
-
         fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
             self.delegate.admitted_capabilities()
         }
@@ -3042,12 +3026,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeSource for GatedTreeStateSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            self.delegate.capabilities()
-        }
-
         fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-            self.delegate.admitted_capabilities()
+            NodeCapabilities::new([
+                NodeCapability::BestChainBlocks,
+                NodeCapability::SourceChainSegments,
+                NodeCapability::TipId,
+                NodeCapability::TreeState,
+                NodeCapability::SubtreeRoots,
+            ])
+            .ok()
         }
 
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
@@ -3086,12 +3073,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeSource for TestNodeSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            ZebraJsonRpcSource::baseline_capabilities()
-        }
-
         fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-            Some(self.capabilities())
+            NodeCapabilities::new([
+                NodeCapability::BestChainBlocks,
+                NodeCapability::SourceChainSegments,
+                NodeCapability::TipId,
+                NodeCapability::SubtreeRoots,
+            ])
+            .ok()
         }
 
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

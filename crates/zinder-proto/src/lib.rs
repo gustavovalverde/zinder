@@ -20,7 +20,11 @@ pub use error_policy::{
 /// Monotonically increasing marker, incremented whenever the semantics of an
 /// existing wire surface are revised in place. Consumers require the minimum
 /// revision they implement and may accept newer revisions when the server's
-/// advertised capabilities satisfy their requirements.
+/// advertised capabilities satisfy their requirements. Revision 5 is the
+/// aggregate cutover from revision 4 for the current unpublished native
+/// contract, including the exact Explorer block-summary and mempool-summary
+/// semantics; their capability identifiers version the individual methods
+/// without consuming another aggregate revision.
 pub const CONTRACT_REVISION: u32 = 5;
 
 /// Encoded descriptor set for native Zinder v1 protobuf services.

@@ -33,7 +33,6 @@ use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::warn;
 use zinder_core::Network;
 use zinder_core::wire::decode_zinder_native_chain_name;
 
@@ -459,10 +458,10 @@ fn resolve_node_auth(section: NodeAuthSection) -> Result<NodeAuth, NodeConfigErr
 
     match method {
         "none" => {
-            warn_unused(section.username.is_some(), "node.auth.username");
-            warn_unused(section.password.is_some(), "node.auth.password");
-            warn_unused(section.path.is_some(), "node.auth.path");
-            warn_unused(section.cookie.is_some(), "node.auth.cookie");
+            reject_present(section.username.is_some(), "node.auth.username", "none")?;
+            reject_present(section.password.is_some(), "node.auth.password", "none")?;
+            reject_present(section.path.is_some(), "node.auth.path", "none")?;
+            reject_present(section.cookie.is_some(), "node.auth.cookie", "none")?;
             Ok(NodeAuth::None)
         }
         "basic" => {
@@ -510,17 +509,6 @@ fn reject_present(
         return Err(NodeConfigError::AuthFieldNotApplicable { field, method });
     }
     Ok(())
-}
-
-fn warn_unused(is_field_present: bool, field: &'static str) {
-    if is_field_present {
-        warn!(
-            event = "node_auth_field_ignored",
-            field,
-            method = "none",
-            "node.auth field is set but ignored because node.auth.method is none"
-        );
-    }
 }
 
 fn read_required(env_var: &'static str) -> Result<String, NodeConfigError> {
@@ -588,26 +576,56 @@ mod tests {
     }
 
     #[test]
-    fn resolve_none_auth_tolerates_unused_path() -> Result<(), NodeConfigError> {
-        let section = NodeSection {
-            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
-            indexer_grpc_addr: None,
-            request_timeout_secs: None,
-            max_response_bytes: None,
-            broadcast_timeout_secs: None,
-            auth: NodeAuthSection {
-                method: Some("none".to_owned()),
-                username: None,
-                password: None,
-                path: Some(PathBuf::from("/var/run/auth/.cookie")),
-                cookie: None,
-            },
-            health: NodeHealthSection::default(),
-        };
-        let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
+    fn resolve_none_auth_rejects_every_inapplicable_field() {
+        for (expected_field, auth) in [
+            (
+                "node.auth.username",
+                NodeAuthSection {
+                    username: Some("zebra".to_owned()),
+                    ..NodeAuthSection::default()
+                },
+            ),
+            (
+                "node.auth.password",
+                NodeAuthSection {
+                    password: Some("zebra".to_owned()),
+                    ..NodeAuthSection::default()
+                },
+            ),
+            (
+                "node.auth.path",
+                NodeAuthSection {
+                    path: Some(PathBuf::from("/var/run/auth/.cookie")),
+                    ..NodeAuthSection::default()
+                },
+            ),
+            (
+                "node.auth.cookie",
+                NodeAuthSection {
+                    cookie: Some("zebra:secret".to_owned()),
+                    ..NodeAuthSection::default()
+                },
+            ),
+        ] {
+            for method in [None, Some("none".to_owned())] {
+                let mut configured_auth = auth.clone();
+                configured_auth.method = method;
+                let section = NodeSection {
+                    json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+                    auth: configured_auth,
+                    ..NodeSection::default()
+                };
+                let outcome = NodeTarget::resolve(Network::ZcashRegtest, section);
 
-        assert!(matches!(target.node_auth, NodeAuth::None));
-        Ok(())
+                assert!(matches!(
+                    outcome,
+                    Err(NodeConfigError::AuthFieldNotApplicable {
+                        field,
+                        method: "none",
+                    }) if field == expected_field
+                ));
+            }
+        }
     }
 
     #[test]

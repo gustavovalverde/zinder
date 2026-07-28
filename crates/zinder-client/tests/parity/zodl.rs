@@ -44,7 +44,7 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
         serving_pair_slot.clone(),
         MockTransactionBroadcaster::broadcast_disabled(),
         Arc::clone(&activations),
-    );
+    )?;
     let adapter =
         LightwalletdGrpcAdapter::new(query, activations).with_serving_pair_slot(serving_pair_slot);
 

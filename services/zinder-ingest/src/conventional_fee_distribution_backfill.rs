@@ -16,6 +16,9 @@ use zinder_store::RocksDbCanonicalSecondary;
 
 use crate::{
     IngestError,
+    canonical_block_context::{
+        validate_canonical_activations_identity, validate_materialized_view_canonical_identity,
+    },
     materialized_view_replay::materialized_view_write_guard,
     runtime_config::{
         HistoricalWorkGate, nonzero_u32, sleep_or_cancel, wait_until_historical_work_or_cancelled,
@@ -95,17 +98,24 @@ pub struct ConventionalFeeDistributionBackfillContext {
 
 impl ConventionalFeeDistributionBackfillContext {
     /// Groups the canonical secondary and materialized-view store for task startup.
-    #[must_use]
-    pub const fn new(
+    pub fn new(
         canonical: Arc<RwLock<RocksDbCanonicalSecondary>>,
         activations: Arc<NetworkUpgradeActivations>,
         materialized_view_store: MaterializedViewStore,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, IngestError> {
+        {
+            let canonical_guard = canonical.read();
+            validate_canonical_activations_identity(&canonical_guard, &activations)?;
+            validate_materialized_view_canonical_identity(
+                &canonical_guard,
+                &materialized_view_store,
+            )?;
+        }
+        Ok(Self {
             canonical,
             activations,
             materialized_view_store,
-        }
+        })
     }
 }
 

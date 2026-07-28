@@ -988,7 +988,7 @@ wallet.address.transparent_history_v1
 wallet.address.transparent_balance_v1
 explorer.server_info_v1
 explorer.transaction.detail_v4
-explorer.block.summary_v1
+explorer.block.summary_v2
 explorer.block.production_series_v2
 explorer.block.production_time_range_v1
 explorer.block.detail_v1
@@ -998,7 +998,7 @@ explorer.block.activity_distribution_v1
 explorer.search_v1
 explorer.commitment_root.search_v1
 explorer.commitment_root.displaced_matches_v1
-explorer.mempool.summary_v1
+explorer.mempool.summary_v2
 explorer.mempool.snapshot_v1
 explorer.mempool.activity_v1
 explorer.transparent_address.activity_v2
@@ -1021,7 +1021,6 @@ explorer.chain.displaced_block_history_v1
 explorer.chain.displaced_block_detail_v1
 explorer.mempool.event_counts_v1
 explorer.transaction.fees_v1
-explorer.transaction.history_v1
 explorer.transaction.recent_v1
 explorer.transaction.history_v2
 explorer.transaction.intrinsic_value_balances_v1

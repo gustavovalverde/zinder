@@ -44,14 +44,15 @@ impl NativeWalletEndpointCapabilities {
 
     /// Derives the capabilities implemented by the exact serving-pair query.
     ///
-    /// `node_capabilities` must be the result of the probe performed on the
-    /// same source handle installed as the query's tree-state provider and
-    /// transaction broadcaster.
+    /// `node_capabilities` must be the admitted evidence from the same source
+    /// handle installed as the query's tree-state provider and transaction
+    /// broadcaster.
     pub(crate) fn for_wallet_serving_pair(
         raw_blob_retention: RawBlobRetention,
         node_capabilities: NodeCapabilities,
     ) -> Self {
-        let node_was_probed = node_capabilities.supports(NodeCapability::OpenRpcDiscovery);
+        let openrpc_discovery_admitted =
+            node_capabilities.supports(NodeCapability::OpenRpcDiscovery);
         Self::from_predicate(|capability| {
             let implemented_without_optional_evidence = matches!(
                 capability,
@@ -75,10 +76,10 @@ impl NativeWalletEndpointCapabilities {
                         | capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
                 ) && raw_blob_retention.retains_block_blobs())
                 || (capability == capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2
-                    && node_was_probed
+                    && openrpc_discovery_admitted
                     && node_capabilities.supports(NodeCapability::TreeState))
                 || (capability == capabilities::WALLET_BROADCAST_TRANSACTION_V1
-                    && node_was_probed
+                    && openrpc_discovery_admitted
                     && node_capabilities.supports(NodeCapability::TransactionBroadcast))
         })
     }
@@ -126,7 +127,7 @@ impl NativeWalletEndpointCapabilities {
     }
 }
 
-/// Diagnostic snapshot from the upstream node probe used by this query.
+/// Diagnostic snapshot from the upstream node admission used by this query.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UpstreamNodeCapabilities {
     /// Node-reported semantic version when available.
@@ -135,8 +136,8 @@ pub struct UpstreamNodeCapabilities {
 }
 
 impl UpstreamNodeCapabilities {
-    /// Captures stable diagnostic names from the successful source probe.
-    pub(crate) fn from_probed(node_capabilities: NodeCapabilities) -> Self {
+    /// Captures stable diagnostic names from admitted source evidence.
+    pub(crate) fn from_admitted(node_capabilities: NodeCapabilities) -> Self {
         Self {
             version: None,
             capabilities: node_capabilities

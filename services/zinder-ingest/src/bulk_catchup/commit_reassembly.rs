@@ -397,7 +397,13 @@ where
         }
     };
 
-    populate_bulk_catchup_tree_state_checkpoint(&run, &mut batch).await;
+    if let Err(error) = populate_bulk_catchup_tree_state_checkpoint(&run, &mut batch).await {
+        return Err(CanonicalCommitFailure {
+            error,
+            retry_state,
+            flush_state,
+        });
+    }
 
     let commit_outcome = match commit_built_bulk_catchup_batch(
         run.store,
@@ -437,16 +443,17 @@ where
 async fn populate_bulk_catchup_tree_state_checkpoint<Source>(
     run: &BulkCatchupRunContext<'_, Source>,
     batch: &mut CanonicalBatch,
-) where
+) -> Result<(), IngestError>
+where
     Source: NodeSource,
 {
     let started_at = Instant::now();
-    if !run
+    let admitted_capabilities = run
         .source
-        .capabilities()
-        .supports(zinder_source::NodeCapability::TreeState)
-    {
-        return;
+        .admitted_capabilities()
+        .ok_or(IngestError::NodeCapabilitiesNotAdmitted)?;
+    if !admitted_capabilities.supports(zinder_source::NodeCapability::TreeState) {
+        return Ok(());
     }
     let existing_heights = batch
         .tree_states
@@ -493,6 +500,7 @@ async fn populate_bulk_catchup_tree_state_checkpoint<Source>(
         ));
     }
     record_bulk_pipeline_stage_duration(BULK_STAGE_CHECKPOINT_TREE_STATE, started_at, None);
+    Ok(())
 }
 
 async fn wait_for_in_flight_canonical_commit(

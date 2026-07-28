@@ -314,14 +314,16 @@ async fn transparent_spends_by_outpoint_resolves_swept_spend_from_materialized_v
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let materialized_view_store =
-        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
+    let materialized_view_store = open_test_materialized_view_store_for_canonical(
+        store_fixture.tempdir_path(),
+        zinder_core::Network::ZcashRegtest,
+    )?;
     let swept = commit_swept_transparent_spend(&store)?;
     seed_transparent_outpoint_spends(&materialized_view_store, std::slice::from_ref(&swept.spend))?;
     seed_complete_transparent_spend_materialized_view(&materialized_view_store, &store)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_materialized_view_store(materialized_view_store);
+        .with_materialized_view_store(materialized_view_store)?;
     let response = wallet_query
         .transparent_spends_by_outpoint(vec![swept.outpoint], None::<ChainEpochId>)
         .await?;
@@ -341,13 +343,38 @@ async fn transparent_spends_by_outpoint_resolves_swept_spend_from_materialized_v
     Ok(())
 }
 
+#[test]
+fn wallet_query_rejects_a_cross_network_materialized_view_store() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let materialized_view_store = open_test_materialized_view_store_for_canonical(
+        store_fixture.tempdir_path(),
+        zinder_core::Network::ZcashTestnet,
+    )?;
+
+    assert!(matches!(
+        WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            (),
+            Arc::new(sample_regtest_upgrade_activations()),
+        )
+        .with_materialized_view_store(materialized_view_store),
+        Err(QueryError::MaterializedViewStoreNetworkMismatch {
+            expected: zinder_core::Network::ZcashRegtest,
+            observed: zinder_core::Network::ZcashTestnet,
+        })
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn transparent_spends_by_outpoint_ignores_materialized_spend_above_settled_tip()
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let materialized_view_store =
-        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
+    let materialized_view_store = open_test_materialized_view_store_for_canonical(
+        store_fixture.tempdir_path(),
+        zinder_core::Network::ZcashRegtest,
+    )?;
     let swept = commit_swept_transparent_spend(&store)?;
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x42; 32]), 0);
     let spend = projected_spend(outpoint, BlockHeight::new(3));
@@ -355,7 +382,7 @@ async fn transparent_spends_by_outpoint_ignores_materialized_spend_above_settled
     seed_complete_transparent_spend_materialized_view(&materialized_view_store, &store)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_materialized_view_store(materialized_view_store);
+        .with_materialized_view_store(materialized_view_store)?;
     let response = wallet_query
         .transparent_spends_by_outpoint(vec![outpoint], None::<ChainEpochId>)
         .await?;
@@ -372,8 +399,10 @@ async fn transparent_spends_by_outpoint_refuses_when_materialized_view_trails_th
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let materialized_view_store =
-        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
+    let materialized_view_store = open_test_materialized_view_store_for_canonical(
+        store_fixture.tempdir_path(),
+        zinder_core::Network::ZcashRegtest,
+    )?;
     commit_swept_transparent_spend(&store)?;
     let reader = store.current_chain_epoch_reader()?;
     let block_one = reader
@@ -401,7 +430,7 @@ async fn transparent_spends_by_outpoint_refuses_when_materialized_view_trails_th
 
     let missing_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x43; 32]), 0);
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_materialized_view_store(materialized_view_store);
+        .with_materialized_view_store(materialized_view_store)?;
     let outcome = wallet_query
         .transparent_spends_by_outpoint(vec![missing_outpoint], None::<ChainEpochId>)
         .await;
@@ -419,8 +448,10 @@ async fn transparent_spends_by_outpoint_refuses_when_materialized_view_trails_th
 async fn transparent_spends_by_outpoint_skips_reorged_out_materialized_spend() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let materialized_view_store =
-        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
+    let materialized_view_store = open_test_materialized_view_store_for_canonical(
+        store_fixture.tempdir_path(),
+        zinder_core::Network::ZcashRegtest,
+    )?;
     let swept = commit_swept_transparent_spend(&store)?;
     let outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x45; 32]), 0);
     let mut stale_spend = projected_spend(outpoint, BlockHeight::new(1));
@@ -429,7 +460,7 @@ async fn transparent_spends_by_outpoint_skips_reorged_out_materialized_spend() -
     seed_complete_transparent_spend_materialized_view(&materialized_view_store, &store)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_materialized_view_store(materialized_view_store);
+        .with_materialized_view_store(materialized_view_store)?;
     let response = wallet_query
         .transparent_spends_by_outpoint(vec![outpoint], None::<ChainEpochId>)
         .await?;
@@ -445,8 +476,10 @@ async fn transparent_spends_by_outpoint_skips_reorged_out_materialized_spend() -
 async fn transparent_spends_by_outpoint_prefers_the_canonical_spender() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
-    let materialized_view_store =
-        open_test_materialized_view_store_for_canonical(store_fixture.tempdir_path())?;
+    let materialized_view_store = open_test_materialized_view_store_for_canonical(
+        store_fixture.tempdir_path(),
+        zinder_core::Network::ZcashRegtest,
+    )?;
     let (spent_outpoint, spend) = commit_spent_outpoint_fixture(&store)?;
     let conflicting_spend = TransparentSpendFact::new(
         spent_outpoint,
@@ -463,7 +496,7 @@ async fn transparent_spends_by_outpoint_prefers_the_canonical_spender() -> eyre:
     seed_transparent_outpoint_spends(&materialized_view_store, &[conflicting_spend])?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_materialized_view_store(materialized_view_store);
+        .with_materialized_view_store(materialized_view_store)?;
     let response = wallet_query
         .transparent_spends_by_outpoint(vec![spent_outpoint], None::<ChainEpochId>)
         .await?;

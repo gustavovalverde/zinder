@@ -161,12 +161,8 @@ impl RecordingParseableSource {
 
 #[async_trait]
 impl NodeSource for RecordingParseableSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities::default()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-        Some(self.capabilities())
+        Some(NodeCapabilities::default())
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

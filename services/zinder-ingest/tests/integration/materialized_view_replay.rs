@@ -16,8 +16,9 @@ use zinder_core::{
     UnixTimestampMillis,
 };
 use zinder_ingest::{
-    CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalFollower, IngestError,
-    MaterializedViewReplayConfig, MaterializedViewTailer, follow_canonical_tip,
+    CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalFollower,
+    ConventionalFeeDistributionBackfillContext, IngestError, MaterializedViewReplayConfig,
+    MaterializedViewTailer, TransactionComponentBackfillContext, follow_canonical_tip,
     load_fresh_canonical, spawn_materialized_view_tailer_task,
 };
 use zinder_materialized_views::{
@@ -53,17 +54,17 @@ async fn a_fresh_view_store_rebuilds_the_rows_event_replay_would_have_written()
 -> Result<(), Box<dyn Error>> {
     let mut harness = CanonicalHarness::baseline().await?;
     let (_incremental_directory, incremental) = view_store()?;
-    harness.tailer(&incremental).catch_up()?;
+    harness.tailer(&incremental)?.catch_up()?;
     assert_eq!(
         block_summary_hashes(&incremental, BASELINE_TIP_HEIGHT)?,
         harness.canonical_hashes(BASELINE_TIP_HEIGHT)
     );
 
     harness.follow_to_tip().await?;
-    harness.tailer(&incremental).catch_up()?;
+    harness.tailer(&incremental)?.catch_up()?;
 
     let (_rebuilt_directory, rebuilt) = view_store()?;
-    harness.tailer(&rebuilt).catch_up()?;
+    harness.tailer(&rebuilt)?.catch_up()?;
 
     assert_eq!(
         block_summary_hashes(&incremental, CHAIN_TIP_HEIGHT)?,
@@ -86,11 +87,11 @@ async fn a_reorg_transition_reverts_and_reapplies_the_replaced_height() -> Resul
     let mut harness = CanonicalHarness::baseline().await?;
     harness.follow_to_tip().await?;
     let (_directory, view) = view_store()?;
-    harness.tailer(&view).catch_up()?;
+    harness.tailer(&view)?.catch_up()?;
     let replaced = harness.canonical_hashes(CHAIN_TIP_HEIGHT);
 
     harness.replace_tip().await?;
-    harness.tailer(&view).catch_up()?;
+    harness.tailer(&view)?.catch_up()?;
 
     let reapplied = harness.canonical_hashes(REPLACEMENT_TIP_HEIGHT);
     assert_ne!(replaced, harness.canonical_hashes(CHAIN_TIP_HEIGHT));
@@ -111,14 +112,14 @@ async fn an_expired_cursor_recovers_onto_the_rows_a_clean_rebuild_produces()
 -> Result<(), Box<dyn Error>> {
     let mut harness = CanonicalHarness::baseline().await?;
     let (_recovered_directory, recovered) = view_store()?;
-    harness.tailer(&recovered).catch_up()?;
+    harness.tailer(&recovered)?.catch_up()?;
 
     harness.follow_to_tip().await?;
     harness.prune_events_to_fence()?;
-    harness.tailer(&recovered).catch_up()?;
+    harness.tailer(&recovered)?.catch_up()?;
 
     let (_rebuilt_directory, rebuilt) = view_store()?;
-    harness.tailer(&rebuilt).catch_up()?;
+    harness.tailer(&rebuilt)?.catch_up()?;
 
     assert_eq!(
         block_summary_hashes(&recovered, CHAIN_TIP_HEIGHT)?,
@@ -141,7 +142,7 @@ async fn an_undecodable_persisted_cursor_names_the_view_store_for_rebuild()
     }
 
     let error = harness
-        .tailer(&view)
+        .tailer(&view)?
         .catch_up()
         .err()
         .ok_or("an undecodable cursor must refuse replay")?;
@@ -165,7 +166,7 @@ async fn the_tailer_publishes_a_live_status_and_opens_the_historical_work_gate()
     let cancel = CancellationToken::new();
 
     let handle = spawn_materialized_view_tailer_task(
-        harness.tailer(&view),
+        harness.tailer(&view)?,
         Duration::from_millis(10),
         gate.clone(),
         cancel.clone(),
@@ -187,10 +188,54 @@ async fn the_tailer_publishes_a_live_status_and_opens_the_historical_work_gate()
     Ok(())
 }
 
+#[tokio::test]
+async fn materialized_view_composition_constructors_reject_cross_network_storage()
+-> Result<(), Box<dyn Error>> {
+    let harness = CanonicalHarness::baseline().await?;
+    let (_directory, view) = view_store_for_network(Network::ZcashTestnet)?;
+
+    assert!(matches!(
+        MaterializedViewTailer::new(
+            Arc::clone(&harness.canonical),
+            view.clone(),
+            MaterializedViewReplayConfig::DEFAULT,
+            Arc::clone(&harness.activations),
+            REORG_WINDOW_BLOCKS,
+            Some(Duration::from_hours(168)),
+            Duration::from_hours(24),
+        ),
+        Err(IngestError::MaterializedViewCanonicalNetworkMismatch { .. })
+    ));
+    assert!(matches!(
+        ConventionalFeeDistributionBackfillContext::new(
+            Arc::clone(&harness.canonical),
+            Arc::clone(&harness.activations),
+            view.clone(),
+        ),
+        Err(IngestError::MaterializedViewCanonicalNetworkMismatch { .. })
+    ));
+    assert!(matches!(
+        TransactionComponentBackfillContext::new(
+            Arc::clone(&harness.canonical),
+            Arc::clone(&harness.activations),
+            view,
+        ),
+        Err(IngestError::MaterializedViewCanonicalNetworkMismatch { .. })
+    ));
+    Ok(())
+}
+
 fn view_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
+    view_store_for_network(Network::ZcashRegtest)
+}
+
+fn view_store_for_network(
+    network: Network,
+) -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
     let directory = TempDir::new()?;
     let store = MaterializedViewStore::open(
         directory.path(),
+        network,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
@@ -296,16 +341,16 @@ impl CanonicalHarness {
         })
     }
 
-    fn tailer(&self, view: &MaterializedViewStore) -> MaterializedViewTailer {
-        MaterializedViewTailer {
-            canonical: Arc::clone(&self.canonical),
-            materialized_view_store: view.clone(),
-            config: MaterializedViewReplayConfig::DEFAULT,
-            activations: Arc::clone(&self.activations),
-            reorg_window_blocks: REORG_WINDOW_BLOCKS,
-            chain_event_retention_window: Some(Duration::from_hours(168)),
-            cursor_at_risk_warning: Duration::from_hours(24),
-        }
+    fn tailer(&self, view: &MaterializedViewStore) -> Result<MaterializedViewTailer, IngestError> {
+        MaterializedViewTailer::new(
+            Arc::clone(&self.canonical),
+            view.clone(),
+            MaterializedViewReplayConfig::DEFAULT,
+            Arc::clone(&self.activations),
+            REORG_WINDOW_BLOCKS,
+            Some(Duration::from_hours(168)),
+            Duration::from_hours(24),
+        )
     }
 
     async fn follow_to_tip(&mut self) -> Result<(), Box<dyn Error>> {
@@ -442,12 +487,8 @@ impl StaticChainSource {
 
 #[async_trait]
 impl NodeSource for StaticChainSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities::default()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-        Some(self.capabilities())
+        Some(NodeCapabilities::default())
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

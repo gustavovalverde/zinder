@@ -66,26 +66,28 @@ const EVENT_STREAM_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// evidence. The same allocation supplies both the operational endpoint and
 /// native `ServerInfo`.
 #[derive(Clone)]
-pub struct IngestNodeComposition {
+pub struct IngestControlNodeComposition {
     network: Network,
     node_source: Arc<dyn NodeSource>,
     ordered_identifiers: Arc<[&'static str]>,
 }
 
-impl IngestNodeComposition {
+impl IngestControlNodeComposition {
     /// Owns an admitted source and freezes the endpoint contract it supports.
     ///
     /// # Errors
     ///
-    /// Returns an error when the source exposes no network identity or only
-    /// optimistic, not-yet-admitted capability defaults.
-    pub fn new(node_source: Arc<dyn NodeSource>) -> Result<Self, IngestNodeCompositionError> {
+    /// Returns an error when the source exposes no network identity or has no
+    /// admitted capability evidence.
+    pub fn new(
+        node_source: Arc<dyn NodeSource>,
+    ) -> Result<Self, IngestControlNodeCompositionError> {
         let network = node_source
             .network()
-            .ok_or(IngestNodeCompositionError::NetworkIdentityMissing)?;
+            .ok_or(IngestControlNodeCompositionError::NetworkIdentityMissing)?;
         let admitted_node_capabilities = node_source
             .admitted_capabilities()
-            .ok_or(IngestNodeCompositionError::CapabilitiesNotAdmitted)?;
+            .ok_or(IngestControlNodeCompositionError::CapabilitiesNotAdmitted)?;
         let chain_value_pools_supported =
             admitted_node_capabilities.supports(NodeCapability::ChainValuePools);
         let ordered_identifiers = capabilities_for_surface(CapabilitySurface::Ingest)
@@ -110,12 +112,6 @@ impl IngestNodeComposition {
         Arc::clone(&self.ordered_identifiers)
     }
 
-    /// Returns the source-owned network identity advertised by the endpoint.
-    #[must_use]
-    pub const fn network(&self) -> Network {
-        self.network
-    }
-
     fn supports_chain_value_pools(&self) -> bool {
         self.ordered_identifiers
             .contains(&INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1)
@@ -125,12 +121,12 @@ impl IngestNodeComposition {
 /// Failure to compose one admitted ingest node endpoint.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum IngestNodeCompositionError {
+pub enum IngestControlNodeCompositionError {
     /// The source cannot authenticate the network named by `ServerInfo`.
     #[error("ingest node source exposes no network identity")]
     NetworkIdentityMissing,
 
-    /// The source still exposes optimistic defaults rather than admitted evidence.
+    /// The source has not exposed admitted capability evidence.
     #[error("ingest node source capabilities have not passed startup admission")]
     CapabilitiesNotAdmitted,
 }
@@ -141,7 +137,7 @@ pub enum IngestNodeCompositionError {
 pub struct CanonicalIngestControlGrpcAdapter {
     canonical: CanonicalControlHandle,
     mempool: LiveMempoolOwner,
-    node: IngestNodeComposition,
+    node: IngestControlNodeComposition,
     bearer_token: Option<BearerToken>,
     readiness: Readiness,
 }
@@ -153,7 +149,7 @@ impl CanonicalIngestControlGrpcAdapter {
     pub fn new(
         canonical: CanonicalControlHandle,
         mempool: LiveMempoolOwner,
-        node: IngestNodeComposition,
+        node: IngestControlNodeComposition,
         readiness: Readiness,
     ) -> Self {
         Self {
@@ -184,9 +180,8 @@ impl CanonicalIngestControlGrpcAdapter {
         InterceptedService::new(server, interceptor)
     }
 
-    /// Shares the exact immutable capability set used by `ServerInfo`.
-    #[must_use]
-    pub fn advertised_capabilities(&self) -> Arc<[&'static str]> {
+    #[cfg(test)]
+    fn advertised_capabilities(&self) -> Arc<[&'static str]> {
         self.node.advertised_capabilities()
     }
 
@@ -764,7 +759,7 @@ mod tests {
     };
 
     use super::{
-        CanonicalIngestControlGrpcAdapter, IngestNodeComposition, canonical_event_message,
+        CanonicalIngestControlGrpcAdapter, IngestControlNodeComposition, canonical_event_message,
     };
 
     #[test]
@@ -1140,7 +1135,7 @@ mod tests {
             ),
         };
         let node_source: Arc<dyn NodeSource> = Arc::new(source);
-        let node_composition = IngestNodeComposition::new(node_source)?;
+        let node_composition = IngestControlNodeComposition::new(node_source)?;
         let operational_capabilities = node_composition.advertised_capabilities();
         let adapter = CanonicalIngestControlGrpcAdapter::new(
             fixture.canonical.clone(),
@@ -1211,7 +1206,7 @@ mod tests {
                 Vec::new(),
             ),
         });
-        let node_composition = IngestNodeComposition::new(node_source)?;
+        let node_composition = IngestControlNodeComposition::new(node_source)?;
         assert!(
             !node_composition
                 .advertised_capabilities()
@@ -1256,7 +1251,7 @@ mod tests {
                 Vec::new(),
             ),
         });
-        let node_composition = IngestNodeComposition::new(source)?;
+        let node_composition = IngestControlNodeComposition::new(source)?;
         let adapter = CanonicalIngestControlGrpcAdapter::new(
             fixture.canonical.clone(),
             fixture.mempool.clone(),
@@ -1281,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn unprobed_zebra_source_cannot_form_an_ingest_node_composition()
+    fn unadmitted_zebra_source_cannot_form_an_ingest_node_composition()
     -> Result<(), Box<dyn std::error::Error>> {
         let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
             zinder_core::Network::ZcashTestnet,
@@ -1289,12 +1284,12 @@ mod tests {
             NodeAuth::None,
             Duration::from_secs(1),
         )?);
-        let error = IngestNodeComposition::new(source)
+        let error = IngestControlNodeComposition::new(source)
             .err()
-            .ok_or("unprobed Zebra source unexpectedly formed a composition")?;
+            .ok_or("unadmitted Zebra source unexpectedly formed a composition")?;
         assert!(matches!(
             error,
-            super::IngestNodeCompositionError::CapabilitiesNotAdmitted
+            super::IngestControlNodeCompositionError::CapabilitiesNotAdmitted
         ));
         Ok(())
     }
@@ -1310,12 +1305,12 @@ mod tests {
                 Vec::new(),
             ),
         });
-        let error = IngestNodeComposition::new(source)
+        let error = IngestControlNodeComposition::new(source)
             .err()
             .ok_or("networkless source unexpectedly formed a composition")?;
         assert!(matches!(
             error,
-            super::IngestNodeCompositionError::NetworkIdentityMissing
+            super::IngestControlNodeCompositionError::NetworkIdentityMissing
         ));
         Ok(())
     }
@@ -1329,10 +1324,6 @@ mod tests {
 
     #[async_trait]
     impl NodeSource for StaticValuePoolSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            self.capabilities
-        }
-
         fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
             Some(self.capabilities)
         }
@@ -1442,7 +1433,7 @@ mod tests {
             RocksDbResourceBudget::for_local_tests(),
         )
         .with_bearer_token(Some(bearer_token.clone()));
-        let node_composition = IngestNodeComposition::new(node_source)?;
+        let node_composition = IngestControlNodeComposition::new(node_source)?;
         let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
             canonical.clone(),
             owner.clone(),

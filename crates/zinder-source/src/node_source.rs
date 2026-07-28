@@ -18,15 +18,11 @@ use crate::{
 /// Configured upstream node source for ingestion.
 #[async_trait]
 pub trait NodeSource: Send + Sync + 'static {
-    /// Returns the source capabilities discovered or declared at startup.
-    fn capabilities(&self) -> NodeCapabilities;
-
-    /// Returns the immutable capability evidence admitted for serving.
+    /// Returns the exact immutable capability evidence admitted for use.
     ///
-    /// Every source must state this decision explicitly. Sources with a fixed
-    /// declared contract return `Some(self.capabilities())`; sources whose
-    /// initial capability set is only an optimistic fallback return `None`
-    /// until discovery succeeds.
+    /// Fixed sources return their declared contract. Discoverable sources
+    /// return `None` until discovery succeeds; callers must reject that state
+    /// rather than substitute optimistic defaults.
     fn admitted_capabilities(&self) -> Option<NodeCapabilities>;
 
     /// Returns the immutable network identity exposed by this source.

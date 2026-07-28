@@ -52,6 +52,9 @@ enum ReadinessCause {
   // `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
   // See ADR-0015.
   READINESS_CAUSE_UPSTREAM_NOT_READY = 16;
+  // The admitted native WalletQuery dependency cannot currently serve or no
+  // longer presents the contract frozen by its consumer at startup.
+  READINESS_CAUSE_WALLET_QUERY_UNAVAILABLE = 17;
 
 }
 

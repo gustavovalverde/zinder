@@ -4,8 +4,8 @@ use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
 use zinder_core::{Network, wire::encode_zinder_native_chain_name};
+use zinder_materialized_views::MaterializedViewStoreError;
 use zinder_proto::{
-    CONTRACT_REVISION,
     capabilities::WALLET_READ_SERVER_INFO_V2,
     v1::wallet::{ServerInfoRequest, ServerInfoResponse, wallet_query_client::WalletQueryClient},
 };
@@ -17,16 +17,27 @@ use zinder_runtime::{
 /// Maximum wall time allowed for connection plus `ServerInfo` admission.
 const WALLET_QUERY_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Oldest `WalletQuery` contract revision this Explorer implementation accepts.
+///
+/// This is deliberately independent of `zinder_proto::CONTRACT_REVISION`.
+/// Explorer-only wire changes must not impose incidental lockstep on an
+/// otherwise compatible `WalletQuery` dependency.
+const MINIMUM_WALLET_QUERY_CONTRACT_REVISION: u32 = 5;
+
+/// Maximum wall time allowed for one admitted `WalletQuery` health probe.
+const WALLET_QUERY_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// A native wallet endpoint admitted before the explorer binds any listener.
 ///
 /// Construction proves the endpoint is reachable through the shared
-/// authenticated transport, serves the expected network and compiled contract,
-/// and advertises its own discovery method. The connected channel and normalized
-/// capability set are immutable for the process lifetime.
+/// authenticated transport, serves the expected network and a compatible
+/// contract revision, and advertises its own discovery method. The connected
+/// channel and normalized capability set are immutable for the process lifetime.
 #[derive(Clone)]
 pub(super) struct AdmittedWalletQueryEndpoint {
     channel: AuthenticatedChannel,
-    capabilities: Arc<[String]>,
+    expected_network: Network,
+    capability_identifiers: Arc<[String]>,
 }
 
 impl AdmittedWalletQueryEndpoint {
@@ -60,10 +71,11 @@ impl AdmittedWalletQueryEndpoint {
                 .await
                 .map_err(ExplorerEndpointAdmissionError::WalletServerInfo)?
                 .into_inner();
-            let capabilities = validate_server_info(response, expected_network)?;
+            let capability_identifiers = validate_server_info(response, expected_network)?;
             Ok(Self {
                 channel,
-                capabilities,
+                expected_network,
+                capability_identifiers,
             })
         })
         .await
@@ -77,7 +89,62 @@ impl AdmittedWalletQueryEndpoint {
 
     /// Returns the normalized upstream capability identifiers.
     pub(crate) fn capability_identifiers(&self) -> &[String] {
-        &self.capabilities
+        &self.capability_identifiers
+    }
+
+    /// Verifies that the admitted channel still serves the frozen capabilities.
+    pub(super) async fn check_health(&self) -> Result<(), ExplorerWalletQueryHealthError> {
+        let response = tokio::time::timeout(
+            WALLET_QUERY_HEALTH_TIMEOUT,
+            WalletQueryClient::new(self.channel.clone()).server_info(ServerInfoRequest {}),
+        )
+        .await
+        .map_err(|_| ExplorerWalletQueryHealthError::TimedOut {
+            timeout: WALLET_QUERY_HEALTH_TIMEOUT,
+        })?
+        .map_err(ExplorerWalletQueryHealthError::Request)?
+        .into_inner();
+        validate_wallet_query_health_response(
+            &self.capability_identifiers,
+            response,
+            self.expected_network,
+        )
+    }
+}
+
+/// Failure observed while checking an already admitted `WalletQuery` dependency.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ExplorerWalletQueryHealthError {
+    /// The traffic-gated `WalletQuery` discovery RPC did not succeed.
+    #[error(
+        "wallet query health check failed with {code:?}: {message}",
+        code = .0.code(),
+        message = .0.message()
+    )]
+    Request(#[source] tonic::Status),
+
+    /// The discovery RPC exceeded its fixed health-check deadline.
+    #[error("wallet query health check timed out after {timeout:?}")]
+    TimedOut {
+        /// Maximum wall time allowed for one health check.
+        timeout: Duration,
+    },
+
+    /// A successful discovery response no longer satisfies startup admission.
+    #[error("wallet query health check returned an incompatible contract: {0}")]
+    ContractMismatch(#[source] ExplorerEndpointAdmissionError),
+
+    /// A valid replacement endpoint changed its advertised capability semantics.
+    #[error("wallet query health check returned capabilities different from startup admission")]
+    ContractChanged,
+}
+
+impl ExplorerWalletQueryHealthError {
+    /// Returns whether the peer answered successfully with incompatible identity.
+    #[must_use]
+    pub const fn is_contract_mismatch(&self) -> bool {
+        matches!(self, Self::ContractMismatch(_) | Self::ContractChanged)
     }
 }
 
@@ -104,6 +171,17 @@ pub enum ExplorerEndpointAdmissionError {
     #[error("canonical secondary has no admitted network identity")]
     CanonicalStoreNetworkUnspecified,
 
+    /// The materialized-view store belongs to another network.
+    #[error(
+        "materialized-view store network mismatch: explorer expects {expected:?}, store serves {actual:?}"
+    )]
+    MaterializedViewStoreNetworkMismatch {
+        /// Network configured for this explorer endpoint.
+        expected: Network,
+        /// Immutable network authenticated by the materialized-view store.
+        actual: Network,
+    },
+
     /// The node-advertised activation table belongs to another network.
     #[error(
         "network-upgrade activation table mismatch: explorer expects {expected:?}, table describes {actual:?}"
@@ -114,6 +192,10 @@ pub enum ExplorerEndpointAdmissionError {
         /// Network carried by the activation table.
         actual: Network,
     },
+
+    /// Active transparent-address ranking metadata could not be read.
+    #[error("transparent-address ranking metadata admission failed: {0}")]
+    TransparentAddressRankingMetadataRead(#[source] MaterializedViewStoreError),
 
     /// The configured endpoint is not a valid tonic endpoint URL.
     #[error("wallet query endpoint URL is invalid: {0}")]
@@ -172,8 +254,10 @@ pub enum ExplorerEndpointAdmissionError {
     #[error("wallet query ServerInfo omitted required capability {WALLET_READ_SERVER_INFO_V2}")]
     WalletServerInfoCapabilityMissing,
 
-    /// A capability identifier was empty or contained whitespace.
-    #[error("wallet query ServerInfo capability at index {index} is empty or contains whitespace")]
+    /// A capability identifier violated the lowercase dotted `_vN` grammar.
+    #[error(
+        "wallet query ServerInfo capability at index {index} is not a lowercase dotted identifier ending in _vN"
+    )]
     WalletCapabilityIdentifierMalformed {
         /// Zero-based position in the received capability list.
         index: usize,
@@ -207,10 +291,10 @@ fn validate_server_info(
             actual: common.network,
         });
     }
-    if common.contract_revision < CONTRACT_REVISION {
+    if common.contract_revision < MINIMUM_WALLET_QUERY_CONTRACT_REVISION {
         return Err(
             ExplorerEndpointAdmissionError::WalletContractRevisionTooOld {
-                minimum: CONTRACT_REVISION,
+                minimum: MINIMUM_WALLET_QUERY_CONTRACT_REVISION,
                 actual: common.contract_revision,
             },
         );
@@ -218,7 +302,7 @@ fn validate_server_info(
     if let Some(index) = common
         .capabilities
         .iter()
-        .position(|capability| capability.is_empty() || capability.chars().any(char::is_whitespace))
+        .position(|capability| !is_capability_identifier(capability))
     {
         return Err(ExplorerEndpointAdmissionError::WalletCapabilityIdentifierMalformed { index });
     }
@@ -233,6 +317,45 @@ fn validate_server_info(
     capabilities.sort_unstable();
     capabilities.dedup();
     Ok(capabilities.into())
+}
+
+fn validate_wallet_query_health_response(
+    admitted_capability_identifiers: &[String],
+    response: ServerInfoResponse,
+    expected_network: Network,
+) -> Result<(), ExplorerWalletQueryHealthError> {
+    let observed_capability_identifiers = validate_server_info(response, expected_network)
+        .map_err(ExplorerWalletQueryHealthError::ContractMismatch)?;
+    if observed_capability_identifiers.as_ref() != admitted_capability_identifiers {
+        return Err(ExplorerWalletQueryHealthError::ContractChanged);
+    }
+    Ok(())
+}
+
+fn is_capability_identifier(identifier: &str) -> bool {
+    let Some((qualified_name, version)) = identifier.rsplit_once("_v") else {
+        return false;
+    };
+    if version.is_empty()
+        || version.starts_with('0')
+        || !version.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let mut segments = qualified_name.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    let valid_segment = |segment: &str| {
+        segment
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    };
+    valid_segment(first) && segments.clone().next().is_some() && segments.all(valid_segment)
 }
 
 #[cfg(test)]
@@ -280,7 +403,7 @@ mod tests {
         let capabilities = validate_server_info(
             response_with(
                 "zcash-regtest",
-                CONTRACT_REVISION,
+                MINIMUM_WALLET_QUERY_CONTRACT_REVISION,
                 vec![
                     WALLET_READ_VISIBLE_TIP_BLOCK_V1,
                     WALLET_READ_SERVER_INFO_V2,
@@ -297,6 +420,22 @@ mod tests {
                 WALLET_READ_VISIBLE_TIP_BLOCK_V1.to_owned(),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_syntactically_valid_unknown_future_capabilities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let capabilities = validate_server_info(
+            response_with(
+                "zcash-regtest",
+                MINIMUM_WALLET_QUERY_CONTRACT_REVISION,
+                vec![WALLET_READ_SERVER_INFO_V2, "future.surface.new_contract_v7"],
+            ),
+            Network::ZcashRegtest,
+        )?;
+
+        assert!(capabilities.contains(&"future.surface.new_contract_v7".to_owned()));
         Ok(())
     }
 
@@ -332,7 +471,7 @@ mod tests {
             validate_server_info(
                 response_with(
                     "zcash-testnet",
-                    CONTRACT_REVISION,
+                    MINIMUM_WALLET_QUERY_CONTRACT_REVISION,
                     vec![WALLET_READ_SERVER_INFO_V2],
                 ),
                 Network::ZcashRegtest,
@@ -350,15 +489,15 @@ mod tests {
             validate_server_info(
                 response_with(
                     "zcash-regtest",
-                    CONTRACT_REVISION.saturating_sub(1),
+                    MINIMUM_WALLET_QUERY_CONTRACT_REVISION.saturating_sub(1),
                     vec![WALLET_READ_SERVER_INFO_V2],
                 ),
                 Network::ZcashRegtest,
             ),
             Err(ExplorerEndpointAdmissionError::WalletContractRevisionTooOld {
-                minimum: CONTRACT_REVISION,
+                minimum: MINIMUM_WALLET_QUERY_CONTRACT_REVISION,
                 actual,
-            }) if actual == CONTRACT_REVISION.saturating_sub(1)
+            }) if actual == MINIMUM_WALLET_QUERY_CONTRACT_REVISION.saturating_sub(1)
         ));
     }
 
@@ -366,7 +505,11 @@ mod tests {
     fn rejects_missing_server_info_capability() {
         assert!(matches!(
             validate_server_info(
-                response_with("zcash-regtest", CONTRACT_REVISION, Vec::new()),
+                response_with(
+                    "zcash-regtest",
+                    MINIMUM_WALLET_QUERY_CONTRACT_REVISION,
+                    Vec::new(),
+                ),
                 Network::ZcashRegtest,
             ),
             Err(ExplorerEndpointAdmissionError::WalletServerInfoCapabilityMissing)
@@ -374,13 +517,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_or_whitespace_capability_identifier() {
-        for malformed in ["", " ", "wallet.read. visible_tip_block_v1"] {
+    fn rejects_malformed_capability_identifier() {
+        for malformed in [
+            "",
+            " ",
+            "wallet.read. visible_tip_block_v1",
+            "Wallet.read.visible_tip_block_v1",
+            "wallet-read-visible-tip-block_v1",
+            "wallet.read.visible_tip_block",
+            "wallet.read.visible_tip_block_v0",
+            "wallet..visible_tip_block_v1",
+        ] {
             assert!(matches!(
                 validate_server_info(
                     response_with(
                         "zcash-regtest",
-                        CONTRACT_REVISION,
+                        MINIMUM_WALLET_QUERY_CONTRACT_REVISION,
                         vec![WALLET_READ_SERVER_INFO_V2, malformed],
                     ),
                     Network::ZcashRegtest,
@@ -392,6 +544,76 @@ mod tests {
                 )
             ));
         }
+    }
+
+    #[test]
+    fn health_accepts_compatible_revision_and_rejects_capability_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let admitted_response = || {
+            response_with(
+                "zcash-regtest",
+                MINIMUM_WALLET_QUERY_CONTRACT_REVISION,
+                vec![WALLET_READ_SERVER_INFO_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1],
+            )
+        };
+        let admitted_capabilities =
+            validate_server_info(admitted_response(), Network::ZcashRegtest)?;
+
+        validate_wallet_query_health_response(
+            &admitted_capabilities,
+            response_with(
+                "zcash-regtest",
+                MINIMUM_WALLET_QUERY_CONTRACT_REVISION.saturating_add(1),
+                vec![WALLET_READ_SERVER_INFO_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1],
+            ),
+            Network::ZcashRegtest,
+        )?;
+        assert!(matches!(
+            validate_wallet_query_health_response(
+                &admitted_capabilities,
+                response_with(
+                    "zcash-regtest",
+                    MINIMUM_WALLET_QUERY_CONTRACT_REVISION.saturating_sub(1),
+                    vec![WALLET_READ_SERVER_INFO_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,],
+                ),
+                Network::ZcashRegtest,
+            ),
+            Err(ExplorerWalletQueryHealthError::ContractMismatch(
+                ExplorerEndpointAdmissionError::WalletContractRevisionTooOld { .. }
+            ))
+        ));
+        assert!(matches!(
+            validate_wallet_query_health_response(
+                &admitted_capabilities,
+                response_with(
+                    "zcash-regtest",
+                    MINIMUM_WALLET_QUERY_CONTRACT_REVISION,
+                    vec![WALLET_READ_SERVER_INFO_V2],
+                ),
+                Network::ZcashRegtest,
+            ),
+            Err(ExplorerWalletQueryHealthError::ContractChanged)
+        ));
+        assert!(matches!(
+            validate_wallet_query_health_response(
+                &admitted_capabilities,
+                response_with(
+                    "zcash-testnet",
+                    MINIMUM_WALLET_QUERY_CONTRACT_REVISION,
+                    vec![WALLET_READ_SERVER_INFO_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,],
+                ),
+                Network::ZcashRegtest,
+            ),
+            Err(ExplorerWalletQueryHealthError::ContractMismatch(
+                ExplorerEndpointAdmissionError::WalletNetworkMismatch { .. }
+            ))
+        ));
+        validate_wallet_query_health_response(
+            &admitted_capabilities,
+            admitted_response(),
+            Network::ZcashRegtest,
+        )?;
+        Ok(())
     }
 
     #[tokio::test]

@@ -36,7 +36,10 @@ libraries. It:
 The boundary rules:
 
 - A `zinder-explorer` crash does not stop ingest or wallet sync. The wallet plane keeps serving every `WalletQuery` primitive, including `WalletQuery.TransparentAddressBalance`.
-- Library compositions may provide a canonical secondary for capabilities whose policies explicitly require retained canonical facts. The checked-in Compose overlay uses the current materialized-view plus wallet composition and omits those capabilities.
+- Library compositions may provide a canonical secondary for methods whose
+  exact admission requirements include retained canonical facts. The
+  checked-in Compose overlay uses the current materialized-view plus wallet
+  composition and omits those capabilities.
 - The explorer plane never extends canonical artifact schemas. When a view needs an authoritative chain fact the canonical surface does not carry, the source boundary extends first, the canonical artifact or event gains the field, then the explorer subscribes.
 - Server-side shielded address scanning, persisted viewing keys, and memo decryption are out of scope by product invariant.
 
@@ -67,7 +70,7 @@ endpoint advertises both `wallet.read.transaction_by_id_v2` and
 `wallet.read.transaction_bytes_v1`, and the explorer materialized-view store
 contains the transaction-fee and transparent-outpoint-spend consumers. The
 current release `WalletServingQuery` advertises neither native transaction
-capability, so the release explorer omits
+capability, so the operator-built explorer binary composition omits
 `explorer.transaction.detail_v4`; a direct call returns `UNIMPLEMENTED` before
 request decoding or any dependency access. Retaining transaction blobs or
 attaching a canonical secondary cannot manufacture the missing wallet
@@ -123,7 +126,18 @@ message BlockSummary {
 }
 ```
 
-`ExplorerQuery.BlockSummariesInRange` returns a range of `BlockSummary` rows ordered by ascending height. The handler reads the materialized record from the consumer store, projects the summary fields, and skips the transaction-id payload so the wire response stays cheap on long ranges.
+`ExplorerQuery.BlockSummariesInRange` returns a range of `BlockSummary` rows
+ordered by ascending height. The request has no caller-selected epoch pin:
+the block-summary consumer state is the authoritative candidate fence. The
+handler requires verified contiguous coverage through that state’s indexed
+tip and across the complete requested range, pins
+`WalletQuery.VisibleTipBlock` to the candidate epoch, and verifies the exact
+epoch id, tip height, and tip hash. It then opens one materialized-view read
+snapshot, rejects a changed state or revision, and batch-reads every requested
+height. A missing row, mismatched row height, or mismatched tip-row hash fails
+the whole request; partial ranges are never returned. The response projects
+only the summary fields and skips the transaction-id payload so the wire shape
+stays cheap on long ranges.
 
 `ExplorerQuery.BlockDetail` resolves either a height or a hash to one `BlockSummary` plus the canonical-ordered list of transaction ids. It is the low-payload read for clients that only need block identity or transaction ids.
 
@@ -204,9 +218,14 @@ Autocomplete indexes are separate materialized views and do not gate the `explor
 
 ## Mempool views
 
-The mempool surface is three request-time views over `WalletQuery.MempoolSnapshot`. None requires a materialized-view consumer: upstream snapshot reads are bounded by the hard cap of 4,096 entries, and every parsed entry uses `zinder_source::parse_transaction_public_fact_set` so privacy-shape and version classifiers stay in lockstep with `TransactionDetail`.
+The mempool surface is three request-time views over
+`WalletQuery.MempoolSnapshot`. None requires a materialized-view consumer.
+Each upstream page is bounded to 4,096 entries, and every parsed entry uses
+`zinder_source::parse_transaction_public_facts` so privacy-shape and version
+classifiers stay in lockstep with `TransactionDetail`.
 
-`ExplorerQuery.MempoolSummary` returns one aggregated page:
+`ExplorerQuery.MempoolSummary` returns one aggregate over the complete
+observed snapshot:
 
 ```proto
 message MempoolSummaryResponse {
@@ -220,7 +239,16 @@ message MempoolSummaryResponse {
 }
 ```
 
-The age fields are wall-clock deltas computed at response time against the entry's `first_seen_unix_millis`; they are zero when the snapshot is empty.
+The handler walks every wallet page with constant aggregation memory. The
+complete walk must retain one exact chain epoch, source tip, and mempool-event
+resume cursor; every source tip must equal its page’s visible tip. A
+non-advancing or repeated cursor, an empty page with a continuation cursor, an
+identity change, or a walk beyond the 1,024-page safety bound fails the
+request. The seen-cursor set is bounded by that same page limit. After the
+terminal page, a fresh empty-cursor head probe must still report that exact
+identity before the aggregate is returned. The age fields are wall-clock
+deltas computed at response time against each entry’s
+`first_seen_unix_millis`; they are zero when the snapshot is empty.
 
 `ExplorerQuery.MempoolSnapshot` is the coherent page-ready view. It returns a `MempoolSnapshotSummary`, one bounded page of `MempoolActivityEntry` rows, and the usual opaque cursor from one `WalletQuery.MempoolSnapshot` response. Its summary and entries therefore cannot straddle a mine, eviction, or newly observed transaction. Consumers that display global statistics beside current rows must use this capability instead of combining `MempoolSummary` and `MempoolActivity` from separate requests.
 
@@ -282,10 +310,22 @@ totals, so consumers can distinguish standard script templates without scanning
 or decoding every ranked row.
 
 The method is available only while an active materialized generation exists.
-Its `ExplorerFreshness` must describe the same materialized-view cursor and canonical epoch
-as that generation; an in-progress replacement generation is never visible.
-This gives dashboards and agents a stable rank snapshot while ingest constructs
-or resumes a replacement after a schema change or interrupted bootstrap.
+Endpoint composition reads the durable active-generation metadata before
+binding. A selected ranking schema without active metadata structurally omits
+both `TransparentAddressRanking` and `TransparentAddressActivity` for that
+process lifetime; malformed or unreadable metadata fails composition rather
+than weakening the advertised contract. A process restart is required after a
+generation is activated because the admitted capability allocation is
+immutable. Its `ExplorerFreshness` must describe the same materialized-view
+cursor and canonical epoch as that generation; an in-progress replacement
+generation is never visible.
+
+The current operator-built binary composition has no provider that initializes the first
+ranking generation, so it advertises neither ranking nor confirmed-address
+activity. A separate ranking-bootstrap provider slice must own the canonical
+snapshot, generation activation, restart/cutover procedure, and
+production-shaped certification before either method joins the binary
+contract.
 
 ## Fee summary
 
@@ -356,9 +396,26 @@ The aggregate is taken at the resolved chain epoch's settled tip, and `summarize
 
 The totals count every unspent transparent output, including non-standard and provably-unspendable scripts (OP_RETURN, bare data outputs). The current-UTXO projection keys outputs by the hash of their raw `scriptPubKey` and never inspects the script template, so it does not apply zcashd's `IsUnspendable` filter. The two totals can therefore sit slightly above a zcashd `gettxoutsetinfo` that excludes the unspendable class.
 
-## Overview snapshot optional fields
+## Overview snapshot coherence
 
-`ExplorerQuery.OverviewSnapshot` requires an admitted wallet tip to anchor its coherent bundle, while its `mempool` and `value_pools` fields are optional. When WalletQuery returns the typed `ENDPOINT_CAPABILITY_UNAVAILABLE` precondition for the exact field capability, `mempool` stays absent or `value_pools` stays empty and `freshness.unavailable` records the corresponding `mempool` or `value_pools` field path with `UNAVAILABLE_UPSTREAM_NOT_SUPPORTED`. The unavailable marker distinguishes structural absence from an observed empty mempool or value-pool list. Transient upstream failures and preconditions whose structured reason, domain, violation type, or capability subject do not match continue to fail the Overview request.
+`ExplorerQuery.OverviewSnapshot` is an all-or-nothing contract. Admission
+requires the block-summary, transaction-history, and mempool-event-count
+consumers plus the wallet visible-tip, complete mempool-snapshot, and
+chain-value-pools capabilities. Block summary and transaction history must
+publish the same exact epoch, tip, and verified coverage; their internal
+revisions may differ. The requested block and fee windows must fit wholly
+inside that common coverage, and recent transaction rows stop at its verified
+lower bound.
+
+The handler pins `WalletQuery.VisibleTipBlock` to the candidate
+materialized-view epoch, verifies the complete mempool walk and value-pool
+response against that same full epoch and source tip, then reads all
+materialized fields from one store snapshot. It rejects state changes,
+coverage gaps, missing block rows, and any wallet identity mismatch. Mempool
+event counts share the store snapshot but do not fabricate a chain-state field
+of their own. A missing structural dependency omits the method at startup; a
+runtime inconsistency fails the whole call rather than returning optional
+cards or `freshness.unavailable` markers.
 
 ## Capability namespace
 
@@ -371,26 +428,38 @@ the registry contains no runtime policy.
 | -------- | ---------------------------- |
 | `explorer.server_info_v1` | Installed handler |
 | `explorer.transaction.detail_v4` | Exact fee and transparent-outpoint-spend consumers plus admitted wallet transaction and raw-byte capabilities |
+| `explorer.block.summary_v2` | Exact block-summary consumer plus admitted wallet visible-tip capability |
 | `explorer.block.production_series_v2` | Canonical secondary plus exact block-summary consumer |
 | `explorer.block.production_time_range_v1` | Canonical secondary plus exact block-time, block-summary, and paid-fee consumers |
 | `explorer.commitment_root.search_v1` | Canonical secondary, exact commitment-root consumer, and admitted Sapling activation evidence |
-| `explorer.transparent_address.activity_v2` | Exact activity and ranking consumers plus either a canonical epoch source or admitted wallet visible-tip capability |
+| `explorer.mempool.summary_v2` | Admitted wallet complete mempool-snapshot capability |
+| `explorer.overview.snapshot_v1` | Exact block-summary, transaction-history, and mempool-event-count consumers plus admitted wallet visible-tip, complete mempool-snapshot, and chain-value-pools capabilities |
+| `explorer.transparent_address.activity_v2` | Exact activity and ranking consumers, durable active ranking-generation metadata, plus either a canonical epoch source or admitted wallet visible-tip capability |
+| `explorer.transparent_address.ranking_v1` | Exact ranking consumer plus durable active ranking-generation metadata and admitted wallet visible-tip capability |
 | `explorer.value_pool.summary_v1` | Admitted wallet chain-value-pools capability |
 | `explorer.utxo_set.summary_v1` | Admitted wallet UTXO-summary capability |
 
-Materializing, partial, and fully covered consumer states all advertise the
-same structurally supported methods. Their mutable state is returned as
-freshness, coverage, or a typed request error. The current registry rows for
-`BlockSummariesInRange`, `MempoolSummary`, `OverviewSnapshot`, and
-`TransparentAddressDeltas` have no installed production handler contract and
-are therefore omitted even when every dependency capability is present.
+Except for the existence of an active ranking generation, materializing,
+partial, and fully covered consumer states all advertise the same structurally
+supported methods. Ranking coverage remains a freshness, coverage, or typed
+request outcome and does not alter admission after startup. The current
+registry row for
+`TransparentAddressDeltas` has no installed production handler contract and
+is therefore omitted even when every dependency capability is present.
 Optional field capabilities are retained only when the same endpoint admits at
 least one method that carries the field, and every carrier suppresses the
 field and its supporting read when the field capability is absent.
 
-The naming follows `explorer.<noun>.<capability>_v{N}`. The noun is a domain category; the capability is the operation. New methods add new capability strings; wire-shape changes ship as `_vN` increments.
+The naming follows `explorer.<noun>.<capability>_v{N}`. Identifiers use only
+lowercase dotted segments, each segment starts with a lowercase letter, and
+the final segment ends in a positive `_vN` suffix. Startup rejects malformed
+advertised identifiers but preserves syntactically valid unknown future
+identifiers. The noun is a domain category; the capability is the operation.
+New methods add new capability strings; wire-shape changes ship as `_vN`
+increments.
 
-Every `explorer.*` capability is served by the explorer plane itself; clients reach these methods on `ExplorerQuery`, never through `WalletQuery`. Materialized-view consumers surfaced through the wallet client follow the federation rule in [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md): the capability lives in the consumer's product namespace, and the wallet plane advertises it only while the consumer's proxy is ready.
+Every `explorer.*` capability is served by the explorer plane itself; clients
+reach these methods on `ExplorerQuery`, never through `WalletQuery`.
 
 ## Freshness envelope
 
@@ -428,16 +497,23 @@ listen_addr = "127.0.0.1:9069"   # shared section; "" disables the endpoint
 path = "/var/lib/zinder/store"
 secondary_path = "/var/lib/zinder/explorer-secondary"
 
+[storage.materialized_views.rocksdb]
+max_open_files = 256             # optional reader budget
+
 [explorer]
 listen_addr = "127.0.0.1:9068"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
 wallet_query_endpoint = "https://zinder.example:9102"   # optional native WalletQuery gRPC adapter
 wallet_query_bearer_token_path = "/run/secrets/zinder-wallet-query-token"
-
-[explorer.freshness]
-max_lag_blocks = 16              # response carries UNAVAILABLE_STALE beyond this
-warn_lag_blocks = 4              # readiness cause flips at this threshold
 ```
+
+Explorer's materialized-view secondary accepts and renders exactly
+`block_cache_bytes`, `max_open_files`, `write_buffer_bytes`,
+`max_write_buffer_count`, `memtable_budget_bytes`, and `statistics_level`.
+These controls are applied to secondary open options, column-family memtable
+posture, or shared cache and write-buffer allocations. `max_wal_bytes` and
+`max_background_jobs` are primary-writer controls; Explorer rejects them as
+unknown rather than displaying inert settings.
 
 When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint
 enforces the same shared-secret bearer-token interceptor as `IngestControl` per
@@ -448,11 +524,34 @@ to the configured wallet endpoint. Explorer authenticates and calls
 revision, then freezes the returned capability set before binding either
 listener. Unreachable, unauthenticated, wrong-network, and malformed discovery
 responses fail startup rather than producing a partially admitted process.
+The explorer later polls `WalletQuery.ServerInfo` over that same admitted
+channel. Transport loss, wallet readiness rejection, or a replacement endpoint
+whose identity or frozen contract differs makes explorer readiness false until
+the admitted contract is observed again; the probe never changes the explorer
+capability allocation. While readiness reports `wallet_query_unavailable`, the
+global Explorer traffic gate rejects every new gRPC request with
+`UNAVAILABLE`, including `ServerInfo` and methods whose handlers are local.
+The operational `/healthz` surface remains available and reports the frozen
+capability allocation unchanged. A matching WalletQuery contract restores
+traffic without rebinding or reallocating capabilities.
+After admission, the runtime pre-binds the explorer gRPC listener before it
+starts the operational listener or background work. A bind failure therefore
+cannot leave an apparently healthy ops-only process. The gRPC server,
+operational server, WalletQuery dependency-health probe, optional
+upstream-observation probe for the configured Zebra `[node]`, and
+materialized-view catch-up task are supervised together; an unexpected exit
+marks readiness as shutting down, cancels the remaining tasks, and preserves
+the primary failure while reporting secondary drain failures.
 
 The optional `[node]` section supplies network-upgrade activation evidence and
 upstream freshness observations. If it is absent, activation-dependent methods
 are omitted. If it is present, activation discovery is a startup requirement;
-an unreachable node or a response without Sapling fails startup.
+an unreachable node or a response without Sapling fails startup. Explorer
+accepts only the JSON-RPC address, authentication, request timeout, maximum
+response size, and optional health-observation settings. Indexer and broadcast
+settings are rejected. Health cadence and floor overrides require
+`node.health.addr`; `--print-config` renders only these effective fields and
+redacts authentication material.
 
 Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-specific fields, plus the shared `ZINDER_OPS__*` prefix for the universal operational endpoint:
 
@@ -471,9 +570,13 @@ The explorer plane fails independently from canonical state.
 - An explorer service crash does not stop `zinder-ingest`. Ingest continues writing canonical artifacts and ChainEvents.
 - An explorer service crash does not stop a separately deployed native `WalletQuery` adapter. Its wallet primitives, including `WalletQuery.TransparentAddressBalance`, remain independent of explorer state: the balance reads the canonical unspent-output index and overlays live mempool data through the configured `IngestControl` endpoint.
 - An explorer materialized view becoming inconsistent does not corrupt canonical state. Operators drop the materialized-view store and rebuild from retained canonical events. When the materialized-view store is absent, `zinder-explorer` starts with materialized-view-backed capabilities omitted.
-- Explorer health and materialization state flow through `/readyz` and typed
-  request outcomes. They never mutate the frozen `ExplorerQuery.ServerInfo`
-  contract or propagate to the wallet plane's readiness.
+- An admitted WalletQuery dependency drives Explorer `/readyz`. A WalletQuery
+  outage or contract mismatch rejects every new Explorer gRPC request with
+  `UNAVAILABLE` until the admitted contract recovers; `/healthz` retains the
+  frozen capability list throughout. Materialized-view lag and coverage plus
+  optional Zebra observations remain typed request and freshness outcomes.
+  None of them mutate the frozen `ExplorerQuery.ServerInfo` contract or
+  propagate to the wallet plane's readiness.
 
 ## Cursor expiry contract
 
@@ -538,14 +641,24 @@ post-catch-up state. The response returns the exact read fence and coverage.
 Opaque cursors bind both the filter and fence, and a supplied stale fence fails
 with `FAILED_PRECONDITION`.
 
-Both transaction-history versions are advertised when the exact history
-consumer and admitted wallet visible-tip dependency are composed. Coverage
-does not select between them. A request against materializing or partial state
-returns the typed materialization result; exact totals are omitted unless
-coverage starts at height 1 and reaches the materialized-view tip with the same
-hash. When returned, their scope is `FULL_HISTORY`. Adapters that walk multiple
-pages or cache totals must carry the fence through every request and include it
-in cache identity.
+This contract raises the `block_summary` and `transaction_history` consumer
+schemas from version 1 to version 2. The cutover is owner-ordered: stop
+Explorer, then stop or otherwise quiesce the ingest writer before removing
+storage. Remove and rebuild the ingest-owned primary at
+`<storage.path>/materialized-views` and the Explorer-owned secondary metadata
+at `<storage.secondary_path>/materialized-views`. Restart ingest first so it
+can initialize and replay the version-2 Explorer preset; restart Explorer only
+after ingest has admitted that primary. There is no compatibility decoder or
+in-place migration for either version-1 schema.
+
+`explorer.transaction.history_v2` is advertised only when the exact history
+consumer and admitted wallet visible-tip dependency are composed. There is no
+v1 alias. A request against materializing or partial state returns the typed
+materialization result; exact totals are omitted unless coverage starts at
+height 1 and reaches the materialized-view tip with the same hash. When
+returned, their scope is `FULL_HISTORY`. Adapters that walk multiple pages or
+cache totals must carry the fence through every request and include it in cache
+identity.
 
 ## Cross-references
 

@@ -345,7 +345,7 @@ async fn production_pair_seeks_transparent_address_ranges_past_a_large_prefix() 
     assert_eq!(
         outputs.outputs[0].created_at.block.height,
         BlockHeight::new(2)
-    );
+    )?;
     assert_eq!(outputs.next_page_after, None);
 
     let history = wallet_reader.address_transaction_history_range_page(
@@ -532,6 +532,10 @@ struct MissingTransactionBlobCanonicalReader {
 }
 
 impl CanonicalReader for MissingTransactionBlobCanonicalReader {
+    fn construction_identity(&self) -> zinder_store::CanonicalStoreConstructionIdentity {
+        self.canonical_reader.construction_identity()
+    }
+
     fn raw_blob_retention(&self) -> RawBlobRetention {
         self.canonical_reader.raw_blob_retention()
     }

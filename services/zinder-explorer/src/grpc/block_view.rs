@@ -23,7 +23,7 @@ use zinder_core::{
 };
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
-    EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1, EXPLORER_BLOCK_SUMMARY_V1,
+    EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1, EXPLORER_BLOCK_SUMMARY_V2,
     EXPLORER_BLOCK_TRANSACTIONS_V2,
 };
 use zinder_proto::v1::explorer::{
@@ -49,9 +49,10 @@ use super::require_matching_chain_epoch;
 use super::transaction_detail::encode_public_facts;
 use super::transparent_input::{encode_mined_transparent_inputs, parent_transaction_ids};
 use zinder_materialized_views::{
-    BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_SUMMARY_COLUMN_FAMILY, BlockProductionTimeConsumer,
-    BlockProductionTimeCursor, BlockProductionTimePageRequest, MaterializedViewState,
-    MaterializedViewStore, MaterializedViewStoreReadSnapshot, PaidFeeDistributionConsumer,
+    BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME,
+    BlockProductionTimeConsumer, BlockProductionTimeCursor, BlockProductionTimePageRequest,
+    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreReadSnapshot,
+    PaidFeeDistributionConsumer,
 };
 use zinder_store::{
     ChainEpochReader, SecondaryChainStore, chain_epoch_from_message, chain_epoch_message,
@@ -108,23 +109,48 @@ pub(crate) async fn query_block_summaries_in_range(
     let end_height = inner.end_height;
     validate_block_view_range(start_height, end_height)?;
 
-    let (chain_epoch, canonical_tip) = read_canonical_tip(wallet_client).await?;
-    let mut summaries =
-        read_materialized_block_summaries(materialized_view_store, start_height, end_height)?;
-    for summary in &mut summaries {
-        annotate_request_time_fields(summary, canonical_tip);
-    }
+    let candidate_state =
+        read_block_summary_state(materialized_view_store, start_height, end_height)?;
+    let wallet_response = wallet_client
+        .visible_tip_block(Request::new(VisibleTipBlockRequest {
+            at_epoch_id: Some(candidate_state.chain_epoch_id.value()),
+        }))
+        .await?
+        .into_inner();
+    let chain_epoch =
+        require_wallet_tip_matches_block_summary_state(&wallet_response, candidate_state)?;
 
-    let freshness = attach_upstream_observation(
-        upstream_observation_cache,
-        build_explorer_freshness(
-            Some(materialized_view_store),
-            EXPLORER_BLOCK_SUMMARY_V1,
+    let (summaries, freshness) = {
+        let snapshot = materialized_view_store.read_snapshot();
+        let final_state = snapshot
+            .consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?
+            .ok_or_else(|| {
+                ExplorerError::not_materialized(
+                    "block-summary materialized-view state is unavailable",
+                )
+            })?;
+        require_unchanged_block_summary_state(candidate_state, final_state)?;
+        require_block_summary_coverage(final_state, start_height, end_height)?;
+        let mut summaries = read_materialized_block_summaries_snapshot(
+            &snapshot,
+            start_height,
+            end_height,
+            final_state,
+        )?;
+        for summary in &mut summaries {
+            annotate_request_time_fields(summary, final_state.tip_height.value());
+        }
+        let freshness = build_explorer_freshness_from_snapshot(
+            &snapshot,
+            EXPLORER_BLOCK_SUMMARY_V2,
             Some(chain_epoch),
             0,
-        )?,
-    )
-    .await;
+        )?;
+        drop(snapshot);
+        (summaries, freshness)
+    };
+    let freshness = attach_upstream_observation(upstream_observation_cache, freshness).await;
 
     Ok(Response::new(BlockSummariesInRangeResponse {
         freshness: Some(freshness),
@@ -684,17 +710,142 @@ fn validate_block_view_range(start_height: u32, end_height: u32) -> Result<u32, 
     Ok(u32::try_from(span).unwrap_or(MAX_BLOCK_SUMMARIES_PER_REQUEST))
 }
 
-fn read_materialized_block_summaries(
+fn read_block_summary_state(
     materialized_view_store: &MaterializedViewStore,
     start_height: u32,
     end_height: u32,
+) -> Result<MaterializedViewState, Status> {
+    let state = materialized_view_store
+        .consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+        .ok_or_else(|| {
+            ExplorerError::not_materialized("block-summary materialized-view state is unavailable")
+        })?;
+    require_block_summary_coverage(state, start_height, end_height)?;
+    Ok(state)
+}
+
+fn require_block_summary_coverage(
+    state: MaterializedViewState,
+    start_height: u32,
+    end_height: u32,
+) -> Result<(), Status> {
+    let coverage = state.coverage.ok_or_else(|| {
+        ExplorerError::not_materialized(
+            "block-summary materialized-view coverage has not been verified",
+        )
+    })?;
+    if coverage.complete_through_height != state.tip_height
+        || coverage.complete_through_hash != state.tip_hash
+    {
+        return Err(ExplorerError::not_materialized(
+            "block-summary materialized-view coverage does not reach its indexed tip",
+        )
+        .into());
+    }
+    if coverage.complete_from_height > BlockHeight::new(start_height)
+        || coverage.complete_through_height < BlockHeight::new(end_height)
+    {
+        return Err(ExplorerError::not_materialized(format!(
+            "block-summary materialized-view coverage {}..={} does not include requested range \
+             {start_height}..={end_height}",
+            coverage.complete_from_height.value(),
+            coverage.complete_through_height.value(),
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn require_unchanged_block_summary_state(
+    candidate: MaterializedViewState,
+    final_state: MaterializedViewState,
+) -> Result<(), Status> {
+    if final_state != candidate {
+        return Err(ExplorerError::unsatisfied_precondition(
+            "block-summary materialized-view state changed while the wallet epoch was observed",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn require_wallet_tip_matches_block_summary_state(
+    response: &wallet::VisibleTipBlockResponse,
+    state: MaterializedViewState,
+) -> Result<wallet::ChainEpoch, Status> {
+    let chain_epoch = response
+        .chain_view
+        .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+        .ok_or_else(|| {
+            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
+        })?;
+    let epoch_tip = chain_epoch.visible_tip.as_ref().ok_or_else(|| {
+        ExplorerError::internal("VisibleTipBlockResponse chain epoch visible_tip missing")
+    })?;
+    let response_tip = response.visible_tip_block.as_ref().ok_or_else(|| {
+        ExplorerError::internal("VisibleTipBlockResponse.visible_tip_block missing")
+    })?;
+    let expected_hash = encode_rpc_block_hash_hex(state.tip_hash);
+    if chain_epoch.chain_epoch_id != state.chain_epoch_id.value()
+        || epoch_tip.height != state.tip_height.value()
+        || epoch_tip.hash != expected_hash
+        || response_tip.height != epoch_tip.height
+        || response_tip.block_hash != epoch_tip.hash
+    {
+        return Err(ExplorerError::unsatisfied_precondition(
+            "wallet visible-tip identity does not match the block-summary materialized-view state",
+        )
+        .into());
+    }
+    Ok(chain_epoch.clone())
+}
+
+fn read_materialized_block_summaries_snapshot(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+    start_height: u32,
+    end_height: u32,
+    state: MaterializedViewState,
 ) -> Result<Vec<BlockSummary>, Status> {
-    read_materialized_block_records(materialized_view_store, start_height, end_height)?
+    let heights = (start_height..=end_height).collect::<Vec<_>>();
+    let keys = heights
+        .iter()
+        .map(|height| encode_height_key_ascending(BlockHeight::new(*height)))
+        .collect::<Vec<_>>();
+    snapshot
+        .multi_get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &keys)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
         .into_iter()
-        .map(|record| {
-            record
+        .zip(heights)
+        .map(|(payload, expected_height)| {
+            let payload = payload.ok_or_else(|| {
+                ExplorerError::not_materialized(format!(
+                    "BlockSummary is not materialized for height {expected_height}"
+                ))
+            })?;
+            let record = BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
+                ExplorerError::internal(format!("BlockSummaryRecord decode failed: {error}"))
+            })?;
+            let summary = record
                 .summary
-                .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing").into())
+                .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing"))?;
+            if summary.block_height != expected_height {
+                return Err(ExplorerError::internal(format!(
+                    "BlockSummaryRecord at height {expected_height} carries height {}",
+                    summary.block_height
+                ))
+                .into());
+            }
+            if expected_height == state.tip_height.value()
+                && summary.block_hash != encode_rpc_block_hash_hex(state.tip_hash)
+            {
+                return Err(ExplorerError::unsatisfied_precondition(
+                    "block-summary tip row does not match its materialized-view state",
+                )
+                .into());
+            }
+            Ok(summary)
         })
         .collect()
 }
@@ -1187,7 +1338,11 @@ mod tests {
         block_production_time_read_fence, decode_and_validate_block_production_cursor_request,
         encode_block_production_cursor, encode_block_transaction_rows,
         join_block_production_points, read_admitted_block_final_note_commitment_roots,
+        read_materialized_block_summaries_snapshot, require_block_summary_coverage,
+        require_unchanged_block_summary_state, require_wallet_tip_matches_block_summary_state,
     };
+    use prost::Message as _;
+    use tempfile::{TempDir, tempdir};
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, ChainEpochId, TransactionFactsArtifact,
         TransactionId, TransactionLocation, TransactionVersion, TransparentAddressScriptHash,
@@ -1198,13 +1353,151 @@ mod tests {
         },
     };
     use zinder_materialized_views::{
-        BlockProductionTimeBackfillCoverage, BlockProductionTimeCursor, MaterializedViewState,
+        BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_SCHEMA, BlockProductionTimeBackfillCoverage,
+        BlockProductionTimeCursor, MaterializedViewCoverage, MaterializedViewState,
+        MaterializedViewStore, MaterializedViewStoreOptions,
     };
     use zinder_proto::v1::explorer::{
         BlockFinalNoteCommitmentRoots, BlockProductionInTimeRangeRequest, BlockProductionPoint,
         BlockSummary, BlockSummaryRecord, TransactionFeesRecord, TransparentInputValueRecord,
     };
     use zinder_testkit::synthetic_transaction_public_facts;
+
+    #[test]
+    fn block_summary_range_requires_complete_verified_coverage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tip_hash = BlockHash::from_bytes([0x33; 32]);
+        let absent = block_summary_state(7, 10, tip_hash, 1, None);
+        let absent_error = require_block_summary_coverage(absent, 8, 10)
+            .err()
+            .ok_or("absent coverage must fail")?;
+        assert_eq!(absent_error.code(), tonic::Code::NotFound);
+
+        let incomplete = block_summary_state(
+            7,
+            10,
+            tip_hash,
+            1,
+            Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(8),
+                complete_through_height: BlockHeight::new(9),
+                complete_through_hash: BlockHash::from_bytes([0x22; 32]),
+            }),
+        );
+        let incomplete_error = require_block_summary_coverage(incomplete, 8, 10)
+            .err()
+            .ok_or("coverage below the indexed tip must fail")?;
+        assert_eq!(incomplete_error.code(), tonic::Code::NotFound);
+
+        let partial = block_summary_state(
+            7,
+            10,
+            tip_hash,
+            1,
+            Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(8),
+                complete_through_height: BlockHeight::new(10),
+                complete_through_hash: tip_hash,
+            }),
+        );
+        let partial_error = require_block_summary_coverage(partial, 7, 10)
+            .err()
+            .ok_or("coverage that omits the requested start must fail")?;
+        assert_eq!(partial_error.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn block_summary_wallet_anchor_requires_exact_epoch_and_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tip_hash = BlockHash::from_bytes([0x33; 32]);
+        let state = complete_block_summary_state(7, 10, tip_hash, 8, 1);
+
+        let wrong_epoch = visible_tip_response(8, 10, tip_hash);
+        let epoch_error = require_wallet_tip_matches_block_summary_state(&wrong_epoch, state)
+            .err()
+            .ok_or("wallet epoch mismatch must fail")?;
+        assert_eq!(epoch_error.code(), tonic::Code::FailedPrecondition);
+
+        let wrong_tip = visible_tip_response(7, 9, BlockHash::from_bytes([0x22; 32]));
+        let tip_error = require_wallet_tip_matches_block_summary_state(&wrong_tip, state)
+            .err()
+            .ok_or("wallet tip mismatch must fail")?;
+        assert_eq!(tip_error.code(), tonic::Code::FailedPrecondition);
+
+        let exact = require_wallet_tip_matches_block_summary_state(
+            &visible_tip_response(7, 10, tip_hash),
+            state,
+        )?;
+        assert_eq!(exact.chain_epoch_id, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn block_summary_fence_rejects_materialized_view_state_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tip_hash = BlockHash::from_bytes([0x33; 32]);
+        let candidate = complete_block_summary_state(7, 10, tip_hash, 8, 1);
+        let final_state = MaterializedViewState {
+            revision: 2,
+            ..candidate
+        };
+
+        let error = require_unchanged_block_summary_state(candidate, final_state)
+            .err()
+            .ok_or("materialized-view revision change must fail")?;
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        Ok(())
+    }
+
+    #[test]
+    fn block_summary_range_requires_exact_contiguous_rows() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_directory, store) = open_block_summary_store()?;
+        let tip_hash = BlockHash::from_bytes([0x33; 32]);
+        let state = complete_block_summary_state(7, 10, tip_hash, 8, 1);
+        put_block_summary(&store, 8, BlockHash::from_bytes([0x11; 32]))?;
+        put_block_summary(&store, 10, tip_hash)?;
+
+        let snapshot = store.read_snapshot();
+        let error = read_materialized_block_summaries_snapshot(&snapshot, 8, 10, state)
+            .err()
+            .ok_or("missing middle block-summary row must fail")?;
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        drop(snapshot);
+
+        put_block_summary(&store, 9, BlockHash::from_bytes([0x22; 32]))?;
+        let snapshot = store.read_snapshot();
+        let summaries = read_materialized_block_summaries_snapshot(&snapshot, 8, 10, state)?;
+        drop(snapshot);
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.block_height)
+                .collect::<Vec<_>>(),
+            vec![8, 9, 10],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn block_summary_range_rejects_tip_row_hash_mismatch() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_directory, store) = open_block_summary_store()?;
+        let tip_hash = BlockHash::from_bytes([0x33; 32]);
+        let state = complete_block_summary_state(7, 10, tip_hash, 10, 1);
+        put_block_summary(&store, 10, BlockHash::from_bytes([0x22; 32]))?;
+
+        let snapshot = store.read_snapshot();
+        let error = read_materialized_block_summaries_snapshot(&snapshot, 10, 10, state)
+            .err()
+            .ok_or("tip-row hash mismatch must fail")?;
+        drop(snapshot);
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        Ok(())
+    }
 
     #[test]
     fn block_production_attaches_validated_coinbase_outputs() -> eyre::Result<()> {
@@ -1475,6 +1768,104 @@ mod tests {
             state.tip_height.value()
         );
         Ok(())
+    }
+
+    fn open_block_summary_store()
+    -> Result<(TempDir, MaterializedViewStore), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let store = MaterializedViewStore::open(
+            directory.path(),
+            zinder_core::Network::ZcashRegtest,
+            MaterializedViewStoreOptions {
+                consumers: &[BLOCK_SUMMARY_SCHEMA],
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?;
+        Ok((directory, store))
+    }
+
+    fn put_block_summary(
+        store: &MaterializedViewStore,
+        height: u32,
+        block_hash: BlockHash,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let record = BlockSummaryRecord {
+            summary: Some(BlockSummary {
+                block_height: height,
+                block_hash: encode_rpc_block_hash_hex(block_hash),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut payload = Vec::new();
+        record.encode(&mut payload)?;
+        store.put_consumer(
+            BLOCK_SUMMARY_COLUMN_FAMILY,
+            &encode_height_key_ascending(BlockHeight::new(height)),
+            &payload,
+        )?;
+        Ok(())
+    }
+
+    fn complete_block_summary_state(
+        chain_epoch_id: u64,
+        tip_height: u32,
+        tip_hash: BlockHash,
+        complete_from_height: u32,
+        revision: u64,
+    ) -> MaterializedViewState {
+        block_summary_state(
+            chain_epoch_id,
+            tip_height,
+            tip_hash,
+            revision,
+            Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(complete_from_height),
+                complete_through_height: BlockHeight::new(tip_height),
+                complete_through_hash: tip_hash,
+            }),
+        )
+    }
+
+    fn block_summary_state(
+        chain_epoch_id: u64,
+        tip_height: u32,
+        tip_hash: BlockHash,
+        revision: u64,
+        coverage: Option<MaterializedViewCoverage>,
+    ) -> MaterializedViewState {
+        MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(chain_epoch_id),
+            tip_height: BlockHeight::new(tip_height),
+            tip_hash,
+            revision,
+            coverage,
+        }
+    }
+
+    fn visible_tip_response(
+        chain_epoch_id: u64,
+        tip_height: u32,
+        tip_hash: BlockHash,
+    ) -> zinder_proto::v1::wallet::VisibleTipBlockResponse {
+        let hash = encode_rpc_block_hash_hex(tip_hash);
+        zinder_proto::v1::wallet::VisibleTipBlockResponse {
+            chain_view: Some(zinder_proto::v1::wallet::ChainView {
+                chain_epoch: Some(zinder_proto::v1::wallet::ChainEpoch {
+                    chain_epoch_id,
+                    visible_tip: Some(zinder_proto::v1::wallet::BlockTip {
+                        height: tip_height,
+                        hash: hash.clone(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            visible_tip_block: Some(zinder_proto::v1::wallet::BlockId {
+                height: tip_height,
+                block_hash: hash,
+            }),
+        }
     }
 
     fn materialized_view_state(revision: u64) -> MaterializedViewState {

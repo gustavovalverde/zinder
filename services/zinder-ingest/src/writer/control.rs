@@ -32,6 +32,9 @@ use zinder_proto::v1::ingest::{
     ReleaseCanonicalProjectionBuildLeaseResponse, RenewCanonicalProjectionBuildLeaseRequest,
     canonical_control_server::{CanonicalControl, CanonicalControlServer},
 };
+use zinder_proto::wire::{
+    CanonicalConstructionManifestBindingFields, encode_canonical_construction_manifest_binding,
+};
 use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind,
@@ -1080,10 +1083,21 @@ fn writer_status_response(
     let retention_floor = store
         .canonical_event_retention_floor()
         .map_err(|error| map_store_error(&error))?;
+    let construction_binding = store
+        .construction_identity()
+        .construction_manifest_binding();
     Ok(CanonicalWriterStatusResponse {
         network_name: encode_zinder_native_chain_name(store.network()).to_owned(),
         fence: Some(writer_fence_message(store)),
         oldest_retained_event_sequence: retention_floor,
+        canonical_construction_manifest_binding: Some(
+            encode_canonical_construction_manifest_binding(
+                CanonicalConstructionManifestBindingFields::new(
+                    construction_binding.version,
+                    construction_binding.sha256,
+                ),
+            ),
+        ),
     })
 }
 

@@ -191,7 +191,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         .value();
     open_storage_phase.complete();
 
-    let query = WalletServingQuery::from_probed_node_source(
+    let query = WalletServingQuery::from_admitted_node_source(
         pair_slot,
         source.clone(),
         Arc::clone(&network_upgrade_activations),

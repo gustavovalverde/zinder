@@ -6,7 +6,7 @@ use eyre::{Result, eyre};
 use rust_rocksdb::WriteBatch;
 use tempfile::TempDir;
 use zinder_core::{
-    BlockHash, BlockHeight, LockTime, PrivacyShape, TransactionComponentCounts,
+    BlockHash, BlockHeight, LockTime, Network, PrivacyShape, TransactionComponentCounts,
     TransactionFactsArtifact, TransactionId, TransactionLocation, TransactionPublicFacts,
     TransactionVersion,
 };
@@ -22,6 +22,7 @@ const TEST_CONSUMERS: &[MaterializedViewConsumerSchema] = &[IRONWOOD_MIGRATION_S
 fn open_store(path: &Path) -> Result<MaterializedViewStore> {
     Ok(MaterializedViewStore::open(
         path,
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: TEST_CONSUMERS,

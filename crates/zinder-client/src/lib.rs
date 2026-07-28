@@ -40,7 +40,7 @@ pub use error_reason::ErrorReason;
 #[cfg(feature = "remote")]
 pub use remote::{MIN_SUPPORTED_CONTRACT_REVISION, RemoteChainIndex, RemoteOpenOptions};
 #[cfg(feature = "remote")]
-pub use server_info::{NodeServerInfo, ServerInfo};
+pub use server_info::{CanonicalConstructionManifestBinding, NodeServerInfo, ServerInfo};
 pub use zinder_core::{
     ArtifactSchemaVersion, BlockHash, BlockHeader, BlockHeight, BlockHeightRange, BlockId,
     BlockSelector, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,

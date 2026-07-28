@@ -23,7 +23,7 @@ use zinder_proto::wire::encode_privacy_shape;
 
 use crate::MaterializedViewState;
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockCheckpoint,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockProjection,
     MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
     MaterializedViewConsumerSchema, advance_verified_materialized_view_coverage,
 };
@@ -38,13 +38,13 @@ pub const TRANSACTION_HISTORY_CONSUMER_NAME: MaterializedViewConsumerName =
 
 /// On-disk schema declaration for canonical transaction history.
 ///
-/// Version 1 includes the full history entry and atomic materialized-view state
-/// maintenance. The consumer has no predecessor because it is additive to
-/// the separately retained `recent_transactions` consumer.
+/// Version 2 includes the full history entry and verified contiguous coverage
+/// maintenance. The consumer has no predecessor because it is additive to the
+/// separately retained `recent_transactions` consumer.
 pub const TRANSACTION_HISTORY_SCHEMA: MaterializedViewConsumerSchema =
     MaterializedViewConsumerSchema::new(
         TRANSACTION_HISTORY_CONSUMER_NAME,
-        1,
+        2,
         &[TRANSACTION_HISTORY_COLUMN_FAMILY],
     );
 
@@ -123,10 +123,7 @@ impl TransactionHistoryConsumer {
         }
     }
 
-    /// Reads and normalizes every persisted transaction row at `height`.
-    ///
-    /// Version-1 payloads omitted `transaction_index`; the unchanged key is
-    /// authoritative for every row version.
+    /// Reads every persisted transaction row at `height`.
     pub fn entries_at_height(
         store: &crate::MaterializedViewStore,
         height: BlockHeight,
@@ -197,9 +194,9 @@ impl BlockKeyedConsumer for TransactionHistoryConsumer {
         Ok(())
     }
 
-    fn stage_chain_event_checkpoint(
+    fn stage_block_projection_state(
         &mut self,
-        checkpoint: MaterializedViewBlockCheckpoint<'_>,
+        checkpoint: MaterializedViewBlockProjection<'_>,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
         let tip_height = checkpoint
@@ -221,12 +218,21 @@ impl BlockKeyedConsumer for TransactionHistoryConsumer {
         let revision = current
             .map_or(Some(1), |state| state.revision.checked_add(1))
             .ok_or(TransactionHistoryConsumerError::MaterializedViewRevisionOverflow)?;
+        let first_staged_height = match checkpoint.chain_event {
+            ChainEvent::ChainCommitted { committed }
+            | ChainEvent::ChainReorged { committed, .. }
+                if committed.block_range.start <= committed.block_range.end =>
+            {
+                Some(committed.block_range.start)
+            }
+            ChainEvent::ChainCommitted { .. } | ChainEvent::ChainReorged { .. } | _ => None,
+        };
         let coverage = advance_verified_materialized_view_coverage(
             current.and_then(|state| state.coverage),
             checkpoint,
             tip_height,
             tip_hash,
-            None,
+            first_staged_height,
         );
         ctx.store.stage_consumer_state(
             ctx.batch,
@@ -259,11 +265,18 @@ fn decode_persisted_entry(
             indexed: indexed_height.value(),
         });
     }
-    let transaction_index = decode_in_block_position(&key[4..])
+    let key_index = decode_in_block_position(&key[4..])
         .map_err(|error| TransactionHistoryConsumerError::Decode(error.to_string()))?;
-    let mut entry = TransactionHistoryEntry::decode(payload)
+    let entry = TransactionHistoryEntry::decode(payload)
         .map_err(|error| TransactionHistoryConsumerError::Decode(error.to_string()))?;
-    entry.transaction_index = transaction_index;
+    if entry.transaction_index != key_index {
+        return Err(
+            TransactionHistoryConsumerError::PersistedTransactionIndexMismatch {
+                key_index,
+                payload_index: entry.transaction_index,
+            },
+        );
+    }
     Ok(entry)
 }
 
@@ -291,6 +304,16 @@ pub enum TransactionHistoryConsumerError {
         /// Height decoded from the key.
         indexed: u32,
     },
+    /// A persisted payload identifies a different in-block position than its key.
+    #[error(
+        "transaction-history key index {key_index} does not match payload index {payload_index}"
+    )]
+    PersistedTransactionIndexMismatch {
+        /// In-block transaction index decoded from the storage key.
+        key_index: u32,
+        /// In-block transaction index encoded in the payload.
+        payload_index: u32,
+    },
     /// One block exceeded the defensive transaction-row limit.
     #[error("transaction-history block {height} exceeds the transaction-row limit")]
     BlockTransactionLimit {
@@ -311,6 +334,7 @@ pub enum TransactionHistoryConsumerError {
 #[cfg(test)]
 mod tests {
     use eyre::Result;
+    use prost::Message as _;
     use rust_rocksdb::WriteBatch;
     use tempfile::tempdir;
     use zinder_core::{
@@ -322,8 +346,8 @@ mod tests {
     use zinder_store::{ChainEpochCommitted, ChainEvent};
 
     use super::{
-        MaterializedViewBlockCheckpoint, MaterializedViewState, TRANSACTION_HISTORY_CONSUMER_NAME,
-        TransactionHistoryConsumer,
+        MaterializedViewBlockProjection, MaterializedViewState, TRANSACTION_HISTORY_CONSUMER_NAME,
+        TransactionHistoryConsumer, TransactionHistoryConsumerError, decode_persisted_entry,
     };
     use crate::consumer::{BlockKeyedConsumer, MaterializedViewConsumerCtx};
     use crate::store::{
@@ -382,7 +406,7 @@ mod tests {
         chunk_event: &ChainEvent,
         tip: u32,
     ) -> Result<()> {
-        let checkpoint = MaterializedViewBlockCheckpoint {
+        let checkpoint = MaterializedViewBlockProjection {
             chain_epoch,
             chain_event: chunk_event,
             tip_height: Some(BlockHeight::new(tip)),
@@ -394,7 +418,7 @@ mod tests {
             batch: &mut batch,
         };
         TransactionHistoryConsumer::new()
-            .stage_chain_event_checkpoint(checkpoint, &mut ctx)
+            .stage_block_projection_state(checkpoint, &mut ctx)
             .map_err(|error| eyre::eyre!("{error}"))?;
         store.write_batch(&batch)?;
         Ok(())
@@ -403,8 +427,11 @@ mod tests {
     #[test]
     fn re_applied_lower_committed_chunk_preserves_advanced_coverage() -> Result<()> {
         let tempdir = tempdir()?;
-        let store =
-            MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            zinder_core::Network::ZcashRegtest,
+            MaterializedViewStoreOptions::default(),
+        )?;
         let armed = seed_materialized_view_state(&store, 180_512, 180_512)?;
 
         let epoch = chain_epoch(1, 180_512);
@@ -419,10 +446,34 @@ mod tests {
     }
 
     #[test]
+    fn empty_committed_checkpoint_does_not_claim_contiguous_coverage() -> Result<()> {
+        let tempdir = tempdir()?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            zinder_core::Network::ZcashRegtest,
+            MaterializedViewStoreOptions::default(),
+        )?;
+        let epoch = chain_epoch(1, 105);
+        let empty_chunk = committed_chunk_event(epoch, 106, 105);
+
+        stage_and_commit_checkpoint(&store, epoch, &empty_chunk, 105)?;
+
+        let stored = store
+            .consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("expected a materialized-view state"))?;
+        assert_eq!(stored.coverage, None);
+        assert_eq!(stored.revision, 1);
+        Ok(())
+    }
+
+    #[test]
     fn contiguous_committed_chunk_advances_coverage_to_tip() -> Result<()> {
         let tempdir = tempdir()?;
-        let store =
-            MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            zinder_core::Network::ZcashRegtest,
+            MaterializedViewStoreOptions::default(),
+        )?;
         seed_materialized_view_state(&store, 180_256, 180_256)?;
 
         let epoch = chain_epoch(1, 180_512);
@@ -479,5 +530,46 @@ mod tests {
             TransactionHistoryConsumer::projected_row_count_for_transactions(&transactions),
             3
         );
+    }
+
+    #[test]
+    fn persisted_entry_accepts_matching_key_and_payload_transaction_indices() -> Result<()> {
+        let height = BlockHeight::new(10);
+        let key = TransactionHistoryConsumer::key_for_row(height, 7);
+        let expected_entry = zinder_proto::v1::explorer::TransactionHistoryEntry {
+            block_height: height.value(),
+            transaction_index: 7,
+            ..zinder_proto::v1::explorer::TransactionHistoryEntry::default()
+        };
+        let payload = expected_entry.encode_to_vec();
+
+        let entry = decode_persisted_entry(height, &key, &payload)?;
+
+        assert_eq!(entry, expected_entry);
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_entry_rejects_mismatched_key_and_payload_transaction_indices() {
+        let height = BlockHeight::new(10);
+        let key = TransactionHistoryConsumer::key_for_row(height, 7);
+        let payload = zinder_proto::v1::explorer::TransactionHistoryEntry {
+            block_height: height.value(),
+            transaction_index: 3,
+            ..zinder_proto::v1::explorer::TransactionHistoryEntry::default()
+        }
+        .encode_to_vec();
+
+        let decode_outcome = decode_persisted_entry(height, &key, &payload);
+
+        assert!(matches!(
+            decode_outcome,
+            Err(
+                TransactionHistoryConsumerError::PersistedTransactionIndexMismatch {
+                    key_index: 7,
+                    payload_index: 3,
+                }
+            )
+        ));
     }
 }

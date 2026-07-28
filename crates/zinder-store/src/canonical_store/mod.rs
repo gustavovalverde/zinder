@@ -23,14 +23,14 @@ mod secondary;
 mod subtree_load;
 mod wallet_events;
 
-use std::{io, num::NonZeroU32, path::PathBuf};
+use std::{io, mem::size_of, num::NonZeroU32, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
-    CommitmentTreeCheckpoint, CommitmentTreeFrontiers,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontiers, Network,
     MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
     ShieldedProtocol,
@@ -51,7 +51,9 @@ pub use event_lifecycle::{
     CanonicalEventRetentionReport, CanonicalRetainedEvent, ProjectionBuildAnchor,
     ProjectionBuildLease, ProjectionBuildLeaseId,
 };
-pub use live_commit::{CanonicalAppendAnchor, CanonicalEventFence, CanonicalLiveAppend};
+pub use live_commit::{
+    CanonicalAppendAnchor, CanonicalEventFence, CanonicalEventFenceDecodeError, CanonicalLiveAppend,
+};
 pub use live_replacement::{CanonicalLiveReplacement, CanonicalReplacementBlock};
 pub use mempool_lifecycle::CanonicalMempoolSnapshotStart;
 pub use publication::{
@@ -85,6 +87,197 @@ pub const TREE_STATE_CHECKPOINT_STRIDE: u32 = 100;
 
 const REQUIRED_CANONICAL_NETWORK_UPGRADES: [&str; 5] =
     ["Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy"];
+const CANONICAL_STORE_CONSTRUCTION_IDENTITY_RECORD_VERSION: u8 = 1;
+const CANONICAL_STORE_CONSTRUCTION_IDENTITY_RECORD_BYTES: usize =
+    1 + size_of::<u32>() + size_of::<u16>() + 32 + size_of::<u16>() + 32;
+
+/// Structural identity claim for one canonical construction.
+///
+/// [`Self::decode_persisted`] reconstructs a structurally valid claim, so this
+/// type is not an unforgeable admission token. A value is authoritative only
+/// when returned by an admitted canonical reader after its build plan,
+/// construction manifest, and READY evidence pass validation. Every derived
+/// store and process boundary must exact-compare its persisted or transported
+/// claim with that reader-owned authority before publishing data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalStoreConstructionIdentity {
+    network: Network,
+    network_upgrade_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+    construction_manifest_binding: CanonicalConstructionManifestBinding,
+}
+
+impl CanonicalStoreConstructionIdentity {
+    pub(super) const fn from_admitted(
+        build_plan: &CanonicalStoreBuildPlan,
+        ready_evidence: CanonicalStoreReadyEvidence,
+    ) -> Self {
+        Self {
+            network: build_plan.network(),
+            network_upgrade_activations_fingerprint: build_plan
+                .network_upgrade_activations_fingerprint(),
+            construction_manifest_binding: CanonicalConstructionManifestBinding {
+                version: ready_evidence.construction_manifest_version,
+                sha256: ready_evidence.construction_manifest_sha256,
+            },
+        }
+    }
+
+    /// Returns the canonical construction's immutable network.
+    #[must_use]
+    pub const fn network(self) -> Network {
+        self.network
+    }
+
+    /// Returns the exact admitted activation-table fingerprint.
+    #[must_use]
+    pub const fn network_upgrade_activations_fingerprint(
+        self,
+    ) -> NetworkUpgradeActivationsFingerprint {
+        self.network_upgrade_activations_fingerprint
+    }
+
+    /// Returns the immutable first-READY construction-manifest binding.
+    #[must_use]
+    pub const fn construction_manifest_binding(self) -> CanonicalConstructionManifestBinding {
+        self.construction_manifest_binding
+    }
+
+    /// Encodes one cohesive persisted construction-identity claim.
+    ///
+    /// The record is copied unchanged into derived stores. Decoding the record
+    /// reconstructs its structurally valid claim; downstream composition must
+    /// still compare that claim with an authoritative identity minted by an
+    /// admitted canonical reader.
+    #[must_use]
+    pub fn encode_persisted(self) -> [u8; CANONICAL_STORE_CONSTRUCTION_IDENTITY_RECORD_BYTES] {
+        let mut encoded = [0; CANONICAL_STORE_CONSTRUCTION_IDENTITY_RECORD_BYTES];
+        encoded[0] = CANONICAL_STORE_CONSTRUCTION_IDENTITY_RECORD_VERSION;
+        encoded[1..5].copy_from_slice(&self.network.id().to_be_bytes());
+        encoded[5..7].copy_from_slice(
+            &self
+                .network_upgrade_activations_fingerprint
+                .version()
+                .value()
+                .to_be_bytes(),
+        );
+        encoded[7..39]
+            .copy_from_slice(&self.network_upgrade_activations_fingerprint.as_bytes());
+        encoded[39..41].copy_from_slice(
+            &self
+                .construction_manifest_binding
+                .version
+                .to_be_bytes(),
+        );
+        encoded[41..73].copy_from_slice(&self.construction_manifest_binding.sha256);
+        encoded
+    }
+
+    /// Decodes one strict persisted construction-identity claim.
+    ///
+    /// Successful decoding does not grant canonical admission. A derived store
+    /// must compare the decoded value with an authoritative identity returned
+    /// by an admitted canonical reader before using its rows.
+    pub fn decode_persisted(
+        encoded: &[u8],
+    ) -> Result<Self, CanonicalStoreConstructionIdentityDecodeError> {
+        if encoded.len() != CANONICAL_STORE_CONSTRUCTION_IDENTITY_RECORD_BYTES {
+            return Err(
+                CanonicalStoreConstructionIdentityDecodeError::WrongRecordLength {
+                    expected: CANONICAL_STORE_CONSTRUCTION_IDENTITY_RECORD_BYTES,
+                    observed: encoded.len(),
+                },
+            );
+        }
+        if encoded[0] != CANONICAL_STORE_CONSTRUCTION_IDENTITY_RECORD_VERSION {
+            return Err(
+                CanonicalStoreConstructionIdentityDecodeError::UnsupportedRecordVersion {
+                    observed: encoded[0],
+                },
+            );
+        }
+        let network_id = u32::from_be_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]);
+        let network = Network::from_id(network_id).ok_or(
+            CanonicalStoreConstructionIdentityDecodeError::UnknownNetwork { network_id },
+        )?;
+        let fingerprint_version_value = u16::from_be_bytes([encoded[5], encoded[6]]);
+        let fingerprint_version =
+            NetworkUpgradeActivationsFingerprintVersion::try_from(fingerprint_version_value)
+                .map_err(|_| {
+                    CanonicalStoreConstructionIdentityDecodeError::UnsupportedActivationsFingerprintVersion {
+                        observed: fingerprint_version_value,
+                    }
+                })?;
+        let mut fingerprint_bytes = [0; 32];
+        fingerprint_bytes.copy_from_slice(&encoded[7..39]);
+        let construction_manifest_version = u16::from_be_bytes([encoded[39], encoded[40]]);
+        if construction_manifest_version != CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION {
+            return Err(
+                CanonicalStoreConstructionIdentityDecodeError::UnsupportedConstructionManifestVersion {
+                    observed: construction_manifest_version,
+                    supported: CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
+                },
+            );
+        }
+        let mut construction_manifest_sha256 = [0; 32];
+        construction_manifest_sha256.copy_from_slice(&encoded[41..73]);
+        Ok(Self {
+            network,
+            network_upgrade_activations_fingerprint:
+                NetworkUpgradeActivationsFingerprint::from_bytes(
+                    fingerprint_version,
+                    fingerprint_bytes,
+                ),
+            construction_manifest_binding: CanonicalConstructionManifestBinding {
+                version: construction_manifest_version,
+                sha256: construction_manifest_sha256,
+            },
+        })
+    }
+}
+
+/// Structural failure decoding a persisted canonical-construction claim.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum CanonicalStoreConstructionIdentityDecodeError {
+    /// The record is not the one exact supported width.
+    #[error(
+        "canonical construction identity record requires {expected} bytes; observed {observed}"
+    )]
+    WrongRecordLength {
+        /// Exact supported record width.
+        expected: usize,
+        /// Persisted record width.
+        observed: usize,
+    },
+    /// The container record version is unsupported.
+    #[error("unsupported canonical construction identity record version {observed}")]
+    UnsupportedRecordVersion {
+        /// Persisted record version.
+        observed: u8,
+    },
+    /// The persisted network identifier is unknown.
+    #[error("canonical construction identity contains unknown network id {network_id}")]
+    UnknownNetwork {
+        /// Persisted numeric network identity.
+        network_id: u32,
+    },
+    /// The persisted activation-fingerprint algorithm is unsupported.
+    #[error("unsupported canonical activation fingerprint version {observed}")]
+    UnsupportedActivationsFingerprintVersion {
+        /// Persisted fingerprint version.
+        observed: u16,
+    },
+    /// The persisted canonical construction-manifest version is unsupported.
+    #[error(
+        "unsupported canonical construction manifest version {observed}; supported version is {supported}"
+    )]
+    UnsupportedConstructionManifestVersion {
+        /// Persisted manifest version.
+        observed: u16,
+        /// Exact manifest version admitted by this release.
+        supported: u16,
+    },
+}
 
 /// Immutable replacement-depth identity for one canonical store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -586,6 +779,19 @@ pub enum CanonicalStoreError {
         path: PathBuf,
         /// Exact incompatibility observed during admission.
         reason: String,
+    },
+
+    /// A live secondary observed a different immutable construction claim.
+    #[error(
+        "canonical construction identity changed during secondary catch-up for {path:?}: before {before:?}, after {after:?}"
+    )]
+    SecondaryConstructionIdentityChanged {
+        /// Canonical primary path being followed.
+        path: PathBuf,
+        /// Identity admitted before catch-up.
+        before: CanonicalStoreConstructionIdentity,
+        /// Structurally valid identity observed after catch-up.
+        after: CanonicalStoreConstructionIdentity,
     },
 
     /// A serving store open encountered an unpublished BUILDING store.

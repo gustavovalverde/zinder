@@ -76,10 +76,10 @@ The explorer plane's capability namespace mirrors the wallet plane's:
 The noun is a domain category (`transaction`, `block`, `mempool`, `transparent_address`, `fee`, `value_pool`, `search`), and the capability names the operation (`detail_v1`, `summary_v1`, `activity_v1`). Examples:
 
 - `explorer.transaction.detail_v4`
-- `explorer.block.summary_v1`
-- `explorer.mempool.summary_v1`
+- `explorer.block.summary_v2`
+- `explorer.mempool.summary_v2`
 - `explorer.value_pool.summary_v1`
-- `explorer.search.v1`
+- `explorer.search_v1`
 
 The `domain.noun.capability_v{N}` shape is identical to the wallet plane's `wallet.subdomain.capability_v{N}` pattern so the namespace stays predictable across surfaces.
 

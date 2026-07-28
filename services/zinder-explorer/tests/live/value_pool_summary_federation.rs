@@ -23,7 +23,7 @@ use zinder_core::{BlockHeight, Network};
 use zinder_explorer::{ExplorerEndpointMetadata, ExplorerQueryGrpcAdapter};
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
-    CanonicalPipelineLimits, CanonicalWriterConfig, IngestNodeComposition, LiveMempoolOwner,
+    CanonicalPipelineLimits, CanonicalWriterConfig, IngestControlNodeComposition, LiveMempoolOwner,
     canonical_control_channel, run_canonical_writer_with_control,
 };
 use zinder_proto::capabilities::EXPLORER_VALUE_POOL_SUMMARY_V1;
@@ -319,7 +319,7 @@ async fn serve_ingest_control_grpc(
 ) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
     source.probe_capabilities().await?;
     let node_source: Arc<dyn NodeSource> = Arc::new(source);
-    let node_composition = IngestNodeComposition::new(node_source)?;
+    let node_composition = IngestControlNodeComposition::new(node_source)?;
     let adapter = CanonicalIngestControlGrpcAdapter::new(
         canonical,
         // The current production adapter owns its `MempoolIndex` through this

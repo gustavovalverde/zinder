@@ -17,10 +17,13 @@ use zinder_core::{
     TransactionFactsArtifact, TransactionPublicFacts, TransparentOutputFact,
 };
 use zinder_proto::v1::explorer::{BlockSummary, BlockSummaryRecord};
+use zinder_store::ChainEvent;
 
+use crate::MaterializedViewState;
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
-    MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockProjection,
+    MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
+    MaterializedViewConsumerSchema, advance_verified_materialized_view_coverage,
 };
 
 /// Column-family name the `BlockSummary` materialized view owns.
@@ -38,7 +41,7 @@ pub const BLOCK_SUMMARY_CONSUMER_NAME: MaterializedViewConsumerName =
 pub const BLOCK_SUMMARY_SCHEMA: MaterializedViewConsumerSchema =
     MaterializedViewConsumerSchema::new(
         BLOCK_SUMMARY_CONSUMER_NAME,
-        1,
+        2,
         &[BLOCK_SUMMARY_COLUMN_FAMILY],
     );
 
@@ -92,6 +95,57 @@ impl BlockKeyedConsumer for BlockSummaryConsumer {
             .store
             .consumer_column_family(BLOCK_SUMMARY_COLUMN_FAMILY)?;
         ctx.batch.delete_cf(&cf, Self::key_for_height(height));
+        Ok(())
+    }
+
+    fn stage_block_projection_state(
+        &mut self,
+        checkpoint: MaterializedViewBlockProjection<'_>,
+        ctx: &mut MaterializedViewConsumerCtx<'_>,
+    ) -> Result<(), MaterializedViewConsumerError> {
+        let tip_height = checkpoint
+            .tip_height
+            .ok_or(BlockSummaryConsumerError::IncompleteMaterializedViewCheckpoint)?;
+        let tip_hash = checkpoint
+            .tip_hash
+            .ok_or(BlockSummaryConsumerError::IncompleteMaterializedViewCheckpoint)?;
+        let current = ctx.store.consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)?;
+        if let Some(state) = current
+            && matches!(checkpoint.chain_event, ChainEvent::ChainCommitted { .. })
+            && tip_height < state.tip_height
+        {
+            return Ok(());
+        }
+        let revision = current
+            .map_or(Some(1), |state| state.revision.checked_add(1))
+            .ok_or(BlockSummaryConsumerError::MaterializedViewRevisionOverflow)?;
+        let first_staged_height = match checkpoint.chain_event {
+            ChainEvent::ChainCommitted { committed }
+            | ChainEvent::ChainReorged { committed, .. }
+                if committed.block_range.start <= committed.block_range.end =>
+            {
+                Some(committed.block_range.start)
+            }
+            ChainEvent::ChainCommitted { .. } | ChainEvent::ChainReorged { .. } | _ => None,
+        };
+        let coverage = advance_verified_materialized_view_coverage(
+            current.and_then(|state| state.coverage),
+            checkpoint,
+            tip_height,
+            tip_hash,
+            first_staged_height,
+        );
+        ctx.store.stage_consumer_state(
+            ctx.batch,
+            BLOCK_SUMMARY_CONSUMER_NAME,
+            MaterializedViewState {
+                chain_epoch_id: checkpoint.chain_epoch.id,
+                tip_height,
+                tip_hash,
+                revision,
+                coverage,
+            },
+        )?;
         Ok(())
     }
 }
@@ -282,6 +336,12 @@ pub enum BlockSummaryConsumerError {
     /// Storage encoding of the materialized record failed.
     #[error("BlockSummaryRecord prost encode failed: {0}")]
     Encode(String),
+    /// A dispatch omitted one or more block contexts required by the consumer.
+    #[error("block-summary materialized-view checkpoint is missing its indexed tip")]
+    IncompleteMaterializedViewCheckpoint,
+    /// Materialized-view revision exhausted its integer domain.
+    #[error("block-summary materialized-view revision overflowed")]
+    MaterializedViewRevisionOverflow,
 }
 
 /// Decodes a stored [`BlockSummaryRecord`] payload, surfacing a typed error
@@ -295,19 +355,124 @@ pub fn decode_stored_record(payload: &[u8]) -> Result<BlockSummaryRecord, prost:
 
 #[cfg(test)]
 mod tests {
+    use eyre::Result;
+    use rust_rocksdb::WriteBatch;
+    use tempfile::tempdir;
     use zinder_core::wire::encode_rpc_transaction_id_hex;
     use zinder_core::{
-        BlockHash, BlockHeaderArtifact, BlockHeight, CanonicalBlockFacts,
-        CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
-        CanonicalTransactionFacts, LockTime, PrivacyShape, TransactionComponentCounts,
-        TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalances,
-        TransactionLocation, TransactionPublicFacts, TransactionVersion,
-        TransparentAddressScriptHash, TransparentOutputFact, decode_canonical_block_replay,
-        encode_canonical_block_replay,
+        ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+        CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
+        CanonicalTransactionFacts, ChainEpoch, ChainEpochId, ChainTipMetadata, LockTime, Network,
+        PrivacyShape, TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
+        TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
+        TransactionVersion, TransparentAddressScriptHash, TransparentOutputFact,
+        UnixTimestampMillis, decode_canonical_block_replay, encode_canonical_block_replay,
+    };
+    use zinder_store::{ChainEpochCommitted, ChainEvent};
+
+    use super::{
+        BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer, project_block_summary_record,
+        project_block_summary_record_from_commit_context,
+    };
+    use crate::consumer::{
+        BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, MaterializedViewBlockProjection,
+        MaterializedViewConsumerCtx, TransparentSpendFacts,
+    };
+    use crate::store::{
+        MaterializedViewCoverage, MaterializedViewState, MaterializedViewStore,
+        MaterializedViewStoreOptions,
     };
 
-    use super::{project_block_summary_record, project_block_summary_record_from_commit_context};
-    use crate::consumer::{BlockCommitContext, BlockCommitInput, TransparentSpendFacts};
+    #[test]
+    fn initial_committed_checkpoint_records_exact_contiguous_coverage() -> Result<()> {
+        let directory = tempdir()?;
+        let store = MaterializedViewStore::open(
+            directory.path(),
+            zinder_core::Network::ZcashRegtest,
+            MaterializedViewStoreOptions::default(),
+        )?;
+        let tip_height = BlockHeight::new(105);
+        let tip_hash = BlockHash::from_bytes([0x55; 32]);
+        let epoch = chain_epoch(1, tip_height, tip_hash);
+        let event = committed_chunk_event(epoch, 100, 105);
+
+        stage_and_commit_checkpoint(&store, epoch, &event, tip_height, tip_hash)?;
+
+        let state = store
+            .consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("block-summary state missing"))?;
+        let coverage = state
+            .coverage
+            .ok_or_else(|| eyre::eyre!("block-summary coverage missing"))?;
+        assert_eq!(coverage.complete_from_height, BlockHeight::new(100));
+        assert_eq!(coverage.complete_through_height, tip_height);
+        assert_eq!(coverage.complete_through_hash, tip_hash);
+        assert_eq!(state.revision, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_committed_checkpoint_does_not_claim_contiguous_coverage() -> Result<()> {
+        let directory = tempdir()?;
+        let store = MaterializedViewStore::open(
+            directory.path(),
+            zinder_core::Network::ZcashRegtest,
+            MaterializedViewStoreOptions::default(),
+        )?;
+        let tip_height = BlockHeight::new(105);
+        let tip_hash = BlockHash::from_bytes([0x55; 32]);
+        let epoch = chain_epoch(1, tip_height, tip_hash);
+        let event = committed_chunk_event(epoch, 106, 105);
+
+        stage_and_commit_checkpoint(&store, epoch, &event, tip_height, tip_hash)?;
+
+        let state = store
+            .consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("block-summary state missing"))?;
+        assert_eq!(state.coverage, None);
+        assert_eq!(state.revision, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn re_applied_lower_committed_chunk_preserves_advanced_coverage() -> Result<()> {
+        let directory = tempdir()?;
+        let store = MaterializedViewStore::open(
+            directory.path(),
+            zinder_core::Network::ZcashRegtest,
+            MaterializedViewStoreOptions::default(),
+        )?;
+        let tip_height = BlockHeight::new(512);
+        let tip_hash = BlockHash::from_bytes([0x55; 32]);
+        let existing = MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(1),
+            tip_height,
+            tip_hash,
+            revision: 5,
+            coverage: Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(100),
+                complete_through_height: tip_height,
+                complete_through_hash: tip_hash,
+            }),
+        };
+        store.put_consumer_state(BLOCK_SUMMARY_CONSUMER_NAME, existing)?;
+        let epoch = chain_epoch(1, tip_height, tip_hash);
+        let re_applied_chunk = committed_chunk_event(epoch, 100, 256);
+
+        stage_and_commit_checkpoint(
+            &store,
+            epoch,
+            &re_applied_chunk,
+            BlockHeight::new(256),
+            BlockHash::from_bytes([0x44; 32]),
+        )?;
+
+        assert_eq!(
+            store.consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)?,
+            Some(existing),
+        );
+        Ok(())
+    }
 
     #[test]
     fn canonical_facts_projection_matches_commit_context_consumer() {
@@ -394,6 +559,59 @@ mod tests {
             Some(facts.block_header.block_size_bytes)
         );
         assert_ne!(transaction_size_sum, facts.block_header.block_size_bytes);
+    }
+
+    fn chain_epoch(id: u64, tip_height: BlockHeight, tip_hash: BlockHash) -> ChainEpoch {
+        ChainEpoch {
+            id: ChainEpochId::new(id),
+            network: Network::ZcashRegtest,
+            visible_tip_height: tip_height,
+            visible_tip_hash: tip_hash,
+            settled_tip_height: BlockHeight::new(1),
+            settled_tip_hash: BlockHash::from_bytes([0x01; 32]),
+            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(1_774_668_200_000 + id),
+        }
+    }
+
+    fn committed_chunk_event(chain_epoch: ChainEpoch, start: u32, end: u32) -> ChainEvent {
+        ChainEvent::ChainCommitted {
+            committed: ChainEpochCommitted {
+                chain_epoch,
+                block_range: BlockHeightRange::inclusive(
+                    BlockHeight::new(start),
+                    BlockHeight::new(end),
+                ),
+            },
+        }
+    }
+
+    fn stage_and_commit_checkpoint(
+        store: &MaterializedViewStore,
+        chain_epoch: ChainEpoch,
+        chain_event: &ChainEvent,
+        tip_height: BlockHeight,
+        tip_hash: BlockHash,
+    ) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        let mut ctx = MaterializedViewConsumerCtx {
+            store,
+            batch: &mut batch,
+        };
+        BlockSummaryConsumer::new()
+            .stage_block_projection_state(
+                MaterializedViewBlockProjection {
+                    chain_epoch,
+                    chain_event,
+                    tip_height: Some(tip_height),
+                    tip_hash: Some(tip_hash),
+                },
+                &mut ctx,
+            )
+            .map_err(|error| eyre::eyre!("{error}"))?;
+        store.write_batch(&batch)?;
+        Ok(())
     }
 
     fn representative_block_facts() -> CanonicalBlockFacts {

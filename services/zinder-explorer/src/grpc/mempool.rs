@@ -1,14 +1,14 @@
 //! `ExplorerQuery` mempool summary, activity, and coherent snapshot views.
 //!
 //! Each handler composes `WalletQuery.MempoolSnapshot` at request time;
-//! no materialized-view consumer is required. `MempoolSnapshot` derives global summary
-//! facts and its requested page from one wallet response. The summary
-//! aggregates every entry into one explorer-shaped page; the activity feed
-//! projects the same entries into typed rows ordered by newest-first
-//! observation time and paginates with an opaque cursor that encodes
-//! `(first_seen_unix_millis, transaction_id)`.
+//! no materialized-view consumer is required. `MempoolSummary` walks every
+//! page under one stable wallet snapshot identity and aggregates with bounded
+//! memory. `MempoolSnapshot` derives global summary facts and its requested
+//! page from one wallet response. The activity feed projects the same entries
+//! into typed rows ordered by newest-first observation time and paginates with
+//! an opaque cursor that encodes `(first_seen_unix_millis, transaction_id)`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tonic::{Request, Response, Status};
@@ -17,7 +17,7 @@ use zinder_core::{
     NetworkUpgradeActivations, TransactionPublicFacts as CoreFacts,
     TransactionVersion as CoreTransactionVersion,
 };
-use zinder_proto::capabilities::{EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V1};
+use zinder_proto::capabilities::{EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V2};
 use zinder_proto::v1::explorer::{
     MempoolActivityEntry, MempoolActivityRequest, MempoolActivityResponse, MempoolSnapshotRequest,
     MempoolSnapshotResponse, MempoolSnapshotSummary, MempoolSummaryRequest, MempoolSummaryResponse,
@@ -39,13 +39,19 @@ use super::freshness::{
 use super::transaction_detail::encode_component_counts;
 use zinder_materialized_views::MaterializedViewStore;
 
-/// Hard cap on the mempool entries the summary aggregates in one call.
+/// Hard cap requested from the Wallet endpoint for each snapshot page.
 ///
-/// Mempool sizes on mainnet sit in the low thousands; bounding the read
-/// keeps parse cost predictable and the gRPC frame within tonic's
-/// per-message limit even when every entry hydrates the raw transaction
-/// bytes.
-const MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST: u32 = 4_096;
+/// The complete observation may walk up to [`MAX_MEMPOOL_SNAPSHOT_PAGES`]
+/// pages. Bounding each page keeps each gRPC frame within tonic's per-message
+/// limit even when every entry hydrates the raw transaction bytes.
+const MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_PAGE: u32 = 4_096;
+
+/// Hard cap on pages in a complete mempool observation.
+///
+/// The source already bounds entries per page. This second fence prevents a
+/// malformed peer from keeping an explorer request alive by emitting an
+/// endless sequence of distinct cursors.
+const MAX_MEMPOOL_SUMMARY_PAGES: usize = 1_024;
 
 /// Hard cap on the rows one `MempoolActivity` page returns.
 ///
@@ -142,6 +148,14 @@ struct MempoolSnapshotPage {
     next_cursor: Vec<u8>,
 }
 
+/// One complete, identity-checked walk of the wallet mempool snapshot.
+pub(crate) struct CompleteMempoolObservation {
+    pub(crate) chain_epoch: wallet::ChainEpoch,
+    pub(crate) source_tip: wallet::BlockTip,
+    pub(crate) snapshot_age_millis: u64,
+    pub(crate) summary: MempoolSnapshotSummary,
+}
+
 /// Executes one `ExplorerQuery.MempoolSummary` request.
 pub(crate) async fn query_mempool_summary(
     materialized_view_store: Option<&MaterializedViewStore>,
@@ -151,33 +165,18 @@ pub(crate) async fn query_mempool_summary(
     request: Request<MempoolSummaryRequest>,
 ) -> Result<Response<MempoolSummaryResponse>, Status> {
     let _inner = request.into_inner();
-    let snapshot = fetch_mempool_snapshot(wallet_client).await?;
-    let now_unix_millis = current_unix_millis();
-    let activations = NetworkUpgradeActivations::empty(network);
-    let mut summary = MempoolSummaryBuilder::default();
-    for entry in &snapshot.entries {
-        let facts = parse_facts(entry, &activations)?;
-        summary.observe(entry, &facts);
-    }
-    let summary = summary.finish(now_unix_millis);
-
-    let chain_epoch = snapshot
-        .chain_view
-        .clone()
-        .and_then(|chain_view| chain_view.chain_epoch)
-        .ok_or_else(|| {
-            ExplorerError::internal("MempoolSnapshotResponse.chain_view.chain_epoch missing")
-        })?;
+    let observation = fetch_complete_mempool_observation(wallet_client, network).await?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
             materialized_view_store,
-            EXPLORER_MEMPOOL_SUMMARY_V1,
-            Some(chain_epoch),
-            snapshot.snapshot_age_millis,
+            EXPLORER_MEMPOOL_SUMMARY_V2,
+            Some(observation.chain_epoch),
+            observation.snapshot_age_millis,
         )?,
     )
     .await;
+    let summary = observation.summary;
 
     Ok(Response::new(MempoolSummaryResponse {
         freshness: Some(freshness),
@@ -379,11 +378,158 @@ async fn fetch_mempool_snapshot(
 ) -> Result<wallet::MempoolSnapshotResponse, Status> {
     Ok(wallet_client
         .mempool_snapshot(Request::new(WalletMempoolSnapshotRequest {
-            max_entries: MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST,
+            max_entries: MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_PAGE,
             from_cursor: Vec::new(),
         }))
         .await?
         .into_inner())
+}
+
+trait MempoolSnapshotPageSource {
+    async fn fetch_mempool_snapshot_page(
+        &mut self,
+        from_cursor: Vec<u8>,
+    ) -> Result<wallet::MempoolSnapshotResponse, Status>;
+}
+
+impl MempoolSnapshotPageSource for WalletQueryClient<AuthenticatedChannel> {
+    async fn fetch_mempool_snapshot_page(
+        &mut self,
+        from_cursor: Vec<u8>,
+    ) -> Result<wallet::MempoolSnapshotResponse, Status> {
+        Ok(self
+            .mempool_snapshot(Request::new(WalletMempoolSnapshotRequest {
+                max_entries: MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_PAGE,
+                from_cursor,
+            }))
+            .await?
+            .into_inner())
+    }
+}
+
+pub(crate) async fn fetch_complete_mempool_observation(
+    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    network: zinder_core::Network,
+) -> Result<CompleteMempoolObservation, Status> {
+    fetch_complete_mempool_observation_from(wallet_client, network).await
+}
+
+async fn fetch_complete_mempool_observation_from(
+    page_source: &mut impl MempoolSnapshotPageSource,
+    network: zinder_core::Network,
+) -> Result<CompleteMempoolObservation, Status> {
+    let activations = NetworkUpgradeActivations::empty(network);
+    let mut summary = MempoolSummaryBuilder::default();
+    let mut from_cursor = Vec::new();
+    // One cursor per admitted page keeps cycle detection bounded by the same
+    // hard page cap as the walk itself.
+    let mut seen_continuation_cursors = BTreeSet::new();
+    let mut identity: Option<(wallet::ChainEpoch, wallet::BlockTip, Vec<u8>)> = None;
+    let mut snapshot_age_millis = 0_u64;
+
+    for page_index in 0..MAX_MEMPOOL_SUMMARY_PAGES {
+        let response = page_source
+            .fetch_mempool_snapshot_page(from_cursor.clone())
+            .await?;
+        let page_identity = mempool_snapshot_identity(&response)?;
+        match &identity {
+            Some((expected_epoch, expected_source_tip, expected_events_cursor))
+                if &page_identity.0 != expected_epoch
+                    || &page_identity.1 != expected_source_tip
+                    || page_identity.2.as_slice() != expected_events_cursor.as_slice() =>
+            {
+                return Err(ExplorerError::unsatisfied_precondition(format!(
+                    "mempool snapshot identity changed on page {}",
+                    page_index.saturating_add(1)
+                ))
+                .into());
+            }
+            None => {
+                identity = Some(page_identity);
+            }
+            Some(_) => {}
+        }
+        snapshot_age_millis = snapshot_age_millis.max(response.snapshot_age_millis);
+        for entry in &response.entries {
+            let facts = parse_facts(entry, &activations)?;
+            summary.observe(entry, &facts);
+        }
+
+        if response.next_cursor.is_empty() {
+            let expected_identity = identity.ok_or_else(|| {
+                ExplorerError::internal("complete mempool observation has no identity")
+            })?;
+            let final_probe = page_source.fetch_mempool_snapshot_page(Vec::new()).await?;
+            let final_identity = mempool_snapshot_identity(&final_probe)?;
+            if final_identity != expected_identity {
+                return Err(ExplorerError::unsatisfied_precondition(
+                    "mempool snapshot identity changed before the final head fence",
+                )
+                .into());
+            }
+            snapshot_age_millis = snapshot_age_millis.max(final_probe.snapshot_age_millis);
+            return Ok(CompleteMempoolObservation {
+                chain_epoch: expected_identity.0,
+                source_tip: expected_identity.1,
+                snapshot_age_millis,
+                summary: summary.finish(current_unix_millis()),
+            });
+        }
+        if response.next_cursor == from_cursor {
+            return Err(ExplorerError::unsatisfied_precondition(
+                "mempool snapshot next_cursor did not advance",
+            )
+            .into());
+        }
+        if !seen_continuation_cursors.insert(response.next_cursor.clone()) {
+            return Err(ExplorerError::unsatisfied_precondition(
+                "mempool snapshot repeated a continuation cursor",
+            )
+            .into());
+        }
+        if response.entries.is_empty() {
+            return Err(ExplorerError::unsatisfied_precondition(
+                "mempool snapshot returned an empty page with a continuation cursor",
+            )
+            .into());
+        }
+        from_cursor = response.next_cursor;
+    }
+
+    Err(ExplorerError::unsatisfied_precondition(format!(
+        "mempool snapshot exceeded the {MAX_MEMPOOL_SUMMARY_PAGES}-page safety bound"
+    ))
+    .into())
+}
+
+fn mempool_snapshot_identity(
+    response: &wallet::MempoolSnapshotResponse,
+) -> Result<(wallet::ChainEpoch, wallet::BlockTip, Vec<u8>), Status> {
+    let chain_epoch = response
+        .chain_view
+        .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+        .ok_or_else(|| {
+            ExplorerError::internal("MempoolSnapshotResponse.chain_view.chain_epoch missing")
+        })?;
+    let visible_tip = chain_epoch.visible_tip.as_ref().ok_or_else(|| {
+        ExplorerError::internal("MempoolSnapshotResponse chain epoch visible_tip missing")
+    })?;
+    let source_tip = response
+        .source_tip
+        .as_ref()
+        .ok_or_else(|| ExplorerError::internal("MempoolSnapshotResponse.source_tip missing"))?;
+    if source_tip != visible_tip {
+        return Err(ExplorerError::unsatisfied_precondition(
+            "mempool snapshot source_tip does not match its chain epoch visible_tip",
+        )
+        .into());
+    }
+    Ok((
+        chain_epoch.clone(),
+        source_tip.clone(),
+        response.events_resume_cursor.clone(),
+    ))
 }
 
 fn parse_facts(
@@ -507,10 +653,42 @@ mod tests {
         reason = "Unit test names describe the behavior under test."
     )]
 
-    use super::{build_mempool_activity_entry, build_mempool_snapshot_page};
+    use std::collections::VecDeque;
+
+    use super::{
+        MAX_MEMPOOL_SUMMARY_PAGES, MempoolSnapshotPageSource, build_mempool_activity_entry,
+        build_mempool_snapshot_page, fetch_complete_mempool_observation_from,
+    };
+    use tonic::{Code, Status};
     use zinder_core::{Network, TransactionId, wire::encode_rpc_transaction_id_hex};
     use zinder_proto::v1::wallet;
     use zinder_source::parse_transaction_public_facts;
+
+    struct ScriptedMempoolSnapshotPageSource {
+        pages: VecDeque<wallet::MempoolSnapshotResponse>,
+        requested_cursors: Vec<Vec<u8>>,
+    }
+
+    impl ScriptedMempoolSnapshotPageSource {
+        fn new(pages: Vec<wallet::MempoolSnapshotResponse>) -> Self {
+            Self {
+                pages: pages.into(),
+                requested_cursors: Vec::new(),
+            }
+        }
+    }
+
+    impl MempoolSnapshotPageSource for ScriptedMempoolSnapshotPageSource {
+        async fn fetch_mempool_snapshot_page(
+            &mut self,
+            from_cursor: Vec<u8>,
+        ) -> Result<wallet::MempoolSnapshotResponse, Status> {
+            self.requested_cursors.push(from_cursor);
+            self.pages
+                .pop_front()
+                .ok_or_else(|| Status::internal("scripted mempool page source exhausted"))
+        }
+    }
 
     #[test]
     fn mempool_activity_entry_uses_parsed_counts_and_live_output_total()
@@ -586,6 +764,358 @@ mod tests {
         );
         assert!(!page.next_cursor.is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_mempool_observation_walks_every_page_under_one_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = zinder_core::NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let first = mempool_entry(
+            transparent_transaction_bytes(),
+            1_700_000_000_000,
+            &activations,
+        )?;
+        let mut newer_bytes = transparent_transaction_bytes();
+        let lock_time_offset = newer_bytes.len().saturating_sub(4);
+        newer_bytes[lock_time_offset..].copy_from_slice(&1_u32.to_le_bytes());
+        let newer = mempool_entry(newer_bytes, 1_700_000_000_100, &activations)?;
+        let continuation = b"page-2".to_vec();
+        let mut source = ScriptedMempoolSnapshotPageSource::new(vec![
+            wallet_snapshot_page(
+                7,
+                20,
+                0x33,
+                b"events".to_vec(),
+                vec![first.clone()],
+                continuation.clone(),
+                11,
+            ),
+            wallet_snapshot_page(7, 20, 0x33, b"events".to_vec(), vec![newer], Vec::new(), 17),
+            wallet_snapshot_page(7, 20, 0x33, b"events".to_vec(), vec![first], Vec::new(), 17),
+        ]);
+
+        let observation =
+            fetch_complete_mempool_observation_from(&mut source, Network::ZcashRegtest).await?;
+
+        assert_eq!(
+            source.requested_cursors,
+            vec![Vec::<u8>::new(), continuation, Vec::<u8>::new()]
+        );
+        assert_eq!(observation.summary.transaction_count, 2);
+        assert_eq!(observation.snapshot_age_millis, 17);
+        assert_eq!(observation.chain_epoch.chain_epoch_id, 7);
+        assert_eq!(observation.source_tip.height, 20);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_mempool_observation_rejects_a_changed_final_head_probe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = zinder_core::NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let entry = mempool_entry(
+            transparent_transaction_bytes(),
+            1_700_000_000_000,
+            &activations,
+        )?;
+        let mut source = ScriptedMempoolSnapshotPageSource::new(vec![
+            wallet_snapshot_page(
+                7,
+                20,
+                0x33,
+                b"original-events".to_vec(),
+                vec![entry.clone()],
+                b"page-2".to_vec(),
+                0,
+            ),
+            wallet_snapshot_page(
+                7,
+                20,
+                0x33,
+                b"original-events".to_vec(),
+                vec![entry.clone()],
+                Vec::new(),
+                0,
+            ),
+            wallet_snapshot_page(
+                7,
+                20,
+                0x33,
+                b"new-head-events".to_vec(),
+                vec![entry],
+                Vec::new(),
+                0,
+            ),
+        ]);
+
+        let error = fetch_complete_mempool_observation_from(&mut source, Network::ZcashRegtest)
+            .await
+            .err()
+            .ok_or_else(|| {
+                std::io::Error::other("changed current mempool head must invalidate the walk")
+            })?;
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("final head fence"));
+        assert_eq!(
+            source.requested_cursors,
+            vec![Vec::<u8>::new(), b"page-2".to_vec(), Vec::<u8>::new()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_mempool_observation_rejects_nonprogress_and_empty_continuation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = zinder_core::NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let entry = mempool_entry(
+            transparent_transaction_bytes(),
+            1_700_000_000_000,
+            &activations,
+        )?;
+        let continuation = b"page-2".to_vec();
+        let first = wallet_snapshot_page(
+            7,
+            20,
+            0x33,
+            b"events".to_vec(),
+            vec![entry.clone()],
+            continuation.clone(),
+            0,
+        );
+        let nonprogress = wallet_snapshot_page(
+            7,
+            20,
+            0x33,
+            b"events".to_vec(),
+            vec![entry],
+            continuation,
+            0,
+        );
+        let mut source = ScriptedMempoolSnapshotPageSource::new(vec![first, nonprogress]);
+        let error = fetch_complete_mempool_observation_from(&mut source, Network::ZcashRegtest)
+            .await
+            .err()
+            .ok_or_else(|| std::io::Error::other("non-progressing cursor must fail"))?;
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("did not advance"));
+
+        let empty_continuation = wallet_snapshot_page(
+            7,
+            20,
+            0x33,
+            b"events".to_vec(),
+            Vec::new(),
+            b"page-2".to_vec(),
+            0,
+        );
+        let mut source = ScriptedMempoolSnapshotPageSource::new(vec![empty_continuation]);
+        let error = fetch_complete_mempool_observation_from(&mut source, Network::ZcashRegtest)
+            .await
+            .err()
+            .ok_or_else(|| {
+                std::io::Error::other("empty page with continuation cursor must fail")
+            })?;
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("empty page"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_mempool_observation_rejects_a_continuation_cursor_cycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = zinder_core::NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let entry = mempool_entry(
+            transparent_transaction_bytes(),
+            1_700_000_000_000,
+            &activations,
+        )?;
+        let first_cursor = b"page-a".to_vec();
+        let second_cursor = b"page-b".to_vec();
+        let pages = [
+            wallet_snapshot_page(
+                7,
+                20,
+                0x33,
+                b"events".to_vec(),
+                vec![entry.clone()],
+                first_cursor.clone(),
+                0,
+            ),
+            wallet_snapshot_page(
+                7,
+                20,
+                0x33,
+                b"events".to_vec(),
+                vec![entry.clone()],
+                second_cursor.clone(),
+                0,
+            ),
+            wallet_snapshot_page(
+                7,
+                20,
+                0x33,
+                b"events".to_vec(),
+                vec![entry],
+                first_cursor.clone(),
+                0,
+            ),
+        ];
+        let mut source = ScriptedMempoolSnapshotPageSource::new(pages.into());
+
+        let error = fetch_complete_mempool_observation_from(&mut source, Network::ZcashRegtest)
+            .await
+            .err()
+            .ok_or_else(|| std::io::Error::other("continuation cursor cycle must fail"))?;
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("repeated a continuation cursor"));
+        assert_eq!(
+            source.requested_cursors,
+            vec![Vec::<u8>::new(), first_cursor, second_cursor]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_mempool_observation_rejects_identity_changes_between_pages()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = zinder_core::NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let entry = mempool_entry(
+            transparent_transaction_bytes(),
+            1_700_000_000_000,
+            &activations,
+        )?;
+        let mut changed_source_tip = wallet_snapshot_page(
+            7,
+            20,
+            0x33,
+            b"events".to_vec(),
+            vec![entry.clone()],
+            Vec::new(),
+            0,
+        );
+        changed_source_tip.source_tip = Some(wallet::BlockTip {
+            height: 19,
+            hash: "22".repeat(32),
+        });
+        let changed_identity_pages = [
+            wallet_snapshot_page(
+                8,
+                20,
+                0x33,
+                b"events".to_vec(),
+                vec![entry.clone()],
+                Vec::new(),
+                0,
+            ),
+            wallet_snapshot_page(
+                7,
+                21,
+                0x22,
+                b"events".to_vec(),
+                vec![entry.clone()],
+                Vec::new(),
+                0,
+            ),
+            wallet_snapshot_page(
+                7,
+                20,
+                0x33,
+                b"different-events".to_vec(),
+                vec![entry.clone()],
+                Vec::new(),
+                0,
+            ),
+            changed_source_tip,
+        ];
+
+        for changed_page in changed_identity_pages {
+            let first = wallet_snapshot_page(
+                7,
+                20,
+                0x33,
+                b"events".to_vec(),
+                vec![entry.clone()],
+                b"page-2".to_vec(),
+                0,
+            );
+            let mut source = ScriptedMempoolSnapshotPageSource::new(vec![first, changed_page]);
+            let error = fetch_complete_mempool_observation_from(&mut source, Network::ZcashRegtest)
+                .await
+                .err()
+                .ok_or_else(|| std::io::Error::other("changed mempool page identity must fail"))?;
+            assert_eq!(error.code(), Code::FailedPrecondition);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_mempool_observation_enforces_page_safety_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = zinder_core::NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let entry = mempool_entry(
+            transparent_transaction_bytes(),
+            1_700_000_000_000,
+            &activations,
+        )?;
+        let pages = (1..=MAX_MEMPOOL_SUMMARY_PAGES)
+            .map(|page| {
+                wallet_snapshot_page(
+                    7,
+                    20,
+                    0x33,
+                    b"events".to_vec(),
+                    vec![entry.clone()],
+                    page.to_be_bytes().to_vec(),
+                    0,
+                )
+            })
+            .collect();
+        let mut source = ScriptedMempoolSnapshotPageSource::new(pages);
+
+        let error = fetch_complete_mempool_observation_from(&mut source, Network::ZcashRegtest)
+            .await
+            .err()
+            .ok_or_else(|| std::io::Error::other("unbounded mempool page walk must fail"))?;
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("page safety bound"));
+        assert_eq!(source.requested_cursors.len(), MAX_MEMPOOL_SUMMARY_PAGES);
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Each argument controls one independently varied snapshot-identity or page field."
+    )]
+    fn wallet_snapshot_page(
+        chain_epoch_id: u64,
+        tip_height: u32,
+        tip_hash_byte: u8,
+        events_resume_cursor: Vec<u8>,
+        entries: Vec<wallet::MempoolEntry>,
+        next_cursor: Vec<u8>,
+        snapshot_age_millis: u64,
+    ) -> wallet::MempoolSnapshotResponse {
+        let tip = wallet::BlockTip {
+            height: tip_height,
+            hash: format!("{tip_hash_byte:02x}").repeat(32),
+        };
+        wallet::MempoolSnapshotResponse {
+            chain_view: Some(wallet::ChainView {
+                chain_epoch: Some(wallet::ChainEpoch {
+                    chain_epoch_id,
+                    visible_tip: Some(tip.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            events_resume_cursor,
+            snapshot_age_millis,
+            entries,
+            next_cursor,
+            source_tip: Some(tip),
+        }
     }
 
     fn transparent_transaction_bytes() -> Vec<u8> {

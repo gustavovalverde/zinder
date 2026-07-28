@@ -196,7 +196,14 @@ pub(crate) enum IngestConfigError {
     Ingest(#[from] IngestError),
 
     #[error(transparent)]
-    NodeComposition(#[from] zinder_ingest::IngestNodeCompositionError),
+    IngestControlNodeComposition(#[from] zinder_ingest::IngestControlNodeCompositionError),
+
+    #[error("failed to bind ingest-control listener at {listen_addr}: {source}")]
+    IngestControlBind {
+        listen_addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error(transparent)]
     CanonicalWriter(#[from] zinder_ingest::CanonicalWriterError),

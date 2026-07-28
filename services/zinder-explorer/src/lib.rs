@@ -1,8 +1,9 @@
 //! Explorer-plane runtime serving block-explorer, dashboard, and analytics reads.
 //!
-//! `zinder-explorer` is the fourth Zinder deployable. It runs in a separate
-//! process from `zinder-ingest` and `zinder-query`, reads the ingest-owned
-//! materialized-view store in secondary mode, and serves the `ExplorerQuery` gRPC surface.
+//! `zinder-explorer` is an optional operator-built runtime. It runs in a
+//! separate process from the release runtimes, reads the ingest-owned
+//! materialized-view store in secondary mode, and serves the `ExplorerQuery`
+//! gRPC surface.
 //!
 //! See `docs/architecture/explorer-plane.md` for the product surface and
 //! `docs/architecture/materialized-view-plane.md` for the materialized-view store this crate reads.
@@ -10,8 +11,9 @@
 mod grpc;
 
 pub use grpc::{
-    ExplorerEndpointAdmissionError, ExplorerEndpointMetadata, ExplorerQueryGrpcAdapter,
-    ExplorerQueryGrpcAdapterBuilder, describe_request_metrics,
+    ExplorerEndpointAdmissionError, ExplorerEndpointMetadata, ExplorerQueryEndpointComposition,
+    ExplorerQueryGrpcAdapter, ExplorerQueryGrpcAdapterBuilder, ExplorerWalletQueryHealthError,
+    describe_request_metrics,
 };
 pub use zinder_materialized_views::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockCommitContext,
@@ -19,7 +21,7 @@ pub use zinder_materialized_views::{
     ChainReorgedEvent, CommittedRange, ConsumerEntry, MATERIALIZED_VIEW_STORE_FORMAT_VERSION,
     MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY, MEMPOOL_EVENT_COUNTS_CONSUMER_NAME,
     MEMPOOL_EVENT_COUNTS_RETENTION_SECONDS, MaterializedViewConsumer, MaterializedViewConsumerCtx,
-    MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewCursorEntry,
+    MaterializedViewConsumerError, MaterializedViewConsumerName,
     MaterializedViewError, MaterializedViewMempoolConsumer, MaterializedViewStore,
     MaterializedViewStoreColumnFamily, MaterializedViewStoreError, MaterializedViewStoreOptions,
     MaterializedViewStoreTable, MempoolConsumerEvent, MempoolConsumerEventVariant,

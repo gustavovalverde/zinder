@@ -66,7 +66,7 @@ stores. It carries:
 | Knob | Canonical writer | Materialized-view writer | Canonical reader | Materialized-view reader | Effect |
 | --- | --- | --- | --- | --- | --- |
 | `block_cache_bytes` | 512 MiB | 256 MiB | 128 MiB | 64 MiB | Bounded LRU cache shared by data, index, and bloom blocks. |
-| `max_wal_bytes` | 256 MiB | 256 MiB | 32 MiB | 16 MiB | Live WAL ceiling. Writer stores flush once the WAL crosses this limit. |
+| `max_wal_bytes` | 256 MiB | 256 MiB | 32 MiB (not applied) | 16 MiB (not applied) | Primary-writer live WAL ceiling. Writer stores flush once the WAL crosses this limit. |
 | `max_open_files` | 512 | 512 | 128 | 64 | Open SST handle cap so RocksDB does not pin metadata for every file. |
 | `write_buffer_bytes` | 16 MiB | 16 MiB | 8 MiB | 4 MiB | Per-column-family mutable memtable size. |
 | `max_write_buffer_count` | 2 | 4 | 2 | 2 | Per-column-family mutable plus immutable memtable count. |
@@ -104,6 +104,13 @@ pressure and byte ticker metrics demonstrate a maintenance backlog.
 `OpenAsSecondary` disables automatic flushes and compactions, so secondary
 profiles retain the field at `2` in the uniform budget type but neither apply it
 nor export it as an effective limit.
+
+Secondaries replay the primary's WAL but do not own a WAL ceiling. Their
+uniform internal budget retains the reader default for validation and
+construction consistency, but secondary opens neither apply
+`max_wal_bytes` nor export `zinder_store_wal_bytes_limit`. Explorer's
+service-local reader configuration therefore accepts only the six
+materialized-view secondary fields that affect its open posture.
 
 ### Locked RocksDB Invariants
 

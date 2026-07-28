@@ -112,10 +112,15 @@ use super::value_pool_flow::{
 };
 use super::value_pool_summary::query_value_pool_summary;
 use super::{
-    endpoint_admission::{AdmittedWalletQueryEndpoint, ExplorerEndpointAdmissionError},
+    endpoint_admission::{
+        AdmittedWalletQueryEndpoint, ExplorerEndpointAdmissionError, ExplorerWalletQueryHealthError,
+    },
     endpoint_capabilities::ExplorerEndpointCapabilities,
 };
-use zinder_materialized_views::{MaterializedViewPreset, MaterializedViewStore};
+use zinder_materialized_views::{
+    MaterializedViewStore, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
+    TransparentAddressRankingConsumer,
+};
 use zinder_store::SecondaryChainStore;
 
 /// Settings the binary populates before constructing the adapter.
@@ -133,10 +138,55 @@ impl Default for ExplorerEndpointMetadata {
     }
 }
 
-/// Composition root for one explorer gRPC adapter.
+/// Exact dependency input for an operator-built `zinder-explorer` binary endpoint.
+///
+/// Both the binary and production-shaped contract proof use this composition
+/// root. Adding a binary dependency therefore changes one shared input shape
+/// before capability admission can succeed.
+pub struct ExplorerQueryEndpointComposition {
+    /// Network identity served by the endpoint.
+    pub metadata: ExplorerEndpointMetadata,
+    /// Read-only explorer materialized-view store, when configured.
+    pub materialized_view_store: Option<MaterializedViewStore>,
+    /// Node-advertised network-upgrade activation evidence, when configured.
+    pub network_upgrade_activations: Option<Arc<NetworkUpgradeActivations>>,
+    /// Native wallet endpoint used by federated explorer reads, when configured.
+    pub wallet_query_endpoint: Option<String>,
+    /// Shared-secret bearer token sent to the native wallet endpoint.
+    pub wallet_query_bearer_token: Option<BearerToken>,
+    /// Shared-secret bearer token required by the explorer endpoint.
+    pub bearer_token: Option<BearerToken>,
+}
+
+impl ExplorerQueryEndpointComposition {
+    /// Admits every configured dependency and freezes the endpoint contract.
+    pub async fn compose(self) -> Result<ExplorerQueryGrpcAdapter, ExplorerEndpointAdmissionError> {
+        let mut builder = ExplorerQueryGrpcAdapter::builder(self.metadata);
+        if let Some(materialized_view_store) = self.materialized_view_store {
+            builder = builder.with_materialized_view_store(materialized_view_store);
+        }
+        if let Some(network_upgrade_activations) = self.network_upgrade_activations {
+            builder = builder.with_network_upgrade_activations(network_upgrade_activations);
+        }
+        if let Some(wallet_query_endpoint) = self.wallet_query_endpoint {
+            builder = builder.with_wallet_query_endpoint(wallet_query_endpoint);
+        }
+        if let Some(wallet_query_bearer_token) = self.wallet_query_bearer_token {
+            builder = builder.with_wallet_query_bearer_token(wallet_query_bearer_token);
+        }
+        if let Some(bearer_token) = self.bearer_token {
+            builder = builder.with_bearer_token(bearer_token);
+        }
+        builder.build().await
+    }
+}
+
+/// Lower-level explorer gRPC adapter builder for library and focused test compositions.
 ///
 /// Capability discovery is unavailable until [`Self::build`] admits the
-/// configured wallet dependency and freezes the composed contract.
+/// configured wallet dependency and freezes the composed contract. The
+/// operator-built binary and its production-shaped proof use
+/// [`ExplorerQueryEndpointComposition`] as their shared composition root.
 pub struct ExplorerQueryGrpcAdapterBuilder {
     metadata: ExplorerEndpointMetadata,
     wallet_query_endpoint: Option<String>,
@@ -144,7 +194,6 @@ pub struct ExplorerQueryGrpcAdapterBuilder {
     bearer_token: Option<BearerToken>,
     canonical_store: Option<SecondaryChainStore>,
     materialized_view_store: Option<MaterializedViewStore>,
-    materialized_view_preset: Option<MaterializedViewPreset>,
     transaction_history_materialized_view_reader:
         Option<Arc<dyn TransactionHistoryMaterializedViewReadApi>>,
     network_upgrade_activations: Option<Arc<NetworkUpgradeActivations>>,
@@ -160,7 +209,6 @@ impl ExplorerQueryGrpcAdapterBuilder {
             bearer_token: None,
             canonical_store: None,
             materialized_view_store: None,
-            materialized_view_preset: None,
             transaction_history_materialized_view_reader: None,
             network_upgrade_activations: None,
             upstream_observation_cache: UpstreamObservationCache::empty(),
@@ -170,7 +218,6 @@ impl ExplorerQueryGrpcAdapterBuilder {
     /// Wires the consumer-side materialized-view store.
     #[must_use]
     pub fn with_materialized_view_store(mut self, store: MaterializedViewStore) -> Self {
-        self.materialized_view_preset = Some(store.effective_materialized_view_preset());
         self.transaction_history_materialized_view_reader = Some(Arc::new(
             TransactionHistoryMaterializedViewReader::new(store.clone()),
         ));
@@ -227,6 +274,16 @@ impl ExplorerQueryGrpcAdapterBuilder {
         if self.wallet_query_endpoint.is_none() && self.wallet_query_bearer_token.is_some() {
             return Err(ExplorerEndpointAdmissionError::WalletAuthorizationRequiresEndpoint);
         }
+        if let Some(materialized_view_store) = self.materialized_view_store.as_ref()
+            && materialized_view_store.network() != self.metadata.network
+        {
+            return Err(
+                ExplorerEndpointAdmissionError::MaterializedViewStoreNetworkMismatch {
+                    expected: self.metadata.network,
+                    actual: materialized_view_store.network(),
+                },
+            );
+        }
         if let Some(canonical_store) = self.canonical_store.as_ref() {
             let canonical_network = canonical_store
                 .network()
@@ -250,6 +307,10 @@ impl ExplorerQueryGrpcAdapterBuilder {
                 },
             );
         }
+        let has_active_transparent_address_ranking_generation =
+            has_active_transparent_address_ranking_generation(
+                self.materialized_view_store.as_ref(),
+            )?;
         let wallet_endpoint = match self.wallet_query_endpoint.as_deref() {
             Some(endpoint) => Some(
                 AdmittedWalletQueryEndpoint::admit(
@@ -266,6 +327,7 @@ impl ExplorerQueryGrpcAdapterBuilder {
             self.materialized_view_store.as_ref(),
             self.network_upgrade_activations.as_deref(),
             wallet_endpoint.as_ref(),
+            has_active_transparent_address_ranking_generation,
         );
         Ok(ExplorerQueryGrpcAdapter {
             metadata: self.metadata,
@@ -273,7 +335,6 @@ impl ExplorerQueryGrpcAdapterBuilder {
             bearer_token: self.bearer_token,
             canonical_store: self.canonical_store,
             materialized_view_store: self.materialized_view_store,
-            materialized_view_preset: self.materialized_view_preset,
             transaction_history_materialized_view_reader: self
                 .transaction_history_materialized_view_reader,
             network_upgrade_activations: self.network_upgrade_activations,
@@ -281,6 +342,19 @@ impl ExplorerQueryGrpcAdapterBuilder {
             upstream_observation_cache: self.upstream_observation_cache,
         })
     }
+}
+
+fn has_active_transparent_address_ranking_generation(
+    materialized_view_store: Option<&MaterializedViewStore>,
+) -> Result<bool, ExplorerEndpointAdmissionError> {
+    let Some(materialized_view_store) = materialized_view_store
+        .filter(|store| store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME))
+    else {
+        return Ok(false);
+    };
+    TransparentAddressRankingConsumer::active_metadata(materialized_view_store)
+        .map(|metadata| metadata.is_some())
+        .map_err(ExplorerEndpointAdmissionError::TransparentAddressRankingMetadataRead)
 }
 
 /// Server adapter implementing the admitted `ExplorerQuery` contract.
@@ -291,7 +365,6 @@ pub struct ExplorerQueryGrpcAdapter {
     bearer_token: Option<BearerToken>,
     canonical_store: Option<SecondaryChainStore>,
     materialized_view_store: Option<MaterializedViewStore>,
-    materialized_view_preset: Option<MaterializedViewPreset>,
     transaction_history_materialized_view_reader:
         Option<Arc<dyn TransactionHistoryMaterializedViewReadApi>>,
     network_upgrade_activations: Option<Arc<NetworkUpgradeActivations>>,
@@ -314,8 +387,11 @@ impl ExplorerQueryGrpcAdapter {
         .into())
     }
 
-    /// Starts composing an adapter. Call [`ExplorerQueryGrpcAdapterBuilder::build`]
-    /// before exposing discovery or request handling.
+    /// Starts a lower-level adapter build for library or focused test use.
+    ///
+    /// Call [`ExplorerQueryGrpcAdapterBuilder::build`] before exposing
+    /// discovery or request handling. Operator-built binary compositions use
+    /// [`ExplorerQueryEndpointComposition`] instead.
     #[must_use]
     pub fn builder(metadata: ExplorerEndpointMetadata) -> ExplorerQueryGrpcAdapterBuilder {
         ExplorerQueryGrpcAdapterBuilder::new(metadata)
@@ -365,6 +441,23 @@ impl ExplorerQueryGrpcAdapter {
     #[must_use]
     pub fn advertised_capabilities(&self) -> Arc<[&'static str]> {
         self.endpoint_capabilities.shared_identifiers()
+    }
+
+    /// Returns whether this composition admitted a native `WalletQuery` dependency.
+    #[must_use]
+    pub fn has_wallet_query_dependency(&self) -> bool {
+        self.wallet_endpoint.is_some()
+    }
+
+    /// Checks the admitted `WalletQuery` channel and its frozen contract.
+    ///
+    /// A composition with no `WalletQuery` dependency is healthy by
+    /// construction and returns `Ok(())`.
+    pub async fn check_wallet_query_health(&self) -> Result<(), ExplorerWalletQueryHealthError> {
+        match self.wallet_endpoint.as_ref() {
+            Some(wallet_endpoint) => wallet_endpoint.check_health().await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -422,9 +515,15 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                         .map(str::to_owned)
                         .collect(),
                     contract_revision: zinder_proto::CONTRACT_REVISION,
-                    materialized_view_preset: self
-                        .materialized_view_preset
-                        .map_or_else(String::new, |preset| preset.as_str().to_owned()),
+                    materialized_view_preset: self.materialized_view_store.as_ref().map_or_else(
+                        String::new,
+                        |store| {
+                            store
+                                .effective_materialized_view_preset()
+                                .as_str()
+                                .to_owned()
+                        },
+                    ),
                     materialized_view_identities: self
                         .materialized_view_store
                         .as_ref()
@@ -495,7 +594,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            self.require_method_capability(capabilities::EXPLORER_BLOCK_SUMMARY_V1, OP.method)?;
+            self.require_method_capability(capabilities::EXPLORER_BLOCK_SUMMARY_V2, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client(OP.method)?;
             query_block_summaries_in_range(
@@ -798,7 +897,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         };
         let started = Instant::now();
         let outcome = async {
-            self.require_method_capability(capabilities::EXPLORER_MEMPOOL_SUMMARY_V1, OP.method)?;
+            self.require_method_capability(capabilities::EXPLORER_MEMPOOL_SUMMARY_V2, OP.method)?;
             let mut client = self.wallet_client(OP.method)?;
             query_mempool_summary(
                 self.materialized_view_store.as_ref(),
@@ -1420,7 +1519,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             self.require_method_capability(
-                capabilities::EXPLORER_TRANSACTION_HISTORY_V1,
+                capabilities::EXPLORER_TRANSACTION_HISTORY_V2,
                 OP.method,
             )?;
             let materialized_view_reader =
@@ -1502,6 +1601,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             query_overview_snapshot(
                 materialized_view_store,
                 &mut client,
+                self.metadata.network,
                 &self.upstream_observation_cache,
                 request,
             )
@@ -1615,20 +1715,12 @@ impl ExplorerQueryGrpcAdapter {
         &self,
         method: &'static str,
     ) -> Result<&MaterializedViewStore, Status> {
-        let materialized_view_store = self.materialized_view_store.as_ref().ok_or_else(|| {
+        self.materialized_view_store.as_ref().ok_or_else(|| {
             Status::from(ExplorerError::dependency_not_configured(format!(
-                "{method} requires the BlockSummary materialized view; configure \
-                 --storage-path and start the explorer with the consumer wired"
+                "{method} requires a materialized-view store with its declared consumers; \
+                 configure --storage-path"
             )))
-        })?;
-        if self.materialized_view_preset != Some(MaterializedViewPreset::Explorer) {
-            return Err(ExplorerError::unsupported(format!(
-                "{method} is unavailable because the stored materialized-view workload omits \
-                 explorer product views"
-            ))
-            .into());
-        }
-        Ok(materialized_view_store)
+        })
     }
 
     fn require_canonical_store(
@@ -1716,7 +1808,67 @@ mod tests {
         reason = "Unit test names describe the behavior under test."
     )]
 
+    use tempfile::{TempDir, tempdir};
+    use zinder_core::{BlockHash, BlockHeight};
+    use zinder_materialized_views::{
+        MaterializedViewStoreOptions, TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY,
+        TRANSPARENT_ADDRESS_RANKING_SCHEMA, TransparentAddressRankingCoverage,
+        TransparentAddressRankingSnapshotPlan,
+    };
+    use zinder_store::RocksDbResourceBudget;
+
     use super::*;
+
+    fn ranking_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn std::error::Error>> {
+        ranking_store_for_network(Network::ZcashRegtest)
+    }
+
+    fn ranking_store_for_network(
+        network: Network,
+    ) -> Result<(TempDir, MaterializedViewStore), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let store = MaterializedViewStore::open(
+            directory.path(),
+            network,
+            MaterializedViewStoreOptions {
+                consumers: &[TRANSPARENT_ADDRESS_RANKING_SCHEMA],
+                sync_writes: false,
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            },
+        )?;
+        Ok((directory, store))
+    }
+
+    fn activate_empty_ranking_generation(
+        store: &MaterializedViewStore,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let height = BlockHeight::new(1);
+        let block_hash = BlockHash::from_bytes([0x11; 32]);
+        TransparentAddressRankingConsumer::initialize_snapshot_generation(
+            store,
+            TransparentAddressRankingSnapshotPlan {
+                generation: 1,
+                base_height: height,
+                base_block_hash: block_hash,
+                target_height: height,
+                target_block_hash: block_hash,
+                expected_summary_count: 0,
+                base_coverage: TransparentAddressRankingCoverage {
+                    balance_complete_through_height: height,
+                    history_complete_from_height: Some(height),
+                    history_complete_through_height: Some(height),
+                    lifetime_statistics_complete: true,
+                },
+            },
+        )?;
+        TransparentAddressRankingConsumer::finalize_snapshot_base(store, 1)?;
+        TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(
+            store,
+            1,
+            b"ranking-admission-test-cursor",
+        )?;
+        Ok(())
+    }
 
     fn require_omitted<T>(
         outcome: Result<Response<T>, Status>,
@@ -1725,6 +1877,94 @@ mod tests {
         outcome
             .err()
             .ok_or_else(|| std::io::Error::other(format!("{method} unexpectedly succeeded")).into())
+    }
+
+    #[test]
+    fn ranking_admission_reports_an_absent_active_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, store) = ranking_store()?;
+
+        assert!(!has_active_transparent_address_ranking_generation(Some(
+            &store
+        ))?);
+        Ok(())
+    }
+
+    #[test]
+    fn ranking_admission_reports_a_present_active_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, store) = ranking_store()?;
+        activate_empty_ranking_generation(&store)?;
+
+        assert!(has_active_transparent_address_ranking_generation(Some(
+            &store
+        ))?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranking_admission_fails_on_malformed_active_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, store) = ranking_store()?;
+        activate_empty_ranking_generation(&store)?;
+        let mut metadata_keys = Vec::new();
+        store.visit_consumer_rows(
+            TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY,
+            |key, _payload| {
+                metadata_keys.push(key.to_vec());
+                Ok(())
+            },
+        )?;
+        assert_eq!(metadata_keys.len(), 1);
+        store.put_consumer(
+            TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY,
+            &metadata_keys[0],
+            b"malformed",
+        )?;
+
+        let outcome = ExplorerQueryGrpcAdapter::builder(ExplorerEndpointMetadata::default())
+            .with_materialized_view_store(store)
+            .build()
+            .await;
+        assert!(matches!(
+            outcome,
+            Err(ExplorerEndpointAdmissionError::TransparentAddressRankingMetadataRead(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builder_accepts_same_network_materialized_view_storage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, store) = ranking_store()?;
+
+        ExplorerQueryGrpcAdapter::builder(ExplorerEndpointMetadata::default())
+            .with_materialized_view_store(store)
+            .build()
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builder_rejects_cross_network_storage_before_endpoint_io_or_capability_derivation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, store) = ranking_store_for_network(Network::ZcashTestnet)?;
+
+        let outcome = ExplorerQueryGrpcAdapter::builder(ExplorerEndpointMetadata::default())
+            .with_materialized_view_store(store)
+            .with_wallet_query_endpoint("not a valid endpoint".to_owned())
+            .build()
+            .await;
+        assert!(matches!(
+            outcome,
+            Err(
+                ExplorerEndpointAdmissionError::MaterializedViewStoreNetworkMismatch {
+                    expected: Network::ZcashRegtest,
+                    actual: Network::ZcashTestnet,
+                }
+            )
+        ));
+        Ok(())
     }
 
     #[tokio::test]

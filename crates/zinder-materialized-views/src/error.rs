@@ -3,7 +3,11 @@
 use std::path::PathBuf;
 
 use thiserror::Error;
-use zinder_store::MempoolDecodeError;
+use zinder_core::{Network, NetworkUpgradeActivationsFingerprint};
+use zinder_store::{
+    CanonicalConstructionManifestBinding, CanonicalStoreConstructionIdentityDecodeError,
+    MempoolDecodeError,
+};
 
 use crate::consumer::MaterializedViewConsumerError;
 
@@ -118,6 +122,82 @@ pub enum MaterializedViewStoreError {
         persisted: u16,
         /// Store-format version the running binary expects.
         running: u16,
+    },
+    /// The current-format store omitted its canonical construction identity.
+    #[error("materialized-view store canonical construction identity is missing")]
+    CanonicalConstructionIdentityMissing,
+    /// Persisted canonical construction identity bytes cannot be decoded.
+    #[error("materialized-view store canonical construction identity is malformed: {source}")]
+    CanonicalConstructionIdentityMalformed {
+        /// Exact strict-codec failure.
+        #[source]
+        source: CanonicalStoreConstructionIdentityDecodeError,
+    },
+    /// Persisted construction identity names a different network.
+    #[error(
+        "materialized-view store canonical construction network mismatch: expected {expected:?}, observed {observed:?}"
+    )]
+    CanonicalConstructionNetworkMismatch {
+        /// Network authenticated by the admitted canonical source.
+        expected: Network,
+        /// Network claimed by the materialized-view store.
+        observed: Network,
+    },
+    /// Persisted construction identity names a different activation table.
+    #[error(
+        "materialized-view store canonical activation fingerprint mismatch: expected {expected:?}, observed {observed:?}"
+    )]
+    CanonicalConstructionActivationsFingerprintMismatch {
+        /// Fingerprint authenticated by the admitted canonical source.
+        expected: NetworkUpgradeActivationsFingerprint,
+        /// Fingerprint claimed by the materialized-view store.
+        observed: NetworkUpgradeActivationsFingerprint,
+    },
+    /// Persisted construction identity names a different first-READY build.
+    #[error(
+        "materialized-view store canonical construction manifest binding mismatch: expected {expected:?}, observed {observed:?}"
+    )]
+    CanonicalConstructionManifestBindingMismatch {
+        /// Binding authenticated by the admitted canonical source.
+        expected: CanonicalConstructionManifestBinding,
+        /// Binding claimed by the materialized-view store.
+        observed: CanonicalConstructionManifestBinding,
+    },
+    /// A dispatched chain event belongs to a different network.
+    #[error(
+        "materialized-view chain event network mismatch: expected {expected:?}, observed {observed:?}"
+    )]
+    ChainEventNetworkMismatch {
+        /// Network authenticated by the store construction identity.
+        expected: Network,
+        /// Network carried by the dispatched chain epoch.
+        observed: Network,
+    },
+    /// A persisted chain-event checkpoint is structurally invalid.
+    #[error("materialized-view chain-event checkpoint for `{consumer}` is malformed: {reason}")]
+    ChainEventCheckpointMalformed {
+        /// Stable consumer identity owning the checkpoint.
+        consumer: &'static str,
+        /// Exact structural failure.
+        reason: String,
+    },
+    /// A cursor was paired with a different resulting canonical fence.
+    #[error(
+        "materialized-view chain-event checkpoint for `{consumer}` disagrees at event sequence {event_sequence}"
+    )]
+    ChainEventCheckpointFenceMismatch {
+        /// Stable consumer identity owning the checkpoint.
+        consumer: &'static str,
+        /// Colliding canonical event sequence.
+        event_sequence: u64,
+    },
+    /// Dispatch paired a canonical fence with a different chain epoch.
+    #[error(
+        "materialized-view chain-event checkpoint at sequence {event_sequence} does not match the dispatched chain epoch"
+    )]
+    ChainEventCheckpointEpochMismatch {
+        /// Canonical event sequence carried by the checkpoint.
+        event_sequence: u64,
     },
     /// The requested preset conflicts with the store's durable consumer
     /// identities.

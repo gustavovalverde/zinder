@@ -598,12 +598,8 @@ mod tests {
 
     #[async_trait]
     impl NodeSource for GenesisSource {
-        fn capabilities(&self) -> NodeCapabilities {
-            NodeCapabilities::new([]).unwrap_or_default()
-        }
-
         fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-            Some(self.capabilities())
+            Some(NodeCapabilities::default())
         }
 
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

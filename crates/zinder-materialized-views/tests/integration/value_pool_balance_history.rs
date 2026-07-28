@@ -2,7 +2,7 @@ use std::error::Error;
 
 use rust_rocksdb::WriteBatch;
 use tempfile::tempdir;
-use zinder_core::{BlockHash, BlockHeight, ValuePoolBalance};
+use zinder_core::{BlockHash, BlockHeight, Network, ValuePoolBalance};
 use zinder_materialized_views::{
     BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, BlockValuePoolBalanceFacts,
     MaterializedViewConsumerCtx, MaterializedViewStore, MaterializedViewStoreOptions,
@@ -44,6 +44,7 @@ fn open_store() -> TestResult<(tempfile::TempDir, MaterializedViewStore)> {
     let tempdir = tempdir()?;
     let store = MaterializedViewStore::open(
         tempdir.path(),
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[VALUE_POOL_BALANCE_HISTORY_SCHEMA],
@@ -269,6 +270,7 @@ fn historical_and_live_tail_coverage_are_independent_atomic_and_restartable() ->
 
     let reopened = MaterializedViewStore::open(
         tempdir.path(),
+        Network::ZcashRegtest,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[VALUE_POOL_BALANCE_HISTORY_SCHEMA],

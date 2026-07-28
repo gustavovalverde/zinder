@@ -6,7 +6,8 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use parking_lot::RwLock;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
+use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
@@ -15,8 +16,8 @@ use zinder_ingest::{
     CanonicalControlGrpcAdapter, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
     CanonicalRunOverrides, CanonicalWriterConfig, ConventionalFeeDistributionBackfillConfig,
     ConventionalFeeDistributionBackfillContext, DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
-    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, HistoricalWorkGate, IngestError,
-    IngestNodeComposition, LiveMempoolOwner, MaterializedViewReplayConfig, MaterializedViewTailer,
+    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, HistoricalWorkGate, IngestControlNodeComposition,
+    IngestError, LiveMempoolOwner, MaterializedViewReplayConfig, MaterializedViewTailer,
     MempoolIngestSettings, NodeSourceKind, TransactionComponentBackfillConfig,
     TransactionComponentBackfillContext, canonical_control_channel, classify_phase,
     mempool_ready_channel, open_primary_materialized_view_store, run_canonical_writer_with_control,
@@ -301,14 +302,21 @@ async fn run_ingest(
         .await
         .map_err(IngestError::from)?;
     check_schema_phase.complete();
-    let node_composition = IngestNodeComposition::new(Arc::new(source.clone()))?;
-    let advertised_capabilities = node_composition.advertised_capabilities();
-    let endpoint_network = node_composition.network();
+    let ingest_control_listener = match command_config.ingest_control_listen_addr {
+        Some(listen_addr) => {
+            let node = IngestControlNodeComposition::new(Arc::new(source.clone()))?;
+            let listener = bind_ingest_control_listener(listen_addr).await?;
+            Some(IngestControlListenerComposition { listener, node })
+        }
+        None => None,
+    };
+    let advertised_capabilities =
+        ingest_control_advertised_capabilities(ingest_control_listener.as_ref());
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::Ingest,
         command_config.ops_listen_addr,
         env!("CARGO_PKG_VERSION"),
-        encode_zinder_native_chain_name(endpoint_network),
+        encode_zinder_native_chain_name(command_config.runtime_config.node.network),
         readiness.clone(),
         Arc::clone(&advertised_capabilities),
     )
@@ -355,7 +363,7 @@ async fn run_ingest(
         &command_config,
         &source,
         &readiness,
-        node_composition,
+        ingest_control_listener,
         &worker_cancel,
         &mut writer_config,
     );
@@ -386,6 +394,31 @@ async fn run_ingest(
 
 type CanonicalControlServer = JoinHandle<Result<(), tonic::transport::Error>>;
 
+struct IngestControlListenerComposition {
+    listener: TcpListener,
+    node: IngestControlNodeComposition,
+}
+
+async fn bind_ingest_control_listener(
+    listen_addr: SocketAddr,
+) -> Result<TcpListener, IngestConfigError> {
+    TcpListener::bind(listen_addr)
+        .await
+        .map_err(|source| IngestConfigError::IngestControlBind {
+            listen_addr,
+            source,
+        })
+}
+
+fn ingest_control_advertised_capabilities(
+    composition: Option<&IngestControlListenerComposition>,
+) -> Arc<[&'static str]> {
+    composition.map_or_else(
+        || Arc::<[&'static str]>::from([]),
+        |composition| composition.node.advertised_capabilities(),
+    )
+}
+
 struct CanonicalControlTasks {
     server: Option<CanonicalControlServer>,
     commands: Option<mpsc::Receiver<CanonicalControlCommand>>,
@@ -403,11 +436,11 @@ fn spawn_canonical_control_tasks(
     command_config: &IngestCommandConfig,
     source: &ZebraJsonRpcSource,
     readiness: &Readiness,
-    node_composition: IngestNodeComposition,
+    listener_composition: Option<IngestControlListenerComposition>,
     cancel: &CancellationToken,
     writer_config: &mut CanonicalWriterConfig,
 ) -> CanonicalControlTasks {
-    if let Some(listen_addr) = command_config.ingest_control_listen_addr {
+    if let Some(IngestControlListenerComposition { listener, node }) = listener_composition {
         let (canonical_control_handle, canonical_control_commands) = canonical_control_channel();
         let mempool = command_config.runtime_config.mempool;
         let mempool_owner =
@@ -457,7 +490,7 @@ fn spawn_canonical_control_tasks(
         let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
             canonical_control_handle,
             mempool_owner,
-            node_composition,
+            node,
             readiness.clone(),
         )
         .with_bearer_token(command_config.ingest_control_bearer_token.clone());
@@ -466,7 +499,10 @@ fn spawn_canonical_control_tasks(
             tonic::transport::Server::builder()
                 .add_service(canonical_adapter.into_server())
                 .add_service(ingest_adapter.into_server())
-                .serve_with_shutdown(listen_addr, server_cancel.cancelled_owned())
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    server_cancel.cancelled_owned(),
+                )
                 .await
         });
         CanonicalControlTasks {
@@ -750,6 +786,8 @@ async fn run_materialized_view_plane(
     };
     let materialized_view_store = match open_primary_materialized_view_store(
         &spec.storage_path,
+        &canonical,
+        &spec.activations,
         MaterializedViewPreset::Explorer,
         spec.materialized_view_rocksdb_budget,
     ) {
@@ -769,45 +807,82 @@ async fn run_materialized_view_plane(
         &spec.activations,
         &materialized_view_store,
     ) {
-        tracing::warn!(
+        tracing::error!(
             target: "zinder::ingest",
-            event = "materialized_view_backfill_cursor_seed_failed",
+            event = "materialized_view_composition_identity_rejected",
             error = %error,
-            "failed to seed backfill-owned consumer cursors; those consumers replay retained history instead"
+            "materialized-view composition identity admission failed"
         );
+        return;
     }
     let canonical = Arc::new(RwLock::new(canonical));
+    let tailer_context = match MaterializedViewTailer::new(
+        Arc::clone(&canonical),
+        materialized_view_store.clone(),
+        MaterializedViewReplayConfig::DEFAULT,
+        Arc::clone(&spec.activations),
+        spec.chain_event_retention_window,
+        spec.cursor_at_risk_warning,
+    ) {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::error!(
+                target: "zinder::ingest",
+                event = "materialized_view_composition_identity_rejected",
+                error = %error,
+                "materialized-view tailer identity admission failed"
+            );
+            return;
+        }
+    };
+    let conventional_fee_distribution_context =
+        match ConventionalFeeDistributionBackfillContext::new(
+            Arc::clone(&canonical),
+            Arc::clone(&spec.activations),
+            materialized_view_store.clone(),
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::error!(
+                    target: "zinder::ingest",
+                    event = "materialized_view_composition_identity_rejected",
+                    error = %error,
+                    "conventional-fee backfill identity admission failed"
+                );
+                return;
+            }
+        };
+    let transaction_component_context = match TransactionComponentBackfillContext::new(
+        canonical,
+        spec.activations,
+        materialized_view_store,
+    ) {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::error!(
+                target: "zinder::ingest",
+                event = "materialized_view_composition_identity_rejected",
+                error = %error,
+                "transaction-component backfill identity admission failed"
+            );
+            return;
+        }
+    };
     let tailer = spawn_materialized_view_tailer_task(
-        MaterializedViewTailer {
-            canonical: Arc::clone(&canonical),
-            materialized_view_store: materialized_view_store.clone(),
-            config: MaterializedViewReplayConfig::DEFAULT,
-            activations: Arc::clone(&spec.activations),
-            reorg_window_blocks: spec.reorg_policy.reorg_window_blocks(),
-            chain_event_retention_window: spec.chain_event_retention_window,
-            cursor_at_risk_warning: spec.cursor_at_risk_warning,
-        },
+        tailer_context,
         DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
         historical_work_gate.clone(),
         cancel.clone(),
     );
     let conventional_fee_distribution_backfill = spawn_conventional_fee_distribution_backfill_task(
         ConventionalFeeDistributionBackfillConfig::DEFAULT,
-        ConventionalFeeDistributionBackfillContext::new(
-            Arc::clone(&canonical),
-            Arc::clone(&spec.activations),
-            materialized_view_store.clone(),
-        ),
+        conventional_fee_distribution_context,
         historical_work_gate.clone(),
         cancel.clone(),
     );
     let transaction_component_backfill = spawn_transaction_component_backfill_task(
         TransactionComponentBackfillConfig::DEFAULT,
-        TransactionComponentBackfillContext::new(
-            canonical,
-            spec.activations,
-            materialized_view_store,
-        ),
+        transaction_component_context,
         historical_work_gate,
         cancel,
     );
@@ -976,21 +1051,12 @@ async fn ensure_node_capabilities(
         .iter()
         .map(zinder_source::NodeCapability::name)
         .collect();
-    if probed_capabilities.supports(NodeCapability::OpenRpcDiscovery) {
-        tracing::info!(
-            target: "zinder::ingest",
-            event = "node_capabilities_probed",
-            advertised = ?advertised,
-            "node advertised capabilities discovered via rpc.discover"
-        );
-    } else {
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "node_capability_probe_fallback",
-            advertised = ?advertised,
-            "node capability probe used baseline capabilities because rpc.discover was unavailable"
-        );
-    }
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "node_capabilities_probed",
+        advertised = ?advertised,
+        "node advertised capabilities discovered via rpc.discover"
+    );
 
     if let Err(error) = require_ingest_node_capabilities(probed_capabilities) {
         if let zinder_source::SourceError::NodeCapabilityMissing { capability } = &error {
@@ -1263,9 +1329,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CanonicalControlTasks, NodeCapabilities, NodeCapability, ZebraJsonRpcSource,
-        coordinate_canonical_writer_lifecycle, require_ingest_node_capabilities,
-        supervise_canonical_writer,
+        CanonicalControlTasks, NodeCapabilities, NodeCapability, bind_ingest_control_listener,
+        coordinate_canonical_writer_lifecycle, ingest_control_advertised_capabilities,
+        require_ingest_node_capabilities, supervise_canonical_writer,
     };
 
     fn reorg_window_exceeded_writer_result() -> Result<(), zinder_ingest::CanonicalWriterError> {
@@ -1473,12 +1539,39 @@ mod tests {
     }
 
     #[test]
-    fn ingest_capability_validation_accepts_zebra_baseline()
+    fn ingest_capability_validation_accepts_exact_required_set()
     -> Result<(), Box<dyn std::error::Error>> {
-        let capabilities = ZebraJsonRpcSource::baseline_capabilities();
+        let capabilities =
+            NodeCapabilities::new(REQUIRED_INGEST_NODE_CAPABILITIES.iter().copied())?;
 
         require_ingest_node_capabilities(capabilities)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_ingest_control_advertises_no_endpoint_capabilities() {
+        assert!(ingest_control_advertised_capabilities(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn occupied_ingest_control_port_fails_during_listener_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listen_addr = occupied.local_addr()?;
+
+        let error = bind_ingest_control_listener(listen_addr)
+            .await
+            .err()
+            .ok_or("occupied ingest-control listener must fail admission")?;
+
+        assert!(matches!(
+            error,
+            crate::config::IngestConfigError::IngestControlBind {
+                listen_addr: actual,
+                ..
+            } if actual == listen_addr
+        ));
         Ok(())
     }
 

@@ -33,6 +33,7 @@ impl ExplorerEndpointCapabilities {
         materialized_view_store: Option<&MaterializedViewStore>,
         network_upgrade_activations: Option<&zinder_core::NetworkUpgradeActivations>,
         wallet_endpoint: Option<&AdmittedWalletQueryEndpoint>,
+        has_active_transparent_address_ranking_generation: bool,
     ) -> Self {
         let wallet_capabilities =
             wallet_endpoint.map(AdmittedWalletQueryEndpoint::capability_identifiers);
@@ -41,6 +42,7 @@ impl ExplorerEndpointCapabilities {
             materialized_view_store,
             network_upgrade_activations,
             wallet_capabilities,
+            has_active_transparent_address_ranking_generation,
         )
     }
 
@@ -49,19 +51,19 @@ impl ExplorerEndpointCapabilities {
         materialized_view_store: Option<&MaterializedViewStore>,
         network_upgrade_activations: Option<&zinder_core::NetworkUpgradeActivations>,
         wallet_capabilities: Option<&[String]>,
+        has_active_transparent_address_ranking_generation: bool,
     ) -> Self {
+        let composition_evidence = ExplorerCompositionEvidence {
+            has_canonical_store,
+            materialized_view_store,
+            network_upgrade_activations,
+            wallet_capabilities,
+            has_active_transparent_address_ranking_generation,
+        };
         let structurally_supported = capabilities_for_surface(CapabilitySurface::Explorer)
             .filter(|spec| {
-                capability_requirements(spec.string, has_canonical_store).is_some_and(
-                    |requirements| {
-                        requirements.satisfied_by(
-                            has_canonical_store,
-                            materialized_view_store,
-                            network_upgrade_activations,
-                            wallet_capabilities,
-                        )
-                    },
-                )
+                capability_requirements(spec.string, has_canonical_store)
+                    .is_some_and(|requirements| requirements.satisfied_by(&composition_evidence))
             })
             .map(|spec| spec.string)
             .collect::<Vec<_>>();
@@ -77,12 +79,21 @@ impl ExplorerEndpointCapabilities {
     }
 }
 
+struct ExplorerCompositionEvidence<'a> {
+    has_canonical_store: bool,
+    materialized_view_store: Option<&'a MaterializedViewStore>,
+    network_upgrade_activations: Option<&'a zinder_core::NetworkUpgradeActivations>,
+    wallet_capabilities: Option<&'a [String]>,
+    has_active_transparent_address_ranking_generation: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExplorerCapabilityRequirements {
     requires_canonical_store: bool,
     consumers: &'static [MaterializedViewConsumerName],
     activation_evidence: ActivationEvidence,
     wallet_all_of: &'static [&'static str],
+    requires_active_transparent_address_ranking_generation: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,30 +104,30 @@ enum ActivationEvidence {
 }
 
 impl ExplorerCapabilityRequirements {
-    fn satisfied_by(
-        self,
-        has_canonical_store: bool,
-        materialized_view_store: Option<&MaterializedViewStore>,
-        network_upgrade_activations: Option<&zinder_core::NetworkUpgradeActivations>,
-        wallet_capabilities: Option<&[String]>,
-    ) -> bool {
-        (!self.requires_canonical_store || has_canonical_store)
+    fn satisfied_by(self, evidence: &ExplorerCompositionEvidence<'_>) -> bool {
+        (!self.requires_canonical_store || evidence.has_canonical_store)
             && (self.consumers.is_empty()
-                || materialized_view_store.is_some_and(|store| {
+                || evidence.materialized_view_store.is_some_and(|store| {
                     self.consumers
                         .iter()
                         .all(|consumer| store.has_consumer(*consumer))
                 }))
             && match self.activation_evidence {
                 ActivationEvidence::None => true,
-                ActivationEvidence::ActivationTable => network_upgrade_activations.is_some(),
+                ActivationEvidence::ActivationTable => {
+                    evidence.network_upgrade_activations.is_some()
+                }
                 ActivationEvidence::Sapling => {
-                    network_upgrade_activations.is_some_and(|activations| {
-                        activations.activation_height_by_name("Sapling").is_some()
-                    })
+                    evidence
+                        .network_upgrade_activations
+                        .is_some_and(|activations| {
+                            activations.activation_height_by_name("Sapling").is_some()
+                        })
                 }
             }
-            && has_all_wallet_capabilities(wallet_capabilities, self.wallet_all_of)
+            && has_all_wallet_capabilities(evidence.wallet_capabilities, self.wallet_all_of)
+            && (!self.requires_active_transparent_address_ranking_generation
+                || evidence.has_active_transparent_address_ranking_generation)
     }
 }
 
@@ -131,17 +142,18 @@ fn capability_requirements(
     use capabilities::{
         EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_DETAIL_V1,
         EXPLORER_BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
-        EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1, EXPLORER_BLOCK_TRANSACTIONS_V2,
-        EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1, EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1,
-        EXPLORER_CHAIN_REORG_HISTORY_V1, EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1,
-        EXPLORER_COMMITMENT_ROOT_SEARCH_V1, EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1,
-        EXPLORER_FEE_SUMMARY_V1, EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
-        EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MIGRATION_COHORTS_V1,
+        EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1, EXPLORER_BLOCK_SUMMARY_V2,
+        EXPLORER_BLOCK_TRANSACTIONS_V2, EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1,
+        EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1, EXPLORER_CHAIN_REORG_HISTORY_V1,
+        EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1, EXPLORER_COMMITMENT_ROOT_SEARCH_V1,
+        EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1, EXPLORER_FEE_SUMMARY_V1,
+        EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
+        EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MEMPOOL_SUMMARY_V2, EXPLORER_MIGRATION_COHORTS_V1,
         EXPLORER_MIGRATION_DENOMINATIONS_V1, EXPLORER_MIGRATION_OVERVIEW_V1,
-        EXPLORER_NETWORK_UPGRADE_STATUS_V1, EXPLORER_PAID_FEE_DISTRIBUTION_V1, EXPLORER_SEARCH_V1,
-        EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2,
-        EXPLORER_TRANSACTION_DETAIL_V4, EXPLORER_TRANSACTION_FEES_V1,
-        EXPLORER_TRANSACTION_HISTORY_V1, EXPLORER_TRANSACTION_HISTORY_V2,
+        EXPLORER_NETWORK_UPGRADE_STATUS_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1,
+        EXPLORER_PAID_FEE_DISTRIBUTION_V1, EXPLORER_SEARCH_V1, EXPLORER_SERVER_INFO_V1,
+        EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2, EXPLORER_TRANSACTION_DETAIL_V4,
+        EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSACTION_HISTORY_V2,
         EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1, EXPLORER_TRANSACTION_RECENT_V1,
         EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2, EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
         EXPLORER_UTXO_SET_COMMITMENT_V1, EXPLORER_UTXO_SET_SUMMARY_V1,
@@ -173,6 +185,7 @@ fn capability_requirements(
             | EXPLORER_SEARCH_V1
             | EXPLORER_MEMPOOL_SNAPSHOT_V1
             | EXPLORER_MEMPOOL_ACTIVITY_V1
+            | EXPLORER_MEMPOOL_SUMMARY_V2
             | EXPLORER_VALUE_POOL_SUMMARY_V1
             | EXPLORER_NETWORK_UPGRADE_STATUS_V1
             | EXPLORER_UTXO_SET_SUMMARY_V1
@@ -205,7 +218,16 @@ fn capability_requirements(
             ),
             EXPLORER_BLOCK_DETAIL_V1
             | EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1
-            | EXPLORER_FEE_SUMMARY_V1 => (false, &[BLOCK_SUMMARY_CONSUMER_NAME]),
+            | EXPLORER_FEE_SUMMARY_V1
+            | EXPLORER_BLOCK_SUMMARY_V2 => (false, &[BLOCK_SUMMARY_CONSUMER_NAME]),
+            EXPLORER_OVERVIEW_SNAPSHOT_V1 => (
+                false,
+                &[
+                    BLOCK_SUMMARY_CONSUMER_NAME,
+                    TRANSACTION_HISTORY_CONSUMER_NAME,
+                    MEMPOOL_EVENT_COUNTS_CONSUMER_NAME,
+                ],
+            ),
             EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2 => (
                 false,
                 &[
@@ -236,9 +258,7 @@ fn capability_requirements(
             EXPLORER_MEMPOOL_EVENT_COUNTS_V1 => (false, &[MEMPOOL_EVENT_COUNTS_CONSUMER_NAME]),
             EXPLORER_TRANSACTION_FEES_V1 => (false, &[TRANSACTION_FEES_CONSUMER_NAME]),
             EXPLORER_TRANSACTION_RECENT_V1 => (false, &[RECENT_TRANSACTIONS_CONSUMER_NAME]),
-            EXPLORER_TRANSACTION_HISTORY_V1 | EXPLORER_TRANSACTION_HISTORY_V2 => {
-                (false, &[TRANSACTION_HISTORY_CONSUMER_NAME])
-            }
+            EXPLORER_TRANSACTION_HISTORY_V2 => (false, &[TRANSACTION_HISTORY_CONSUMER_NAME]),
             EXPLORER_MIGRATION_OVERVIEW_V1
             | EXPLORER_MIGRATION_COHORTS_V1
             | EXPLORER_MIGRATION_DENOMINATIONS_V1 => (false, &[IRONWOOD_MIGRATION_CONSUMER_NAME]),
@@ -274,6 +294,12 @@ fn capability_requirements(
         EXPLORER_MEMPOOL_SNAPSHOT_V1 | EXPLORER_MEMPOOL_ACTIVITY_V1 => {
             &[WALLET_SNAPSHOT_MEMPOOL_V3]
         }
+        EXPLORER_MEMPOOL_SUMMARY_V2 => &[WALLET_SNAPSHOT_MEMPOOL_V3],
+        EXPLORER_OVERVIEW_SNAPSHOT_V1 => &[
+            WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+            WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+        ],
         EXPLORER_VALUE_POOL_SUMMARY_V1 => &[WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1],
         EXPLORER_UTXO_SET_SUMMARY_V1 => &[WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1],
         EXPLORER_UTXO_SET_COMMITMENT_V1 => &[
@@ -287,7 +313,8 @@ fn capability_requirements(
                 &[WALLET_READ_VISIBLE_TIP_BLOCK_V1]
             }
         }
-        EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1
+        EXPLORER_BLOCK_SUMMARY_V2
+        | EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1
         | EXPLORER_FEE_SUMMARY_V1
         | EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1
         | EXPLORER_PAID_FEE_DISTRIBUTION_V1
@@ -302,7 +329,6 @@ fn capability_requirements(
         | EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1
         | EXPLORER_MEMPOOL_EVENT_COUNTS_V1
         | EXPLORER_TRANSACTION_RECENT_V1
-        | EXPLORER_TRANSACTION_HISTORY_V1
         | EXPLORER_TRANSACTION_HISTORY_V2
         | EXPLORER_MIGRATION_OVERVIEW_V1
         | EXPLORER_MIGRATION_COHORTS_V1
@@ -316,11 +342,16 @@ fn capability_requirements(
         }
         _ => ActivationEvidence::None,
     };
+    let requires_active_transparent_address_ranking_generation = matches!(
+        explorer_capability,
+        EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2 | EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1
+    );
     Some(ExplorerCapabilityRequirements {
         requires_canonical_store,
         consumers,
         activation_evidence,
         wallet_all_of,
+        requires_active_transparent_address_ranking_generation,
     })
 }
 
@@ -339,14 +370,12 @@ fn field_carriers(capability: &str) -> Option<&'static [&'static str]> {
     match capability {
         capabilities::EXPLORER_TRANSACTION_FEES_V1 => Some(&[
             capabilities::EXPLORER_TRANSACTION_DETAIL_V4,
-            capabilities::EXPLORER_TRANSACTION_HISTORY_V1,
             capabilities::EXPLORER_TRANSACTION_HISTORY_V2,
             capabilities::EXPLORER_TRANSACTION_RECENT_V1,
             capabilities::EXPLORER_BLOCK_TRANSACTIONS_V2,
         ]),
         capabilities::EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1 => Some(&[
             capabilities::EXPLORER_TRANSACTION_DETAIL_V4,
-            capabilities::EXPLORER_TRANSACTION_HISTORY_V1,
             capabilities::EXPLORER_TRANSACTION_HISTORY_V2,
         ]),
         capabilities::EXPLORER_BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_V1 => {
@@ -377,9 +406,11 @@ mod tests {
     use tempfile::{TempDir, tempdir};
     use zinder_core::{BlockHash, BlockHeight, ChainEpochId};
     use zinder_materialized_views::{
-        BLOCK_SUMMARY_SCHEMA, MaterializedViewConsumerSchema, MaterializedViewCoverage,
-        MaterializedViewState, MaterializedViewStoreOptions, RECENT_TRANSACTIONS_SCHEMA,
-        TRANSACTION_FEES_SCHEMA, TRANSACTION_HISTORY_CONSUMER_NAME, TRANSACTION_HISTORY_SCHEMA,
+        BLOCK_SUMMARY_CONSUMER_NAME, BLOCK_SUMMARY_SCHEMA, MEMPOOL_EVENT_COUNTS_CONSUMER_NAME,
+        MaterializedViewConsumerSchema, MaterializedViewCoverage, MaterializedViewState,
+        MaterializedViewStoreOptions, RECENT_TRANSACTIONS_SCHEMA, TRANSACTION_FEES_SCHEMA,
+        TRANSACTION_HISTORY_CONSUMER_NAME, TRANSACTION_HISTORY_SCHEMA,
+        TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA, TRANSPARENT_ADDRESS_RANKING_SCHEMA,
         TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
     };
     use zinder_store::RocksDbResourceBudget;
@@ -399,6 +430,7 @@ mod tests {
         let directory = tempdir()?;
         let store = MaterializedViewStore::open(
             directory.path(),
+            zinder_core::Network::ZcashRegtest,
             MaterializedViewStoreOptions {
                 consumers,
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -408,12 +440,8 @@ mod tests {
         Ok((directory, store))
     }
 
-    const UNSERVED_EXPLORER_CAPABILITIES: [&str; 4] = [
-        capabilities::EXPLORER_BLOCK_SUMMARY_V1,
-        capabilities::EXPLORER_MEMPOOL_SUMMARY_V1,
-        capabilities::EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
-        capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1,
-    ];
+    const UNSERVED_EXPLORER_CAPABILITIES: [&str; 1] =
+        [capabilities::EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1];
 
     fn wallet_requirements_satisfied(
         explorer_capability: &str,
@@ -490,6 +518,104 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_endpoint_requirements_are_exact() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            capability_requirements(capabilities::EXPLORER_BLOCK_SUMMARY_V2, false)
+                .ok_or("block-summary contract is not served")?,
+            ExplorerCapabilityRequirements {
+                requires_canonical_store: false,
+                consumers: &[BLOCK_SUMMARY_CONSUMER_NAME],
+                activation_evidence: ActivationEvidence::None,
+                wallet_all_of: &[capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1],
+                requires_active_transparent_address_ranking_generation: false,
+            },
+        );
+        assert_eq!(
+            capability_requirements(capabilities::EXPLORER_MEMPOOL_SUMMARY_V2, false)
+                .ok_or("mempool-summary contract is not served")?,
+            ExplorerCapabilityRequirements {
+                requires_canonical_store: false,
+                consumers: &[],
+                activation_evidence: ActivationEvidence::None,
+                wallet_all_of: &[capabilities::WALLET_SNAPSHOT_MEMPOOL_V3],
+                requires_active_transparent_address_ranking_generation: false,
+            },
+        );
+        assert_eq!(
+            capability_requirements(capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1, false)
+                .ok_or("overview-snapshot contract is not served")?,
+            ExplorerCapabilityRequirements {
+                requires_canonical_store: false,
+                consumers: &[
+                    BLOCK_SUMMARY_CONSUMER_NAME,
+                    TRANSACTION_HISTORY_CONSUMER_NAME,
+                    MEMPOOL_EVENT_COUNTS_CONSUMER_NAME,
+                ],
+                activation_evidence: ActivationEvidence::None,
+                wallet_all_of: &[
+                    capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+                    capabilities::WALLET_SNAPSHOT_MEMPOOL_V3,
+                    capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+                ],
+                requires_active_transparent_address_ranking_generation: false,
+            },
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_endpoint_wallet_requirements_fail_when_any_exact_dependency_is_missing() {
+        let visible_tip = normalized([capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1]);
+        assert!(wallet_requirements_satisfied(
+            capabilities::EXPLORER_BLOCK_SUMMARY_V2,
+            Some(&visible_tip),
+            false,
+        ));
+        assert!(!wallet_requirements_satisfied(
+            capabilities::EXPLORER_BLOCK_SUMMARY_V2,
+            Some(&[]),
+            false,
+        ));
+
+        let mempool = normalized([capabilities::WALLET_SNAPSHOT_MEMPOOL_V3]);
+        assert!(wallet_requirements_satisfied(
+            capabilities::EXPLORER_MEMPOOL_SUMMARY_V2,
+            Some(&mempool),
+            false,
+        ));
+        assert!(!wallet_requirements_satisfied(
+            capabilities::EXPLORER_MEMPOOL_SUMMARY_V2,
+            Some(&visible_tip),
+            false,
+        ));
+
+        let overview_dependencies = [
+            capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+            capabilities::WALLET_SNAPSHOT_MEMPOOL_V3,
+            capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+        ];
+        let complete = normalized(overview_dependencies);
+        assert!(wallet_requirements_satisfied(
+            capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1,
+            Some(&complete),
+            false,
+        ));
+        for missing in overview_dependencies {
+            let incomplete = normalized(
+                overview_dependencies
+                    .iter()
+                    .copied()
+                    .filter(|capability| *capability != missing),
+            );
+            assert!(!wallet_requirements_satisfied(
+                capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1,
+                Some(&incomplete),
+                false,
+            ));
+        }
+    }
+
+    #[test]
     fn transaction_detail_carrier_does_not_add_a_visible_tip_requirement_to_fee_projection()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, store) =
@@ -504,6 +630,7 @@ mod tests {
             Some(&store),
             None,
             Some(&wallet_capabilities),
+            false,
         );
 
         assert!(capabilities.contains(capabilities::EXPLORER_TRANSACTION_DETAIL_V4));
@@ -532,22 +659,56 @@ mod tests {
     }
 
     #[test]
-    fn transaction_history_support_is_structural_for_both_versions()
+    fn ranking_contracts_require_an_active_ranking_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, store) = materialized_view_store(&[
+            TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
+            TRANSPARENT_ADDRESS_RANKING_SCHEMA,
+        ])?;
+        let wallet_capabilities = normalized([capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1]);
+        let inactive = ExplorerEndpointCapabilities::derive_from_composition(
+            false,
+            Some(&store),
+            None,
+            Some(&wallet_capabilities),
+            false,
+        );
+        for capability in [
+            capabilities::EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
+            capabilities::EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
+        ] {
+            assert!(!inactive.contains(capability));
+        }
+
+        let active = ExplorerEndpointCapabilities::derive_from_composition(
+            false,
+            Some(&store),
+            None,
+            Some(&wallet_capabilities),
+            true,
+        );
+        for capability in [
+            capabilities::EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
+            capabilities::EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
+        ] {
+            assert!(active.contains(capability));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_history_support_requires_exact_structural_evidence()
     -> Result<(), Box<dyn std::error::Error>> {
         use zinder_materialized_views::TRANSACTION_HISTORY_CONSUMER_NAME;
 
-        for capability in [
-            capabilities::EXPLORER_TRANSACTION_HISTORY_V1,
-            capabilities::EXPLORER_TRANSACTION_HISTORY_V2,
-        ] {
-            let requirements = capability_requirements(capability, false)
+        let requirements =
+            capability_requirements(capabilities::EXPLORER_TRANSACTION_HISTORY_V2, false)
                 .ok_or("history contract is not served")?;
-            assert_eq!(requirements.consumers, &[TRANSACTION_HISTORY_CONSUMER_NAME]);
-            assert_eq!(
-                requirements.wallet_all_of,
-                &[capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1],
-            );
-        }
+        assert_eq!(requirements.consumers, &[TRANSACTION_HISTORY_CONSUMER_NAME]);
+        assert_eq!(
+            requirements.wallet_all_of,
+            &[capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1],
+        );
         Ok(())
     }
 
@@ -582,7 +743,6 @@ mod tests {
             Some(
                 &[
                     capabilities::EXPLORER_TRANSACTION_DETAIL_V4,
-                    capabilities::EXPLORER_TRANSACTION_HISTORY_V1,
                     capabilities::EXPLORER_TRANSACTION_HISTORY_V2,
                     capabilities::EXPLORER_TRANSACTION_RECENT_V1,
                     capabilities::EXPLORER_BLOCK_TRANSACTIONS_V2,
@@ -594,7 +754,6 @@ mod tests {
             Some(
                 &[
                     capabilities::EXPLORER_TRANSACTION_DETAIL_V4,
-                    capabilities::EXPLORER_TRANSACTION_HISTORY_V1,
                     capabilities::EXPLORER_TRANSACTION_HISTORY_V2,
                 ][..],
             ),
@@ -640,8 +799,8 @@ mod tests {
             Some(&history_store),
             None,
             Some(&wallet_capabilities),
+            false,
         );
-        assert!(history.contains(capabilities::EXPLORER_TRANSACTION_HISTORY_V1));
         assert!(history.contains(capabilities::EXPLORER_TRANSACTION_HISTORY_V2));
         assert!(!history.contains(capabilities::EXPLORER_TRANSACTION_FEES_V1));
         assert!(!history.contains(capabilities::EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1));
@@ -653,6 +812,7 @@ mod tests {
             Some(&recent_store),
             None,
             Some(&wallet_capabilities),
+            false,
         );
         assert!(recent.contains(capabilities::EXPLORER_TRANSACTION_RECENT_V1));
         assert!(!recent.contains(capabilities::EXPLORER_TRANSACTION_FEES_V1));
@@ -669,6 +829,7 @@ mod tests {
             Some(&fees_store),
             None,
             Some(&wallet_capabilities),
+            false,
         );
         assert!(!fees_without_carrier.contains(capabilities::EXPLORER_TRANSACTION_FEES_V1));
 
@@ -679,6 +840,7 @@ mod tests {
             Some(&history_store),
             None,
             Some(&wallet_capabilities),
+            false,
         );
         assert!(history_with_fees.contains(capabilities::EXPLORER_TRANSACTION_FEES_V1));
 
@@ -687,6 +849,7 @@ mod tests {
             Some(&history_store),
             None,
             Some(&wallet_capabilities),
+            false,
         );
         assert!(
             intrinsic_with_history
@@ -708,6 +871,7 @@ mod tests {
             Some(&block_store),
             None,
             Some(&wallet_capabilities),
+            false,
         );
         assert!(block.contains(capabilities::EXPLORER_BLOCK_TRANSACTIONS_V2));
         assert!(block.contains(capabilities::EXPLORER_BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_V1));
@@ -730,6 +894,7 @@ mod tests {
             None,
             None,
             Some(&summary_only),
+            false,
         );
         assert!(base.contains(capabilities::EXPLORER_UTXO_SET_SUMMARY_V1));
         assert!(!base.contains(capabilities::EXPLORER_UTXO_SET_COMMITMENT_V1));
@@ -743,6 +908,7 @@ mod tests {
             None,
             None,
             Some(&summary_with_commitment),
+            false,
         );
         assert!(committed.contains(capabilities::EXPLORER_UTXO_SET_COMMITMENT_V1));
     }
@@ -768,6 +934,7 @@ mod tests {
             Some(&history_store),
             None,
             Some(&wallet_capabilities),
+            false,
         );
         let frozen = capabilities.shared_identifiers();
         assert!(capabilities.contains(capabilities::EXPLORER_TRANSACTION_HISTORY_V2));
@@ -799,6 +966,7 @@ mod tests {
             Some(&history_store),
             None,
             Some(&wallet_capabilities),
+            false,
         );
         assert_eq!(capabilities, rederived);
         Ok(())

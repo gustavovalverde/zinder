@@ -1540,6 +1540,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            zinder_core::Network::ZcashRegtest,
             MaterializedViewStoreOptions {
                 consumers: &[CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),

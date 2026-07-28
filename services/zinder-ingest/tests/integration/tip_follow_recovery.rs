@@ -268,12 +268,13 @@ impl ViewChangingSource {
 
 #[async_trait]
 impl NodeSource for ViewChangingSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        zinder_source::ZebraJsonRpcSource::baseline_capabilities()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-        Some(self.capabilities())
+        NodeCapabilities::new([
+            zinder_source::NodeCapability::BestChainBlocks,
+            zinder_source::NodeCapability::SourceChainSegments,
+            zinder_source::NodeCapability::TipId,
+        ])
+        .ok()
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
@@ -340,12 +341,13 @@ impl ControllableTipSource {
 
 #[async_trait]
 impl NodeSource for ControllableTipSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        zinder_source::ZebraJsonRpcSource::baseline_capabilities()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-        Some(self.capabilities())
+        NodeCapabilities::new([
+            zinder_source::NodeCapability::BestChainBlocks,
+            zinder_source::NodeCapability::SourceChainSegments,
+            zinder_source::NodeCapability::TipId,
+        ])
+        .ok()
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
@@ -396,12 +398,13 @@ impl ProtocolMismatchSource {
 
 #[async_trait]
 impl NodeSource for ProtocolMismatchSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        zinder_source::ZebraJsonRpcSource::baseline_capabilities()
-    }
-
     fn admitted_capabilities(&self) -> Option<NodeCapabilities> {
-        Some(self.capabilities())
+        NodeCapabilities::new([
+            zinder_source::NodeCapability::BestChainBlocks,
+            zinder_source::NodeCapability::SourceChainSegments,
+            zinder_source::NodeCapability::TipId,
+        ])
+        .ok()
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {

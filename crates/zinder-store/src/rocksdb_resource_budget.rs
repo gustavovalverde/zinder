@@ -22,18 +22,22 @@
 
 /// Bounded `RocksDB` resource budget applied to one DB instance at open.
 ///
-/// The fields together cap the resident-memory peak at roughly
+/// For a primary, the fields together cap the resident-memory peak at roughly
 /// `block_cache_bytes + max_wal_bytes + memtable_budget_bytes` regardless of
-/// store size. Each field has a single concrete effect:
+/// store size. A secondary applies the cache and memtable controls but does not
+/// own or apply the primary's WAL ceiling. Each field has a single concrete
+/// effect:
 ///
 /// - `block_cache_bytes` is the size of the bounded LRU cache shared by
 ///   data blocks, index blocks, and bloom filter blocks. Without a bounded
 ///   cache, `RocksDB` pins index and bloom blocks per-SST in resident memory,
 ///   which scales with store size.
-/// - `max_wal_bytes` is the ceiling for the live WAL across all column
-///   families. Crossing it triggers a memtable flush so the WAL truncates.
-///   The default of 0 (`RocksDB`'s own) means "never trigger from WAL size",
-///   which is the bug the OOM-recovery runbook documents.
+/// - `max_wal_bytes` is the primary's ceiling for the live WAL across all
+///   column families. Crossing it triggers a memtable flush so the WAL
+///   truncates. The default of 0 (`RocksDB`'s own) means "never trigger from
+///   WAL size", which is the bug the OOM-recovery runbook documents.
+///   `OpenAsSecondary` replays that WAL but neither applies nor reports this
+///   field as an effective limit.
 /// - `max_open_files` caps the number of `SST` file handles `RocksDB` keeps
 ///   open. The default of -1 (`RocksDB`'s own) means "open every `SST` and
 ///   pin its metadata", which is what makes a mainnet-sized store's
@@ -52,7 +56,10 @@
 pub struct RocksDbResourceBudget {
     /// Bounded LRU cache size for data, index, and filter blocks.
     pub block_cache_bytes: u64,
-    /// Total live WAL size ceiling across all column families.
+    /// Primary-writer live WAL size ceiling across all column families.
+    ///
+    /// Secondary opens retain this field in the uniform budget but do not
+    /// apply it.
     pub max_wal_bytes: u64,
     /// Open `SST` file handle limit. `RocksDB` takes `i32` natively;
     /// negative values mean "unbounded".

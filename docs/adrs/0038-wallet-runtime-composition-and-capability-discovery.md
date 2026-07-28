@@ -81,9 +81,9 @@ one pair before reading. Test and library callers cannot mutate the slot or
 install a replacement that bypasses retention, fence, or source-identity
 admission.
 
-The release query admits one probed `NodeSource` and installs clones of that
-same source as its tree-state and broadcast providers. A
-node-backed capability requires the corresponding probed node feature, the
+The node-backed query admits one `NodeSource` and installs clones of that same
+source as its tree-state and broadcast providers. A node-backed capability
+requires the corresponding admitted node feature, the
 concrete provider, and `TipId`, which is the liveness prerequisite. The release
 composition deliberately omits native transaction lookup and live mempool
 claims until their full handler semantics and authenticated provider boundary
@@ -147,16 +147,26 @@ those inputs is not published.
 The same support-versus-readiness rule applies to the other native endpoints
 without introducing a shared runtime-policy framework.
 
-`ExplorerQueryGrpcAdapter::builder` finalizes an explorer endpoint
-asynchronously. When `explorer.wallet_query_endpoint` is configured, startup
+The global native `CONTRACT_REVISION` is 5 for this single aggregate,
+unpublished cutover from main revision 4. The exact Explorer block-summary and
+mempool-summary contracts are part of that cutover, so their capability
+identifier changes do not advance the aggregate marker to 6.
+
+`ExplorerQueryEndpointComposition` is the shared operator-built binary
+composition root used by both the binary and its production-shaped contract
+proof. It finalizes an explorer endpoint asynchronously. When
+`explorer.wallet_query_endpoint` is configured, startup
 connects through the shared authenticated transport and calls
 `WalletQuery.ServerInfo` before either the explorer gRPC listener or its
 operational endpoint is bound. Admission verifies the configured network,
-minimum contract revision, the wallet discovery capability, and well-formed
-capability identifiers. Authentication failures, unreachable endpoints, and
-the bounded admission timeout are process-start failures. The finalized
-adapter retains the admitted channel and normalized capability strings; it
-does not reconnect lazily to decide support.
+the Explorer-owned minimum Wallet contract revision, the wallet discovery
+capability, and well-formed capability identifiers. That dependency minimum is
+not derived from the global revision of the Explorer endpoint, so an
+Explorer-only protocol change cannot impose incidental Wallet lockstep.
+Authentication failures, unreachable endpoints, and the bounded admission
+timeout are process-start failures. The finalized adapter retains the admitted
+channel, expected network, and normalized capability strings; it does not
+reconnect lazily to decide support.
 
 Explorer support is derived from the concrete composition:
 
@@ -164,25 +174,90 @@ Explorer support is derived from the concrete composition:
 - presence of the admitted canonical secondary where a method reads canonical
   artifacts;
 - an admitted network-upgrade table, including Sapling evidence for
-  commitment-root search; and
-- all required capabilities advertised by the admitted wallet endpoint.
+  commitment-root search;
+- all required capabilities advertised by the admitted wallet endpoint; and
+- durable active transparent-address ranking metadata for the ranking and
+  confirmed-address-activity methods.
 
 Configuring `[node]` makes activation discovery a startup requirement. An
 unconfigured node deliberately omits activation-dependent explorer methods; a
 configured node that cannot be reached or does not report Sapling fails
 startup. Materialization progress, coverage, replica lag, and the current
 chain epoch remain request outcomes and freshness data, never capability
-inputs. Field capabilities are retained only alongside an admitted carrier
-method and are checked again where the optional field is emitted.
+inputs. Active ranking-generation existence is structural evidence, not a
+coverage claim: an absent generation omits both dependent methods, while a
+metadata read or decode error fails composition. Once admitted, ranking
+coverage remains a request outcome and freshness data. Ranking health and
+readiness ownership are deferred to the provider slice that activates an
+operator-selected generation. Field capabilities are retained only alongside an
+admitted carrier method and are checked again where the optional field is
+emitted.
+
+Five explorer contracts have additional exact composition rules:
+
+- `explorer.block.summary_v2` requires the block-summary consumer and
+  `wallet.read.visible_tip_block_v1`;
+- `explorer.mempool.summary_v2` requires
+  `wallet.snapshot.mempool_v3`;
+- `explorer.overview.snapshot_v1` requires the block-summary,
+  transaction-history, and mempool-event-count consumers plus wallet
+  visible-tip, mempool-snapshot, and chain-value-pool capabilities;
+- `explorer.transparent_address.ranking_v1` requires the ranking consumer, an
+  active durable ranking generation, and wallet visible-tip;
+- `explorer.transparent_address.activity_v2` requires the activity and ranking
+  consumers, that same active generation, and either a canonical epoch source
+  or wallet visible-tip.
+
+Block summary derives its request fence from verified materialized-view state,
+not from a caller-selected epoch. Mempool summary performs a bounded complete
+page walk under one exact epoch, source tip, and event-resume cursor, followed
+by an empty-cursor head probe that must retain that identity. Overview is
+all-or-nothing: block summary and transaction history share one exact state and
+coverage, wallet observations match that state, and every materialized field
+comes from one read snapshot. Partial cards and capability-unavailable
+fallbacks are not part of the overview contract.
+
+The exact fences raise the `block_summary` and `transaction_history` consumer
+schemas from version 1 to version 2. This is a fresh-store/replay cutover:
+version-1 Explorer stores fail manifest admission and must be rebuilt. No
+compatibility decoder or in-place migration is retained.
+
+Those strengthened method semantics are advertised as
+`explorer.block.summary_v2` and `explorer.mempool.summary_v2`. Their version-1
+identifiers are removed rather than retained as aliases because the runtime no
+longer serves the older contracts.
 
 `ExplorerEndpointMetadata` contains only descriptive endpoint identity. The
 finalized adapter owns one immutable capability allocation shared verbatim by
 `ExplorerQuery.ServerInfo` and the operational endpoint.
+`materialized_view_preset` remains descriptive workload metadata; exact
+materialized-view identities decide structural support.
+
+The current operator-built binary composition has no ranking-bootstrap
+provider and therefore omits both ranking and confirmed-address activity even
+though the Explorer preset selects their schemas. Tests do not synthesize an
+active generation to broaden the binary contract. A separate provider slice
+must establish the first canonical
+snapshot, activation ownership, operational cutover, and consumer
+certification before those methods can be admitted.
+
+The operator-built explorer binary pre-binds its gRPC listener and completes
+operational listener and metrics admission before spawning any background
+probe or secondary catch-up task. No fallible startup step follows those
+spawns. The gRPC server, operational endpoint, Wallet dependency-health probe,
+optional Zebra observation probe, and materialized-view catch-up task are
+supervised as one process lifetime. The Wallet probe calls `ServerInfo` through
+the already-admitted channel: transport loss, Wallet readiness rejection, a
+response below the minimum revision, a network mismatch, or a change to the
+frozen capabilities drains Explorer readiness. A compatible response restores
+readiness. An unexpected
+task exit marks readiness as shutting down, cancels siblings before draining,
+and preserves the primary failure.
 
 After startup admission, the ingest runtime moves the admitted node source
-into one `IngestNodeComposition`. Construction freezes endpoint capability
+into one `IngestControlNodeComposition`. Construction freezes endpoint capability
 identifiers and the network identity from that same source. A source with no
-network identity or only optimistic pre-probe capability defaults is rejected,
+network identity or no admitted capability evidence is rejected,
 so a caller cannot pair a source with an independently constructed capability
 or endpoint-network claim.
 `ingest.control.chain_value_pools_at_tip_v1`, for example, exists only when
@@ -192,6 +267,14 @@ cloned into `IngestControl.ServerInfo` and the operational endpoint. There is
 no protocol-wide advertise-policy enum and no caller-supplied readiness
 projection.
 
+When `[ingest_control]` is disabled, no control listener or node-owned control
+composition is constructed and the operational endpoint advertises no
+ingest-control capabilities. When enabled, the control listener is pre-bound
+before the operational endpoint and writer tasks start; listener bind failure
+is therefore a typed startup failure rather than a detached, partially serving
+process. The already-admitted listener and node composition are moved into the
+control server task, so serving cannot reopen or substitute either dependency.
+
 `ExplorerQuery.TransactionDetail` has one production transaction-fact path
 regardless of whether the explorer also composes a canonical secondary for
 other methods. It requires `WalletQuery.Transaction` plus retained raw
@@ -199,14 +282,15 @@ transaction bytes, parses those bytes through the shared source parser, and
 uses the exact fee and transparent-spend materialized-view consumers for
 optional joins. The former canonical-facts plus
 `WalletQuery.TransparentSpendsByOutpoint` alternative is removed because no
-release composition used it. A canonical secondary remains an independent
+operator-built binary composition used it. A canonical secondary remains an independent
 field dependency for intrinsic value balances and for other explorer
 methods.
 
 The current release `WalletServingQuery` does not advertise either native
 transaction lookup or transaction-byte capability. Consequently the current
-release explorer omits `explorer.transaction.detail_v4`, even when its wallet
-store retains transaction blobs and the explorer has a canonical secondary.
+operator-built explorer binary composition omits
+`explorer.transaction.detail_v4`, even when its wallet store retains
+transaction blobs and the explorer has a canonical secondary.
 A direct call returns `UNIMPLEMENTED` before request parsing or dependency
 access. This is an intentional structural omission until a real native
 production composition owns both required capabilities; tests must not create
@@ -240,7 +324,7 @@ evidence but are not downstream certification.
 
 - Operators configure storage retention and dependency endpoints, not an
   implementation profile or a set of overlapping support flags.
-- Invalid capability claims become unconstructable at the release composition
+- Invalid capability claims become unconstructable at the binary composition
   root, and missing structural requirements fail before traffic is accepted.
 - Full-block service has explicit disk, ingestion, secondary catch-up, and
   migration cost.
