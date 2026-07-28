@@ -433,7 +433,11 @@ Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-s
 The explorer plane fails independently from canonical state.
 
 - An explorer service crash does not stop `zinder-ingest`. Ingest continues writing canonical artifacts and ChainEvents.
-- An explorer service crash does not stop a separately deployed native `WalletQuery` adapter. Its wallet primitives, including `WalletQuery.TransparentAddressBalance`, remain independent of explorer state: the balance reads the canonical unspent-output index and overlays live mempool data through the configured `IngestControl` endpoint.
+- An explorer service crash does not stop a separately deployed native
+  `WalletQuery` adapter. Its admitted wallet primitives remain independent of
+  explorer state. The current release adapter omits
+  `WalletQuery.TransparentAddressBalance`; P2b must supply a coherent
+  canonical-and-mempool snapshot before Explorer can depend on that primitive.
 - An explorer materialized view becoming inconsistent does not corrupt canonical state. Operators drop the materialized-view store and rebuild from retained canonical events. When the materialized-view store is absent, `zinder-explorer` starts with materialized-view-backed capabilities omitted.
 - Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
 

@@ -362,7 +362,8 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::StorageUnavailable
         | ErrorReason::UnsupportedWalletEncoding
         | ErrorReason::NoVisibleChainEpoch
-        | ErrorReason::UpstreamUnreachable => RetryPolicy::RetryWithBackoff,
+        | ErrorReason::UpstreamUnreachable
+        | ErrorReason::ServiceNotReady => RetryPolicy::RetryWithBackoff,
         ErrorReason::Unknown(_) => retry_policy_for_status(code),
     }
 }

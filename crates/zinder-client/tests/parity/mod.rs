@@ -21,8 +21,8 @@ use zinder_client::{
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd;
 use zinder_query::{
-    CanonicalReader, WalletEndpointMetadata, WalletProjectionReader, WalletQueryGrpcAdapter,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, CanonicalReader, WalletEndpointMetadata, WalletProjectionReader,
+    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceTreeState,
@@ -30,8 +30,8 @@ use zinder_source::{
 };
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, WalletServingStoreFixture,
-    sample_regtest_upgrade_activations,
+    ChainFixture, FixtureTransactionRows, IngestControlFixture, MockTransactionBroadcaster,
+    WalletServingStoreFixture, sample_regtest_upgrade_activations,
 };
 
 const PARITY_TREE_STATE_PAYLOAD: &[u8] =
@@ -248,14 +248,26 @@ async fn open_remote_chain_index(chain_fixture: &ChainFixture) -> eyre::Result<R
         Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
-    let wallet_query =
-        WalletServingQuery::from_probed_node_source(serving_pair_slot, node_source, activations)?;
+    let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let admitted_ingest_control = AdmittedIngestControl::connect(
+        ingest_control_fixture.endpoint(),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_sources(
+        serving_pair_slot,
+        node_source,
+        admitted_ingest_control,
+        activations,
+    )?;
     let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let incoming = TcpListenerStream::new(listener);
     tokio::spawn(async move {
         let _store_fixture = store_fixture;
+        let _ingest_control_fixture = ingest_control_fixture;
         let _server_result = Server::builder()
             .add_service(adapter.into_server())
             .serve_with_incoming(incoming)

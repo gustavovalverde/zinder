@@ -9,7 +9,7 @@ use std::{collections::HashSet, fmt, num::NonZeroU32, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{OnceCell, mpsc};
 use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
@@ -32,6 +32,7 @@ use zinder_proto::capabilities::{
     WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
     WALLET_READ_TRANSPARENT_SPENDS_V1,
 };
+use zinder_runtime::AuthenticatedChannel;
 use zinder_source::{SourceError, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
     AddressOutputIndexPageRequest, ArtifactFamily, BlockHashLookup, ChainEpochReadApi,
@@ -41,6 +42,7 @@ use zinder_store::{
 };
 
 mod grpc;
+mod ingest_control;
 mod native_wallet_endpoint_capabilities;
 mod wallet_serving_pair;
 mod wallet_serving_pair_publisher;
@@ -60,6 +62,7 @@ pub use grpc::{
     transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
     visible_tip_block_response,
 };
+pub use ingest_control::{AdmittedIngestControl, IngestControlAdmissionError};
 pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
 };
@@ -69,7 +72,7 @@ pub use wallet_serving_pair::{
 pub use wallet_serving_pair_publisher::{
     WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
     WalletServingPairPublisher, WalletServingPairSlot, WalletServingReadiness,
-    spawn_wallet_node_readiness_probe,
+    spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
 };
 pub use wallet_serving_query::WalletServingQuery;
 /// Wallet-facing read API backed by epoch-bound canonical reads.
@@ -353,6 +356,10 @@ pub struct WalletQuery<ReadApi, Broadcaster = ()> {
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     tree_state_upstream: Option<Arc<dyn TreeStateUpstream>>,
     native_endpoint_capabilities: NativeWalletEndpointCapabilities,
+    // Temporary primary-store test compositions may defer this fixture
+    // connection. Release composition admits `AdmittedIngestControl` first.
+    legacy_ingest_control_proxy_endpoint: Option<String>,
+    legacy_ingest_control_channel: Arc<OnceCell<AuthenticatedChannel>>,
 }
 
 impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
@@ -375,6 +382,14 @@ impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
             .field(
                 "native_endpoint_capabilities",
                 &self.native_endpoint_capabilities,
+            )
+            .field(
+                "legacy_ingest_control_proxy_configured",
+                &self.legacy_ingest_control_proxy_endpoint.is_some(),
+            )
+            .field(
+                "legacy_ingest_control_channel_initialized",
+                &self.legacy_ingest_control_channel.get().is_some(),
             )
             .finish()
     }
@@ -468,6 +483,8 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
             tree_state_upstream: None,
             native_endpoint_capabilities:
                 NativeWalletEndpointCapabilities::for_chain_epoch_read_api(),
+            legacy_ingest_control_proxy_endpoint: None,
+            legacy_ingest_control_channel: Arc::new(OnceCell::new()),
         }
     }
 

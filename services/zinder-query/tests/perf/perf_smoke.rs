@@ -90,9 +90,12 @@ async fn full_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Resu
         Arc::new(canonical),
         Arc::new(wallet),
     )?);
-    let wallet_query = WalletServingQuery::from_serving_pair_slot(
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
         (),
+        ingest_control,
         activations,
     );
 

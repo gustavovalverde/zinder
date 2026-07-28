@@ -187,6 +187,7 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         WireErrorReason::ExplorerPreconditionUnsatisfied,
         WireErrorReason::DependencyNotConfigured,
         WireErrorReason::UpstreamUnreachable,
+        WireErrorReason::ServiceNotReady,
     ];
 
     for reason in reasons {

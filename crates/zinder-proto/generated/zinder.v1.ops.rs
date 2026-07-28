@@ -237,6 +237,9 @@ pub enum ReadinessCause {
     /// `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
     /// See ADR-0015.
     UpstreamNotReady = 16,
+    /// The authenticated ingest-control channel or one of its required live
+    /// health RPCs is temporarily unavailable.
+    IngestControlUnavailable = 17,
 }
 impl ReadinessCause {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -259,6 +262,9 @@ impl ReadinessCause {
             Self::CursorAtRisk => "READINESS_CAUSE_CURSOR_AT_RISK",
             Self::ShuttingDown => "READINESS_CAUSE_SHUTTING_DOWN",
             Self::UpstreamNotReady => "READINESS_CAUSE_UPSTREAM_NOT_READY",
+            Self::IngestControlUnavailable => {
+                "READINESS_CAUSE_INGEST_CONTROL_UNAVAILABLE"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -282,6 +288,9 @@ impl ReadinessCause {
             "READINESS_CAUSE_CURSOR_AT_RISK" => Some(Self::CursorAtRisk),
             "READINESS_CAUSE_SHUTTING_DOWN" => Some(Self::ShuttingDown),
             "READINESS_CAUSE_UPSTREAM_NOT_READY" => Some(Self::UpstreamNotReady),
+            "READINESS_CAUSE_INGEST_CONTROL_UNAVAILABLE" => {
+                Some(Self::IngestControlUnavailable)
+            }
             _ => None,
         }
     }
@@ -364,6 +373,11 @@ pub enum ErrorReason {
     /// A configured federated endpoint is temporarily unreachable (cold start,
     /// restart, or transient network fault). Retrying with backoff clears it.
     UpstreamUnreachable = 42,
+    /// UNAVAILABLE family.
+    /// The process is alive but its shared readiness gate is closed. ErrorInfo
+    /// metadata carries the stable `readiness_cause` label; `/readyz` carries
+    /// any structured cause detail.
+    ServiceNotReady = 50,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -421,6 +435,7 @@ impl ErrorReason {
             Self::ExplorerMethodDisabled => "EXPLORER_METHOD_DISABLED",
             Self::DependencyNotConfigured => "DEPENDENCY_NOT_CONFIGURED",
             Self::UpstreamUnreachable => "UPSTREAM_UNREACHABLE",
+            Self::ServiceNotReady => "SERVICE_NOT_READY",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -481,6 +496,7 @@ impl ErrorReason {
             "EXPLORER_METHOD_DISABLED" => Some(Self::ExplorerMethodDisabled),
             "DEPENDENCY_NOT_CONFIGURED" => Some(Self::DependencyNotConfigured),
             "UPSTREAM_UNREACHABLE" => Some(Self::UpstreamUnreachable),
+            "SERVICE_NOT_READY" => Some(Self::ServiceNotReady),
             _ => None,
         }
     }

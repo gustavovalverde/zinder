@@ -106,4 +106,10 @@ enum ErrorReason {
   // restart, or transient network fault). Retrying with backoff clears it.
   UPSTREAM_UNREACHABLE = 42;
 
+  // UNAVAILABLE family.
+  // The process is alive but its shared readiness gate is closed. ErrorInfo
+  // metadata carries the stable `readiness_cause` label; `/readyz` carries
+  // any structured cause detail.
+  SERVICE_NOT_READY = 50;
+
 }

@@ -158,10 +158,10 @@ pub const WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
 pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transparent_history_v1";
 /// Capability advertised for `WalletQuery.TransparentAddressBalance`.
 ///
-/// The confirmed total is summed in-process from the wallet projection's
-/// unspent-output index. A native runtime advertises this only when that
-/// concrete projection is admitted; compatibility adapters own their
-/// independent support decision.
+/// The endpoint must prove the complete balance semantics implemented by its
+/// adapter. A wallet projection alone does not admit a native composite that
+/// also reads live mempool state; compatibility adapters own their independent
+/// support decision.
 pub const WALLET_ADDRESS_TRANSPARENT_BALANCE_V1: &str = "wallet.address.transparent_balance_v1";
 /// Capability advertised for `ExplorerQuery.ServerInfo`.
 pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";

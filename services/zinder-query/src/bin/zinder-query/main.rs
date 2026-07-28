@@ -6,8 +6,9 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_query::{
-    WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairConfig,
-    WalletServingPairPublisher, WalletServingQuery, WalletServingReadiness,
+    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
+    WalletServingPairConfig, WalletServingPairPublisher, WalletServingQuery,
+    WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
     spawn_wallet_node_readiness_probe,
 };
 use zinder_runtime::{
@@ -133,8 +134,25 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     }
 
     let readiness = Readiness::default();
-    let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
-    let start_api_phase = StartupPhase::StartApi.start();
+    let serving_readiness =
+        WalletServingReadiness::awaiting_node_and_ingest_control(readiness.clone());
+    let admit_ingest_control_phase = StartupPhase::AdmitIngestControl.start();
+    let ingest_control = match AdmittedIngestControl::connect(
+        &query_config.ingest_control_addr,
+        query_config.ingest_control_bearer_token.as_ref(),
+        query_config.network,
+    )
+    .await
+    {
+        Ok(ingest_control) => {
+            admit_ingest_control_phase.complete();
+            ingest_control
+        }
+        Err(error) => {
+            admit_ingest_control_phase.fail(&error);
+            return Err(error.into());
+        }
+    };
     let connect_node_phase = StartupPhase::ConnectNode.start();
     let source = ZebraJsonRpcSource::with_options(
         query_config.node.network,
@@ -159,30 +177,30 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     connect_node_phase.complete();
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let (pair_publisher, pair_slot) = WalletServingPairPublisher::bootstrap(
-        WalletServingPairConfig {
-            canonical_primary_path: query_config.storage.path.clone(),
-            canonical_secondary_root: query_config.storage.secondary_path.clone(),
-            wallet_primary_path: query_config.wallet_primary_path.clone(),
-            wallet_secondary_root: query_config.wallet_secondary_root.clone(),
-            network: query_config.network,
-            network_upgrade_activations: Arc::clone(&network_upgrade_activations),
-            expected_raw_blob_retention: query_config.storage.expected_raw_blob_retention,
-            canonical_reorg_policy: query_config.canonical_reorg_policy,
-            canonical_resource_budget: query_config.storage.canonical_rocksdb_budget,
-            wallet_resource_budget: query_config.wallet_rocksdb_budget,
-            catchup_interval: query_config.storage.secondary_catchup_interval,
-            convergence_timeout: query_config.storage.initial_catchup_timeout,
-            convergence_attempts: query_config.pair_convergence_attempts,
-            replica_lag_threshold_chain_epochs: query_config
-                .storage
-                .secondary_replica_lag_threshold_chain_epochs,
-        },
-        serving_readiness.clone(),
-        &query_config.ingest_control_addr,
-        query_config.ingest_control_bearer_token.as_ref(),
-    )
-    .await?;
+    let (pair_publisher, pair_slot) =
+        WalletServingPairPublisher::bootstrap_with_admitted_ingest_control(
+            WalletServingPairConfig {
+                canonical_primary_path: query_config.storage.path.clone(),
+                canonical_secondary_root: query_config.storage.secondary_path.clone(),
+                wallet_primary_path: query_config.wallet_primary_path.clone(),
+                wallet_secondary_root: query_config.wallet_secondary_root.clone(),
+                network: query_config.network,
+                network_upgrade_activations: Arc::clone(&network_upgrade_activations),
+                expected_raw_blob_retention: query_config.storage.expected_raw_blob_retention,
+                canonical_reorg_policy: query_config.canonical_reorg_policy,
+                canonical_resource_budget: query_config.storage.canonical_rocksdb_budget,
+                wallet_resource_budget: query_config.wallet_rocksdb_budget,
+                catchup_interval: query_config.storage.secondary_catchup_interval,
+                convergence_timeout: query_config.storage.initial_catchup_timeout,
+                convergence_attempts: query_config.pair_convergence_attempts,
+                replica_lag_threshold_chain_epochs: query_config
+                    .storage
+                    .secondary_replica_lag_threshold_chain_epochs,
+            },
+            serving_readiness.clone(),
+            &ingest_control,
+        )
+        .await?;
     let visible_height = pair_slot
         .capture()
         .canonical_fence()
@@ -191,9 +209,10 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         .value();
     open_storage_phase.complete();
 
-    let query = WalletServingQuery::from_probed_node_source(
+    let query = WalletServingQuery::from_admitted_native_sources(
         pair_slot,
         source.clone(),
+        ingest_control.clone(),
         Arc::clone(&network_upgrade_activations),
     )?;
     let endpoint_metadata = WalletEndpointMetadata {
@@ -206,6 +225,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     };
     let native_endpoint_capabilities = query.native_endpoint_capabilities().clone();
     let advertised_capabilities = native_endpoint_capabilities.shared_identifiers();
+    let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::Query,
         query_config.ops_listen_addr,
@@ -232,6 +252,15 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         ),
         cancel.clone(),
     )?;
+    // Health and serving-pair refresh observe the same ingest control plane, so
+    // they intentionally share one configured freshness cadence.
+    let ingest_control_health_poll_interval = query_config.storage.secondary_catchup_interval;
+    let ingest_control_readiness_handle = spawn_wallet_ingest_control_readiness_probe(
+        ingest_control,
+        serving_readiness.clone(),
+        ingest_control_health_poll_interval,
+        cancel.clone(),
+    );
     let publisher_handle = pair_publisher.spawn(cancel.clone());
     let traffic_readiness = TrafficReadinessInterceptor::new(readiness.clone());
     let reflection_readiness = TrafficReadinessInterceptor::new(readiness.clone());
@@ -265,6 +294,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         QueryBackgroundTasks {
             serving_pair_publisher: publisher_handle,
             node_readiness_probe: node_readiness_handle,
+            ingest_control_readiness_probe: ingest_control_readiness_handle,
             operations: ops_handle,
         },
     )
@@ -274,6 +304,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
 struct QueryBackgroundTasks {
     serving_pair_publisher: tokio::task::JoinHandle<()>,
     node_readiness_probe: tokio::task::JoinHandle<()>,
+    ingest_control_readiness_probe: tokio::task::JoinHandle<()>,
     operations: Option<OpsEndpointHandle>,
 }
 
@@ -282,9 +313,14 @@ enum QueryRuntimeExit {
     GrpcServer(Result<(), tonic::transport::Error>),
     ServingPairPublisher(Result<(), tokio::task::JoinError>),
     NodeReadinessProbe(Result<(), tokio::task::JoinError>),
+    IngestControlReadinessProbe(Result<(), tokio::task::JoinError>),
     Operations(Result<(), OpsServerError>),
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the explicit match keeps every supervised task's fatal-exit and drain ordering auditable"
+)]
 async fn supervise_query_runtime<Server>(
     server: Server,
     cancel: CancellationToken,
@@ -297,6 +333,7 @@ where
     let QueryBackgroundTasks {
         mut serving_pair_publisher,
         mut node_readiness_probe,
+        mut ingest_control_readiness_probe,
         mut operations,
     } = background_tasks;
     tokio::pin!(server);
@@ -309,6 +346,9 @@ where
         }
         node_probe_outcome = &mut node_readiness_probe => {
             QueryRuntimeExit::NodeReadinessProbe(node_probe_outcome)
+        }
+        ingest_control_probe_outcome = &mut ingest_control_readiness_probe => {
+            QueryRuntimeExit::IngestControlReadinessProbe(ingest_control_probe_outcome)
         }
         operations_outcome = wait_for_operations_exit(&mut operations) => {
             QueryRuntimeExit::Operations(operations_outcome)
@@ -324,12 +364,20 @@ where
             let server_result = server.await;
             require_clean_task_shutdown("serving-pair publisher", serving_pair_publisher.await)?;
             require_clean_task_shutdown("node-readiness probe", node_readiness_probe.await)?;
+            require_clean_task_shutdown(
+                "ingest-control-readiness probe",
+                ingest_control_readiness_probe.await,
+            )?;
             operations_shutdown?;
             server_result.map_err(QueryConfigError::Transport)
         }
         QueryRuntimeExit::GrpcServer(server_result) => {
             require_clean_task_shutdown("serving-pair publisher", serving_pair_publisher.await)?;
             require_clean_task_shutdown("node-readiness probe", node_readiness_probe.await)?;
+            require_clean_task_shutdown(
+                "ingest-control-readiness probe",
+                ingest_control_readiness_probe.await,
+            )?;
             operations_shutdown?;
             server_result.map_err(QueryConfigError::Transport)?;
             Err(QueryConfigError::GrpcServerStopped)
@@ -338,6 +386,10 @@ where
             let task_error = unexpected_task_exit("serving-pair publisher", task_result);
             drain_server_after_runtime_failure(server.await);
             drain_task_after_runtime_failure("node-readiness probe", node_readiness_probe.await);
+            drain_task_after_runtime_failure(
+                "ingest-control-readiness probe",
+                ingest_control_readiness_probe.await,
+            );
             drain_operations_after_runtime_failure(operations_shutdown);
             Err(task_error)
         }
@@ -348,6 +400,21 @@ where
                 "serving-pair publisher",
                 serving_pair_publisher.await,
             );
+            drain_task_after_runtime_failure(
+                "ingest-control-readiness probe",
+                ingest_control_readiness_probe.await,
+            );
+            drain_operations_after_runtime_failure(operations_shutdown);
+            Err(task_error)
+        }
+        QueryRuntimeExit::IngestControlReadinessProbe(task_result) => {
+            let task_error = unexpected_task_exit("ingest-control-readiness probe", task_result);
+            drain_server_after_runtime_failure(server.await);
+            drain_task_after_runtime_failure(
+                "serving-pair publisher",
+                serving_pair_publisher.await,
+            );
+            drain_task_after_runtime_failure("node-readiness probe", node_readiness_probe.await);
             drain_operations_after_runtime_failure(operations_shutdown);
             Err(task_error)
         }
@@ -364,6 +431,10 @@ where
                 serving_pair_publisher.await,
             );
             drain_task_after_runtime_failure("node-readiness probe", node_readiness_probe.await);
+            drain_task_after_runtime_failure(
+                "ingest-control-readiness probe",
+                ingest_control_readiness_probe.await,
+            );
             drain_operations_after_runtime_failure(operations_shutdown);
             Err(task_error)
         }
@@ -492,6 +563,10 @@ mod tests {
         let node_probe = tokio::spawn(async move {
             node_cancel.cancelled().await;
         });
+        let ingest_control_cancel = cancel.clone();
+        let ingest_control_probe = tokio::spawn(async move {
+            ingest_control_cancel.cancelled().await;
+        });
         let server_cancel = cancel.clone();
         let server = async move {
             server_cancel.cancelled().await;
@@ -505,6 +580,7 @@ mod tests {
             QueryBackgroundTasks {
                 serving_pair_publisher: publisher,
                 node_readiness_probe: node_probe,
+                ingest_control_readiness_probe: ingest_control_probe,
                 operations: None,
             },
         )
@@ -536,6 +612,10 @@ mod tests {
         let node_probe = tokio::spawn(async move {
             node_cancel.cancelled().await;
         });
+        let ingest_control_cancel = cancel.clone();
+        let ingest_control_probe = tokio::spawn(async move {
+            ingest_control_cancel.cancelled().await;
+        });
         let server_cancel = cancel.clone();
         let server = async move {
             server_cancel.cancelled().await;
@@ -550,6 +630,7 @@ mod tests {
             QueryBackgroundTasks {
                 serving_pair_publisher: publisher,
                 node_readiness_probe: node_probe,
+                ingest_control_readiness_probe: ingest_control_probe,
                 operations: None,
             },
         )
@@ -574,6 +655,10 @@ mod tests {
         });
         let node_probe = tokio::spawn(future::pending::<()>());
         node_probe.abort();
+        let ingest_control_cancel = cancel.clone();
+        let ingest_control_probe = tokio::spawn(async move {
+            ingest_control_cancel.cancelled().await;
+        });
         let server_cancel = cancel.clone();
         let server = async move {
             server_cancel.cancelled().await;
@@ -587,6 +672,7 @@ mod tests {
             QueryBackgroundTasks {
                 serving_pair_publisher: publisher,
                 node_readiness_probe: node_probe,
+                ingest_control_readiness_probe: ingest_control_probe,
                 operations: None,
             },
         )
@@ -596,6 +682,54 @@ mod tests {
             runtime_outcome,
             Err(QueryConfigError::RuntimeTaskJoin {
                 task: "node-readiness probe",
+                ..
+            })
+        ));
+        assert!(matches!(
+            runtime_readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
+    }
+
+    #[tokio::test]
+    async fn ingest_control_probe_join_failure_is_a_typed_runtime_failure() {
+        let runtime_readiness = Readiness::default();
+        let serving_readiness =
+            WalletServingReadiness::without_node_source(runtime_readiness.clone());
+        let cancel = CancellationToken::new();
+        let publisher_cancel = cancel.clone();
+        let publisher = tokio::spawn(async move {
+            publisher_cancel.cancelled().await;
+        });
+        let node_cancel = cancel.clone();
+        let node_probe = tokio::spawn(async move {
+            node_cancel.cancelled().await;
+        });
+        let ingest_control_probe = tokio::spawn(future::pending::<()>());
+        ingest_control_probe.abort();
+        let server_cancel = cancel.clone();
+        let server = async move {
+            server_cancel.cancelled().await;
+            Ok(())
+        };
+
+        let runtime_outcome = supervise_query_runtime(
+            server,
+            cancel,
+            &serving_readiness,
+            QueryBackgroundTasks {
+                serving_pair_publisher: publisher,
+                node_readiness_probe: node_probe,
+                ingest_control_readiness_probe: ingest_control_probe,
+                operations: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            runtime_outcome,
+            Err(QueryConfigError::RuntimeTaskJoin {
+                task: "ingest-control-readiness probe",
                 ..
             })
         ));

@@ -87,6 +87,7 @@ define_error_reasons! {
     ExplorerMethodDisabled => "EXPLORER_METHOD_DISABLED",
     DependencyNotConfigured => "DEPENDENCY_NOT_CONFIGURED",
     UpstreamUnreachable => "UPSTREAM_UNREACHABLE",
+    ServiceNotReady => "SERVICE_NOT_READY",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -145,6 +146,7 @@ mod tests {
             WireErrorReason::ExplorerMethodDisabled,
             WireErrorReason::DependencyNotConfigured,
             WireErrorReason::UpstreamUnreachable,
+            WireErrorReason::ServiceNotReady,
         ];
 
         for generated in generated_reasons {

@@ -52,7 +52,9 @@ enum ReadinessCause {
   // `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
   // See ADR-0015.
   READINESS_CAUSE_UPSTREAM_NOT_READY = 16;
-
+  // The authenticated ingest-control channel or one of its required live
+  // health RPCs is temporarily unavailable.
+  READINESS_CAUSE_INGEST_CONTROL_UNAVAILABLE = 17;
 }
 
 // Snapshot of the current readiness state surfaced to operators and orchestrators.

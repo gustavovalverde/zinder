@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroU32;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -663,14 +662,11 @@ impl ChainIndex for RemoteChainIndex {
         {
             Ok(response) => response.into_inner(),
             Err(status) if status.code() == tonic::Code::NotFound => {
-                if at_epoch_id.is_some() {
-                    return Ok(TxStatus::NotFound);
-                }
-                return self.lookup_in_mempool(transaction_id).await;
+                return Ok(TxStatus::NotFound);
             }
             Err(status) => return Err(self.map_status(status)),
         };
-        tx_status_from_message(self.network, at_epoch_id, response)
+        tx_status_from_message(self.network, transaction_id, at_epoch_id, response)
     }
 
     async fn transparent_address_unspent_outputs(
@@ -1590,64 +1586,6 @@ fn transparent_mempool_spend_from_message(
         .map_err(wallet_decode_error_to_indexer_error)
 }
 
-impl RemoteChainIndex {
-    async fn lookup_in_mempool(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Result<TxStatus, IndexerError> {
-        let mut found_entry: Option<MempoolEntry> = None;
-        self.for_each_mempool_entry(|entry| {
-            if entry.transaction_id() == transaction_id {
-                found_entry = Some(entry);
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .await?;
-        Ok(found_entry.map_or(TxStatus::NotFound, TxStatus::InMempool))
-    }
-
-    /// Walks the live mempool one server-bounded page at a time, applying
-    /// `visitor` to every entry until the visitor returns
-    /// [`ControlFlow::Break`] or the writer returns no `next_cursor`.
-    ///
-    /// Each page is bounded by the server's `MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE`
-    /// (1024 entries today). For typical mempool sizes this is one
-    /// round-trip; iterating callers pay O(mempool-size) by design, since
-    /// `MempoolSnapshot` is the only public mempool enumeration surface.
-    /// Per-txid presence checks should call [`ChainIndex::is_in_mempool`]
-    /// rather than walk the snapshot.
-    async fn for_each_mempool_entry<Visitor>(
-        &self,
-        mut visitor: Visitor,
-    ) -> Result<(), IndexerError>
-    where
-        Visitor: FnMut(MempoolEntry) -> ControlFlow<()>,
-    {
-        let mut from_cursor: Option<MempoolSnapshotCursor> = None;
-        loop {
-            let snapshot = self
-                .mempool_snapshot(MempoolSnapshotRequest {
-                    // 0 asks the writer for its default page size; the
-                    // writer caps at MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE.
-                    max_entries: 0,
-                    from_cursor,
-                })
-                .await?;
-            for entry in snapshot.entries {
-                if visitor(entry) == ControlFlow::Break(()) {
-                    return Ok(());
-                }
-            }
-            match snapshot.next_cursor {
-                Some(cursor) => from_cursor = Some(cursor),
-                None => return Ok(()),
-            }
-        }
-    }
-}
-
 fn ensure_network_name(expected: Network, actual_name: &str) -> Result<(), IndexerError> {
     let Some(actual) = decode_zinder_native_chain_name(actual_name).ok() else {
         return Err(IndexerError::NetworkMismatch {
@@ -1915,10 +1853,7 @@ fn mined_block_location_from_message(
     message: wallet::MinedBlockLocation,
 ) -> Result<TransactionLocation, IndexerError> {
     Ok(TransactionLocation::new(
-        transaction_id_from_rpc_hex(
-            "mined_block_location.transaction_id",
-            &message.transaction_id,
-        )?,
+        transaction_id_from_rpc_hex("mined.location.transaction_id", &message.transaction_id)?,
         BlockHeight::new(message.block_height),
         block_hash_from_rpc_hex("mined_block_location.block_hash", &message.block_hash)?,
         message.tx_index_in_block,
@@ -2332,6 +2267,7 @@ fn block_selector_to_message(
 )]
 fn tx_status_from_message(
     expected_network: Network,
+    expected_transaction_id: TransactionId,
     expected_epoch_id: Option<ChainEpochId>,
     response: wallet::TransactionStatusResponse,
 ) -> Result<TxStatus, IndexerError> {
@@ -2356,6 +2292,12 @@ fn tx_status_from_message(
                 mined_block_location_from_message(mined.location.ok_or_else(|| {
                     IndexerError::malformed("mined.location", "field is missing")
                 })?)?;
+            if location.transaction_id != expected_transaction_id {
+                return Err(IndexerError::malformed(
+                    "mined.location.transaction_id",
+                    "response transaction id does not match requested transaction id",
+                ));
+            }
             let chain_context_message = mined.chain_context.ok_or_else(|| {
                 IndexerError::malformed("mined.chain_context", "field is missing")
             })?;
@@ -2376,6 +2318,12 @@ fn tx_status_from_message(
             let entry = mempool_entry_from_message(in_mempool)
                 .map_err(wallet_decode_error_to_indexer_error)?;
             ensure_mempool_entry_network(expected_network, &entry)?;
+            if entry.transaction_id() != expected_transaction_id {
+                return Err(IndexerError::malformed(
+                    "location.in_mempool.transaction_id",
+                    "response transaction id does not match requested transaction id",
+                ));
+            }
             Ok(TxStatus::InMempool(entry))
         }
     }
@@ -2670,8 +2618,9 @@ fn mempool_eviction_reason_from_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::IndexerError;
+    use crate::{ErrorReason, IndexerError};
     use tonic::{Code, Status};
+    use tonic_types::ErrorDetails;
 
     const EXPECTED_NETWORK: Network = Network::ZcashRegtest;
     const MISMATCHED_NETWORK: Network = Network::ZcashMainnet;
@@ -3313,6 +3262,7 @@ mod tests {
     fn transaction_in_mempool_rejects_mismatched_network() {
         let outcome = tx_status_from_message(
             EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x33; 32]),
             None,
             transaction_in_mempool_message(MISMATCHED_NETWORK),
         );
@@ -3330,6 +3280,7 @@ mod tests {
     fn transaction_in_mempool_accepts_matching_network() {
         let outcome = tx_status_from_message(
             EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x33; 32]),
             None,
             transaction_in_mempool_message(EXPECTED_NETWORK),
         );
@@ -3342,9 +3293,28 @@ mod tests {
     }
 
     #[test]
+    fn transaction_in_mempool_rejects_a_different_transaction_id() {
+        let outcome = tx_status_from_message(
+            EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x44; 32]),
+            None,
+            transaction_in_mempool_message(EXPECTED_NETWORK),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(IndexerError::MalformedResponse {
+                field: "location.in_mempool.transaction_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn mined_transaction_rejects_mismatched_network() {
         let outcome = tx_status_from_message(
             EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x33; 32]),
             None,
             mined_transaction_message(MISMATCHED_NETWORK),
         );
@@ -3353,9 +3323,28 @@ mod tests {
     }
 
     #[test]
+    fn mined_transaction_rejects_a_different_transaction_id() {
+        let outcome = tx_status_from_message(
+            EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x44; 32]),
+            None,
+            mined_transaction_message(EXPECTED_NETWORK),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(IndexerError::MalformedResponse {
+                field: "mined.location.transaction_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn transaction_status_rejects_a_response_from_another_epoch() {
         let outcome = tx_status_from_message(
             EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x33; 32]),
             Some(ChainEpochId::new(8)),
             transaction_in_mempool_message(EXPECTED_NETWORK),
         );
@@ -3626,5 +3615,39 @@ mod tests {
             before, after,
             "application-level errors with InvalidArgument must not rebuild the channel"
         );
+    }
+
+    #[tokio::test]
+    async fn map_status_keeps_channel_on_typed_readiness_unavailable() {
+        let index = build_index();
+        let before = current_client_ptr(&index);
+        let status = Status::with_error_details(
+            Code::Unavailable,
+            "service readiness is closed",
+            ErrorDetails::with_error_info(
+                ErrorReason::ServiceNotReady.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                std::collections::HashMap::from([(
+                    "readiness_cause".to_owned(),
+                    "ingest_control_unavailable".to_owned(),
+                )]),
+            ),
+        );
+
+        let error = index.map_status(status);
+
+        let after = current_client_ptr(&index);
+        assert_eq!(
+            before, after,
+            "typed readiness failures must not be mistaken for poisoned transport"
+        );
+        assert!(matches!(
+            error,
+            IndexerError::RemoteFailure {
+                reason: ErrorReason::ServiceNotReady,
+                retry_policy: crate::RetryPolicy::RetryWithBackoff,
+                ..
+            }
+        ));
     }
 }

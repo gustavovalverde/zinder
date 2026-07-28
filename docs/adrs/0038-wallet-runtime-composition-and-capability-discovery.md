@@ -85,12 +85,30 @@ The release query admits one probed `NodeSource` and installs clones of that
 same source as its tree-state and broadcast providers. A
 node-backed capability requires the corresponding probed node feature, the
 concrete provider, and `TipId`, which is the liveness prerequisite. The release
-composition deliberately omits native transaction lookup and live mempool
-claims until their full handler semantics and authenticated provider boundary
-are admitted. It also omits chain value pools: discovering an OpenRPC method
-name does not prove that the node returns the required `valuePools` payload, and
-the readiness loop does not yet retain that semantic evidence. Method presence
-in the protocol, adapter, or upstream schema is not support.
+query also admits one `AdmittedIngestControl` before opening storage or binding
+traffic. Admission opens an authenticated channel once, calls `ServerInfo`,
+and requires the exact `zinder-ingest` service identity, network, contract
+revision, and seven control methods needed by the composition:
+`ServerInfo`, `WriterStatus`, `MempoolSnapshot`, `MempoolTransaction`,
+`MempoolEvents`, `TransparentMempoolOutputsByAddress`, and
+`TransparentMempoolSpendsByOutpoint`. The query, serving-pair publisher, live
+wallet handlers, and readiness probe clone that same accepted channel. They do
+not accept independently configured provider identities or perform a second
+dial at their use sites.
+
+This evidence admits native transaction lookup, mempool snapshot and events,
+and transparent mempool outputs-by-address and spends-by-outpoint.
+Transaction-byte support additionally requires authenticated transaction-blob
+retention. Transparent live balance remains omitted: its legacy handler
+performs multiple canonical and live calls without one authenticated mempool
+generation, so the two admitted primitives are not sufficient evidence for the
+composite claim. P2b owns that coherent snapshot. Transparent mempool
+outputs-by-outpoint also remains omitted because it is not part of the required
+admitted provider contract.
+Chain value pools also remain omitted: discovering an OpenRPC method name does
+not prove that the node returns the required `valuePools` payload, and the
+readiness loop does not retain that semantic evidence. Method presence in the
+protocol, adapter, or upstream schema is not support.
 
 Every native RPC except `ServerInfo` checks its method capability in the native
 adapter before invoking a domain method, touching storage, or contacting a
@@ -107,23 +125,31 @@ range before pair capture or storage access with
 
 Structural support is immutable for the process lifetime. A structurally
 supported operation is advertised even while one of its admitted dependencies
-is temporarily unhealthy; readiness becomes false and the request returns a
-typed `UNAVAILABLE` result. A structurally absent operation is omitted and a
-direct call returns a precise unsupported or failed-precondition result. An
-expired chain view retains its capability and returns the typed epoch-expiry
-outcome. A replacement pair that changes the process contract is rejected,
-leaves the prior pair authoritative where safe, and makes readiness false.
+is temporarily unhealthy; readiness becomes false and the request returns
+`UNAVAILABLE` with `SERVICE_NOT_READY` plus the stable `readiness_cause`
+metadata. A structurally absent operation is omitted and a direct call returns
+a precise unsupported or failed-precondition result. An expired chain view
+retains its capability and returns the typed epoch-expiry outcome. A
+replacement pair that changes the process contract is rejected, leaves the
+prior pair authoritative where safe, and makes readiness false.
 
 Capability discovery is not a health check. Pair publication, provider health,
 and replica lag may change readiness but never rewrite the endpoint contract.
 
-`WalletServingReadiness` retains pair state and admitted-node state
-independently and projects their conjunction into the shared operational and
-gRPC readiness handle. Shutdown dominates later writes. The node liveness task
-uses `tip_id` plus upstream synchronization health through the exact admitted
-source; it never repeats capability discovery or mutates the cached structural
-feature set. An unexpected serving-pair publisher or node-readiness task exit
-drains readiness, cancels the runtime, and returns a typed process failure.
+`WalletServingReadiness` retains pair state, admitted-node state, and
+ingest-control health independently and projects their conjunction into the
+shared operational and gRPC readiness handle. Shutdown dominates later writes.
+The node liveness task uses `tip_id` plus upstream synchronization health
+through the exact admitted source; it never repeats capability discovery or
+mutates the cached structural feature set. The ingest-control task calls
+`WriterStatus` and `MempoolSnapshot(max_entries = 1)` through the admitted
+channel, validates coherent network and tip evidence, and publishes
+`ingest_control_unavailable` on failure. It does not repeat `ServerInfo`
+admission. The task logs only outage and recovery transitions, and shares the
+serving-pair refresh cadence because both observe the same control plane. An
+unexpected serving-pair publisher, node-readiness task, or
+ingest-control-readiness task exit drains readiness, cancels the runtime, and
+returns a typed process failure.
 
 ## Storage and pair admission
 

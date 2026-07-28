@@ -486,9 +486,12 @@ async fn serving_query_rejects_oversized_subtree_root_range() -> eyre::Result<()
         Arc::new(canonical),
         Arc::new(wallet),
     )?);
-    let wallet_query = WalletServingQuery::from_serving_pair_slot(
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(pair),
         (),
+        ingest_control,
         activations,
     );
     let requested = MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1);
@@ -839,9 +842,12 @@ async fn serving_pair_compact_range_enforces_the_release_limit_before_storage() 
         Arc::new(canonical),
         Arc::new(wallet),
     )?);
-    let query = WalletServingQuery::from_serving_pair_slot(
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(pair),
         (),
+        ingest_control,
         activations,
     );
     let requested = DEFAULT_MAX_COMPACT_BLOCK_RANGE.get().saturating_add(1);

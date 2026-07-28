@@ -68,6 +68,8 @@ pub(super) enum QueryConfigError {
     #[error(transparent)]
     WalletServingPair(#[from] zinder_query::WalletServingPairError),
     #[error(transparent)]
+    IngestControlAdmission(#[from] zinder_query::IngestControlAdmissionError),
+    #[error(transparent)]
     WalletQuery(#[from] zinder_query::QueryError),
     #[error("node source initialization failed: {0}")]
     Source(Box<zinder_source::SourceError>),

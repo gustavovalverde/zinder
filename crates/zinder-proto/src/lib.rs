@@ -12,7 +12,7 @@ pub use capabilities::{
 };
 pub use error_policy::{
     BoundaryError, ReasonPolicy, RetryDisposition, ZINDER_ERROR_DOMAIN, reason_policy,
-    status_for_reason, status_with_reason,
+    status_for_reason, status_with_reason, status_with_reason_and_metadata,
 };
 
 /// Wire-contract revision advertised in every `ops.ServerInfo` response.

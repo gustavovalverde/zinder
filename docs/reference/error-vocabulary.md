@@ -117,6 +117,7 @@ Service is reachable but a dependency is not, or the operation is not yet suppor
 | `UNSUPPORTED_BLOCK_SELECTOR` | The requested selector shape cannot be represented |
 | `UNSUPPORTED_TRANSACTION_STATUS` | The received transaction-status variant cannot be decoded |
 | `UPSTREAM_UNREACHABLE` | A configured federated endpoint (for example the explorer's wallet-query endpoint) is temporarily unreachable |
+| `SERVICE_NOT_READY` | The process is alive but its shared readiness gate is closed; `ErrorInfo.metadata["readiness_cause"]` contains the stable readiness label and `/readyz` carries any structured detail |
 | `NO_VISIBLE_CHAIN_EPOCH` | No visible chain epoch has been committed yet (the store is empty or still bootstrapping) |
 
 ### `UNIMPLEMENTED` family

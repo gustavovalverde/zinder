@@ -217,9 +217,12 @@ async fn commit_store_and_spawn_grpc() -> Result<String> {
         Arc::new(canonical),
         Arc::new(wallet),
     )?);
-    let wallet_query = WalletServingQuery::from_serving_pair_slot(
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
         (),
+        ingest_control,
         activations,
     );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
@@ -227,7 +230,9 @@ async fn commit_store_and_spawn_grpc() -> Result<String> {
 }
 
 async fn spawn_wallet_query_server(
-    grpc_adapter: WalletQueryGrpcAdapter<WalletServingQuery<()>>,
+    grpc_adapter: WalletQueryGrpcAdapter<
+        WalletServingQuery<(), zinder_query::AdmittedIngestControl>,
+    >,
     store_fixture: WalletServingStoreFixture,
 ) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;

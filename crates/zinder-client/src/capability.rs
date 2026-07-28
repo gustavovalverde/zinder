@@ -41,7 +41,7 @@ pub enum Capability {
     SubtreeRoots,
     /// Ironwood subtree-root responses.
     SubtreeRootsIronwood,
-    /// Mined transaction lookup by transaction identifier.
+    /// Canonical-or-mempool transaction lookup by transaction identifier.
     Transaction,
     /// Transparent unspent outputs for one address.
     TransparentAddressUnspentOutputs,

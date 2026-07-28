@@ -9,12 +9,19 @@
 //! type below converts to the proto message via [`Into`] for any gRPC
 //! consumer.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
 use serde::Serialize;
 use tonic::{Request, Status, service::Interceptor};
-use zinder_proto::v1::{ingest as ingest_proto, ops as ops_proto};
+use tonic_types::ErrorDetails;
+use zinder_proto::{
+    status_with_reason_and_metadata,
+    v1::{
+        ingest as ingest_proto,
+        ops::{self as ops_proto, ErrorReason},
+    },
+};
 
 /// Current phase of the phase-driven ingest loop ([ADR-0015]).
 ///
@@ -123,6 +130,9 @@ pub enum ReadinessCause {
     },
     /// The private ingest writer-status RPC cannot be reached.
     WriterStatusUnavailable,
+    /// The authenticated ingest-control channel or one of its required live
+    /// health RPCs is temporarily unavailable.
+    IngestControlUnavailable,
     /// Retained event history is approaching the configured cursor-expiry window.
     CursorAtRisk {
         /// Age of the oldest retained event, rounded down to whole hours.
@@ -291,6 +301,7 @@ impl ReadinessCause {
         "reorg_window_exceeded",
         "replica_lagging",
         "writer_status_unavailable",
+        "ingest_control_unavailable",
         "cursor_at_risk",
         "shutting_down",
         "upstream_not_ready",
@@ -310,6 +321,7 @@ impl ReadinessCause {
             Self::ReorgWindowExceeded { .. } => "reorg_window_exceeded",
             Self::ReplicaLagging { .. } => "replica_lagging",
             Self::WriterStatusUnavailable => "writer_status_unavailable",
+            Self::IngestControlUnavailable => "ingest_control_unavailable",
             Self::CursorAtRisk { .. } => "cursor_at_risk",
             Self::ShuttingDown => "shutting_down",
             Self::UpstreamNotReady(_) => "upstream_not_ready",
@@ -336,6 +348,7 @@ impl ReadinessCause {
             | Self::ReorgWindowExceeded { .. }
             | Self::ReplicaLagging { .. }
             | Self::WriterStatusUnavailable
+            | Self::IngestControlUnavailable
             | Self::CursorAtRisk { .. }
             | Self::ShuttingDown
             | Self::UpstreamNotReady(_) => None,
@@ -543,11 +556,16 @@ impl TrafficReadinessInterceptor {
 
 impl Interceptor for TrafficReadinessInterceptor {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        if self.readiness.report().is_ready {
+        let report = self.readiness.report();
+        if report.is_ready {
             Ok(request)
         } else {
-            Err(Status::unavailable(
-                "service is not ready to accept new traffic",
+            let readiness_cause = report.cause.metric_label();
+            Err(status_with_reason_and_metadata(
+                ErrorReason::ServiceNotReady,
+                format!("service is not ready to accept new traffic: {readiness_cause}"),
+                ErrorDetails::new(),
+                HashMap::from([("readiness_cause".to_owned(), readiness_cause.to_owned())]),
             ))
         }
     }
@@ -776,6 +794,7 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
             ReadinessCause::ReorgWindowExceeded { .. } => Self::ReorgWindowExceeded,
             ReadinessCause::ReplicaLagging { .. } => Self::ReplicaLagging,
             ReadinessCause::WriterStatusUnavailable => Self::WriterStatusUnavailable,
+            ReadinessCause::IngestControlUnavailable => Self::IngestControlUnavailable,
             ReadinessCause::CursorAtRisk { .. } => Self::CursorAtRisk,
             ReadinessCause::ShuttingDown => Self::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => Self::UpstreamNotReady,
@@ -852,6 +871,7 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
             | ReadinessCause::StorageUnavailable
             | ReadinessCause::SchemaMismatch
             | ReadinessCause::WriterStatusUnavailable
+            | ReadinessCause::IngestControlUnavailable
             | ReadinessCause::ShuttingDown => return None,
         };
         Some(ops_proto::ReadinessCauseDetail {
@@ -881,6 +901,8 @@ impl From<ReadinessReport> for ops_proto::ReadinessReport {
 
 #[cfg(test)]
 mod tests {
+    use tonic_types::StatusExt as _;
+
     use super::*;
 
     #[test]
@@ -902,6 +924,18 @@ mod tests {
             .err()
             .ok_or("starting readiness must reject new traffic")?;
         assert_eq!(blocked.code(), tonic::Code::Unavailable);
+        let starting_error_details = blocked.get_error_details();
+        let starting_error_info = starting_error_details
+            .error_info()
+            .ok_or("readiness rejection must carry ErrorInfo")?;
+        assert_eq!(
+            starting_error_info.reason,
+            ErrorReason::ServiceNotReady.as_str_name()
+        );
+        assert_eq!(
+            starting_error_info.metadata.get("readiness_cause"),
+            Some(&"starting".to_owned())
+        );
 
         readiness.set(ReadinessState::ready(Some(100)));
         interceptor.call(Request::new(()))?;
@@ -915,6 +949,14 @@ mod tests {
             .err()
             .ok_or("replica lag readiness must reject new traffic")?;
         assert_eq!(blocked.code(), tonic::Code::Unavailable);
+        let replica_error_details = blocked.get_error_details();
+        let replica_error_info = replica_error_details
+            .error_info()
+            .ok_or("readiness rejection must carry ErrorInfo")?;
+        assert_eq!(
+            replica_error_info.metadata.get("readiness_cause"),
+            Some(&"replica_lagging".to_owned())
+        );
         Ok(())
     }
 
@@ -1157,6 +1199,7 @@ mod tests {
                 lag_chain_epochs: 0,
             },
             ReadinessCause::WriterStatusUnavailable,
+            ReadinessCause::IngestControlUnavailable,
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,
@@ -1204,6 +1247,9 @@ mod tests {
             ReadinessCause::WriterStatusUnavailable => {
                 ops_proto::ReadinessCause::WriterStatusUnavailable
             }
+            ReadinessCause::IngestControlUnavailable => {
+                ops_proto::ReadinessCause::IngestControlUnavailable
+            }
             ReadinessCause::CursorAtRisk { .. } => ops_proto::ReadinessCause::CursorAtRisk,
             ReadinessCause::ShuttingDown => ops_proto::ReadinessCause::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => ops_proto::ReadinessCause::UpstreamNotReady,
@@ -1243,6 +1289,7 @@ mod tests {
                 lag_chain_epochs: 0,
             },
             ReadinessCause::WriterStatusUnavailable,
+            ReadinessCause::IngestControlUnavailable,
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,

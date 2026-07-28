@@ -229,22 +229,16 @@ their configured consensus parameters before opening or migrating wallet state;
 they derive active versus pending status against the epoch-pinned latest block
 rather than trusting a second node query.
 
-The mined arm also carries `raw_transaction_bytes`: the serialized consensus
-transaction bytes, symmetric with the mempool arm's `raw_transaction_bytes`. This makes
-`WalletQuery.Transaction` a verbose mined-transaction read that returns the
-serialized bytes, the mined block hash and height, the block time, and
-epoch-bound confirmations in one response, which is the shape a
-`getrawtransaction verbose` consumer needs. The bytes are filled from the same
-`TransactionBlobArtifact` the canonical reader resolves; they are not a separate
-RPC. The field rides on the existing `wallet.read.transaction_by_id_v2`
-capability rather than a new one, because the bytes are not unconditionally
-present: ingest writes transaction blobs only when `raw_blob_policy` is
-`transactions` or `all`. When the policy is `none`, the field is empty and the
-location plus enrichment fields are still returned. Wallet-serving ingest defaults
-an omitted policy to `transactions` and rejects an explicit `none`, because its
-lightwalletd transaction and transparent-history methods require retained bytes.
-A consumer that requires the serialized form runs against a deployment configured to retain transaction
-blobs.
+The mined arm may also carry `raw_transaction_bytes`: the serialized consensus
+transaction bytes, symmetric with the mempool arm's live bytes. The field is
+gated separately by `wallet.read.transaction_bytes_v1` because it is not
+unconditionally present. Ingest writes canonical transaction blobs only when
+`raw_blob_policy` is `transactions` or `all`; under `none`, typed transaction
+location and enrichment remain available while mined bytes are absent. The
+bytes come from the same `TransactionBlobArtifact` the canonical reader
+resolves and are not a separate RPC. A consumer requiring the serialized mined
+form preflights both `wallet.read.transaction_by_id_v2` and
+`wallet.read.transaction_bytes_v1`.
 
 A response builder must not call the upstream node or latest tip again during
 response construction.
@@ -368,11 +362,10 @@ contents first, then subscribes `MempoolEvents` with
 at-least-once, matching lightwalletd-go semantics. The shim also races the
 stream against retained `ChainEvents` after the first page's `chain_epoch.id`;
 a change already observed during stream startup closes the stream immediately
-instead of being discarded. Deployments without that
-surface omit
-`wallet.events.mempool_v2` and `wallet.snapshot.mempool_v3` from
-`ServerCapabilities` and return a typed unavailable response from the compat
-methods.
+instead of being discarded. A compatibility runtime without that concrete
+surface returns a typed unavailable response from the lightwalletd methods.
+It does not publish or interpret the native Wallet capability descriptor;
+native discovery remains owned by `zinder-query`.
 
 ## Transparent Address Outputs
 
@@ -555,18 +548,33 @@ This live snapshot is a prerequisite fact, not a value-pool history or value-flo
 
 The native surface is `WalletQuery.TransparentAddressBalance(TransparentAddressBalanceRequest) returns (TransparentAddressBalanceResponse)`. The request carries `repeated AddressLookup addresses` and an `optional uint64 at_epoch_id`. The response carries the binding `chain_view` at field tag 1, then `confirmed_zat: uint64`, `unconfirmed_delta_zat: int64`, and `address_count: uint32`.
 
-The balance is served in the wallet plane (`zinder-query`) and advertises one capability: `wallet.address.transparent_balance_v1`, always on. The canonical unspent-output index it sums is present on every wallet-plane deployment, so the capability never gates on a separate plane. The release handler sums the confirmed total from the wallet projection (a saturating sum) pinned to `at_epoch_id`; absent, the read resolves against the visible tip. The release native composition does not admit an ingest-control mempool overlay, so `unconfirmed_delta_zat` is always zero. A later live-balance slice must admit a concrete authenticated provider and advertise its own live-state contract before a nonzero delta can be promised.
+The protocol and temporary generic primary-store composition retain
+`wallet.address.transparent_balance_v1`, but the release `zinder-query`
+endpoint does not advertise it. The legacy handler combines a pinned canonical
+confirmed total with multiple live ingest-control calls; even when those calls
+report the same chain epoch, they do not authenticate one mempool generation.
+The admitted outputs-by-address and spends-by-outpoint primitives therefore do
+not make the composite claim truthful. P2b must compose one coherent
+canonical-and-mempool snapshot before the release endpoint can advertise the
+balance. Direct calls currently fail the endpoint capability guard before
+request parsing or provider access.
 
 The address list is capped at 256 per request (`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`), enforced in the wallet/native layer. An over-cap list is rejected with `INVALID_ARGUMENT` carrying `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`; an empty list is rejected with `INVALID_ARGUMENT`. The signed delta saturates to the `int64` range; `confirmed_zat` is a `uint64`.
 
-Mempool live state is not chain-epoch-pinnable. If a future native capability
-admits an overlay, `at_epoch_id` will pin only the canonical confirmed read and
-the response will remain bound to that epoch. Historical balance at an
-arbitrary height is out of scope.
+Mempool live state is not chain-epoch-pinnable. `at_epoch_id` pins only the
+canonical confirmed read; it cannot fence a sequence of live writer calls.
+Readiness proves that the admitted ingest control is healthy, but health is not
+a response snapshot and cannot justify this capability. Historical balance at
+an arbitrary height is out of scope.
 
 The lightwalletd compat shim answers `GetTaddressBalance` and `GetTaddressBalanceStream` by calling the wallet primitive and projecting it into one `int64 value_zat` (confirmed total minus pending outflows, saturating to zero, capped at `i64::MAX`); pending inflows are ignored because the legacy lightwalletd balance field is confirmed-shaped and carries no overlay slot. `GetTaddressBalanceStream` collects the streamed addresses and uses the same projection as the unary call; it exists only for the lightwalletd contract.
 
-The `ChainIndex` Rust API exposes `transparent_address_balance(addresses)` returning `TransparentAddressBalance`. `RemoteChainIndex` maps it to the production `WalletServingQuery` implementation; the capability-coverage test asserts the method exists for the `wallet.address.transparent_balance_v1` capability.
+The `ChainIndex` Rust API retains
+`transparent_address_balance(addresses) -> TransparentAddressBalance` for the
+protocol surface and legacy tests. `RemoteChainIndex` requires
+`wallet.address.transparent_balance_v1` before invoking it, so the current
+release endpoint rejects the operation during capability preflight. P2b owns
+the coherent implementation and release admission proof.
 
 ## Capability Discovery
 

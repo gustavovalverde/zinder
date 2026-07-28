@@ -54,7 +54,7 @@ eyre.workspace = true
 prost.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }
 tonic = { workspace = true, features = ["transport"] }
 tonic-health.workspace = true
 tonic-reflection.workspace = true

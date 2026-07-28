@@ -36,6 +36,7 @@ version and commit appear in the `zinder_build_info` metric and native
 | `reorg_window_exceeded` | A replacement crosses the persisted reorg policy. |
 | `replica_lagging` | A RocksDB secondary exceeds the admitted epoch lag. |
 | `writer_status_unavailable` | A trusted reader cannot reach the writer control API. |
+| `ingest_control_unavailable` | Native wallet live-state health failed on the admitted ingest-control channel. |
 | `cursor_at_risk` | Canonical event retention is approaching an active cursor. |
 | `shutting_down` | New traffic has been drained for termination. |
 
@@ -73,20 +74,39 @@ do not agree.
 
 ### Native wallet query
 
-Native wallet query is ready only when both of its independently retained
-inputs are healthy: the admitted canonical-and-wallet serving pair and the
-exact node source used by every advertised node-backed operation. Pair
-publication cannot erase a node failure, and node recovery cannot erase
-replica lag, writer-status failure, or pair-admission failure. Capability
-discovery remains immutable while either dependency is temporarily unhealthy.
+Native wallet query is ready only when all three independently retained inputs
+are healthy: the admitted canonical-and-wallet serving pair, the exact node
+source used by every advertised node-backed operation, and the authenticated
+ingest-control channel used by pair publication and live wallet operations.
+No input can erase another input's failure. Capability discovery remains
+immutable while any admitted dependency is temporarily unhealthy.
+
+Before storage is opened or traffic is bound, `AdmittedIngestControl` connects
+once and validates `ServerInfo` service identity, network, contract revision,
+and the seven methods required by the native composition. The accepted
+identity and channel are then immutable. Health checks do not repeat structural
+admission: they call `WriterStatus` and a bounded
+`MempoolSnapshot(max_entries = 1)` through that same authenticated channel and
+validate coherent network and tip evidence. A transition into failure emits
+one classified warning and drains readiness with
+`ingest_control_unavailable`; recovery emits one event and restores only the
+ingest-control input. The health probe intentionally shares the configured
+serving-pair refresh cadence because both observe the same control plane.
 
 The node probe exercises `tip_id` and upstream synchronization health through
 the same shared source handle installed in the query. It does not repeat
 structural capability discovery. Any node-backed composition must admit
 `TipId` before binding so this liveness prerequisite cannot fail later as a
-configuration surprise. The serving-pair publisher and node-readiness probe
-are supervised with the gRPC server; an unexpected exit drains readiness and
-terminates the runtime.
+configuration surprise. The serving-pair publisher, node-readiness probe, and
+ingest-control-readiness probe are supervised with the gRPC server; an
+unexpected exit drains readiness and terminates the runtime.
+
+When the shared traffic gate is closed, new gRPC calls return
+`UNAVAILABLE` with `ErrorReason = SERVICE_NOT_READY` and
+`ErrorInfo.metadata["readiness_cause"]` set to the stable readiness label.
+`/readyz` carries the corresponding structured detail. This keeps a
+readiness outage distinguishable from poisoned transport without mutating the
+endpoint's immutable capability set.
 
 ### Lightwalletd compatibility
 
@@ -95,12 +115,19 @@ status, catch canonical and wallet secondaries up, and publish a pair that
 passes exact-fence admission, and while the admitted node source needed by its
 compatibility methods is healthy. Traffic uses a readiness interceptor, so a
 process that has drained readiness does not accept new gRPC requests.
+Until P3, compatibility retains its existing writer-status endpoint bootstrap
+and separate ingest-control channels for mempool and tip-change traffic. It
+does not instantiate the native query's admitted ingest type or advertise
+native capabilities. Compatibility-specific structural admission, channel
+unification, lightwalletd mempool semantics, and trusted-edge behavior remain
+the P3/P4 certification boundary.
 
 ## Startup and shutdown
 
 Startup phases use the shared `StartupPhase` vocabulary, including load config,
-connect node, check schema, recover state, open storage, start API, and ready.
-Phase duration and failure are metrics and structured logs.
+connect node, admit ingest control, check schema, recover state, open storage,
+start API, and ready. Phase duration and failure are metrics and structured
+logs.
 
 On termination, a runtime sets `shutting_down`, stops accepting new traffic,
 cancels background tasks, waits for owned tasks and servers, and closes the

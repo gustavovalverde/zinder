@@ -6,6 +6,8 @@ use zinder_proto::capabilities::{self, CapabilitySurface, capabilities_for_surfa
 use zinder_source::{NodeCapabilities, NodeCapability};
 use zinder_store::RawBlobRetention;
 
+use crate::AdmittedIngestControl;
+
 /// Immutable native capability set for one admitted wallet endpoint.
 ///
 /// Callers can inspect this value, but cannot construct it from arbitrary
@@ -42,7 +44,7 @@ impl NativeWalletEndpointCapabilities {
             || self.contains(capabilities::WALLET_BROADCAST_TRANSACTION_V1)
     }
 
-    /// Derives the capabilities implemented by the exact serving-pair query.
+    /// Derives the capabilities implemented by the shared exact-pair query.
     ///
     /// `node_capabilities` must be the result of the probe performed on the
     /// same source handle installed as the query's tree-state provider and
@@ -51,37 +53,77 @@ impl NativeWalletEndpointCapabilities {
         raw_blob_retention: RawBlobRetention,
         node_capabilities: NodeCapabilities,
     ) -> Self {
-        let node_was_probed = node_capabilities.supports(NodeCapability::OpenRpcDiscovery);
         Self::from_predicate(|capability| {
-            let implemented_without_optional_evidence = matches!(
-                capability,
-                capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1
-                    | capabilities::WALLET_READ_SETTLED_TIP_BLOCK_V1
-                    | capabilities::WALLET_READ_BLOCK_ID_BY_SELECTOR_V1
-                    | capabilities::WALLET_READ_COMPACT_BLOCK_AT_V2
-                    | capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V2
-                    | capabilities::WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2
-                    | capabilities::WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2
-                    | capabilities::WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1
-                    | capabilities::WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1
-                    | capabilities::WALLET_READ_SERVER_INFO_V2
-                    | capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1
-                    | capabilities::WALLET_EVENTS_CHAIN_V1
-                    | capabilities::WALLET_ADDRESS_TRANSPARENT_BALANCE_V1
-            );
-            implemented_without_optional_evidence
-                || (matches!(
-                    capability,
-                    capabilities::WALLET_READ_FULL_BLOCK_AT_V1
-                        | capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
-                ) && raw_blob_retention.retains_block_blobs())
-                || (capability == capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2
-                    && node_was_probed
-                    && node_capabilities.supports(NodeCapability::TreeState))
-                || (capability == capabilities::WALLET_BROADCAST_TRANSACTION_V1
-                    && node_was_probed
-                    && node_capabilities.supports(NodeCapability::TransactionBroadcast))
+            Self::wallet_serving_pair_supports(capability, raw_blob_retention, node_capabilities)
         })
+    }
+
+    /// Derives the native endpoint contract after its ingest control is admitted.
+    ///
+    /// The shared exact-pair query does not require this native-only dependency.
+    /// Its admitted type state is supplied only by the native composition root.
+    pub(crate) fn for_admitted_native_wallet_query(
+        raw_blob_retention: RawBlobRetention,
+        node_capabilities: NodeCapabilities,
+        ingest_control: &AdmittedIngestControl,
+    ) -> Self {
+        Self::from_predicate(|capability| {
+            let transaction_lookup_supported =
+                ingest_control.supports(capabilities::INGEST_CONTROL_MEMPOOL_TRANSACTION_V2);
+            Self::wallet_serving_pair_supports(capability, raw_blob_retention, node_capabilities)
+                || (capability == capabilities::WALLET_READ_TRANSACTION_BY_ID_V2
+                    && transaction_lookup_supported)
+                || (capability == capabilities::WALLET_READ_TRANSACTION_BYTES_V1
+                    && transaction_lookup_supported
+                    && raw_blob_retention.retains_transaction_blobs())
+                || (capability == capabilities::WALLET_SNAPSHOT_MEMPOOL_V3
+                    && ingest_control.supports(capabilities::INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3))
+                || (capability == capabilities::WALLET_EVENTS_MEMPOOL_V2
+                    && ingest_control.supports(capabilities::INGEST_CONTROL_MEMPOOL_EVENTS_V2))
+                || (capability == capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1
+                    && ingest_control.supports(
+                        capabilities::INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
+                    ))
+                || (capability == capabilities::WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1
+                    && ingest_control.supports(
+                        capabilities::INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
+                    ))
+        })
+    }
+
+    fn wallet_serving_pair_supports(
+        capability: &str,
+        raw_blob_retention: RawBlobRetention,
+        node_capabilities: NodeCapabilities,
+    ) -> bool {
+        let node_was_probed = node_capabilities.supports(NodeCapability::OpenRpcDiscovery);
+        let implemented_without_optional_evidence = matches!(
+            capability,
+            capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1
+                | capabilities::WALLET_READ_SETTLED_TIP_BLOCK_V1
+                | capabilities::WALLET_READ_BLOCK_ID_BY_SELECTOR_V1
+                | capabilities::WALLET_READ_COMPACT_BLOCK_AT_V2
+                | capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V2
+                | capabilities::WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2
+                | capabilities::WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2
+                | capabilities::WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1
+                | capabilities::WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1
+                | capabilities::WALLET_READ_SERVER_INFO_V2
+                | capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1
+                | capabilities::WALLET_EVENTS_CHAIN_V1
+        );
+        implemented_without_optional_evidence
+            || (matches!(
+                capability,
+                capabilities::WALLET_READ_FULL_BLOCK_AT_V1
+                    | capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
+            ) && raw_blob_retention.retains_block_blobs())
+            || (capability == capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2
+                && node_was_probed
+                && node_capabilities.supports(NodeCapability::TreeState))
+            || (capability == capabilities::WALLET_BROADCAST_TRANSACTION_V1
+                && node_was_probed
+                && node_capabilities.supports(NodeCapability::TransactionBroadcast))
     }
 
     /// Conservative contract for the temporary generic primary-store query.

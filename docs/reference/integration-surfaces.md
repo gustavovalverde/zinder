@@ -153,15 +153,31 @@ At connect time, call `ServerInfo` and check:
 2. `contract_revision` meets the consumer's minimum.
 3. Every capability the consumer requires is present in `capabilities`.
 
-The release `zinder-query` composition does not admit an ingest-control
-mempool provider, so it omits `wallet.snapshot.mempool_v3`,
-`wallet.events.mempool_v2`, and the `wallet.mempool.*` capabilities. Calling
-one of those native methods directly fails with
-`ENDPOINT_CAPABILITY_UNAVAILABLE` before dialing a configured endpoint.
-Adding the live native mempool surface requires authenticated provider
-admission, readiness integration, and current-consumer certification; a URL
-alone is not evidence of support. `wallet.events.chain_v1` is independently
-derived from the admitted serving pair.
+The release `zinder-query` composition admits one authenticated
+`IngestControl` identity before opening storage or binding traffic. Admission
+validates the exact service name, network, contract revision, and the seven
+control methods required for pair publication, transaction lookup, mempool
+snapshot and events, and the two admitted transparent mempool primitives. The query,
+serving-pair publisher, live wallet handlers, and readiness probe all clone the
+same admitted channel. The probe checks `WriterStatus` plus a bounded,
+tip-coherent `MempoolSnapshot`; it does not repeat structural `ServerInfo`
+discovery.
+
+The native endpoint therefore advertises transaction lookup, mempool snapshot
+and events, transparent mempool outputs-by-address and
+spends-by-outpoint from that concrete composition. It omits
+`wallet.address.transparent_balance_v1`: the legacy composite performs multiple
+canonical and live calls without one authenticated mempool snapshot, so
+provider presence alone is not sufficient admission evidence. Transaction-byte
+support additionally requires authenticated transaction-blob retention.
+Temporary ingest-control failure drains readiness without rewriting the
+immutable capability set. Methods with no admitted provider or coherent
+snapshot, including transparent mempool outputs-by-outpoint and transparent
+balance, remain omitted and fail their capability guard before provider
+access. These Zinder contract claims do not replace current Zallet or ZODL
+consumer certification.
+`wallet.events.chain_v1` remains independently derived from the admitted
+serving pair.
 
 ## Server-side wallets
 

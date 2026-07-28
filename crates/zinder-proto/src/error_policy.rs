@@ -122,6 +122,7 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::NodeUnavailable
         | ErrorReason::StorageUnavailable
         | ErrorReason::UpstreamUnreachable
+        | ErrorReason::ServiceNotReady
         | ErrorReason::NoVisibleChainEpoch => {
             ReasonPolicy::new(Code::Unavailable, RetryAfterBackoff)
         }
@@ -145,12 +146,29 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
 pub fn status_with_reason(
     reason: ErrorReason,
     message: impl Into<String>,
+    details: ErrorDetails,
+) -> Status {
+    status_with_reason_and_metadata(reason, message, details, std::collections::HashMap::new())
+}
+
+/// Builds a `Status` for `reason` with `message`, structured `details`, and
+/// stable automation metadata attached to `google.rpc.ErrorInfo`.
+///
+/// Use this only when a reason has a documented metadata contract. Free-form
+/// diagnostics belong in the status message or a typed detail message.
+#[must_use]
+pub fn status_with_reason_and_metadata(
+    reason: ErrorReason,
+    message: impl Into<String>,
     mut details: ErrorDetails,
+    metadata: impl IntoIterator<Item = (String, String)>,
 ) -> Status {
     details.set_error_info(
         reason.as_str_name(),
         ZINDER_ERROR_DOMAIN,
-        std::collections::HashMap::new(),
+        metadata
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>(),
     );
     Status::with_error_details(reason_policy(reason).code, message.into(), details)
 }

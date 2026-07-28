@@ -22,8 +22,8 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairSlot,
-    WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceTreeState,
@@ -51,7 +51,7 @@ async fn native_and_operations_surfaces_advertise_the_same_admitted_capabilities
         tree_state: None,
         broadcast_outcome: None,
     };
-    let (query, _store_fixture) = serving_query(source)?;
+    let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
     let admitted = query.native_endpoint_capabilities().shared_identifiers();
     let adapter = WalletQueryGrpcAdapter::new(query.clone(), WalletEndpointMetadata::default());
     let native =
@@ -140,7 +140,7 @@ async fn openrpc_value_pool_method_is_not_sufficient_native_admission_evidence()
         tree_state: None,
         broadcast_outcome: None,
     };
-    let (query, _store_fixture) = serving_query(source)?;
+    let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
 
     assert!(
         !query
@@ -190,7 +190,7 @@ async fn absent_node_value_pool_capability_is_omitted_and_rejected_before_fetch(
         tree_state: None,
         broadcast_outcome: None,
     };
-    let (query, _store_fixture) = serving_query(source)?;
+    let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
 
     assert!(
         !query
@@ -214,8 +214,8 @@ async fn absent_node_value_pool_capability_is_omitted_and_rejected_before_fetch(
     Ok(())
 }
 
-#[test]
-fn node_backed_composition_requires_tip_liveness_capability() -> eyre::Result<()> {
+#[tokio::test]
+async fn node_backed_composition_requires_tip_liveness_capability() -> eyre::Result<()> {
     let source = ProbedValuePoolSource {
         capabilities: NodeCapabilities::new([
             NodeCapability::OpenRpcDiscovery,
@@ -233,7 +233,7 @@ fn node_backed_composition_requires_tip_liveness_capability() -> eyre::Result<()
     };
 
     assert!(matches!(
-        serving_query(source),
+        serving_query(source).await,
         Err(error)
             if error
                 .downcast_ref::<zinder_query::QueryError>()
@@ -280,7 +280,8 @@ async fn probed_tree_and_broadcast_capabilities_are_advertised_and_invokable() -
             transaction_id: accepted_transaction_id,
         })),
     };
-    let (query, _store_fixture) = serving_query_from_chain(source, &chain, &activations)?;
+    let (query, _store_fixture, _ingest_control_fixture) =
+        serving_query_from_chain(source, &chain, &activations).await?;
 
     for capability in [
         WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
@@ -338,7 +339,7 @@ async fn absent_tree_and_broadcast_capabilities_reject_without_invoking_the_sour
         tree_state: None,
         broadcast_outcome: None,
     };
-    let (query, _store_fixture) = serving_query(source)?;
+    let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
 
     for capability in [
         WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
@@ -365,67 +366,28 @@ async fn absent_tree_and_broadcast_capabilities_reject_without_invoking_the_sour
     Ok(())
 }
 
-#[tokio::test]
-async fn omitted_native_mempool_capability_rejects_before_proxy_dial() -> eyre::Result<()> {
-    let source = ProbedValuePoolSource {
-        capabilities: NodeCapabilities::new([NodeCapability::OpenRpcDiscovery])?,
-        value_pools: ChainValuePools::new(
-            BlockId::new(BlockHeight::new(7), BlockHash::from_bytes([0x77; 32])),
-            Vec::new(),
-        ),
-        fetch_count: Arc::new(AtomicUsize::new(0)),
-        tree_state_fetch_count: Arc::new(AtomicUsize::new(0)),
-        broadcast_count: Arc::new(AtomicUsize::new(0)),
-        tree_state: None,
-        broadcast_outcome: None,
-    };
-    let (query, _store_fixture) = serving_query(source)?;
-    let adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
-        query,
-        WalletEndpointMetadata::default(),
-        "http://127.0.0.1:1".to_owned(),
-    );
-
-    let status = WalletQueryService::mempool_snapshot(
-        &adapter,
-        Request::new(wallet::MempoolSnapshotRequest {
-            max_entries: 1,
-            from_cursor: Vec::new(),
-        }),
-    )
-    .await
-    .err()
-    .ok_or_else(|| eyre::eyre!("unadvertised mempool snapshot unexpectedly succeeded"))?;
-    let details = status.get_error_details();
-
-    assert_eq!(status.code(), Code::FailedPrecondition);
-    assert_eq!(
-        details.error_info().map(|info| info.reason.as_str()),
-        Some("ENDPOINT_CAPABILITY_UNAVAILABLE")
-    );
-    Ok(())
-}
-
-fn serving_query(
+async fn serving_query(
     source: ProbedValuePoolSource,
 ) -> eyre::Result<(
-    WalletServingQuery<ProbedValuePoolSource>,
+    WalletServingQuery<ProbedValuePoolSource, AdmittedIngestControl>,
     WalletServingStoreFixture,
+    zinder_testkit::IngestControlFixture,
 )> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
         .extend_blocks(1);
-    serving_query_from_chain(source, &chain, &activations)
+    serving_query_from_chain(source, &chain, &activations).await
 }
 
-fn serving_query_from_chain(
+async fn serving_query_from_chain(
     source: ProbedValuePoolSource,
     chain: &ChainFixture,
     activations: &Arc<zinder_core::NetworkUpgradeActivations>,
 ) -> eyre::Result<(
-    WalletServingQuery<ProbedValuePoolSource>,
+    WalletServingQuery<ProbedValuePoolSource, AdmittedIngestControl>,
     WalletServingStoreFixture,
+    zinder_testkit::IngestControlFixture,
 )> {
     let mut store_fixture = WalletServingStoreFixture::from_chain(chain, activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
@@ -433,12 +395,15 @@ fn serving_query_from_chain(
         Arc::new(canonical),
         Arc::new(wallet),
     )?);
-    let query = WalletServingQuery::from_probed_node_source(
+    let (ingest_control, ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let query = WalletServingQuery::from_admitted_native_sources(
         WalletServingPairSlot::new(pair),
         source,
+        ingest_control,
         Arc::clone(activations),
     )?;
-    Ok((query, store_fixture))
+    Ok((query, store_fixture, ingest_control_fixture))
 }
 
 #[derive(Clone)]

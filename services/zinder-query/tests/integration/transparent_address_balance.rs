@@ -160,7 +160,7 @@ async fn transparent_address_balance_rejects_more_addresses_than_the_cap() -> ey
 }
 
 #[tokio::test]
-async fn release_balance_rejects_more_addresses_than_the_cap_before_store_reads() -> eyre::Result<()>
+async fn release_balance_is_unavailable_before_request_parsing_or_store_reads() -> eyre::Result<()>
 {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
@@ -171,25 +171,19 @@ async fn release_balance_rejects_more_addresses_than_the_cap_before_store_reads(
         Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
         Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
     )?);
-    let query = WalletServingQuery::from_serving_pair_slot(
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
         (),
+        ingest_control,
         activations,
     );
     let grpc_adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
-    let over_cap = MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES + 1;
-    let addresses = (0..over_cap)
-        .map(|index| {
-            let mut script_hash_bytes = [0u8; 32];
-            script_hash_bytes[..4].copy_from_slice(&index.to_be_bytes());
-            script_hash_lookup(TransparentAddressScriptHash::from_bytes(script_hash_bytes))
-        })
-        .collect();
-
     let status = WalletQueryService::transparent_address_balance(
         &grpc_adapter,
         Request::new(TransparentAddressBalanceRequest {
-            addresses,
+            addresses: Vec::new(),
             at_epoch_id: None,
         }),
     )
@@ -197,14 +191,7 @@ async fn release_balance_rejects_more_addresses_than_the_cap_before_store_reads(
     .err()
     .ok_or_else(|| eyre!("release balance unexpectedly accepted an over-cap request"))?;
 
-    assert_eq!(status.code(), Code::InvalidArgument);
-    assert_eq!(
-        status
-            .get_error_details()
-            .error_info()
-            .map(|error_info| error_info.reason.as_str()),
-        Some(ErrorReason::TransparentBalanceAddressCountExceeded.as_str_name())
-    );
+    assert_eq!(status.code(), Code::FailedPrecondition);
     Ok(())
 }
 

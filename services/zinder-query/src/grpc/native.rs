@@ -906,30 +906,42 @@ fn native_shielded_protocol(
 mod server_info_tests {
     use zinder_proto::capabilities::{
         WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_MEMPOOL_V2,
-        WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1, WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
-        WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_FULL_BLOCK_AT_V1,
-        WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
-        WALLET_READ_SERVER_INFO_V2, WALLET_READ_SETTLED_TIP_BLOCK_V1,
-        WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1,
-        WALLET_READ_TRANSPARENT_OUTPUTS_V1, WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
-        WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
-        WALLET_SNAPSHOT_MEMPOOL_V3,
+        WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
+        WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1, WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
+        WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, WALLET_READ_COMPACT_BLOCK_RANGE_V2,
+        WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
+        WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1, WALLET_READ_SERVER_INFO_V2,
+        WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
+        WALLET_READ_TRANSACTION_BYTES_V1, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
+        WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+        WALLET_READ_VISIBLE_TIP_BLOCK_V1, WALLET_SNAPSHOT_MEMPOOL_V3,
     };
     use zinder_source::{NodeCapabilities, NodeCapability};
     use zinder_store::RawBlobRetention;
+    use zinder_testkit::IngestControlFixture;
 
     use super::{
         MaterializedViewPreset, NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
         WalletEndpointMetadata, build_wallet_server_info,
     };
+    use crate::AdmittedIngestControl;
 
-    #[test]
-    fn build_wallet_server_info_populates_node_when_upstream_known()
+    #[tokio::test]
+    async fn build_wallet_server_info_populates_node_when_upstream_known()
     -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture =
+            IngestControlFixture::spawn(zinder_core::Network::ZcashRegtest).await?;
+        let admitted_ingest_control = AdmittedIngestControl::connect(
+            ingest_fixture.endpoint(),
+            None,
+            zinder_core::Network::ZcashRegtest,
+        )
+        .await?;
         let metadata = WalletEndpointMetadata::default();
-        let capabilities = NativeWalletEndpointCapabilities::for_wallet_serving_pair(
+        let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::Transactions,
             NodeCapabilities::default(),
+            &admitted_ingest_control,
         );
         let mut upstream = UpstreamNodeCapabilities::from_probed(NodeCapabilities::new([
             NodeCapability::SubtreeRoots,
@@ -957,18 +969,29 @@ mod server_info_tests {
         assert!(!common.capabilities.is_empty());
         assert!(common.materialized_view_preset.is_empty());
         assert!(common.materialized_view_identities.is_empty());
+        ingest_fixture.shutdown().await?;
         Ok(())
     }
 
-    #[test]
-    fn server_info_reports_the_effective_wallet_workload() {
+    #[tokio::test]
+    async fn server_info_reports_the_effective_wallet_workload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture =
+            IngestControlFixture::spawn(zinder_core::Network::ZcashRegtest).await?;
+        let admitted_ingest_control = AdmittedIngestControl::connect(
+            ingest_fixture.endpoint(),
+            None,
+            zinder_core::Network::ZcashRegtest,
+        )
+        .await?;
         let metadata = WalletEndpointMetadata {
             materialized_view_preset: Some(MaterializedViewPreset::Wallet),
             ..WalletEndpointMetadata::default()
         };
-        let capabilities = NativeWalletEndpointCapabilities::for_wallet_serving_pair(
+        let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::Transactions,
             NodeCapabilities::default(),
+            &admitted_ingest_control,
         );
         let common = build_wallet_server_info(metadata, &capabilities, None)
             .common
@@ -983,14 +1006,26 @@ mod server_info_tests {
                 .map(|schema| schema.name.as_str().to_owned())
                 .collect::<Vec<_>>()
         );
+        ingest_fixture.shutdown().await?;
+        Ok(())
     }
 
-    #[test]
-    fn build_wallet_server_info_emits_empty_node_when_no_upstream() {
+    #[tokio::test]
+    async fn build_wallet_server_info_emits_empty_node_when_no_upstream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture =
+            IngestControlFixture::spawn(zinder_core::Network::ZcashRegtest).await?;
+        let admitted_ingest_control = AdmittedIngestControl::connect(
+            ingest_fixture.endpoint(),
+            None,
+            zinder_core::Network::ZcashRegtest,
+        )
+        .await?;
         let metadata = WalletEndpointMetadata::default();
-        let capabilities = NativeWalletEndpointCapabilities::for_wallet_serving_pair(
+        let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::Transactions,
             NodeCapabilities::default(),
+            &admitted_ingest_control,
         );
         let descriptor = build_wallet_server_info(metadata, &capabilities, None);
         let Some(node) = descriptor.node else {
@@ -1003,14 +1038,25 @@ mod server_info_tests {
             unreachable!("common ops.ServerInfo field must always be set")
         };
         assert_eq!(common.network, "zcash-regtest");
+        ingest_fixture.shutdown().await?;
+        Ok(())
     }
 
-    #[test]
-    fn wallet_serving_capabilities_come_from_retention_and_probed_node_evidence()
+    #[tokio::test]
+    async fn wallet_serving_capabilities_come_from_composed_service_evidence()
     -> Result<(), Box<dyn std::error::Error>> {
-        let transactions = NativeWalletEndpointCapabilities::for_wallet_serving_pair(
+        let ingest_fixture =
+            IngestControlFixture::spawn(zinder_core::Network::ZcashRegtest).await?;
+        let admitted_ingest_control = AdmittedIngestControl::connect(
+            ingest_fixture.endpoint(),
+            None,
+            zinder_core::Network::ZcashRegtest,
+        )
+        .await?;
+        let transactions = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::Transactions,
             NodeCapabilities::default(),
+            &admitted_ingest_control,
         );
         for always_supported in [
             WALLET_READ_VISIBLE_TIP_BLOCK_V1,
@@ -1019,6 +1065,12 @@ mod server_info_tests {
             WALLET_READ_COMPACT_BLOCK_RANGE_V2,
             WALLET_READ_SERVER_INFO_V2,
             WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+            WALLET_READ_TRANSACTION_BY_ID_V2,
+            WALLET_READ_TRANSACTION_BYTES_V1,
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+            WALLET_EVENTS_MEMPOOL_V2,
+            WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
+            WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
         ] {
             assert!(transactions.contains(always_supported));
         }
@@ -1028,14 +1080,8 @@ mod server_info_tests {
             WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
             WALLET_BROADCAST_TRANSACTION_V1,
             WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
-            WALLET_READ_TRANSACTION_BY_ID_V2,
-            WALLET_READ_TRANSACTION_BYTES_V1,
             WALLET_READ_TRANSPARENT_OUTPUTS_V1,
             WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
-            WALLET_SNAPSHOT_MEMPOOL_V3,
-            WALLET_EVENTS_MEMPOOL_V2,
-            WALLET_READ_TRANSACTION_BY_ID_V2,
-            WALLET_READ_TRANSACTION_BYTES_V1,
         ] {
             assert!(!transactions.contains(structurally_absent));
         }
@@ -1045,26 +1091,32 @@ mod server_info_tests {
             NodeCapability::TreeState,
             NodeCapability::TransactionBroadcast,
         ])?;
-        let all = NativeWalletEndpointCapabilities::for_wallet_serving_pair(
+        let all = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::All,
             probed_node,
+            &admitted_ingest_control,
         );
         for evidence_backed in [
             WALLET_READ_FULL_BLOCK_AT_V1,
             WALLET_READ_FULL_BLOCK_RANGE_V1,
             WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
             WALLET_BROADCAST_TRANSACTION_V1,
+            WALLET_READ_TRANSACTION_BY_ID_V2,
+            WALLET_READ_TRANSACTION_BYTES_V1,
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+            WALLET_EVENTS_MEMPOOL_V2,
+            WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
+            WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
         ] {
             assert!(all.contains(evidence_backed));
         }
         for still_absent in [
             WALLET_READ_TRANSPARENT_OUTPUTS_V1,
             WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
-            WALLET_SNAPSHOT_MEMPOOL_V3,
-            WALLET_EVENTS_MEMPOOL_V2,
         ] {
             assert!(!all.contains(still_absent));
         }
+        ingest_fixture.shutdown().await?;
         Ok(())
     }
 }

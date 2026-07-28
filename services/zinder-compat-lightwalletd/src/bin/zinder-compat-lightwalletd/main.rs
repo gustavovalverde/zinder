@@ -177,30 +177,33 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         }
     };
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let (serving_pair_publisher, serving_pair_slot) = WalletServingPairPublisher::bootstrap(
-        WalletServingPairConfig {
-            canonical_primary_path: lightwalletd_config.storage.path.clone(),
-            canonical_secondary_root: lightwalletd_config.storage.secondary_path.clone(),
-            wallet_primary_path: lightwalletd_config.wallet_primary_path.clone(),
-            wallet_secondary_root: lightwalletd_config.wallet_secondary_root.clone(),
-            network: lightwalletd_config.network,
-            network_upgrade_activations: Arc::clone(&network_upgrade_activations),
-            expected_raw_blob_retention: lightwalletd_config.storage.expected_raw_blob_retention,
-            canonical_reorg_policy: lightwalletd_config.canonical_reorg_policy,
-            canonical_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
-            wallet_resource_budget: lightwalletd_config.wallet_rocksdb_budget,
-            catchup_interval: lightwalletd_config.storage.secondary_catchup_interval,
-            convergence_timeout: lightwalletd_config.storage.initial_catchup_timeout,
-            convergence_attempts: lightwalletd_config.pair_convergence_attempts,
-            replica_lag_threshold_chain_epochs: lightwalletd_config
-                .storage
-                .secondary_replica_lag_threshold_chain_epochs,
-        },
-        serving_readiness.clone(),
-        &lightwalletd_config.ingest_control_addr,
-        lightwalletd_config.ingest_control_bearer_token.as_ref(),
-    )
-    .await?;
+    let (serving_pair_publisher, serving_pair_slot) =
+        WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+            WalletServingPairConfig {
+                canonical_primary_path: lightwalletd_config.storage.path.clone(),
+                canonical_secondary_root: lightwalletd_config.storage.secondary_path.clone(),
+                wallet_primary_path: lightwalletd_config.wallet_primary_path.clone(),
+                wallet_secondary_root: lightwalletd_config.wallet_secondary_root.clone(),
+                network: lightwalletd_config.network,
+                network_upgrade_activations: Arc::clone(&network_upgrade_activations),
+                expected_raw_blob_retention: lightwalletd_config
+                    .storage
+                    .expected_raw_blob_retention,
+                canonical_reorg_policy: lightwalletd_config.canonical_reorg_policy,
+                canonical_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
+                wallet_resource_budget: lightwalletd_config.wallet_rocksdb_budget,
+                catchup_interval: lightwalletd_config.storage.secondary_catchup_interval,
+                convergence_timeout: lightwalletd_config.storage.initial_catchup_timeout,
+                convergence_attempts: lightwalletd_config.pair_convergence_attempts,
+                replica_lag_threshold_chain_epochs: lightwalletd_config
+                    .storage
+                    .secondary_replica_lag_threshold_chain_epochs,
+            },
+            serving_readiness.clone(),
+            &lightwalletd_config.ingest_control_addr,
+            lightwalletd_config.ingest_control_bearer_token.as_ref(),
+        )
+        .await?;
     let visible_height = Some(
         serving_pair_slot
             .capture()

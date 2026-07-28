@@ -131,10 +131,16 @@ fence, and wallet digest.
 | --- | --- | --- |
 | ingest | `starting` or `syncing` | Canonical lag is within threshold and mempool snapshot is complete |
 | projector | `starting` or `syncing` | Wallet store is published and following the admitted canonical source |
-| native query | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair is published |
+| native query | `starting`, `replica_lagging`, `writer_status_unavailable`, or `ingest_control_unavailable` | One exact canonical and wallet pair is published, the admitted node is healthy, and `WriterStatus` plus a bounded mempool snapshot succeed through the admitted ingest-control channel |
 | compatibility | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair is published |
 
-`node_unavailable` and `upstream_not_ready` are recoverable source conditions.
+`node_unavailable`, `upstream_not_ready`, and
+`ingest_control_unavailable` are recoverable dependency conditions. For native
+query, inspect the classified `ingest_control_health_unavailable` warning and
+restore the admitted writer endpoint, authentication, writer status, or
+tip-coherent mempool snapshot. Startup identity, network, contract-revision,
+or required-capability mismatches fail before traffic binds and require
+configuration or deployment correction rather than health-probe retries.
 `schema_mismatch`, `reorg_window_exceeded`, corrupt store errors, and source
 identity mismatches require operator action.
 

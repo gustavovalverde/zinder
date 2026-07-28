@@ -178,6 +178,7 @@ Important current reasons include:
 | `ENDPOINT_CAPABILITY_UNAVAILABLE` | The admitted endpoint does not structurally implement the requested operation |
 | `DEPENDENCY_NOT_CONFIGURED` | A required federated dependency is absent |
 | `UPSTREAM_UNREACHABLE` | A configured dependency is temporarily unreachable |
+| `SERVICE_NOT_READY` | The process is alive but its shared readiness gate is closed; `ErrorInfo.metadata["readiness_cause"]` identifies the stable cause |
 | `NODE_CAPABILITY_MISSING` | The source node cannot provide a required capability |
 
 Do not encode retry policy in error text. Do not reuse a reason for a different
