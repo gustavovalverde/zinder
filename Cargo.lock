@@ -5882,6 +5882,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic",
+ "tonic-types",
  "tracing",
  "zebra-chain",
  "zinder-core",

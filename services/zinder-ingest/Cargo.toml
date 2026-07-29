@@ -55,5 +55,6 @@ tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thr
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
+tonic-types.workspace = true
 zinder-query.workspace = true
 zinder-testkit.workspace = true
