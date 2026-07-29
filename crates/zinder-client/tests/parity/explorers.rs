@@ -5,13 +5,10 @@
 //! per-address state. These compile-time assertions ensure the trait surface
 //! they depend on stays intact through future refactors.
 
-use std::num::NonZeroU32;
-use tokio_stream::StreamExt as _;
-
 use zinder_client::{
-    BlockHeight, ChainIndex, EndpointBackedIndex, RemoteChainIndex, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentAddressTxIndexArtifact,
-    TransparentAddressUnspentOutputsQuery, TransparentOutPoint, TransparentUnspentOutput,
+    BlockHeight, Capability, CapabilityDescriptor, ChainIndex, EndpointBackedIndex, ErrorReason,
+    RemoteChainIndex, RetryPolicy, TransactionId, TransparentAddressScriptHash,
+    TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_testkit::FixtureTransactionRows;
 
@@ -47,9 +44,9 @@ fn parity_chain_index_surface_compiles_for_block_explorers() {
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "End-to-end fixture covering the unspent stream, tx history, and balance refusal in one flow."
+    reason = "End-to-end fixture proving that an otherwise readable balance is rejected when the release composition cannot provide one coherent canonical-and-mempool snapshot."
 )]
-async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> {
+async fn release_endpoint_rejects_unadmitted_explorer_transparent_balance() -> eyre::Result<()> {
     let address_script_hash = TransparentAddressScriptHash::from_bytes([0xA7; 32]);
     let transaction_id = TransactionId::from_bytes([0xA8; 32]);
     let base_fixture = parity_chain_fixture(1);
@@ -67,13 +64,6 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
         block_height,
         block_hash,
     );
-    let tx_history = TransparentAddressTxIndexArtifact::new(
-        address_script_hash,
-        block_height,
-        0,
-        transaction_id,
-        block_hash,
-    );
     let chain_fixture = base_fixture
         .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
             transaction_id,
@@ -85,58 +75,20 @@ async fn serves_explorer_transparent_indexes_from_fixture() -> eyre::Result<()> 
         .with_address_output_index(utxo.clone());
     let chain_index = open_remote_chain_index(&chain_fixture).await?;
 
-    let mut utxo_stream = chain_index
-        .transparent_address_unspent_outputs(TransparentAddressUnspentOutputsQuery {
-            address_script_hash,
-            start_height: BlockHeight::new(1),
-            at_epoch_id: None,
-        })
-        .await?;
-    let mut utxo_items = Vec::new();
-    while let Some(stream_item) = utxo_stream.next().await {
-        utxo_items.push(stream_item?);
-    }
-    let mut history = chain_index
-        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsQuery {
-            address_script_hash,
-            start_height: BlockHeight::new(1),
-            end_height: BlockHeight::new(1),
-            max_entries: Some(
-                NonZeroU32::new(10)
-                    .ok_or_else(|| eyre::eyre!("test max_entries constant must be non-zero"))?,
-            ),
-            from_cursor: None,
-            descending: false,
-        })
-        .await?;
-    let history_item = history
-        .next()
-        .await
-        .ok_or_else(|| eyre::eyre!("missing transparent history item"))??;
-
-    let utxo_chain_epoch = utxo_items
-        .first()
-        .map(|stream_item| stream_item.chain_epoch)
-        .ok_or_else(|| eyre::eyre!("unspent stream must not be empty"))?;
-    assert_eq!(
-        utxo_items
-            .iter()
-            .map(|stream_item| stream_item.output.clone())
-            .collect::<Vec<_>>(),
-        vec![utxo]
-    );
-    assert_eq!(history_item.chain_epoch, utxo_chain_epoch);
-    assert_eq!(history_item.artifact, tx_history);
-    assert!(history_item.cursor.is_none());
-    assert!(history.next().await.is_none());
-
-    let balance = chain_index
+    let server_info = chain_index.server_info().await?;
+    assert!(!server_info.supports(Capability::TransparentAddressBalance));
+    let error = chain_index
         .transparent_address_balance(&[address_script_hash])
-        .await?;
-    assert_eq!(balance.confirmed_zat, 321);
-    assert_eq!(balance.unconfirmed_delta_zat, 0);
-    assert_eq!(balance.address_count, 1);
-    assert_eq!(balance.chain_epoch, utxo_chain_epoch);
+        .await
+        .err()
+        .ok_or_else(|| {
+            eyre::eyre!("release endpoint must reject the unadmitted transparent balance")
+        })?;
+    assert_eq!(
+        error.reason(),
+        Some(ErrorReason::EndpointCapabilityUnavailable)
+    );
+    assert_eq!(error.retry_policy(), RetryPolicy::OperatorActionRequired);
 
     Ok(())
 }

@@ -68,6 +68,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
         &activations,
         checkpoint,
         fixed_tip,
+        zinder_store::RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let temporary = tempdir()?;
@@ -94,6 +95,7 @@ async fn canonical_blocks_load_requested_range_from_fixed_checkpoint() -> Result
         &store_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
         resource_budget,
     )

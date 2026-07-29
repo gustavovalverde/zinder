@@ -6,12 +6,24 @@ The release topology serves both Zinder's native `WalletQuery` protocol and [lig
 
 ## Wallet integration paths
 
-- **Existing lightwalletd clients** keep their `CompactTxStreamer` integration and point it at `zinder-compat-lightwalletd`. ZODL and Vizor use this protocol shape, although each current wallet release still needs end-to-end validation before Zinder claims support.
-- **Native wallet clients** call the published `zinder-query` runtime when they need epoch-pinned compact blocks, transaction status, chain events, mempool state, or typed broadcast outcomes.
+- **Existing lightwalletd clients** keep their `CompactTxStreamer` integration
+  and point it at `zinder-compat-lightwalletd`. Protocol compatibility does not
+  become a named-wallet support claim until that wallet's current release
+  passes end-to-end certification.
+- **Native wallet clients** call the published `zinder-query` runtime for the
+  epoch-pinned reads and node-backed operations admitted and advertised by that
+  deployment, including compact blocks, chain events, and typed broadcast
+  outcomes.
 - **Rust wallet libraries and applications** use the remote-first `zinder-client` SDK. Its default `RemoteChainIndex` connects to `zinder-query` without linking Zinder's RocksDB storage stack.
 - **Explorers and application backends** use epoch-consistent wallet reads plus the optional `ExplorerQuery` plane for block summaries, transaction details, mempool views, typed search, and rebuildable materialized views.
 
-Zinder is strongest when chain access should survive one wallet process, serve several independent consumers, or remain decoupled from a particular wallet implementation. An embedded indexer such as Zaino can be simpler for one tightly coupled wallet process, while direct Zebra RPC may be sufficient when a consumer only needs node-owned data. See [What Zinder is and is not](docs/architecture/indexer-wallet-boundary.md) for the detailed comparison.
+Zinder is strongest when chain access should survive one wallet process, serve
+several independent consumers, or remain decoupled from a particular wallet
+implementation. An embedded indexer can be simpler for one tightly coupled
+wallet process, while direct Zebra RPC may be sufficient when a consumer only
+needs node-owned data. See
+[What Zinder is and is not](docs/architecture/indexer-wallet-boundary.md) for
+the detailed comparison.
 
 The deployment target is single-operator self-hosting backed by one Zebra node. Public endpoints sit behind operator-controlled TLS termination, authentication, rate limiting, and quota accounting.
 
@@ -21,8 +33,12 @@ The supported wallet-serving topology uses four independent release runtimes
 on one host filesystem: `zinder-ingest` owns canonical storage,
 `zinder-projector` owns the wallet projection, and
 `zinder-query` and `zinder-compat-lightwalletd` independently serve native and
-compatibility protocols over immutable exact-fence pairs. Explorer and mixed
-single-container images are not built or published by the release workflow.
+compatibility protocols over immutable exact-fence pairs. A separate
+[single-volume container target](docs/runbooks/deploying-wallet-serving.md)
+runs ingest, projector, and native query as supervised processes when a host
+can attach one volume to only one container; that target omits
+`zinder-compat-lightwalletd` and is not a published release image. Explorer
+images are also outside the release catalog.
 
 Tagged releases also provide checksum-bound GNU/Linux bundles containing these
 same 4 executables for `x86_64-v3` and AArch64 hosts. The x86 archive

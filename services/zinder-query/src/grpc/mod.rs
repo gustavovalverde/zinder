@@ -14,17 +14,17 @@ use crate::QueryError;
 
 pub use adapter::WalletQueryGrpcAdapter;
 pub use native::{
-    ServerInfoSettings, UpstreamNodeCapabilities, WalletCapabilityProfile,
-    address_lookup_to_script_hash, block_header_by_selector_response,
+    WalletEndpointMetadata, address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response,
     build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
     build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
-    build_wallet_server_info, chain_events_response, compact_block_response, full_block_response,
-    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
-    subtree_roots_response, transaction_response, transparent_address_tx_ids_response,
-    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
-    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
-    tree_state_at_response, visible_tip_block_response, wallet_capability_strings,
+    build_wallet_server_info, chain_events_response, chain_value_pools_at_tip_response,
+    compact_block_response, full_block_response, latest_tree_state_checkpoint_response,
+    network_upgrade_activations_response, subtree_roots_response, transaction_response,
+    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
+    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
+    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
+    visible_tip_block_response,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
@@ -54,7 +54,8 @@ pub fn status_from_query_error(error: &QueryError) -> Status {
 fn typed_detail_for(error: &QueryError) -> ErrorDetails {
     match error {
         QueryError::InvalidBlockRange { .. }
-        | QueryError::CompactBlockRangeTooLarge { .. }
+        | QueryError::BlockRangeTooLarge { .. }
+        | QueryError::SubtreeRootRangeTooLarge { .. }
         | QueryError::ChainEventCursorInvalid { .. }
         | QueryError::TransparentHistoryCursorInvalid { .. }
         | QueryError::InvalidAddress { .. }
@@ -62,6 +63,7 @@ fn typed_detail_for(error: &QueryError) -> ErrorDetails {
         | QueryError::BroadcastTransactionTooLarge { .. } => bad_request_details(error),
         QueryError::TransactionBroadcastDisabled
         | QueryError::MaterializedViewUnavailable { .. }
+        | QueryError::EndpointCapabilityUnavailable { .. }
         | QueryError::ChainEventCursorExpired { .. }
         | QueryError::ChainEpochPinUnavailable { .. } => precondition_failure_details(error),
         QueryError::ArtifactUnavailable { family, key } => ErrorDetails::with_resource_info(
@@ -101,10 +103,16 @@ fn bad_request_details(error: &QueryError) -> ErrorDetails {
                 ),
             ),
         ]),
-        QueryError::CompactBlockRangeTooLarge { requested, maximum } => {
+        QueryError::BlockRangeTooLarge { requested, maximum } => {
             ErrorDetails::with_bad_request_violation(
                 "end_height",
-                format!("requested {requested} compact blocks; maximum is {maximum}"),
+                format!("requested {requested} blocks; maximum is {maximum}"),
+            )
+        }
+        QueryError::SubtreeRootRangeTooLarge { requested, maximum } => {
+            ErrorDetails::with_bad_request_violation(
+                "max_entries",
+                format!("requested {requested} subtree roots; maximum is {maximum}"),
             )
         }
         QueryError::ChainEventCursorInvalid { reason }
@@ -150,6 +158,13 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
                 "materialized view is not configured for this deployment",
             )
         }
+        QueryError::EndpointCapabilityUnavailable { capability } => {
+            ErrorDetails::with_precondition_failure_violation(
+                "ENDPOINT_CAPABILITY_UNAVAILABLE",
+                *capability,
+                "the composed endpoint does not structurally implement this capability",
+            )
+        }
         QueryError::ChainEventCursorExpired {
             event_sequence,
             oldest_retained_sequence,
@@ -173,7 +188,7 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
 mod tests {
     use tonic::Code;
     use tonic_types::StatusExt as _;
-    use zinder_core::BlockHeight;
+    use zinder_core::{BlockHeight, MAX_SUBTREE_ROOTS_PER_REQUEST};
 
     use super::*;
 
@@ -219,5 +234,25 @@ mod tests {
 
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(fields, vec!["start_height", "end_height"]);
+    }
+
+    #[test]
+    fn oversized_subtree_root_range_status_names_max_entries() {
+        let status = status_from_query_error(&QueryError::SubtreeRootRangeTooLarge {
+            requested: MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1),
+            maximum: MAX_SUBTREE_ROOTS_PER_REQUEST,
+        });
+        let details = status.get_error_details();
+        let violation = details
+            .bad_request()
+            .and_then(|bad_request| bad_request.field_violations.first());
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(matches!(
+            violation,
+            Some(violation)
+                if violation.field == "max_entries"
+                    && violation.description.contains("maximum is 1024")
+        ));
     }
 }

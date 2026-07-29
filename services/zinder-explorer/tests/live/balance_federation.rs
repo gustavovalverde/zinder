@@ -25,7 +25,7 @@ use zinder_proto::v1::wallet::{
     wallet_query_client::WalletQueryClient,
 };
 use zinder_query::{
-    ServerInfoSettings, TransparentAddressUnspentOutputsRequest, WalletQuery, WalletQueryApi,
+    TransparentAddressUnspentOutputsRequest, WalletEndpointMetadata, WalletQuery, WalletQueryApi,
     WalletQueryGrpcAdapter,
 };
 use zinder_source::{NodeSource as _, SourceBlock};
@@ -169,7 +169,7 @@ async fn serve_wallet_query(
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(
-                WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default())
+                WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default())
                     .into_server(),
             )
             .serve_with_incoming(TcpListenerStream::new(listener))

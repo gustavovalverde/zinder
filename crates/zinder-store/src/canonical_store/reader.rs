@@ -1,12 +1,15 @@
 //! Typed serving reads for an admitted canonical store.
 
-use crate::BoundedRocksDbOpen;
+use std::mem::size_of;
+
+use crate::{BlockHashLookup, BoundedRocksDbOpen};
 use rust_rocksdb::{Direction, IteratorMode};
 use zinder_core::{
-    ArtifactSchemaVersion, BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, ChainEpoch,
-    ChainTipMetadata, CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact,
-    SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
-    UnixTimestampMillis, wire::encode_internal_transaction_id,
+    ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, BlockId, ChainEpoch, ChainTipMetadata, CommitmentTreeCheckpoint,
+    CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
+    TransactionId, TransactionLocation, UnixTimestampMillis,
+    wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
 use super::{
@@ -18,9 +21,10 @@ use super::{
     },
     publication::column_family,
     rocksdb::{
-        BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
+        CHAIN_EPOCH_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY,
+        TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
     subtree_load::{decode_subtree_root, encode_subtree_root_key},
 };
@@ -28,6 +32,7 @@ use super::{
 const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
 const TRANSACTION_LOCATION_VALUE_BYTES: usize = 40;
 const COMPACT_BLOCK_MULTI_GET_BATCH_SIZE: usize = 1_024;
+const BLOCK_BLOB_MULTI_GET_BATCH_SIZE: usize = 1_024;
 
 trait CanonicalServingRead {
     fn serving_open(&self) -> &BoundedRocksDbOpen;
@@ -99,6 +104,34 @@ macro_rules! impl_canonical_typed_reads {
                 height: BlockHeight,
             ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
                 read_block_header_at(self, height)
+            }
+
+            /// Resolves a block hash through the canonical best-chain index.
+            pub fn block_hash_lookup(
+                &self,
+                block_hash: BlockHash,
+            ) -> Result<BlockHashLookup, CanonicalStoreError> {
+                read_block_hash_lookup(self, block_hash)
+            }
+
+            /// Reads one retained raw block by height.
+            pub fn block_blob_at(
+                &self,
+                height: BlockHeight,
+            ) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError> {
+                read_block_blob_at(self, height)
+            }
+
+            /// Batch-reads retained raw blocks for an inclusive height range.
+            ///
+            /// The output preserves range order and contains one entry per
+            /// requested height. `None` means this store did not retain that
+            /// height's raw block bytes.
+            pub fn block_blobs_in_range(
+                &self,
+                range: BlockHeightRange,
+            ) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError> {
+                read_block_blobs_in_range(self, range)
             }
 
             /// Reads one compact block by height.
@@ -187,6 +220,36 @@ fn read_block_header_at(
     )?
     .map(|encoded| decode_block_header(height, &encoded))
     .transpose()
+}
+
+fn read_block_hash_lookup(
+    store: &impl CanonicalServingRead,
+    block_hash: BlockHash,
+) -> Result<BlockHashLookup, CanonicalStoreError> {
+    let Some(encoded_height) = read_optional(
+        store,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY,
+        &encode_internal_block_hash(block_hash),
+        "block hash index read",
+    )?
+    else {
+        return Ok(BlockHashLookup::NotIndexed);
+    };
+    if encoded_height.len() != size_of::<u32>() {
+        return Err(CanonicalStoreError::publication(
+            "block hash index height is not the exact version-1 value",
+        ));
+    }
+    let height = BlockHeight::new(read_u32_be(&encoded_height, 0)?);
+    if height > read_chain_epoch(store)?.visible_tip_height {
+        return Ok(BlockHashLookup::NotInBestChain);
+    }
+    match read_block_header_at(store, height)? {
+        Some(header) if header.block_hash == block_hash => {
+            Ok(BlockHashLookup::Resolved(BlockId::new(height, block_hash)))
+        }
+        Some(_) | None => Ok(BlockHashLookup::NotInBestChain),
+    }
 }
 
 fn read_compact_block_at(
@@ -326,6 +389,91 @@ fn read_transaction_blob(
         "transaction blob read",
     )?
     .map(|raw_transaction_bytes| TransactionBlobArtifact::new(location, raw_transaction_bytes)))
+}
+
+fn read_block_blob_at(
+    store: &impl CanonicalServingRead,
+    height: BlockHeight,
+) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError> {
+    read_block_blobs_in_range(store, BlockHeightRange::inclusive(height, height))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| CanonicalStoreError::publication("single-height block blob read is empty"))
+}
+
+fn read_block_blobs_in_range(
+    store: &impl CanonicalServingRead,
+    range: BlockHeightRange,
+) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError> {
+    let mut blobs = Vec::new();
+    let mut heights = Vec::with_capacity(BLOCK_BLOB_MULTI_GET_BATCH_SIZE);
+    for height in range {
+        heights.push(height);
+        if heights.len() == BLOCK_BLOB_MULTI_GET_BATCH_SIZE {
+            append_block_blob_batch(store, &heights, &mut blobs)?;
+            heights.clear();
+        }
+    }
+    append_block_blob_batch(store, &heights, &mut blobs)?;
+    Ok(blobs)
+}
+
+fn append_block_blob_batch(
+    store: &impl CanonicalServingRead,
+    heights: &[BlockHeight],
+    blobs: &mut Vec<Option<BlockBlobArtifact>>,
+) -> Result<(), CanonicalStoreError> {
+    if heights.is_empty() {
+        return Ok(());
+    }
+    let block_blob_family = column_family(&store.serving_open().db, BLOCK_BLOB_COLUMN_FAMILY)?;
+    let header_family = column_family(&store.serving_open().db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    let keys = heights
+        .iter()
+        .copied()
+        .map(encode_block_position)
+        .collect::<Vec<_>>();
+    let mut inputs = Vec::with_capacity(keys.len().saturating_mul(2));
+    for key in &keys {
+        inputs.push((&block_blob_family, key.as_slice()));
+        inputs.push((&header_family, key.as_slice()));
+    }
+    let mut rows = store.serving_open().db.multi_get_cf(inputs).into_iter();
+
+    for height in heights {
+        let raw_block_bytes = rows
+            .next()
+            .ok_or_else(|| CanonicalStoreError::publication("block blob multi-get is truncated"))?
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "block blob range read",
+                source,
+            })?;
+        let encoded_header = rows
+            .next()
+            .ok_or_else(|| CanonicalStoreError::publication("block header multi-get is truncated"))?
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "block blob header range read",
+                source,
+            })?;
+        let Some(raw_block_bytes) = raw_block_bytes else {
+            blobs.push(None);
+            continue;
+        };
+        let encoded_header = encoded_header.ok_or_else(|| {
+            CanonicalStoreError::publication(format!(
+                "retained block blob at height {} has no canonical header",
+                height.value()
+            ))
+        })?;
+        let header = decode_block_header(*height, &encoded_header)?;
+        blobs.push(Some(BlockBlobArtifact::new(
+            *height,
+            header.block_hash,
+            header.parent_hash,
+            raw_block_bytes,
+        )));
+    }
+    Ok(())
 }
 
 fn read_tree_state_checkpoint_at_or_before(

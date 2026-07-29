@@ -7,7 +7,7 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
 use thiserror::Error;
 
-use crate::{BUILD_GIT_COMMIT, OpsServer};
+use crate::{BUILD_GIT_COMMIT, OpsServer, sections::RuntimeService};
 
 static PROMETHEUS_HANDLE: OnceLock<MetricsHandle> = OnceLock::new();
 static PROMETHEUS_INSTALL_LOCK: Mutex<()> = Mutex::new(());
@@ -71,12 +71,43 @@ pub enum MetricsInstallError {
 /// recorder. Calling this more than once through Zinder runtime returns the
 /// already-installed handle and records another `zinder_build_info` label set.
 pub fn install_metrics_recorder(server: &OpsServer) -> Result<MetricsHandle, MetricsInstallError> {
+    install_metrics_recorder_with_identity(
+        server.service_name,
+        server.service_version,
+        server.network_name,
+    )
+}
+
+/// Installs the global Prometheus recorder for a known runtime service and
+/// records its build identity.
+///
+/// Use this before startup work that emits metrics but precedes construction
+/// of an [`OpsServer`]. Later operational-endpoint startup reuses the same
+/// recorder through [`install_metrics_recorder`].
+pub fn install_metrics_recorder_for_service(
+    service: RuntimeService,
+    service_version: &'static str,
+    network_name: &'static str,
+) -> Result<MetricsHandle, MetricsInstallError> {
+    install_metrics_recorder_with_identity(service.binary_name(), service_version, network_name)
+}
+
+fn install_metrics_recorder_with_identity(
+    service_name: &'static str,
+    service_version: &'static str,
+    network_name: &'static str,
+) -> Result<MetricsHandle, MetricsInstallError> {
     let handle = if let Some(handle) = PROMETHEUS_HANDLE.get() {
         handle.clone()
     } else {
         let _install_guard = PROMETHEUS_INSTALL_LOCK.lock();
         if let Some(handle) = PROMETHEUS_HANDLE.get() {
-            return Ok(record_build_info(handle.clone(), server));
+            return Ok(record_build_info(
+                handle.clone(),
+                service_name,
+                service_version,
+                network_name,
+            ));
         }
         let prometheus = PrometheusBuilder::new()
             .set_buckets_for_metric(
@@ -96,10 +127,20 @@ pub fn install_metrics_recorder(server: &OpsServer) -> Result<MetricsHandle, Met
         installed
     };
 
-    Ok(record_build_info(handle, server))
+    Ok(record_build_info(
+        handle,
+        service_name,
+        service_version,
+        network_name,
+    ))
 }
 
-fn record_build_info(handle: MetricsHandle, server: &OpsServer) -> MetricsHandle {
+fn record_build_info(
+    handle: MetricsHandle,
+    service_name: &'static str,
+    service_version: &'static str,
+    network_name: &'static str,
+) -> MetricsHandle {
     describe_gauge!(
         "zinder_build_info",
         Unit::Count,
@@ -107,10 +148,10 @@ fn record_build_info(handle: MetricsHandle, server: &OpsServer) -> MetricsHandle
     );
     metrics::gauge!(
         "zinder_build_info",
-        "service" => server.service_name,
-        "version" => server.service_version,
+        "service" => service_name,
+        "version" => service_version,
         "git_commit" => BUILD_GIT_COMMIT,
-        "network" => server.network_name
+        "network" => network_name
     )
     .set(1.0);
 

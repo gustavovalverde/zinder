@@ -292,6 +292,7 @@ impl CanonicalHarness {
             &sample_regtest_upgrade_activations(),
             first_block.block_time_seconds.saturating_sub(1),
             block_id(&blocks, CHAIN_TIP_HEIGHT)?,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         Self::publish(blocks, build_plan).await
@@ -310,6 +311,7 @@ impl CanonicalHarness {
                 sapling_only_frontiers(),
             ),
             block_id(&blocks, CHAIN_TIP_HEIGHT)?,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         Self::publish(blocks, build_plan).await
@@ -327,6 +329,7 @@ impl CanonicalHarness {
             temporary.path().join("canonical-secondary"),
             &sample_regtest_upgrade_activations(),
             CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;

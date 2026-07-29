@@ -20,11 +20,21 @@ use zinder_core::{
     UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet;
+use zinder_query::AdmittedIngestControl;
 use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts};
 use zinder_testkit::{
-    FixtureTransactionRows, build_fixture_transaction_rows, encode_fixture_block_replay,
-    synthetic_transaction_public_facts,
+    FixtureTransactionRows, IngestControlFixture, build_fixture_transaction_rows,
+    encode_fixture_block_replay, synthetic_transaction_public_facts,
 };
+
+/// Admits the standard in-process ingest-control identity for serving-query tests.
+pub async fn admitted_ingest_control_fixture()
+-> eyre::Result<(AdmittedIngestControl, IngestControlFixture)> {
+    let fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let ingest_control =
+        AdmittedIngestControl::connect(fixture.endpoint(), None, Network::ZcashRegtest).await?;
+    Ok((ingest_control, fixture))
+}
 
 /// Builds commit-ready canonical artifacts whose replay envelopes and
 /// transparent projection rows come from the same fixture transaction rows.

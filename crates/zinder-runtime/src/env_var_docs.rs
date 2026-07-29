@@ -238,29 +238,44 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__ADDR",
         toml_path: "node.health.addr",
-        used_by: &["zinder-ingest"],
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "URL of the upstream's HTTP `/ready` endpoint. When set, the writer polls \
-                      it as the primary upstream-sync signal; when unset, the writer falls back \
+        description: "URL of the upstream's HTTP `/ready` endpoint. When set, ingest and the \
+                      wallet-serving readers poll it as the primary upstream-sync signal; when \
+                      unset, they fall back \
                       to `getblockchaininfo.verificationprogress`/`estimatedheight`. See \
                       [ADR-0015](../adrs/0015-phase-driven-ingest.md).",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__POLL_INTERVAL_MS",
         toml_path: "node.health.poll_interval_ms",
-        used_by: &["zinder-ingest", "zinder-explorer"],
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Cadence of the upstream-health probe in milliseconds. Defaults to 30000. \
-                      Must be greater than zero. `zinder-explorer` reuses the same cadence for \
+                      Must be greater than zero. Query and compatibility use it to refresh \
+                      serving readiness; `zinder-explorer` reuses the same cadence for \
                       its upstream-observation probe (the one that populates \
                       `ExplorerFreshness.chain_view.upstream_tip`).",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR",
         toml_path: "node.health.verification_progress_floor",
-        used_by: &["zinder-ingest"],
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Lower bound on `getblockchaininfo.verificationprogress` below which the \
@@ -270,7 +285,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS",
         toml_path: "node.health.estimated_gap_floor_blocks",
-        used_by: &["zinder-ingest"],
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Block gap between `estimatedheight` and the local tip above which the \
@@ -849,7 +868,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_STORAGE__RAW_BLOB_POLICY",
         toml_path: "storage.raw_blob_policy",
-        used_by: &["zinder-ingest"],
+        used_by: &[
+            "zinder-ingest",
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Immutable raw-blob retention contract: `none`, `transactions`, or `all`. \
@@ -858,8 +882,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Wallet-serving coverage defaults to `transactions` and rejects `none`, because \
                       native and lightwalletd-compatible transaction and transparent-history methods \
                       require retained bytes. \
-                      The first canonical commit fixes historical coverage; changing a non-empty store \
-                      requires a rebuild.",
+                      Projector, query, and compatibility readers use the same value as an exact \
+                      admission expectation; Zallet full-block serving requires `all`. The first \
+                      canonical commit fixes historical coverage; changing a non-empty store requires \
+                      a rebuild and blue-green cutover.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__REORG_WINDOW_BLOCKS",

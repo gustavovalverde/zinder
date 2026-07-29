@@ -3,16 +3,17 @@
 //! This crate serves indexed artifacts through [`ChainEpochReadApi`] without
 //! mutating canonical storage or using upstream nodes as a fallback for
 //! indexed history. Upstream access is limited to explicitly delegated sparse
-//! tree-state fill and transaction broadcast operations.
+//! tree-state fill and transaction broadcast.
 
 use std::{collections::HashSet, fmt, num::NonZeroU32, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{OnceCell, mpsc};
 use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
-    ChainEpoch, ChainEpochId, CompactBlockArtifact, MAX_RAW_TRANSACTION_BYTES, MinedTransaction,
+    ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
+    MAX_RAW_TRANSACTION_BYTES, MAX_SUBTREE_ROOTS_PER_REQUEST, MinedTransaction,
     MinedTransactionChainContext, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionBlobArtifact,
     TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressBalance,
@@ -28,8 +29,10 @@ use zinder_materialized_views::{
     TransparentAddressTransactionHistoryPageRequest, TransparentOutpointSpendConsumer,
 };
 use zinder_proto::capabilities::{
-    WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
+    WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+    WALLET_READ_TRANSPARENT_SPENDS_V1,
 };
+use zinder_runtime::AuthenticatedChannel;
 use zinder_source::{SourceError, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
     AddressOutputIndexPageRequest, ArtifactFamily, BlockHashLookup, ChainEpochReadApi,
@@ -39,30 +42,37 @@ use zinder_store::{
 };
 
 mod grpc;
+mod ingest_control;
+mod native_wallet_endpoint_capabilities;
 mod wallet_serving_pair;
 mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
 
 pub use grpc::{
-    ServerInfoSettings, UpstreamNodeCapabilities, WalletCapabilityProfile, WalletQueryGrpcAdapter,
-    address_lookup_to_script_hash, block_header_by_selector_response,
-    block_id_by_selector_response, broadcast_transaction_response,
-    build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
-    build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
-    build_wallet_server_info, chain_events_response, compact_block_response, full_block_response,
+    WalletEndpointMetadata, WalletQueryGrpcAdapter, address_lookup_to_script_hash,
+    block_header_by_selector_response, block_id_by_selector_response,
+    broadcast_transaction_response, build_transparent_address_tx_ids_chunk,
+    build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
+    build_transparent_unspent_outputs_header, build_wallet_server_info, chain_events_response,
+    chain_value_pools_at_tip_response, compact_block_response, full_block_response,
     latest_tree_state_checkpoint_response, network_upgrade_activations_response,
     status_from_query_error, subtree_roots_response, transaction_response,
     transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
     transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
     transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
-    visible_tip_block_response, wallet_capability_strings,
+    visible_tip_block_response,
+};
+pub use ingest_control::{AdmittedIngestControl, IngestControlAdmissionError};
+pub use native_wallet_endpoint_capabilities::{
+    NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
 };
 pub use wallet_serving_pair::{
     CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
 };
 pub use wallet_serving_pair_publisher::{
     WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
-    WalletServingPairPublisher, WalletServingPairSlot,
+    WalletServingPairPublisher, WalletServingPairSlot, WalletServingReadiness,
+    spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
 };
 pub use wallet_serving_query::WalletServingQuery;
 /// Wallet-facing read API backed by epoch-bound canonical reads.
@@ -73,9 +83,25 @@ pub use wallet_serving_query::WalletServingQuery;
 /// instead of accepting a pin.
 #[async_trait]
 pub trait WalletQueryApi: Send + Sync + 'static {
+    /// Returns the immutable structural capability set derived when this query
+    /// was composed and admitted.
+    fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;
+
+    /// Returns the diagnostic capability snapshot from the exact upstream
+    /// source handle installed in this query, when one exists.
+    fn upstream_node_capabilities(&self) -> Option<&UpstreamNodeCapabilities>;
+
     /// Returns the network-upgrade activation table advertised by the
     /// configured upstream node.
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError>;
+
+    /// Reads chain-wide value-pool totals from the exact admitted upstream
+    /// source and binds them to the query's current chain epoch.
+    async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, QueryError> {
+        Err(QueryError::EndpointCapabilityUnavailable {
+            capability: WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
+        })
+    }
 
     /// Reads the visible-tip block identity.
     async fn visible_tip_block(
@@ -267,7 +293,6 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     async fn transparent_utxo_set_summary(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-        commitment_enabled: bool,
     ) -> Result<TransparentUtxoSetSummary, QueryError>;
 
     /// Reads the tree state at exactly `height`.
@@ -288,6 +313,9 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     ) -> Result<TreeState, QueryError>;
 
     /// Reads subtree-root artifacts for a bounded subtree range.
+    ///
+    /// Rejects ranges above [`MAX_SUBTREE_ROOTS_PER_REQUEST`] with
+    /// [`QueryError::SubtreeRootRangeTooLarge`] before reading storage.
     async fn subtree_roots(
         &self,
         subtree_root_range: SubtreeRootRange,
@@ -327,6 +355,11 @@ pub struct WalletQuery<ReadApi, Broadcaster = ()> {
     options: WalletQueryOptions,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     tree_state_upstream: Option<Arc<dyn TreeStateUpstream>>,
+    native_endpoint_capabilities: NativeWalletEndpointCapabilities,
+    // Temporary primary-store test compositions may defer this fixture
+    // connection. Release composition admits `AdmittedIngestControl` first.
+    legacy_ingest_control_proxy_endpoint: Option<String>,
+    legacy_ingest_control_channel: Arc<OnceCell<AuthenticatedChannel>>,
 }
 
 impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
@@ -346,6 +379,18 @@ impl<ReadApi: fmt::Debug, Broadcaster: fmt::Debug> fmt::Debug
                 &self.network_upgrade_activations,
             )
             .field("tree_state_upstream", &self.tree_state_upstream.is_some())
+            .field(
+                "native_endpoint_capabilities",
+                &self.native_endpoint_capabilities,
+            )
+            .field(
+                "legacy_ingest_control_proxy_configured",
+                &self.legacy_ingest_control_proxy_endpoint.is_some(),
+            )
+            .field(
+                "legacy_ingest_control_channel_initialized",
+                &self.legacy_ingest_control_channel.get().is_some(),
+            )
             .finish()
     }
 }
@@ -363,7 +408,7 @@ pub const DEFAULT_MAX_FULL_BLOCK_RANGE: NonZeroU32 = NonZeroU32::MIN.saturating_
 /// Blocks read per store multi-get while streaming a full-block range.
 ///
 /// Caps the producer's working set to one sub-read regardless of window width.
-const FULL_BLOCK_STREAM_SUB_READ_BLOCKS: u32 = 16;
+pub(crate) const FULL_BLOCK_STREAM_SUB_READ_BLOCKS: u32 = 16;
 
 /// Bounded depth of the full-block range channel.
 ///
@@ -423,7 +468,7 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
 
     /// Creates a wallet query boundary with explicit runtime options.
     #[must_use]
-    pub const fn with_options(
+    pub fn with_options(
         read_api: ReadApi,
         transaction_broadcaster: Broadcaster,
         network_upgrade_activations: Arc<NetworkUpgradeActivations>,
@@ -436,6 +481,10 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
             options,
             network_upgrade_activations,
             tree_state_upstream: None,
+            native_endpoint_capabilities:
+                NativeWalletEndpointCapabilities::for_chain_epoch_read_api(),
+            legacy_ingest_control_proxy_endpoint: None,
+            legacy_ingest_control_channel: Arc::new(OnceCell::new()),
         }
     }
 
@@ -481,6 +530,14 @@ where
     ReadApi: ChainEpochReadApi + Clone + Send + Sync + 'static,
     Broadcaster: TransactionBroadcaster + Clone,
 {
+    fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
+        &self.native_endpoint_capabilities
+    }
+
+    fn upstream_node_capabilities(&self) -> Option<&UpstreamNodeCapabilities> {
+        None
+    }
+
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
         Ok((*self.network_upgrade_activations).clone())
     }
@@ -1148,14 +1205,13 @@ where
     async fn transparent_utxo_set_summary(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-        commitment_enabled: bool,
     ) -> Result<TransparentUtxoSetSummary, QueryError> {
         let started_at = Instant::now();
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             reader
-                .transparent_utxo_set_summary(commitment_enabled)
+                .transparent_utxo_set_summary(false)
                 .map_err(QueryError::Store)
         }))
         .await;
@@ -1331,6 +1387,11 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SubtreeRoots, QueryError> {
         let started_at = Instant::now();
+        if let Err(error) = validate_subtree_root_range(subtree_root_range) {
+            let query_outcome = Err(error);
+            record_wallet_query_outcome("subtree_roots_in_range", started_at, &query_outcome, None);
+            return query_outcome;
+        }
         let read_api = self.read_api.clone();
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
@@ -1877,7 +1938,8 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
     match error {
         None => "none",
         Some(QueryError::InvalidBlockRange { .. }) => "invalid_block_range",
-        Some(QueryError::CompactBlockRangeTooLarge { .. }) => "compact_block_range_too_large",
+        Some(QueryError::BlockRangeTooLarge { .. }) => "block_range_too_large",
+        Some(QueryError::SubtreeRootRangeTooLarge { .. }) => "subtree_root_range_too_large",
         Some(QueryError::TransparentBalanceAddressCountExceeded { .. }) => {
             "transparent_balance_address_count_exceeded"
         }
@@ -1898,6 +1960,7 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
         Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
         Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
+        Some(QueryError::EndpointCapabilityUnavailable { .. }) => "endpoint_capability_unavailable",
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
@@ -2225,12 +2288,21 @@ pub enum QueryError {
     },
 
     /// Requested block range exceeds the configured response bound.
-    #[error("compact block range is too large: requested {requested}, maximum {maximum}")]
-    CompactBlockRangeTooLarge {
-        /// Requested compact-block count.
+    #[error("block range is too large: requested {requested}, maximum {maximum}")]
+    BlockRangeTooLarge {
+        /// Requested block count.
         requested: usize,
-        /// Maximum allowed compact-block count.
+        /// Maximum allowed block count.
         maximum: usize,
+    },
+
+    /// Requested subtree-root range exceeds the public per-request bound.
+    #[error("subtree-root range is too large: requested {requested}, maximum {maximum}")]
+    SubtreeRootRangeTooLarge {
+        /// Requested subtree-root count.
+        requested: u32,
+        /// Maximum allowed subtree-root count.
+        maximum: u32,
     },
 
     /// Balance request named an empty address list or more addresses than the
@@ -2370,6 +2442,13 @@ pub enum QueryError {
         capability: &'static str,
     },
 
+    /// The composed endpoint does not structurally implement a capability.
+    #[error("endpoint capability is unavailable: {capability}")]
+    EndpointCapabilityUnavailable {
+        /// Exact capability identifier required by the operation.
+        capability: &'static str,
+    },
+
     /// A blocking read task failed unexpectedly (panic or runtime shutdown).
     #[error("query read task failed: {reason}")]
     BlockingTaskFailed {
@@ -2417,7 +2496,8 @@ impl zinder_proto::BoundaryError for QueryError {
         use zinder_proto::v1::ops::ErrorReason;
         match self {
             Self::InvalidBlockRange { .. } => ErrorReason::InvalidBlockRange,
-            Self::CompactBlockRangeTooLarge { .. } => ErrorReason::CompactBlockRangeTooLarge,
+            Self::BlockRangeTooLarge { .. } => ErrorReason::BlockRangeTooLarge,
+            Self::SubtreeRootRangeTooLarge { .. } => ErrorReason::SubtreeRootRangeTooLarge,
             Self::TransparentBalanceAddressCountExceeded { .. } => {
                 ErrorReason::TransparentBalanceAddressCountExceeded
             }
@@ -2430,6 +2510,9 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::TransactionBroadcastDisabled => ErrorReason::BroadcastDisabled,
             Self::BroadcastTransactionTooLarge { .. } => ErrorReason::BroadcastTransactionTooLarge,
             Self::MaterializedViewUnavailable { .. } => ErrorReason::MaterializedViewUnavailable,
+            Self::EndpointCapabilityUnavailable { .. } => {
+                ErrorReason::EndpointCapabilityUnavailable
+            }
             Self::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
             Self::ChainEpochPinUnavailable { .. } => ErrorReason::ChainEpochPinUnavailable,
             Self::ArtifactUnavailable { .. } => ErrorReason::ArtifactUnavailable,
@@ -2540,9 +2623,20 @@ pub(crate) fn validate_block_range(
     let requested = block_range.into_iter().len();
     let maximum = u32_to_usize(max_blocks.get());
     if requested > maximum {
-        return Err(QueryError::CompactBlockRangeTooLarge { requested, maximum });
+        return Err(QueryError::BlockRangeTooLarge { requested, maximum });
     }
 
+    Ok(())
+}
+
+fn validate_subtree_root_range(subtree_root_range: SubtreeRootRange) -> Result<(), QueryError> {
+    let requested = subtree_root_range.max_entries.get();
+    if requested > MAX_SUBTREE_ROOTS_PER_REQUEST {
+        return Err(QueryError::SubtreeRootRangeTooLarge {
+            requested,
+            maximum: MAX_SUBTREE_ROOTS_PER_REQUEST,
+        });
+    }
     Ok(())
 }
 
@@ -2579,9 +2673,13 @@ mod error_reason_tests {
                 start_height: BlockHeight::new(2),
                 end_height: BlockHeight::new(1),
             },
-            QueryError::CompactBlockRangeTooLarge {
+            QueryError::BlockRangeTooLarge {
                 requested: 2,
                 maximum: 1,
+            },
+            QueryError::SubtreeRootRangeTooLarge {
+                requested: MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1),
+                maximum: MAX_SUBTREE_ROOTS_PER_REQUEST,
             },
             QueryError::TransparentBalanceAddressCountExceeded {
                 requested: 257,
@@ -2627,6 +2725,9 @@ mod error_reason_tests {
             QueryError::MaterializedViewUnavailable {
                 capability: "probe",
             },
+            QueryError::EndpointCapabilityUnavailable {
+                capability: "probe",
+            },
             QueryError::BlockingTaskFailed {
                 reason: "probe".to_owned(),
             },
@@ -2654,5 +2755,18 @@ mod error_reason_tests {
                 "QueryError variant {error:?} mapped to ERROR_REASON_UNSPECIFIED"
             );
         }
+    }
+
+    #[test]
+    fn subtree_root_range_limit_has_stable_metrics_classification() {
+        let error = QueryError::SubtreeRootRangeTooLarge {
+            requested: MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1),
+            maximum: MAX_SUBTREE_ROOTS_PER_REQUEST,
+        };
+
+        assert_eq!(
+            query_error_class(Some(&error)),
+            "subtree_root_range_too_large"
+        );
     }
 }

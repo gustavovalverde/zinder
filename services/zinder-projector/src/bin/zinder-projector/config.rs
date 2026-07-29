@@ -12,18 +12,20 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection,
-    NetworkSection, NetworkToml, NodeToml, OpsSection, OpsToml, ProjectorControlSection,
-    ProjectorControlToml, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, SecuritySection,
-    SecurityToml, StorageRoleSection, guard_optional_serving_bind, require_field,
-    resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
-    resolve_ingest_control_reader, resolve_ops_listen_addr, resolve_projector_control,
+    NetworkSection, NetworkToml, NodeToml, OpsSection, OpsServerError, OpsToml,
+    ProjectorControlSection, ProjectorControlToml, RocksDbResourceBudgetSection,
+    RocksDbResourceBudgetToml, SecuritySection, SecurityToml, StorageRoleSection,
+    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
+    resolve_canonical_reader_rocksdb_budget, resolve_ingest_control_reader,
+    resolve_ops_listen_addr, resolve_projector_control,
     resolve_wallet_projection_writer_rocksdb_budget,
 };
 use zinder_source::{NodeSection, NodeTarget};
-use zinder_store::RocksDbResourceBudget;
+use zinder_store::{RawBlobRetention, RocksDbResourceBudget};
 
 const DEFAULT_CANONICAL_PATH: &str = "/var/lib/zinder/canonical";
 const DEFAULT_CANONICAL_SECONDARY_PATH: &str = "/var/lib/zinder/projector/canonical-secondary";
+const DEFAULT_RAW_BLOB_RETENTION: RawBlobRetention = RawBlobRetention::Transactions;
 const DEFAULT_WALLET_PATH: &str = "/var/lib/zinder/wallet";
 const DEFAULT_OPS_LISTEN_ADDR: &str = "127.0.0.1:9110";
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 100;
@@ -52,6 +54,7 @@ pub(crate) struct ProjectorConfig {
     pub(crate) network: Network,
     pub(crate) canonical_path: PathBuf,
     pub(crate) canonical_secondary_path: PathBuf,
+    pub(crate) expected_canonical_raw_blob_retention: RawBlobRetention,
     pub(crate) wallet_path: PathBuf,
     pub(crate) canonical_rocksdb_budget: RocksDbResourceBudget,
     pub(crate) wallet_rocksdb_budget: RocksDbResourceBudget,
@@ -110,6 +113,9 @@ pub(crate) struct ProjectorConfigOverrides {
 pub(crate) enum ProjectorError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+
+    #[error(transparent)]
+    OpsServer(#[from] OpsServerError),
 
     #[error("node source initialization failed: {0}")]
     NodeConfig(#[from] zinder_source::NodeConfigError),
@@ -211,41 +217,7 @@ pub(crate) fn load_projector_config(
     config_path: Option<PathBuf>,
     overrides: ProjectorConfigOverrides,
 ) -> Result<ProjectorConfig, ProjectorError> {
-    let raw: ProjectorRawConfig = ConfigLoader::new()
-        .with_default("storage.canonical_path", DEFAULT_CANONICAL_PATH)?
-        .with_default(
-            "storage.canonical_secondary_path",
-            DEFAULT_CANONICAL_SECONDARY_PATH,
-        )?
-        .with_default("wallet.path", DEFAULT_WALLET_PATH)?
-        .with_default("projector.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
-        .with_default(
-            "projector.build.max_outpoint_sort_memory_bytes",
-            DEFAULT_OUTPOINT_SORT_MEMORY_BYTES,
-        )?
-        .with_default(
-            "projector.build.max_secondary_sort_memory_bytes_per_sorter",
-            DEFAULT_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER,
-        )?
-        .with_default(
-            "projector.build.max_temporary_file_bytes_per_sorter",
-            DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER,
-        )?
-        .with_default(
-            "projector.build.sst_target_logical_bytes",
-            DEFAULT_SST_TARGET_LOGICAL_BYTES,
-        )?
-        .with_default(
-            "projector.build.max_accounted_reorg_undo_bytes",
-            DEFAULT_ACCOUNTED_REORG_UNDO_BYTES,
-        )?
-        .with_default(
-            "projector.follow.max_transition_logical_bytes",
-            DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES,
-        )?
-        .with_default("ops.listen_addr", DEFAULT_OPS_LISTEN_ADDR)?
-        .with_default("ingest_control.addr", "http://127.0.0.1:9100")?
-        .with_security_section()?
+    let raw: ProjectorRawConfig = projector_config_loader()?
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
@@ -293,6 +265,48 @@ pub(crate) fn load_projector_config(
     resolve_projector_config(raw)
 }
 
+fn projector_config_loader() -> Result<ConfigLoader, ConfigError> {
+    ConfigLoader::new()
+        .with_default("storage.canonical_path", DEFAULT_CANONICAL_PATH)?
+        .with_default(
+            "storage.canonical_secondary_path",
+            DEFAULT_CANONICAL_SECONDARY_PATH,
+        )?
+        .with_default(
+            "storage.raw_blob_policy",
+            DEFAULT_RAW_BLOB_RETENTION.as_kebab_case(),
+        )?
+        .with_default("wallet.path", DEFAULT_WALLET_PATH)?
+        .with_default("projector.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
+        .with_default(
+            "projector.build.max_outpoint_sort_memory_bytes",
+            DEFAULT_OUTPOINT_SORT_MEMORY_BYTES,
+        )?
+        .with_default(
+            "projector.build.max_secondary_sort_memory_bytes_per_sorter",
+            DEFAULT_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER,
+        )?
+        .with_default(
+            "projector.build.max_temporary_file_bytes_per_sorter",
+            DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER,
+        )?
+        .with_default(
+            "projector.build.sst_target_logical_bytes",
+            DEFAULT_SST_TARGET_LOGICAL_BYTES,
+        )?
+        .with_default(
+            "projector.build.max_accounted_reorg_undo_bytes",
+            DEFAULT_ACCOUNTED_REORG_UNDO_BYTES,
+        )?
+        .with_default(
+            "projector.follow.max_transition_logical_bytes",
+            DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES,
+        )?
+        .with_default("ops.listen_addr", DEFAULT_OPS_LISTEN_ADDR)?
+        .with_default("ingest_control.addr", "http://127.0.0.1:9100")?
+        .with_security_section()
+}
+
 /// Renders the complete accepted config shape without exposing auth material.
 pub(crate) fn projector_config_toml(config: &ProjectorConfig) -> Result<String, ProjectorError> {
     toml::to_string(&ProjectorConfigToml::from_config(config))
@@ -319,6 +333,7 @@ struct ProjectorRawConfig {
 struct ProjectorStorageSection {
     canonical_path: Option<PathBuf>,
     canonical_secondary_path: Option<PathBuf>,
+    raw_blob_policy: Option<RawBlobRetention>,
     canonical: StorageRoleSection,
 }
 
@@ -362,6 +377,8 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
         raw.storage.canonical_secondary_path,
         "storage.canonical_secondary_path",
     )?;
+    let expected_canonical_raw_blob_retention =
+        require_field(raw.storage.raw_blob_policy, "storage.raw_blob_policy")?;
     let wallet_path = require_field(raw.wallet.path, "wallet.path")?;
     require_distinct_paths(&canonical_path, &canonical_secondary_path, &wallet_path)?;
     let canonical_rocksdb_budget =
@@ -393,6 +410,7 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
         network,
         canonical_path,
         canonical_secondary_path,
+        expected_canonical_raw_blob_retention,
         wallet_path,
         canonical_rocksdb_budget,
         wallet_rocksdb_budget,
@@ -592,6 +610,7 @@ impl ProjectorConfigToml {
             storage: ProjectorStorageToml {
                 canonical_path: config.canonical_path.clone(),
                 canonical_secondary_path: config.canonical_secondary_path.clone(),
+                raw_blob_policy: config.expected_canonical_raw_blob_retention,
                 canonical: ProjectorStorageRoleToml::from_budget(config.canonical_rocksdb_budget),
             },
             wallet: ProjectorWalletToml {
@@ -625,6 +644,7 @@ impl ProjectorConfigToml {
 struct ProjectorStorageToml {
     canonical_path: PathBuf,
     canonical_secondary_path: PathBuf,
+    raw_blob_policy: RawBlobRetention,
     canonical: ProjectorStorageRoleToml,
 }
 

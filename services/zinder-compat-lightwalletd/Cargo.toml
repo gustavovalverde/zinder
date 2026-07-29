@@ -12,7 +12,6 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-arc-swap.workspace = true
 async-trait.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true

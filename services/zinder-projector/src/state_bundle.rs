@@ -26,7 +26,8 @@ use zinder_core::{
 use zinder_proto::v1::ingest::{CanonicalWriterFence, CreateCanonicalOwnerCheckpointResponse};
 use zinder_store::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CANONICAL_STORE_IDENTITY,
-    CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreWorkload, RocksDbResourceBudget,
+    CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreWorkload, RawBlobRetention,
+    RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_STORE_IDENTITY, WalletCanonicalSourceIdentity,
@@ -39,7 +40,7 @@ use zinder_wallet_rocksdb::{
 /// Exact bundle identity admitted by this release.
 pub const STATE_BUNDLE_IDENTITY: &str = "state-bundle";
 /// Exact state-bundle manifest format admitted by this release.
-pub const STATE_BUNDLE_FORMAT_VERSION: u16 = 1;
+pub const STATE_BUNDLE_FORMAT_VERSION: u16 = 2;
 /// Only certified physical topology represented by a state bundle.
 pub const STATE_BUNDLE_TOPOLOGY: &str = "rocksdb-single-host";
 /// Fixed canonical checkpoint directory within a bundle.
@@ -510,7 +511,7 @@ pub enum StateBundleError {
         reason: String,
     },
     /// A manifest was not valid exact JSON.
-    #[error("state-bundle manifest {path} is not valid format-1 JSON: {source}")]
+    #[error("state-bundle manifest {path} is not valid format-2 JSON: {source}")]
     ManifestDecode {
         /// Manifest path.
         path: PathBuf,
@@ -580,6 +581,7 @@ struct CanonicalAdmission {
 struct CanonicalBuildPlanAdmission {
     activation_fingerprint_version: u16,
     activation_fingerprint: [u8; 32],
+    raw_blob_retention: RawBlobRetention,
     reorg_window_blocks: u32,
     history_preceding_checkpoint: Option<BlockId>,
     history_predecessor: CanonicalHistoryPredecessorAdmission,
@@ -1163,6 +1165,7 @@ impl CanonicalCheckpointManifest {
 struct CanonicalBuildPlanManifest {
     activation_fingerprint_version: u16,
     activation_fingerprint: String,
+    raw_blob_retention: RawBlobRetention,
     reorg_window_blocks: u32,
     history_preceding_checkpoint: Option<BlockManifest>,
     history_predecessor: CanonicalHistoryPredecessorManifest,
@@ -1174,6 +1177,7 @@ impl CanonicalBuildPlanManifest {
         Self {
             activation_fingerprint_version: build_plan.activation_fingerprint_version,
             activation_fingerprint: hex::encode(build_plan.activation_fingerprint),
+            raw_blob_retention: build_plan.raw_blob_retention,
             reorg_window_blocks: build_plan.reorg_window_blocks,
             history_preceding_checkpoint: build_plan
                 .history_preceding_checkpoint
@@ -1784,6 +1788,12 @@ fn decode_build_plan(
         &evidence.activation_fingerprint,
         "canonical activation fingerprint",
     )?;
+    let raw_blob_retention = RawBlobRetention::from_kebab_case(&evidence.raw_blob_retention)
+        .ok_or_else(|| {
+            StateBundleError::manifest_contract(
+                "canonical raw-blob retention must be none, transactions, or all",
+            )
+        })?;
     require_manifest_value(
         evidence.reorg_window_blocks > 0,
         "canonical build-plan reorg window must be nonzero",
@@ -1803,6 +1813,7 @@ fn decode_build_plan(
     Ok(CanonicalBuildPlanAdmission {
         activation_fingerprint_version,
         activation_fingerprint,
+        raw_blob_retention,
         reorg_window_blocks: evidence.reorg_window_blocks,
         history_preceding_checkpoint: history.preceding_checkpoint,
         history_predecessor: history.predecessor,
@@ -2078,9 +2089,13 @@ mod tests {
             &sample_wallet_admission(7)?,
         )?;
         let valid = serde_json::to_value(manifest)?;
-        let mutations: [(&str, Value); 16] = [
+        let unsupported_construction_manifest_version =
+            CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
+                .checked_add(1)
+                .ok_or("construction manifest test version overflow")?;
+        let mutations: [(&str, Value); 17] = [
             ("/identity", Value::String("state_bundle".to_owned())),
-            ("/format_version", Value::from(2)),
+            ("/format_version", Value::from(1)),
             ("/topology", Value::String("mixed-runtime".to_owned())),
             ("/candidate_id", Value::String("../outside".to_owned())),
             ("/network", Value::String("mainnet".to_owned())),
@@ -2091,7 +2106,7 @@ mod tests {
             ),
             (
                 "/canonical_checkpoint/construction_manifest_version",
-                Value::from(3),
+                Value::from(unsupported_construction_manifest_version),
             ),
             (
                 "/canonical_checkpoint/construction_manifest_sha256",
@@ -2104,6 +2119,10 @@ mod tests {
             (
                 "/canonical_checkpoint/build_plan/reorg_window_blocks",
                 Value::from(0),
+            ),
+            (
+                "/canonical_checkpoint/build_plan/raw_blob_retention",
+                Value::String("headers".to_owned()),
             ),
             (
                 "/canonical_checkpoint/build_plan/history_predecessor/block_id/hash",
@@ -2127,11 +2146,11 @@ mod tests {
                 .pointer_mut(pointer)
                 .ok_or("test mutation pointer must resolve")?;
             *field = replacement;
-            let decoded: StateBundleManifest = serde_json::from_value(corrupted)?;
-            assert!(
-                decoded.validate(Network::ZcashRegtest).is_err(),
-                "corruption at {pointer} was admitted"
-            );
+            let rejected = serde_json::from_value::<StateBundleManifest>(corrupted)
+                .map_or(true, |decoded| {
+                    decoded.validate(Network::ZcashRegtest).is_err()
+                });
+            assert!(rejected, "corruption at {pointer} was admitted");
         }
         Ok(())
     }
@@ -2251,6 +2270,16 @@ mod tests {
             .reorg_window_blocks = 0;
         assert!(CanonicalCheckpointAdmissionEvidence::try_from(zero_reorg_window).is_err());
 
+        let mut unknown_raw_blob_retention = response.clone();
+        unknown_raw_blob_retention
+            .build_plan
+            .as_mut()
+            .ok_or("sample response must contain build-plan evidence")?
+            .raw_blob_retention = "headers".to_owned();
+        assert!(
+            CanonicalCheckpointAdmissionEvidence::try_from(unknown_raw_blob_retention).is_err()
+        );
+
         let mut wrong_predecessor = response.clone();
         wrong_predecessor
             .build_plan
@@ -2298,11 +2327,15 @@ mod tests {
         assert!(CanonicalCheckpointAdmissionEvidence::try_from(malformed_digest).is_err());
 
         let mut wrong_construction_version = sample_canonical_control_response(7);
+        let unsupported_construction_manifest_version =
+            CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
+                .checked_add(1)
+                .ok_or("construction manifest test version overflow")?;
         wrong_construction_version
             .ready_evidence
             .as_mut()
             .ok_or("sample response must contain READY evidence")?
-            .construction_manifest_version = 3;
+            .construction_manifest_version = u32::from(unsupported_construction_manifest_version);
         assert!(
             CanonicalCheckpointAdmissionEvidence::try_from(wrong_construction_version).is_err()
         );
@@ -2411,6 +2444,7 @@ mod tests {
             build_plan: CanonicalBuildPlanAdmission {
                 activation_fingerprint_version: 1,
                 activation_fingerprint: [0xaa; 32],
+                raw_blob_retention: RawBlobRetention::Transactions,
                 reorg_window_blocks: 100,
                 history_preceding_checkpoint: None,
                 history_predecessor: CanonicalHistoryPredecessorAdmission {
@@ -2483,6 +2517,11 @@ mod tests {
                     canonical.build_plan.activation_fingerprint_version,
                 ),
                 activation_fingerprint: canonical.build_plan.activation_fingerprint.to_vec(),
+                raw_blob_retention: canonical
+                    .build_plan
+                    .raw_blob_retention
+                    .as_kebab_case()
+                    .to_owned(),
                 reorg_window_blocks: canonical.build_plan.reorg_window_blocks,
                 history_preceding_checkpoint: canonical
                     .build_plan

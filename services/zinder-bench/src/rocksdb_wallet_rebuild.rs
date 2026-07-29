@@ -8,7 +8,8 @@ use zinder_bench::BenchError;
 use zinder_core::wire::decode_zinder_native_chain_name;
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, build_wallet_from_canonical};
 
@@ -39,6 +40,13 @@ pub(crate) struct RocksDbWalletRebuildArgs {
     /// Fresh destination for the wallet store.
     #[arg(long = "wallet-store")]
     wallet_store: PathBuf,
+    /// Persisted raw-blob retention contract expected on the canonical store.
+    #[arg(
+        long = "raw-blob-retention",
+        default_value = "transactions",
+        value_parser = parse_raw_blob_retention
+    )]
+    raw_blob_retention: RawBlobRetention,
     /// Per-request source timeout in seconds.
     #[arg(long = "request-timeout-secs", default_value_t = DEFAULT_REQUEST_TIMEOUT_SECONDS)]
     request_timeout_seconds: u64,
@@ -106,6 +114,7 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
         &args.canonical_store,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        args.raw_blob_retention,
         CanonicalReorgPolicy::new(args.supported_reorg_depth)?,
         RocksDbResourceBudget::canonical_reader_defaults(),
     )?;
@@ -151,6 +160,11 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
         ready_publication_seconds: durations.ready_publication.as_secs_f64(),
         total_seconds: durations.total.as_secs_f64(),
     })
+}
+
+fn parse_raw_blob_retention(encoded: &str) -> Result<RawBlobRetention, String> {
+    RawBlobRetention::from_kebab_case(encoded)
+        .ok_or_else(|| "--raw-blob-retention must be one of none, transactions, or all".to_owned())
 }
 
 fn validate_rebuild_args(args: &RocksDbWalletRebuildArgs) -> Result<(), BenchError> {

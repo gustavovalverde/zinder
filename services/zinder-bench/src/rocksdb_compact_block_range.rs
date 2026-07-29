@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use zinder_bench::{BenchError, fixture::FixtureManifest};
 use zinder_core::{BlockHeight, BlockHeightRange, CompactBlockArtifact};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CanonicalReorgPolicy, CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RawBlobRetention,
     RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 
@@ -123,6 +123,7 @@ pub(crate) fn run_rocksdb_compact_block_range(
             &secondary_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             reorg_policy,
             RocksDbResourceBudget::canonical_reader_defaults(),
         )?;

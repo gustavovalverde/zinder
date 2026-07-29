@@ -12,7 +12,7 @@ pub use capabilities::{
 };
 pub use error_policy::{
     BoundaryError, ReasonPolicy, RetryDisposition, ZINDER_ERROR_DOMAIN, reason_policy,
-    status_for_reason, status_with_reason,
+    status_for_reason, status_with_reason, status_with_reason_and_metadata,
 };
 
 /// Wire-contract revision advertised in every `ops.ServerInfo` response.
@@ -21,7 +21,7 @@ pub use error_policy::{
 /// existing wire surface are revised in place. Consumers require the minimum
 /// revision they implement and may accept newer revisions when the server's
 /// advertised capabilities satisfy their requirements.
-pub const CONTRACT_REVISION: u32 = 4;
+pub const CONTRACT_REVISION: u32 = 5;
 
 /// Encoded descriptor set for native Zinder v1 protobuf services.
 ///

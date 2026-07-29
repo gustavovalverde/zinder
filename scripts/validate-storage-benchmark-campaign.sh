@@ -107,7 +107,7 @@ validate_report() {
     and .round_trip.replay_format_version == 1
     and .round_trip.semantic_replay_validated == true
     and .fixture.contract_identity == "canonical-fixture"
-    and .fixture.fixture_format_version == 2
+    and .fixture.fixture_format_version == 3
     and (.fixture.canonical_artifact_schema_version > 0)
     and (.fixture.digest_sha256 | lowercase_sha256)
     and .fixture.canonical_block_facts_digest_evidence.block_digest_version == 1

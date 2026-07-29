@@ -47,9 +47,10 @@ published four-image release catalog.
 `zinder-ingest` is the only process that opens canonical storage for writes.
 Its runtime uses `RocksDbCanonicalStore` with the `canonical` identity,
 `CANONICAL_STORE_SCHEMA_VERSION`, the selected network, a fixed
-`CanonicalReorgPolicy`, and the wallet workload. Opening a non-empty path with
-different identity, version, network, workload, activation fingerprint, or
-reorg policy fails without mutation.
+`CanonicalReorgPolicy`, an immutable `RawBlobRetention`, and the wallet
+workload. Opening a non-empty path with different identity, version, network,
+workload, activation fingerprint, raw-blob retention, reorg policy, or
+construction-manifest build identity fails without mutation.
 
 The canonical record for each block is `CanonicalBlockFacts`. It contains the
 header and ordered transaction facts required to reconstruct consumer state.
@@ -62,7 +63,8 @@ Canonical storage also owns the small direct indexes and control records that
 must be queried without expanding every replay envelope:
 
 - height and hash chain position;
-- optional transaction locations and retained transaction blobs;
+- transaction locations derived from canonical facts and optional retained
+  transaction blobs;
 - compact blocks, tree checkpoints, and subtree roots;
 - the visible `ChainEpoch` and authenticated `CanonicalEventFence`;
 - retained canonical events and displaced-block evidence;

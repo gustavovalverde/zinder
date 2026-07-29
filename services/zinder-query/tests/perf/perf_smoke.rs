@@ -16,9 +16,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use zinder_core::{BlockHeight, BlockHeightRange, ChainEpochId, Network};
-use zinder_query::{FULL_BLOCK_STREAM_CHANNEL_CAPACITY, WalletQuery, WalletQueryApi};
+use zinder_query::{
+    FULL_BLOCK_STREAM_CHANNEL_CAPACITY, WalletQuery, WalletQueryApi, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
+};
 use zinder_store::RawBlobRetention;
-use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    ChainFixture, StoreFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
+};
 
 const PERF_SMOKE_BLOCK_COUNT: u32 = 1_000;
 const PERF_SMOKE_RANGE_BUDGET: Duration = Duration::from_secs(2);
@@ -78,11 +83,20 @@ async fn full_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Resu
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(PERF_SMOKE_BLOCK_COUNT);
-    let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain_fixture, &activations)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical),
+        Arc::new(wallet),
+    )?);
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(serving_pair),
         (),
-        Arc::new(sample_regtest_upgrade_activations()),
+        ingest_control,
+        activations,
     );
 
     let start = Instant::now();

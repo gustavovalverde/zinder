@@ -264,6 +264,7 @@ async fn canonical_follower_settles_from_local_header_without_historical_source_
             .block_time_seconds
             .saturating_sub(1),
         build_tip,
+        zinder_store::RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(2)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
@@ -397,6 +398,7 @@ async fn canonical_follower_cancellation_after_reorg_preparation_preserves_origi
         &store_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -507,6 +509,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
         &store_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -631,6 +634,7 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
         &store_path,
         &activations,
         CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -776,6 +780,7 @@ async fn publish_parseable_store(
             .block_time_seconds
             .saturating_sub(1),
         block_id(blocks, build_tip.value())?,
+        zinder_store::RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(reorg_window_blocks)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(

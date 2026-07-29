@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_core::wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name};
-use zinder_source::{NodeAuth, NodeConfigError, NodeTarget};
+use zinder_source::{NodeAuth, NodeConfigError, NodeHealthConfig, NodeTarget};
 
 use crate::auth::{BearerToken, BearerTokenError};
 use crate::env_diagnostics::{RejectedEnvVar, translate_env_error};
@@ -568,6 +568,32 @@ impl NodeAuthToml {
     }
 }
 
+/// TOML projection of `[node.health]` for `--print-config`.
+#[derive(Debug, Serialize)]
+pub struct NodeHealthToml {
+    /// Full URL of the upstream node's readiness endpoint.
+    pub addr: String,
+    /// Upstream-health probe cadence in milliseconds.
+    pub poll_interval_ms: u64,
+    /// Verification-progress floor used by the JSON-RPC fallback.
+    pub verification_progress_floor: f64,
+    /// Estimated-height gap floor, in blocks, used by the JSON-RPC fallback.
+    pub estimated_gap_floor_blocks: u32,
+}
+
+impl NodeHealthToml {
+    /// Builds a [`NodeHealthToml`] from a resolved [`NodeHealthConfig`].
+    #[must_use]
+    pub fn from_node_health_config(health: &NodeHealthConfig) -> Self {
+        Self {
+            addr: health.addr.clone(),
+            poll_interval_ms: duration_as_millis_u64(health.poll_interval),
+            verification_progress_floor: health.verification_progress_floor,
+            estimated_gap_floor_blocks: health.estimated_gap_floor_blocks,
+        }
+    }
+}
+
 /// Redacted TOML projection of `[node]` for `--print-config`.
 #[derive(Debug, Serialize)]
 pub struct NodeToml {
@@ -583,6 +609,9 @@ pub struct NodeToml {
     /// Per-broadcast timeout in seconds, applied only to `sendrawtransaction`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broadcast_timeout_secs: Option<u64>,
+    /// Optional upstream-health probe subsection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<NodeHealthToml>,
     /// Auth subsection.
     pub auth: NodeAuthToml,
 }
@@ -597,6 +626,10 @@ impl NodeToml {
             request_timeout_secs: target.request_timeout.as_secs(),
             max_response_bytes: target.max_response_bytes.get(),
             broadcast_timeout_secs: target.broadcast_timeout.map(|d| d.as_secs()),
+            health: target
+                .health
+                .as_ref()
+                .map(NodeHealthToml::from_node_health_config),
             auth: NodeAuthToml::from_node_auth(&target.node_auth),
         }
     }
@@ -628,5 +661,70 @@ mod tests {
     fn duration_as_millis_u64_saturates_on_overflow() {
         assert_eq!(duration_as_millis_u64(Duration::from_millis(1_500)), 1_500);
         assert_eq!(duration_as_millis_u64(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn configured_node_health_survives_node_toml_serialization() -> Result<(), toml::ser::Error> {
+        let target = NodeTarget::new(
+            Network::ZcashRegtest,
+            "http://127.0.0.1:18232".to_owned(),
+            NodeAuth::None,
+            Duration::from_secs(30),
+            std::num::NonZeroU64::MIN,
+        )
+        .with_health(Some(NodeHealthConfig::new(
+            "http://127.0.0.1:18233/ready".to_owned(),
+            Duration::from_millis(1_250),
+            0.875,
+            42,
+        )));
+
+        let rendered = toml::to_string(&NodeToml::from_node_target(&target))?;
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "json_rpc_addr = \"http://127.0.0.1:18232\"\n",
+                "request_timeout_secs = 30\n",
+                "max_response_bytes = 1\n",
+                "\n",
+                "[health]\n",
+                "addr = \"http://127.0.0.1:18233/ready\"\n",
+                "poll_interval_ms = 1250\n",
+                "verification_progress_floor = 0.875\n",
+                "estimated_gap_floor_blocks = 42\n",
+                "\n",
+                "[auth]\n",
+                "method = \"none\"\n",
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absent_node_health_is_omitted_from_node_toml_serialization() -> Result<(), toml::ser::Error>
+    {
+        let target = NodeTarget::new(
+            Network::ZcashRegtest,
+            "http://127.0.0.1:18232".to_owned(),
+            NodeAuth::None,
+            Duration::from_secs(30),
+            std::num::NonZeroU64::MIN,
+        );
+
+        let rendered = toml::to_string(&NodeToml::from_node_target(&target))?;
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "json_rpc_addr = \"http://127.0.0.1:18232\"\n",
+                "request_timeout_secs = 30\n",
+                "max_response_bytes = 1\n",
+                "\n",
+                "[auth]\n",
+                "method = \"none\"\n",
+            )
+        );
+        Ok(())
     }
 }

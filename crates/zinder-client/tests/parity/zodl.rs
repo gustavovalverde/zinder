@@ -1,21 +1,19 @@
 //! Zodl parity assertions.
 //!
 //! Zodl (mobile, via `zcash-android-wallet-sdk`) consumes the lightwalletd
-//! compat surface and the federated `explorer.*` surface. These
-//! compile-time assertions ensure the `ChainIndex` methods Zodl's typed
-//! gRPC paths depend on are present on the trait surface.
+//! compatibility surface, not the native Rust `ChainIndex`. These fixtures
+//! exercise only the protocol adapter shape that current Zodl calls.
 //!
 //! Cross-references: [Integration surfaces](../../../../docs/reference/integration-surfaces.md).
 
-use arc_swap::ArcSwap;
 use std::sync::Arc;
 use tokio_stream::StreamExt as _;
 use tonic::Request;
-use zinder_client::{ChainIndex, EndpointBackedIndex, RemoteChainIndex};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::{
-    CanonicalReader, WalletProjectionReader, WalletServingQuery, WalletServingReadPair,
+    CanonicalReader, WalletProjectionReader, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_testkit::{
     MockTransactionBroadcaster, WalletServingStoreFixture, sample_regtest_upgrade_activations,
@@ -25,27 +23,6 @@ use super::{
     address_history_filter, build_transparent_address_adapter,
     build_transparent_address_serving_fixture, parity_chain_fixture,
 };
-
-#[test]
-fn parity_chain_index_surface_compiles_for_zodl_use_cases() {
-    fn assert_base_compiles<T: ChainIndex>() {
-        // typed BlockSelector resolver (compact-block hash-only paths)
-        let _ = T::block_id_by_selector;
-        // typed TransparentAddressBalance from the canonical unspent index
-        let _ = T::transparent_address_balance;
-        // typed subtree-root reads for SDK scan
-        let _ = T::subtree_roots_in_range;
-        // typed TxStatus envelope (raw decode + status disambiguation)
-        let _ = T::transaction_by_id;
-    }
-    fn assert_endpoint_compiles<T: EndpointBackedIndex>() {
-        // mempool point lookups for unmined UTXO overlays
-        let _ = T::transparent_mempool_outputs_by_address;
-        let _ = T::transparent_mempool_spends_by_outpoint;
-    }
-    assert_base_compiles::<RemoteChainIndex>();
-    assert_endpoint_compiles::<RemoteChainIndex>();
-}
 
 #[tokio::test]
 #[allow(
@@ -62,9 +39,9 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
         Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
         Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
     )?);
-    let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
+    let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let query = WalletServingQuery::from_serving_pair_slot(
-        Arc::clone(&serving_pair_slot),
+        serving_pair_slot.clone(),
         MockTransactionBroadcaster::broadcast_disabled(),
         Arc::clone(&activations),
     );

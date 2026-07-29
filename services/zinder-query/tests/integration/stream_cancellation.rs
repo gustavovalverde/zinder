@@ -29,15 +29,14 @@ use eyre::{Result, eyre};
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::transport::Server;
-use zinder_core::{BlockBlobArtifact, BlockHeight};
+use zinder_core::Network;
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_store::{ChainEpochArtifacts, ChainStoreOptions, PrimaryChainStore, RawBlobRetention};
-use zinder_testkit::{
-    StoreFixture, encode_fixture_block_replay_with_raw_block, sample_regtest_upgrade_activations,
+use zinder_query::{
+    WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
-
-use crate::common::{block_hash_from_seed, synthetic_chain_epoch, synthetic_raw_block_bytes};
+use zinder_store::RawBlobRetention;
+use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
 /// Number of pre-committed blocks the test store carries. Picked so each
 /// streamed range yields multiple chunks but the fixture build stays fast.
@@ -208,50 +207,43 @@ async fn parallel_compact_block_range_readers_all_drain_to_completion() -> Resul
 }
 
 async fn commit_store_and_spawn_grpc() -> Result<String> {
-    let store_fixture = StoreFixture::open_with_options(ChainStoreOptions {
-        raw_blob_retention: RawBlobRetention::All,
-        ..ChainStoreOptions::for_local_tests()
-    })?;
-    let store = store_fixture.chain_store().clone();
-    commit_synthetic_chain(&store, COMMITTED_BLOCK_COUNT)?;
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
-    spawn_wallet_query_server(grpc_adapter).await
-}
-
-fn commit_synthetic_chain(store: &PrimaryChainStore, block_count: u32) -> Result<()> {
-    for height in 1..=block_count {
-        let (chain_epoch, block, compact_block) = synthetic_chain_epoch(u64::from(height), height);
-        let block_blob = BlockBlobArtifact::new(
-            BlockHeight::new(height),
-            block_hash_from_seed(height),
-            block_hash_from_seed(height.saturating_sub(1)),
-            synthetic_raw_block_bytes(height),
-        );
-        let replay =
-            encode_fixture_block_replay_with_raw_block(&block, &block_blob.raw_block_bytes, &[]);
-        store.commit_chain_epoch(
-            ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
-                .with_block_blobs(vec![block_blob]),
-        )?;
-    }
-    Ok(())
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::All)
+        .extend_blocks(COMMITTED_BLOCK_COUNT);
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain_fixture, &activations)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical),
+        Arc::new(wallet),
+    )?);
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(serving_pair),
+        (),
+        ingest_control,
+        activations,
+    );
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
+    spawn_wallet_query_server(grpc_adapter, store_fixture).await
 }
 
 async fn spawn_wallet_query_server(
-    grpc_adapter: WalletQueryGrpcAdapter<WalletQuery<PrimaryChainStore>>,
+    grpc_adapter: WalletQueryGrpcAdapter<
+        WalletServingQuery<(), zinder_query::AdmittedIngestControl>,
+    >,
+    store_fixture: WalletServingStoreFixture,
 ) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let listen_addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        let _ = Server::builder()
+    let _server_task = tokio::spawn(async move {
+        let server_result = Server::builder()
             .add_service(grpc_adapter.into_server())
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await;
+        drop(store_fixture);
+        server_result
     });
-    // Avoid clippy::needless_pass_by_value; BlockHeight import keeps the
-    // crate's documented vocabulary even though this helper does not use
-    // it directly.
-    let _ = BlockHeight::new(0);
     Ok(format!("http://{listen_addr}"))
 }

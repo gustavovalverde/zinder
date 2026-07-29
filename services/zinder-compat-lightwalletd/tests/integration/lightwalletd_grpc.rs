@@ -733,6 +733,14 @@ fn synthetic_compact_block(height: BlockHeight) -> CompactBlockArtifact {
 
 #[async_trait]
 impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
+    fn native_endpoint_capabilities(&self) -> &zinder_query::NativeWalletEndpointCapabilities {
+        self.inner.native_endpoint_capabilities()
+    }
+
+    fn upstream_node_capabilities(&self) -> Option<&zinder_query::UpstreamNodeCapabilities> {
+        self.inner.upstream_node_capabilities()
+    }
+
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
         self.inner.network_upgrade_activations().await
     }
@@ -798,7 +806,7 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
             let maximum =
                 usize::try_from(DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()).unwrap_or(usize::MAX);
             if requested > maximum {
-                return Err(QueryError::CompactBlockRangeTooLarge { requested, maximum });
+                return Err(QueryError::BlockRangeTooLarge { requested, maximum });
             }
             return Ok(CompactBlockRange {
                 chain_epoch: self.visible_tip_block(at_epoch_id).await?.chain_epoch,
@@ -936,12 +944,9 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     async fn transparent_utxo_set_summary(
         &self,
         at_epoch_id: Option<ChainEpochId>,
-        commitment_enabled: bool,
     ) -> Result<TransparentUtxoSetSummary, QueryError> {
         self.record(at_epoch_id);
-        self.inner
-            .transparent_utxo_set_summary(at_epoch_id, commitment_enabled)
-            .await
+        self.inner.transparent_utxo_set_summary(at_epoch_id).await
     }
 
     async fn tree_state_at(

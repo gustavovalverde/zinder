@@ -65,6 +65,10 @@ fn print_config_renders_the_complete_fail_closed_contract() -> eyre::Result<()> 
         )),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("raw_blob_policy = \"transactions\""),
+        "{stdout}"
+    );
     assert!(stdout.contains("[wallet]"), "{stdout}");
     assert!(
         stdout.contains(&format!("path = {:?}", wallet_path.display().to_string())),

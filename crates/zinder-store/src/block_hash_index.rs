@@ -23,10 +23,9 @@ use crate::{
 pub enum BlockHashLookup {
     /// The hash addresses a block currently visible in the best chain.
     Resolved(BlockId),
-    /// The hash was indexed but its block is no longer visible at the
-    /// request epoch (reorged out).
+    /// The indexed height does not contain this hash in the visible best chain.
     NotInBestChain,
-    /// No entry was written for this hash by any committed chain epoch.
+    /// No entry is present for this hash in the reader's canonical index.
     NotIndexed,
 }
 

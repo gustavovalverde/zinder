@@ -17,11 +17,11 @@ use tonic_reflection::pb::v1::{
 };
 use zinder_proto::{
     capabilities::{
-        WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1, WALLET_EVENTS_CHAIN_V1,
-        WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2, WALLET_READ_COMPACT_BLOCK_RANGE_V2,
-        WALLET_READ_SERVER_INFO_V2, WALLET_READ_SETTLED_TIP_BLOCK_V1,
-        WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1, WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
-        WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+        WALLET_EVENTS_CHAIN_V1, WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
+        WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_SERVER_INFO_V2,
+        WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
+        WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+        WALLET_READ_VISIBLE_TIP_BLOCK_V1,
     },
     v1::wallet::{self, wallet_query_client::WalletQueryClient},
     wire::{chain_epoch_from_message, compact_block_from_message},
@@ -90,10 +90,10 @@ async fn verify_server_info(
         .ok_or_else(|| eyre!("WalletQuery ServerInfo response omitted common identity"))?;
     assert_eq!(common.service_name, "zinder-query");
     assert_eq!(common.network, expected_network);
-    assert!(
-        common.contract_revision >= 4,
-        "native contract revision must be at least 4, got {}",
-        common.contract_revision
+    assert_eq!(
+        common.contract_revision,
+        zinder_proto::CONTRACT_REVISION,
+        "live standalone query must serve the exact native contract under test"
     );
     for required_capability in [
         WALLET_READ_SERVER_INFO_V2,
@@ -104,7 +104,6 @@ async fn verify_server_info(
         WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
         WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
         WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
-        WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
         WALLET_EVENTS_CHAIN_V1,
     ] {
         assert!(
@@ -112,7 +111,7 @@ async fn verify_server_info(
                 .capabilities
                 .iter()
                 .any(|capability| capability == required_capability),
-            "standalone WalletQuery omitted a capability required by Zally sync: {required_capability}"
+            "standalone WalletQuery omitted a capability required by the P1 Zallet tracer: {required_capability}"
         );
     }
     Ok(())

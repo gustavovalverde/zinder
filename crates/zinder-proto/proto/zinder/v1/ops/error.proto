@@ -23,15 +23,19 @@ package zinder.v1.ops;
 // `tonic_types::ErrorDetails` shapes (`ResourceInfo`, `PreconditionFailure`,
 // `BadRequest`).
 //
-// New reasons are additive only and must reserve a new scalar code;
-// existing reasons' semantics are stable within a major version.
+// Additive reasons reserve a new scalar code. Renaming, removing, or changing
+// an existing reason's semantics is a breaking native-contract change: bump
+// `WalletServerInfo.contract_revision`, reserve any removed name and scalar,
+// and cut controlled consumers over with the server.
 enum ErrorReason {
+  reserved "COMPACT_BLOCK_RANGE_TOO_LARGE";
+
   // Default scalar so unset fields do not silently match a real reason.
   ERROR_REASON_UNSPECIFIED = 0;
 
   // INVALID_ARGUMENT family.
   INVALID_BLOCK_RANGE = 1;
-  COMPACT_BLOCK_RANGE_TOO_LARGE = 2;
+  BLOCK_RANGE_TOO_LARGE = 2;
   CHAIN_EVENT_CURSOR_INVALID = 3;
   ADDRESS_OUTPUT_CURSOR_INVALID = 4;
   TRANSPARENT_HISTORY_CURSOR_INVALID = 5;
@@ -43,6 +47,7 @@ enum ErrorReason {
   TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED = 43;
   SNAPSHOT_PAGE_CURSOR_INVALID = 44;
   BROADCAST_TRANSACTION_TOO_LARGE = 46;
+  SUBTREE_ROOT_RANGE_TOO_LARGE = 49;
 
   // FAILED_PRECONDITION family.
   BROADCAST_DISABLED = 11;
@@ -82,6 +87,7 @@ enum ErrorReason {
   MATERIALIZED_VIEW_UNAVAILABLE = 34;
   NODE_CAPABILITY_MISSING = 36;
   EXPLORER_PRECONDITION_UNSATISFIED = 40;
+  ENDPOINT_CAPABILITY_UNAVAILABLE = 48;
 
   // UNAVAILABLE family.
   NO_VISIBLE_CHAIN_EPOCH = 38;
@@ -99,5 +105,11 @@ enum ErrorReason {
   // A configured federated endpoint is temporarily unreachable (cold start,
   // restart, or transient network fault). Retrying with backoff clears it.
   UPSTREAM_UNREACHABLE = 42;
+
+  // UNAVAILABLE family.
+  // The process is alive but its shared readiness gate is closed. ErrorInfo
+  // metadata carries the stable `readiness_cause` label; `/readyz` carries
+  // any structured cause detail.
+  SERVICE_NOT_READY = 50;
 
 }

@@ -9,14 +9,20 @@ use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
 };
 use zinder_runtime::{
-    Readiness, RuntimeService, StartupPhase, TrafficReadinessInterceptor,
-    cancel_on_terminating_signal, install_tracing_subscriber, spawn_ops_endpoint_for,
+    OpsServerError, Readiness, RuntimeService, StartupPhase, TrafficReadinessInterceptor,
+    cancel_on_terminating_signal, install_metrics_recorder_for_service, install_tracing_subscriber,
+    spawn_ops_endpoint_for,
 };
-use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_source::{
+    DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+};
 
 mod config;
 use config::{LightwalletdConfigError, LightwalletdConfigOverrides};
-use zinder_query::{WalletServingPairConfig, WalletServingPairPublisher};
+use zinder_query::{
+    WalletQueryApi, WalletServingPairConfig, WalletServingPairPublisher, WalletServingReadiness,
+    spawn_wallet_node_readiness_probe,
+};
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
@@ -119,16 +125,17 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             return Err(error);
         }
     };
+    if lightwalletd_config.ops_listen_addr.is_some() {
+        install_metrics_recorder_for_service(
+            RuntimeService::CompatLightwalletd,
+            env!("CARGO_PKG_VERSION"),
+            encode_zinder_native_chain_name(lightwalletd_config.network),
+        )
+        .map_err(OpsServerError::from)?;
+    }
     let readiness = Readiness::default();
+    let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
     let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle = spawn_ops_endpoint_for(
-        RuntimeService::CompatLightwalletd,
-        lightwalletd_config.ops_listen_addr,
-        env!("CARGO_PKG_VERSION"),
-        encode_zinder_native_chain_name(lightwalletd_config.network),
-        readiness.clone(),
-        Vec::new(),
-    );
 
     let connect_node_phase = StartupPhase::ConnectNode.start();
     let broadcaster = match build_broadcaster(lightwalletd_config.broadcaster.as_ref()) {
@@ -150,6 +157,10 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         start_api_phase.fail(&wrapped);
         return Err(wrapped);
     };
+    broadcaster_source
+        .probe_capabilities()
+        .await
+        .map_err(|source_error| LightwalletdConfigError::Source(Box::new(source_error)))?;
     let network_upgrade_activations = match broadcaster_source
         .discover_network_upgrade_activations("zinder-compat-lightwalletd")
         .await
@@ -165,40 +176,40 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
             return Err(wrapped);
         }
     };
-    let tree_state_upstream = broadcaster
-        .as_ref()
-        .map(|source| Arc::new(source.clone()) as Arc<dyn zinder_source::TreeStateUpstream>);
-
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let (serving_pair_publisher, serving_pair_slot) = WalletServingPairPublisher::bootstrap(
-        WalletServingPairConfig {
-            canonical_primary_path: lightwalletd_config.storage.path.clone(),
-            canonical_secondary_root: lightwalletd_config.storage.secondary_path.clone(),
-            wallet_primary_path: lightwalletd_config.wallet_primary_path.clone(),
-            wallet_secondary_root: lightwalletd_config.wallet_secondary_root.clone(),
-            network: lightwalletd_config.network,
-            network_upgrade_activations: Arc::clone(&network_upgrade_activations),
-            canonical_reorg_policy: lightwalletd_config.canonical_reorg_policy,
-            canonical_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
-            wallet_resource_budget: lightwalletd_config.wallet_rocksdb_budget,
-            catchup_interval: lightwalletd_config.storage.secondary_catchup_interval,
-            convergence_timeout: lightwalletd_config.storage.initial_catchup_timeout,
-            convergence_attempts: lightwalletd_config.pair_convergence_attempts,
-            replica_lag_threshold_chain_epochs: lightwalletd_config
-                .storage
-                .secondary_replica_lag_threshold_chain_epochs,
-            serving_pair_staleness_ceiling: lightwalletd_config
-                .storage
-                .serving_pair_staleness_ceiling,
-        },
-        readiness.clone(),
-        &lightwalletd_config.ingest_control_addr,
-        lightwalletd_config.ingest_control_bearer_token.as_ref(),
-    )
-    .await?;
+    let (serving_pair_publisher, serving_pair_slot) =
+        WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+            WalletServingPairConfig {
+                canonical_primary_path: lightwalletd_config.storage.path.clone(),
+                canonical_secondary_root: lightwalletd_config.storage.secondary_path.clone(),
+                wallet_primary_path: lightwalletd_config.wallet_primary_path.clone(),
+                wallet_secondary_root: lightwalletd_config.wallet_secondary_root.clone(),
+                network: lightwalletd_config.network,
+                network_upgrade_activations: Arc::clone(&network_upgrade_activations),
+                expected_raw_blob_retention: lightwalletd_config
+                    .storage
+                    .expected_raw_blob_retention,
+                canonical_reorg_policy: lightwalletd_config.canonical_reorg_policy,
+                canonical_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
+                wallet_resource_budget: lightwalletd_config.wallet_rocksdb_budget,
+                catchup_interval: lightwalletd_config.storage.secondary_catchup_interval,
+                convergence_timeout: lightwalletd_config.storage.initial_catchup_timeout,
+                convergence_attempts: lightwalletd_config.pair_convergence_attempts,
+                replica_lag_threshold_chain_epochs: lightwalletd_config
+                    .storage
+                    .secondary_replica_lag_threshold_chain_epochs,
+                serving_pair_staleness_ceiling: lightwalletd_config
+                    .storage
+                    .serving_pair_staleness_ceiling,
+            },
+            serving_readiness.clone(),
+            &lightwalletd_config.ingest_control_addr,
+            lightwalletd_config.ingest_control_bearer_token.as_ref(),
+        )
+        .await?;
     let visible_height = Some(
         serving_pair_slot
-            .load_full()
+            .capture()
             .canonical_fence()
             .visible_tip()
             .height
@@ -206,17 +217,40 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     );
     open_storage_phase.complete();
 
-    let mut wallet_query = zinder_query::WalletServingQuery::from_serving_pair_slot(
-        Arc::clone(&serving_pair_slot),
-        broadcaster,
+    let wallet_query = zinder_query::WalletServingQuery::from_probed_node_source(
+        serving_pair_slot.clone(),
+        broadcaster_source.clone(),
         network_upgrade_activations.clone(),
-    );
-    if let Some(tree_state_upstream) = tree_state_upstream {
-        wallet_query = wallet_query.with_tree_state_upstream(tree_state_upstream);
-    }
+    )?;
+    let native_endpoint_capabilities = wallet_query.native_endpoint_capabilities().clone();
+    let ops_handle = spawn_ops_endpoint_for(
+        RuntimeService::CompatLightwalletd,
+        lightwalletd_config.ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(lightwalletd_config.network),
+        readiness.clone(),
+        Arc::from([]),
+    )
+    .await?;
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
-    let serving_pair_publisher_handle = serving_pair_publisher.spawn(cancel.clone());
+    let node_readiness_handle = spawn_wallet_node_readiness_probe(
+        broadcaster_source.clone(),
+        &native_endpoint_capabilities,
+        serving_readiness.clone(),
+        lightwalletd_config
+            .broadcaster
+            .as_ref()
+            .and_then(|target| target.health.as_ref())
+            .map_or_else(
+                || std::time::Duration::from_millis(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS),
+                |health| health.poll_interval,
+            ),
+        cancel.clone(),
+    )?;
+    let serving_runtime_drained = CancellationToken::new();
+    let serving_pair_publisher_handle =
+        serving_pair_publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
     let mempool_surface = Arc::new({
         let mut surface =
             IngestControlMempoolSurface::new(lightwalletd_config.ingest_control_addr.clone());
@@ -274,7 +308,9 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         )
         .await;
 
+    serving_readiness.publish_shutting_down();
     cancel.cancel();
+    serving_runtime_drained.cancel();
 
     tracing::info!(
         target: "zinder::compat_lightwalletd",
@@ -283,7 +319,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     );
 
     if let Some(handle) = ops_handle {
-        handle.shutdown().await;
+        handle.shutdown().await?;
     }
 
     // Drain the tip-change publisher so a panic in its task surfaces in
@@ -321,6 +357,22 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         ),
     }
 
+    match node_readiness_handle.await {
+        Ok(()) => {}
+        Err(join_error) if join_error.is_panic() => tracing::warn!(
+            target: "zinder::compat_lightwalletd",
+            event = "wallet_node_readiness_probe_panic",
+            error = %join_error,
+            "wallet node-readiness probe task panicked"
+        ),
+        Err(join_error) => tracing::warn!(
+            target: "zinder::compat_lightwalletd",
+            event = "wallet_node_readiness_probe_join_failed",
+            error = %join_error,
+            "wallet node-readiness probe task did not exit cleanly"
+        ),
+    }
+
     server_result.map_err(LightwalletdConfigError::Transport)
 }
 
@@ -346,7 +398,8 @@ fn build_broadcaster(
             broadcast_timeout: broadcaster_target.broadcast_timeout,
         },
     )
-    .map_err(|source| LightwalletdConfigError::Source(Box::new(source)))?;
+    .map_err(|source| LightwalletdConfigError::Source(Box::new(source)))?
+    .with_health_config(broadcaster_target.health.clone());
 
     tracing::info!(
         target: "zinder::compat_lightwalletd",

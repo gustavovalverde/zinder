@@ -2,7 +2,8 @@
 
 use zinder_client::{Capability, CapabilityDescriptor, ErrorReason, ServerInfo};
 use zinder_proto::capabilities::{
-    WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1, WALLET_EVENTS_CHAIN_V1,
+    WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+    WALLET_EVENTS_CHAIN_V1, WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
     WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2, WALLET_READ_COMPACT_BLOCK_RANGE_V2,
     WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
     WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1, WALLET_READ_SERVER_INFO_V2,
@@ -38,6 +39,10 @@ fn wallet_sync_capabilities_use_client_owned_exact_match_vocabulary() {
             WALLET_READ_SETTLED_TIP_BLOCK_V1,
         ),
         (
+            Capability::BlockIdBySelector,
+            WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+        ),
+        (
             Capability::CompactBlockRange,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2,
         ),
@@ -58,6 +63,10 @@ fn wallet_sync_capabilities_use_client_owned_exact_match_vocabulary() {
         (
             Capability::TransparentAddressUnspentOutputs,
             WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+        ),
+        (
+            Capability::TransparentAddressHistory,
+            WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
         ),
         (Capability::ChainEvents, WALLET_EVENTS_CHAIN_V1),
     ] {

@@ -38,6 +38,7 @@
 
 pub mod chain_fixture;
 pub mod commitment_tree_fixtures;
+pub mod ingest_control_fixture;
 pub mod json_rpc_test_server;
 pub mod live;
 pub mod log_capture;
@@ -55,6 +56,7 @@ pub use chain_fixture::{
     synthetic_transaction_public_facts,
 };
 pub use commitment_tree_fixtures::{completed_sapling_subtree_frontier, one_leaf_sapling_frontier};
+pub use ingest_control_fixture::{IngestControlFixture, IngestControlFixtureService};
 pub use json_rpc_test_server::{
     JsonRpcRequest, JsonRpcStub, JsonRpcStubBuilder, JsonRpcTestServer, RpcReply, method,
 };

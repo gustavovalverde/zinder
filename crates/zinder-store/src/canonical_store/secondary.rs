@@ -9,7 +9,8 @@ use zinder_core::{
 };
 
 use crate::{
-    BoundedRocksDbOpen, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget, open_bounded_rocksdb,
+    BoundedRocksDbOpen, RawBlobRetention, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
+    open_bounded_rocksdb,
 };
 
 use super::{
@@ -17,6 +18,7 @@ use super::{
     CanonicalSequenceCheckpoint, CanonicalStoreBuildState, CanonicalStoreError,
     CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
     block_replay::{CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at},
+    construction_manifest::validate_ready_construction_manifest,
     event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
     live_commit::event_fence_from_ready,
     mempool_lifecycle::validate_mempool_lifecycle_admission,
@@ -73,7 +75,10 @@ pub struct RocksDbCanonicalSecondary {
 }
 
 impl RocksDbCanonicalSecondary {
-    /// Opens one admitted secondary and catches it up to the primary's current state.
+    /// Opens one exactly admitted secondary and catches it up to the primary's current state.
+    ///
+    /// The expected raw-blob retention is an immutable store identity, not a
+    /// request to infer coverage from currently present rows.
     #[allow(
         clippy::too_many_arguments,
         reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
@@ -83,6 +88,7 @@ impl RocksDbCanonicalSecondary {
         secondary_path: impl AsRef<Path>,
         expected_network_upgrade_activations: &NetworkUpgradeActivations,
         expected_workload: CanonicalStoreWorkload,
+        expected_raw_blob_retention: RawBlobRetention,
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
@@ -98,6 +104,7 @@ impl RocksDbCanonicalSecondary {
         let expectation = CanonicalStoreAdmissionExpectation::from_activations(
             expected_network_upgrade_activations,
             expected_workload,
+            expected_raw_blob_retention,
             expected_reorg_policy,
         );
         require_exact_primary_column_family_metadata(&primary_path)?;
@@ -131,6 +138,12 @@ impl RocksDbCanonicalSecondary {
         let CanonicalStoreBuildState::Ready(ready_evidence) = opened_control.build_state else {
             return Err(CanonicalStoreError::StoreNotReady { path: primary_path });
         };
+        validate_ready_construction_manifest(
+            &primary_path,
+            &ready_evidence,
+            opened_control.workload,
+            &opened_control.build_plan,
+        )?;
         validate_ready_publication(
             &bounded_open.db,
             &opened_control.build_plan,
@@ -237,6 +250,12 @@ impl RocksDbCanonicalSecondary {
     #[must_use]
     pub const fn workload(&self) -> CanonicalStoreWorkload {
         self.workload
+    }
+
+    /// Returns the immutable raw-blob retention authenticated at admission.
+    #[must_use]
+    pub const fn raw_blob_retention(&self) -> RawBlobRetention {
+        self.build_plan.raw_blob_retention()
     }
 
     /// Returns the immutable retained canonical range.

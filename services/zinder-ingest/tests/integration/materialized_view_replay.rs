@@ -265,6 +265,7 @@ impl CanonicalHarness {
             &activations,
             block_at(&blocks, 1)?.block_time_seconds.saturating_sub(1),
             block_id(&blocks, BASELINE_TIP_HEIGHT)?,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         let builder = RocksDbCanonicalBuilder::create_fresh(
@@ -386,6 +387,7 @@ fn open_secondary(
         temporary_path.join("canonical-secondary"),
         activations,
         CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)

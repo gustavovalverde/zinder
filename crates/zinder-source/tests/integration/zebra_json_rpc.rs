@@ -38,6 +38,15 @@ fn regtest_source(server: &JsonRpcTestServer) -> Result<ZebraJsonRpcSource, Sour
     )
 }
 
+fn testnet_source(server: &JsonRpcTestServer) -> Result<ZebraJsonRpcSource, SourceError> {
+    ZebraJsonRpcSource::new(
+        Network::ZcashTestnet,
+        server.url(),
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )
+}
+
 #[tokio::test]
 async fn fetch_block_at_uses_expected_json_rpc_methods_and_basic_auth() -> eyre::Result<()> {
     // `fetch_block_at` keys the required RPCs on the requested height
@@ -1984,7 +1993,7 @@ async fn poll_upstream_health_falls_back_to_verification_progress() -> eyre::Res
             "valuePools": [],
             "upgrades": {},
         })))])?;
-    let source = regtest_source(&server)?;
+    let source = testnet_source(&server)?;
 
     let snapshot = source.poll_upstream_health().await?;
     assert!(!snapshot.ready_for_queries);
@@ -2003,6 +2012,25 @@ async fn poll_upstream_health_falls_back_to_verification_progress() -> eyre::Res
 }
 
 #[tokio::test]
+async fn poll_upstream_health_treats_regtest_tip_observation_as_ready() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "blocks": 125,
+            "estimatedheight": 6_519_740,
+            "verificationprogress": 1.0,
+            "valuePools": [],
+            "upgrades": {},
+        })))])?;
+    let source = regtest_source(&server)?;
+
+    let snapshot = source.poll_upstream_health().await?;
+    assert!(snapshot.ready_for_queries);
+    assert_eq!(snapshot.upstream_committed_height, Some(125));
+    assert_eq!(snapshot.upstream_estimated_height, Some(6_519_740));
+    Ok(())
+}
+
+#[tokio::test]
 async fn poll_upstream_health_flags_estimated_gap_when_progress_is_above_floor() -> eyre::Result<()>
 {
     let server =
@@ -2013,7 +2041,7 @@ async fn poll_upstream_health_flags_estimated_gap_when_progress_is_above_floor()
             "valuePools": [],
             "upgrades": {},
         })))])?;
-    let source = regtest_source(&server)?;
+    let source = testnet_source(&server)?;
 
     let snapshot = source.poll_upstream_health().await?;
     assert!(!snapshot.ready_for_queries);
@@ -2037,7 +2065,7 @@ async fn poll_upstream_health_reports_ready_when_progress_and_gap_within_floors(
             "valuePools": [],
             "upgrades": {},
         })))])?;
-    let source = regtest_source(&server)?;
+    let source = testnet_source(&server)?;
 
     let snapshot = source.poll_upstream_health().await?;
     assert!(snapshot.ready_for_queries);
@@ -2063,7 +2091,7 @@ async fn poll_upstream_health_falls_back_when_ready_endpoint_unreachable() -> ey
     // Point the health probe at a port that nothing listens on so the
     // first call errors out and the source falls back to the JSON-RPC
     // path within the same `poll_upstream_health` invocation.
-    let source = regtest_source(&server)?.with_health_config(Some(NodeHealthConfig::new(
+    let source = testnet_source(&server)?.with_health_config(Some(NodeHealthConfig::new(
         "http://127.0.0.1:1/ready".to_owned(),
         Duration::from_millis(500),
         0.999,

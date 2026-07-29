@@ -48,8 +48,9 @@ transparent-output and transparent-history reads at the serving fence.
 3. Keep the wallet-serving live tests focused on retained compact blocks, tree
    states, subtree roots, transaction bytes, transparent history and UTXOs, and
    strict below-floor failures.
-4. Run the ignored Zingolib live test when its known binary is available. It
-   is the independent-client proof, not a substitute for protocol parity.
+4. Run the current Zcash Android SDK and ZODL lifecycle against the real
+   Android-trusted TLS route. This is independent-client proof, not a
+   substitute for protocol parity.
 5. Before a public claim, validate the actual TLS/proxy deployment and record
    the exact commands, image digests, client version, network, and store floor
    with the release. No repository-side manifest schema is required.

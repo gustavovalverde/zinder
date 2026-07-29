@@ -13,6 +13,7 @@ use super::{
     CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError, CanonicalStoreBuildState,
     CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
 };
+use crate::RawBlobRetention;
 
 const BUILDING_STATE: u8 = 1;
 const READY_STATE: u8 = 2;
@@ -20,6 +21,9 @@ const COMPLETE_HISTORY: u8 = 0;
 const CHECKPOINTED_HISTORY: u8 = 1;
 const WALLET_WORKLOAD: u8 = 1;
 const EXPLORER_WORKLOAD: u8 = 2;
+const NO_RAW_BLOB_RETENTION: u8 = 0;
+const TRANSACTION_RAW_BLOB_RETENTION: u8 = 1;
+const ALL_RAW_BLOB_RETENTION: u8 = 2;
 const FRONTIER_ABSENT: u8 = 0;
 const FRONTIER_PRESENT: u8 = 1;
 const ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH: usize = 2 + 32;
@@ -31,6 +35,7 @@ const STORE_CONTROL_MINIMUM_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
     + 2
     + 4
     + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
+    + 1
     + 1
     + 4
     + HISTORY_FIXED_FIELDS_LENGTH
@@ -112,6 +117,11 @@ fn encode_store_control_prefix(
     encoded.push(match workload {
         CanonicalStoreWorkload::Wallet => WALLET_WORKLOAD,
         CanonicalStoreWorkload::Explorer => EXPLORER_WORKLOAD,
+    });
+    encoded.push(match build_plan.raw_blob_retention() {
+        RawBlobRetention::None => NO_RAW_BLOB_RETENTION,
+        RawBlobRetention::Transactions => TRANSACTION_RAW_BLOB_RETENTION,
+        RawBlobRetention::All => ALL_RAW_BLOB_RETENTION,
     });
     encoded.extend_from_slice(
         &build_plan
@@ -219,6 +229,7 @@ pub(super) fn decode_store_control(
             ));
         }
     };
+    let raw_blob_retention = decode_raw_blob_retention(&mut decoder)?;
     let reorg_policy =
         super::CanonicalReorgPolicy::new(decoder.read_u32("reorg window blocks")?)
             .map_err(|source| CanonicalStoreError::admission(path, source.to_string()))?;
@@ -230,6 +241,7 @@ pub(super) fn decode_store_control(
     let build_plan = CanonicalStoreBuildPlan {
         network,
         network_upgrade_activations_fingerprint,
+        raw_blob_retention,
         reorg_policy,
         history_bounds,
         history_predecessor,
@@ -260,6 +272,22 @@ pub(super) fn decode_store_control(
         build_plan,
         cursor_auth_key,
         build_state,
+    })
+}
+
+fn decode_raw_blob_retention(
+    decoder: &mut Decoder<'_>,
+) -> Result<RawBlobRetention, CanonicalStoreError> {
+    Ok(match decoder.read_u8("raw blob retention")? {
+        NO_RAW_BLOB_RETENTION => RawBlobRetention::None,
+        TRANSACTION_RAW_BLOB_RETENTION => RawBlobRetention::Transactions,
+        ALL_RAW_BLOB_RETENTION => RawBlobRetention::All,
+        retention => {
+            return Err(CanonicalStoreError::admission(
+                decoder.path,
+                format!("store control contains unknown raw blob retention {retention}"),
+            ));
+        }
     })
 }
 
@@ -643,7 +671,7 @@ mod tests {
         }
 
         let reorg_window_offset =
-            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH + 1;
+            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH + 1 + 1;
         let mut zero_reorg_window = encode_building_store_control(
             CanonicalStoreWorkload::Wallet,
             &complete_build_plan(Network::ZcashTestnet),
@@ -719,6 +747,7 @@ mod tests {
             + 4
             + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
             + 1
+            + 1
             + 4
             + HISTORY_FIXED_FIELDS_LENGTH
             + BUILD_TIP_FIELDS_LENGTH
@@ -778,7 +807,8 @@ mod tests {
         let activations_fingerprint_version = network_start + 4;
         let workload_offset =
             activations_fingerprint_version + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH;
-        let history_kind = workload_offset + 1 + 4;
+        let raw_blob_retention_offset = workload_offset + 1;
+        let history_kind = raw_blob_retention_offset + 1 + 4;
         let sapling_frontier_presence = history_kind + 1 + 4 + 32 + 4;
         let build_tip = history_kind + HISTORY_FIXED_FIELDS_LENGTH;
         let cursor_auth_key = build_tip + BUILD_TIP_FIELDS_LENGTH;
@@ -795,7 +825,7 @@ mod tests {
                 encoded[identity_end..identity_end + 2].copy_from_slice(&1_u16.to_le_bytes());
                 (
                     encoded,
-                    "store schema version 1 does not equal required version 6",
+                    "store schema version 1 does not equal required version 7",
                 )
             },
             {
@@ -819,6 +849,11 @@ mod tests {
                 let mut encoded = base.clone();
                 encoded[workload_offset] = 99;
                 (encoded, "unknown workload")
+            },
+            {
+                let mut encoded = base.clone();
+                encoded[raw_blob_retention_offset] = 99;
+                (encoded, "unknown raw blob retention")
             },
             {
                 let mut encoded = base.clone();
@@ -874,8 +909,13 @@ mod tests {
             &build_plan,
             CURSOR_AUTH_KEY,
         )?;
-        let history_kind =
-            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH + 1 + 4;
+        let history_kind = CANONICAL_STORE_IDENTITY.len()
+            + 2
+            + 4
+            + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
+            + 1
+            + 1
+            + 4;
         let sapling_presence = history_kind + 1 + 4 + 32 + 4;
         assert_eq!(encoded[sapling_presence], FRONTIER_PRESENT);
         let sapling_root = sapling_presence + 1;
@@ -907,6 +947,7 @@ mod tests {
         encoded.extend_from_slice(&ACTIVATIONS_FINGERPRINT.version().value().to_le_bytes());
         encoded.extend_from_slice(&ACTIVATIONS_FINGERPRINT.as_bytes());
         encoded.push(EXPLORER_WORKLOAD);
+        encoded.push(TRANSACTION_RAW_BLOB_RETENTION);
         encoded.extend_from_slice(&1_u32.to_le_bytes());
         encoded.push(COMPLETE_HISTORY);
         encoded.extend_from_slice(&0_u32.to_le_bytes());
@@ -994,6 +1035,7 @@ mod tests {
         CanonicalStoreBuildPlan {
             network,
             network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
+            raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: CanonicalReorgPolicy {
                 reorg_window_blocks: NonZeroU32::MIN,
             },
@@ -1014,6 +1056,7 @@ mod tests {
         CanonicalStoreBuildPlan {
             network: Network::ZcashTestnet,
             network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
+            raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: CanonicalReorgPolicy {
                 reorg_window_blocks: NonZeroU32::MIN,
             },

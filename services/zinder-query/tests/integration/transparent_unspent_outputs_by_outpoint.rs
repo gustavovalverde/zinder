@@ -12,7 +12,7 @@ use zinder_core::{
     TransparentOutputArtifact, TransparentSpendFact,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
+use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::{chain_epoch_artifacts_with_transparent_facts, synthetic_chain_epoch};
@@ -186,7 +186,7 @@ async fn transparent_unspent_outputs_by_outpoint_grpc_rejects_coinbase_sentinel(
         Vec::new(),
     )?)?;
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let request = Request::new(wallet::TransparentUnspentOutputsByOutpointRequest {
         outpoints: vec![wallet::OutPoint {
@@ -219,7 +219,7 @@ async fn transparent_unspent_outputs_by_outpoint_grpc_carries_chain_view() -> ey
         commit_unspent_and_spent_outputs(&store)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let request = Request::new(wallet::TransparentUnspentOutputsByOutpointRequest {
         outpoints: vec![wallet::OutPoint {

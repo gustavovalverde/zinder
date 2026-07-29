@@ -70,7 +70,10 @@ not become successful observations.
 
 Without an explicit readiness endpoint, the writer relies on the source
 observations available through Zebra JSON-RPC. Upstream health remains
-independent from the local ingest phase in both cases.
+independent from the local ingest phase in both cases. The progress and
+estimated-gap thresholds apply to Mainnet and Testnet. Regtest has no external
+network tip, so a successful JSON-RPC tip and health observation is ready even
+when Zebra reports a public-network-shaped estimated height.
 
 ## Consequences
 

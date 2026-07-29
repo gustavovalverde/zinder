@@ -20,6 +20,7 @@ use zinder_core::{
     MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, TransactionId, TransactionLocation,
     TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
     TransparentSpendFact,
+    explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
     wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
@@ -38,14 +39,15 @@ use zinder_proto::capabilities::{
 use zinder_proto::v1::explorer::{
     BlockActivityDistributionRequest, BlockDetailRequest, BlockProductionSeriesRequest,
     BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, BlockTransactionsResponse,
-    ChainReorgHistoryRequest, OverviewSnapshotRequest, PrevoutResolutionStatus, ServerInfoRequest,
-    TransactionDetailRequest, TransactionDetailResponse, TransparentAddressDeltasRecord,
-    TransparentAddressDeltasRequest, TransparentDeltaKind, block_detail_request,
+    ChainReorgHistoryRequest, OverviewSnapshotRequest, OverviewSnapshotResponse,
+    PrevoutResolutionStatus, ServerInfoRequest, TransactionDetailRequest,
+    TransactionDetailResponse, TransparentAddressDeltasRecord, TransparentAddressDeltasRequest,
+    TransparentDeltaKind, UnavailableReason, block_detail_request,
     explorer_query_client::ExplorerQueryClient,
 };
 use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
@@ -1092,12 +1094,7 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_s
         first.tip_block_time_unix_seconds,
         first.recent_blocks[0].block_time_unix_seconds
     );
-    assert_eq!(first.value_pools.len(), 0);
-    let first_mempool = first
-        .mempool
-        .as_ref()
-        .ok_or_else(|| eyre!("mempool sub-field missing"))?;
-    assert_eq!(first_mempool.transaction_count, 0);
+    assert_overview_wallet_fields_unavailable(&first)?;
 
     // Coherence guarantee: a second call against the same upstream tip
     // returns the same snapshot identity (tip_hash). The bundle never
@@ -1461,7 +1458,7 @@ async fn spawn_wallet_query_server(
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(adapter.into_server())
@@ -1653,6 +1650,32 @@ fn assert_advertises_capability(capabilities: &[String], capability: &str) {
             .any(|advertised| advertised == capability),
         "expected capability {capability}",
     );
+}
+
+fn assert_overview_wallet_fields_unavailable(response: &OverviewSnapshotResponse) -> Result<()> {
+    assert!(response.mempool.is_none());
+    assert!(response.value_pools.is_empty());
+    let freshness = response
+        .freshness
+        .as_ref()
+        .ok_or_else(|| eyre!("overview response missing freshness"))?;
+    assert_eq!(freshness.unavailable.len(), 2);
+    for field_path in ["mempool", "value_pools"] {
+        let unavailable_field = freshness
+            .unavailable
+            .iter()
+            .find(|unavailable| unavailable.field_path == field_path)
+            .ok_or_else(|| eyre!("overview freshness missing unavailable field {field_path}"))?;
+        assert_eq!(
+            unavailable_field.reason,
+            UnavailableReason::UnavailableUpstreamNotSupported as i32
+        );
+        assert_eq!(
+            unavailable_field.human_reason,
+            WALLET_QUERY_CAPABILITY_NOT_SUPPORTED
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]

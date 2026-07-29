@@ -13,7 +13,7 @@ use zinder_core::{
 use zinder_proto::v1::wallet::{
     TransparentUtxoSetSummaryRequest, wallet_query_server::WalletQuery as WalletQueryService,
 };
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_store::PrimaryChainStore;
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
@@ -39,7 +39,7 @@ async fn transparent_utxo_set_summary_counts_and_sums_the_unspent_set() -> eyre:
     )?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let response = WalletQueryService::transparent_utxo_set_summary(
         &grpc_adapter,
@@ -66,51 +66,13 @@ async fn transparent_utxo_set_summary_counts_and_sums_the_unspent_set() -> eyre:
 }
 
 #[tokio::test]
-async fn transparent_utxo_set_summary_carries_the_commitment_when_enabled() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    commit_unspent_outputs(
-        &store,
-        ChainEpochId::new(1),
-        &[
-            TransparentAddressScriptHash::from_bytes([0x11; 32]),
-            TransparentAddressScriptHash::from_bytes([0x22; 32]),
-        ],
-    )?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let settings = ServerInfoSettings {
-        utxo_set_commitment_enabled: true,
-        ..ServerInfoSettings::default()
-    };
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, settings);
-
-    let response = WalletQueryService::transparent_utxo_set_summary(
-        &grpc_adapter,
-        Request::new(TransparentUtxoSetSummaryRequest { at_epoch_id: None }),
-    )
-    .await?
-    .into_inner();
-
-    let commitment = response
-        .commitment
-        .ok_or_else(|| eyre::eyre!("commitment present when enabled"))?;
-    assert_eq!(
-        commitment.scheme,
-        zinder_proto::v1::wallet::UtxoSetCommitmentScheme::Lthash16 as i32
-    );
-    assert_eq!(commitment.commitment.len(), 2048);
-    Ok(())
-}
-
-#[tokio::test]
 async fn transparent_utxo_set_summary_is_zero_for_an_empty_set() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     let _ = commit_unspent_outputs(&store, ChainEpochId::new(1), &[])?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let response = WalletQueryService::transparent_utxo_set_summary(
         &grpc_adapter,

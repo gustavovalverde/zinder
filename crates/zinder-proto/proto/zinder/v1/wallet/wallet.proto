@@ -660,7 +660,8 @@ enum ShieldedProtocol {
   SHIELDED_PROTOCOL_IRONWOOD = 3;
 }
 
-// Inclusive-start bounded subtree-root request.
+// Inclusive-start bounded subtree-root request. One request may return at
+// most 1024 subtree roots.
 message SubtreeRootsRequest {
   // Shielded protocol to read.
   ShieldedProtocol shielded_protocol = 1;
@@ -668,7 +669,9 @@ message SubtreeRootsRequest {
   // First requested subtree-root index.
   uint32 start_index = 2;
 
-  // Maximum number of subtree-root entries to return.
+  // Maximum number of subtree-root entries to return. Must be in 1..=1024;
+  // larger values fail with INVALID_ARGUMENT and
+  // SUBTREE_ROOT_RANGE_TOO_LARGE.
   uint32 max_entries = 3;
 
   // Optional chain-epoch id that must be used to answer the request. When
@@ -928,8 +931,8 @@ message ChainEventEnvelope {
 // `common` carries the cross-service identity and capability set defined
 // in [`zinder.v1.ops.ServerInfo`]. The wallet-specific fields below
 // describe operator configuration that constrains a wallet consumer's
-// behavior (retention windows, reorg depth, upstream-node capability
-// snapshot and canonical artifact schema version).
+// behavior (reorg depth, upstream-node capability snapshot and canonical
+// artifact schema version).
 message WalletServerInfo {
   // Cross-service identity and capability descriptor.
   zinder.v1.ops.ServerInfo common = 1;
@@ -943,14 +946,10 @@ message WalletServerInfo {
   // settled prefix (settled_tip_height) once it is buried at least this deep.
   uint32 reorg_window_blocks = 4;
 
-  // Chain-event retention window in seconds. 0 indicates unbounded retention
-  // (development mode; rejected by --print-config in production).
-  uint64 chain_event_retention_seconds = 5;
-
-  // Mempool retention windows in seconds. 0 indicates the corresponding event
-  // family is not retained on this deployment.
-  uint64 mempool_mined_retention_seconds = 6;
-  uint64 mempool_invalidated_retention_seconds = 7;
+  // Removed because the query reader had no authenticated writer evidence
+  // for these values. Reuse would make old clients misread another field as a
+  // retention duration.
+  reserved 5, 6, 7;
 
   // Upstream node capabilities detected by zinder-source.
   NodeCapabilitiesDescriptor node = 8;
@@ -1687,7 +1686,7 @@ service WalletQuery {
   // Return the latest checkpoint tree state visible to the selected epoch.
   rpc LatestTreeStateCheckpoint(LatestTreeStateCheckpointRequest) returns (TreeStateResponse);
 
-  // Return shielded subtree roots.
+  // Return at most 1024 shielded subtree roots per request.
   rpc SubtreeRoots(SubtreeRootsRequest) returns (SubtreeRootsResponse);
 
   // Broadcast a raw transaction.

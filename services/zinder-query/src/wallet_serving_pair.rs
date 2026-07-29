@@ -4,14 +4,14 @@ use std::{fmt, io, num::NonZeroU16, sync::Arc};
 
 use thiserror::Error;
 use zinder_core::{
-    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
+    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
     CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
     TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
 };
 use zinder_store::{
-    CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
-    RocksDbCanonicalSecondary,
+    BlockHashLookup, CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope,
+    ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
+    EventStreamStartPosition, RawBlobRetention, RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -29,6 +29,9 @@ use crate::QueryError;
 /// Implementations must never catch up or otherwise mutate their observed
 /// fence while a caller holds the same instance in a [`WalletServingReadPair`].
 pub trait CanonicalReader: Send + Sync + 'static {
+    /// Returns the persisted raw-blob retention authenticated at admission.
+    fn raw_blob_retention(&self) -> RawBlobRetention;
+
     /// Returns the immutable network admitted by this canonical reader.
     fn network(&self) -> Network;
 
@@ -50,6 +53,12 @@ pub trait CanonicalReader: Send + Sync + 'static {
         height: BlockHeight,
     ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError>;
 
+    /// Resolves a block hash through the admitted canonical best-chain index.
+    fn block_hash_lookup(
+        &self,
+        block_hash: zinder_core::BlockHash,
+    ) -> Result<BlockHashLookup, CanonicalStoreError>;
+
     /// Reads one compact block by height.
     fn compact_block_at(
         &self,
@@ -61,6 +70,18 @@ pub trait CanonicalReader: Send + Sync + 'static {
         &self,
         range: BlockHeightRange,
     ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError>;
+
+    /// Reads one retained full block blob by height.
+    fn block_blob_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError>;
+
+    /// Reads retained full block blobs for an inclusive height range.
+    fn block_blobs_in_range(
+        &self,
+        range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError>;
 
     /// Reads the canonical location of a transaction.
     fn transaction_location(
@@ -193,6 +214,10 @@ pub enum WalletServingAdmissionError {
 macro_rules! impl_canonical_read {
     ($store:ty) => {
         impl CanonicalReader for $store {
+            fn raw_blob_retention(&self) -> RawBlobRetention {
+                self.raw_blob_retention()
+            }
+
             fn network(&self) -> Network {
                 self.network()
             }
@@ -219,6 +244,13 @@ macro_rules! impl_canonical_read {
                 self.block_header_at(height)
             }
 
+            fn block_hash_lookup(
+                &self,
+                block_hash: zinder_core::BlockHash,
+            ) -> Result<BlockHashLookup, CanonicalStoreError> {
+                self.block_hash_lookup(block_hash)
+            }
+
             fn compact_block_at(
                 &self,
                 height: BlockHeight,
@@ -231,6 +263,20 @@ macro_rules! impl_canonical_read {
                 range: BlockHeightRange,
             ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
                 self.compact_blocks_in_range(range)
+            }
+
+            fn block_blob_at(
+                &self,
+                height: BlockHeight,
+            ) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError> {
+                self.block_blob_at(height)
+            }
+
+            fn block_blobs_in_range(
+                &self,
+                range: BlockHeightRange,
+            ) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError> {
+                self.block_blobs_in_range(range)
             }
 
             fn transaction_location(

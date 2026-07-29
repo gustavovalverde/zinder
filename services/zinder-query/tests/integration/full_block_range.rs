@@ -11,14 +11,17 @@ use zinder_core::wire::encode_rpc_block_hash_hex;
 use zinder_core::{
     BlockBlobArtifact, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, Network,
 };
-use zinder_proto::v1::wallet;
+use zinder_proto::{
+    capabilities::{WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1},
+    v1::wallet,
+};
 use zinder_query::{
     ArtifactKey, DEFAULT_MAX_FULL_BLOCK_RANGE, FullBlockStream, QueryError, WalletQuery,
-    WalletQueryApi,
+    WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{ArtifactFamily, ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention};
 use zinder_testkit::{
-    ChainFixture, StoreFixture, encode_fixture_block_replay,
+    ChainFixture, StoreFixture, WalletServingStoreFixture, encode_fixture_block_replay,
     encode_fixture_block_replay_with_raw_block, sample_regtest_upgrade_activations,
 };
 
@@ -339,12 +342,118 @@ async fn full_block_range_above_cap_is_rejected() -> eyre::Result<()> {
     assert!(
         matches!(
             outcome,
-            Err(QueryError::CompactBlockRangeTooLarge { requested, maximum })
+            Err(QueryError::BlockRangeTooLarge { requested, maximum })
                 if requested == usize::try_from(over_cap)?
                     && maximum == usize::try_from(DEFAULT_MAX_FULL_BLOCK_RANGE.get())?
         ),
         "an over-cap range must be rejected before streaming, got {outcome:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn serving_pair_with_all_retention_advertises_and_serves_full_blocks() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::All)
+        .extend_blocks(2);
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical),
+        Arc::new(wallet),
+    )?);
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(pair),
+        (),
+        ingest_control,
+        activations,
+    );
+
+    assert!(
+        query
+            .native_endpoint_capabilities()
+            .contains(WALLET_READ_FULL_BLOCK_AT_V1)
+    );
+    assert!(
+        query
+            .native_endpoint_capabilities()
+            .contains(WALLET_READ_FULL_BLOCK_RANGE_V1)
+    );
+
+    let tip = query.visible_tip_block(None).await?;
+    let block = query
+        .full_block_at(BlockHeight::new(1), Some(tip.chain_epoch.id))
+        .await?;
+    assert_eq!(block.chain_epoch, tip.chain_epoch);
+    assert_eq!(block.block_blob.height, BlockHeight::new(1));
+
+    let stream = query
+        .full_blocks_in_range(
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
+            Some(tip.chain_epoch.id),
+        )
+        .await?;
+    let (stream_epoch, blobs, terminal_error) = drain_full_block_stream(stream).await;
+    assert_eq!(stream_epoch, tip.chain_epoch);
+    assert_eq!(
+        blobs.iter().map(|blob| blob.height).collect::<Vec<_>>(),
+        vec![BlockHeight::new(1), BlockHeight::new(2)]
+    );
+    assert!(terminal_error.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn serving_pair_without_block_retention_omits_and_rejects_full_blocks() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(1);
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical),
+        Arc::new(wallet),
+    )?);
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(pair),
+        (),
+        ingest_control,
+        activations,
+    );
+
+    assert!(
+        !query
+            .native_endpoint_capabilities()
+            .contains(WALLET_READ_FULL_BLOCK_AT_V1)
+    );
+    assert!(
+        !query
+            .native_endpoint_capabilities()
+            .contains(WALLET_READ_FULL_BLOCK_RANGE_V1)
+    );
+    assert!(matches!(
+        query.full_block_at(BlockHeight::new(1), None).await,
+        Err(QueryError::EndpointCapabilityUnavailable {
+            capability: WALLET_READ_FULL_BLOCK_AT_V1,
+        })
+    ));
+    assert!(matches!(
+        query
+            .full_blocks_in_range(
+                BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1)),
+                None,
+            )
+            .await,
+        Err(QueryError::EndpointCapabilityUnavailable {
+            capability: WALLET_READ_FULL_BLOCK_RANGE_V1,
+        })
+    ));
     Ok(())
 }

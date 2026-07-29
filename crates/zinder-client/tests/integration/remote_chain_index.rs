@@ -3,15 +3,14 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::time::Duration;
 use std::{
     convert::Infallible,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
+use std::{num::NonZeroU32, time::Duration};
 
-use arc_swap::ArcSwap;
 use eyre::eyre;
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
@@ -24,18 +23,23 @@ use tonic::{
 };
 use zinder_client::{
     BlockHeight, BlockHeightRange, Capability, CapabilityDescriptor, ChainEvent, ChainIndex,
-    ConsensusBranchId, EndpointBackedIndex, EventStreamStart, IndexerError, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, RemoteChainIndex,
-    RemoteOpenOptions, RetryPolicy, TransactionBroadcastOutcome, TransactionId,
+    ConsensusBranchId, EndpointBackedIndex, EventStreamStart, Network, NetworkUpgradeActivation,
+    OwnedChainSnapshot, RemoteChainIndex, RemoteOpenOptions, TransactionId,
+    TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentOutPoint,
+    TransparentUnspentOutput,
+};
+use zinder_proto::capabilities::{
+    WALLET_READ_TRANSPARENT_OUTPUTS_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
+    WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1, WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    ServerInfoSettings, WalletCapabilityProfile, WalletQuery, WalletQueryGrpcAdapter,
-    WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, WalletEndpointMetadata, WalletQuery, WalletQueryApi,
+    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_testkit::{
-    ChainFixture, MockTransactionBroadcaster, StoreFixture, WalletServingStoreFixture,
-    sample_regtest_upgrade_activations,
+    ChainFixture, IngestControlFixture, MockTransactionBroadcaster, StoreFixture,
+    WalletServingStoreFixture, sample_regtest_upgrade_activations,
 };
 
 #[tokio::test]
@@ -43,20 +47,12 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
     let store_fixture =
         StoreFixture::with_chain_committed(&chain_fixture, zinder_client::ChainEpochId::new(1))?;
-    let transaction_id = TransactionId::from_bytes([0x66; 32]);
-    let broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
     let wallet_query = WalletQuery::new(
         store_fixture.chain_store().clone(),
-        broadcaster,
+        MockTransactionBroadcaster::broadcast_disabled(),
         Arc::new(sample_regtest_upgrade_activations()),
     );
-    let grpc_adapter = WalletQueryGrpcAdapter::new(
-        wallet_query,
-        ServerInfoSettings {
-            transaction_broadcast_enabled: true,
-            ..ServerInfoSettings::default()
-        },
-    );
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let endpoint = spawn_wallet_query(grpc_adapter).await?;
     let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
         endpoint,
@@ -79,9 +75,6 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
         compact_block_result?;
         compact_block_count += 1;
     }
-    let broadcast_outcome = chain_index
-        .broadcast_transaction(RawTransactionBytes::new([0x01, 0x02]))
-        .await?;
     let mut events = chain_index
         .chain_events(EventStreamStart::EarliestRetained)
         .await?;
@@ -91,14 +84,9 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
 
     assert_eq!(server_info.network, Network::ZcashRegtest);
     assert_eq!(server_info.service_name, "zinder-query");
-    assert!(server_info.supports(Capability::Broadcast));
     assert_eq!(current_epoch.visible_tip_height, BlockHeight::new(2));
     assert_eq!(compact_block.height(), BlockHeight::new(1));
     assert_eq!(compact_block_count, 2);
-    assert_eq!(
-        broadcast_outcome,
-        TransactionBroadcastOutcome::Accepted(zinder_client::BroadcastAccepted { transaction_id })
-    );
     assert!(matches!(
         first_event.event,
         ChainEvent::ChainCommitted { committed }
@@ -121,15 +109,23 @@ async fn remote_chain_index_returns_typed_network_upgrade_activations() -> eyre:
         Arc::new(canonical_reader),
         Arc::new(wallet_reader),
     )?);
-    let serving_pair_slot = Arc::new(ArcSwap::from(serving_pair));
-    let wallet_query =
-        WalletServingQuery::from_serving_pair_slot(serving_pair_slot, (), activations);
+    let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
+    let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let admitted_ingest_control = AdmittedIngestControl::connect(
+        ingest_control_fixture.endpoint(),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
+        serving_pair_slot,
+        (),
+        admitted_ingest_control,
+        activations,
+    );
     let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
         wallet_query,
-        ServerInfoSettings {
-            capability_profile: WalletCapabilityProfile::ExactPair,
-            ..ServerInfoSettings::default()
-        },
+        WalletEndpointMetadata::default(),
     ))
     .await?;
     let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
@@ -157,85 +153,173 @@ async fn remote_chain_index_returns_typed_network_upgrade_activations() -> eyre:
 }
 
 #[tokio::test]
-async fn remote_chain_index_maps_released_serving_query_stale_pin_to_refresh() -> eyre::Result<()> {
-    let mut delayed_activations = sample_regtest_upgrade_activations().activations().to_vec();
-    for activation in &mut delayed_activations {
-        if matches!(activation.name.as_str(), "Sapling" | "NU5" | "NU6.3") {
-            activation.activation_height = BlockHeight::new(100);
-        }
-    }
-    let activations = Arc::new(NetworkUpgradeActivations::new(
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end contract test keeps capability admission, exact-pair reads, pagination, empty history, and epoch replacement in one server lifecycle"
+)]
+async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resumable()
+-> eyre::Result<()> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let address_script_hash = TransparentAddressScriptHash::from_bytes([0x51; 32]);
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let indexed_blocks = chain_fixture.blocks().to_vec();
+    let chain_fixture =
+        indexed_blocks
+            .iter()
+            .enumerate()
+            .fold(chain_fixture, |chain, (tx_index, block)| {
+                chain.with_address_output_index(TransparentUnspentOutput::new(
+                    address_script_hash,
+                    vec![0x51],
+                    TransparentOutPoint::new(
+                        TransactionId::from_bytes(
+                            [u8::try_from(tx_index + 1).unwrap_or_default(); 32],
+                        ),
+                        0,
+                    ),
+                    u64::try_from(tx_index + 1).unwrap_or_default(),
+                    block.height,
+                    block.hash,
+                ))
+            });
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader),
+        Arc::new(wallet_reader),
+    )?);
+    let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let admitted_ingest_control = AdmittedIngestControl::connect(
+        ingest_control_fixture.endpoint(),
+        None,
         Network::ZcashRegtest,
-        delayed_activations,
-    )?);
-    let initial_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let replacement_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let mut initial_store =
-        WalletServingStoreFixture::from_chain(&initial_chain, activations.as_ref())?;
-    let (initial_canonical, initial_wallet) = initial_store.take_readers()?;
-    let initial_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(initial_canonical),
-        Arc::new(initial_wallet),
-    )?);
-    let initial_epoch_id = initial_pair.canonical_fence().chain_epoch_id();
-    let serving_slot = Arc::new(ArcSwap::from(initial_pair));
-    let query = WalletServingQuery::from_serving_pair_slot(
-        Arc::clone(&serving_slot),
+    )
+    .await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(serving_pair),
         (),
-        Arc::clone(&activations),
+        admitted_ingest_control,
+        activations,
     );
     let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
-        query,
-        ServerInfoSettings::default(),
+        wallet_query,
+        WalletEndpointMetadata::default(),
     ))
     .await?;
-    let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
+    let chain_index = Arc::new(RemoteChainIndex::connect(RemoteOpenOptions {
         endpoint,
         network: Network::ZcashRegtest,
-    })?;
+    })?);
 
-    let snapshot = chain_index.snapshot().await?;
-    assert_eq!(snapshot.chain_epoch().id, initial_epoch_id);
-    let initial_tip = snapshot.visible_tip_block().await?;
+    let server_info = chain_index.server_info().await?;
+    assert!(server_info.supports(Capability::TransparentAddressUnspentOutputs));
+    assert!(server_info.supports(Capability::TransparentAddressHistory));
+    for omitted in [Capability::Broadcast, Capability::TransparentAddressBalance] {
+        assert!(!server_info.supports(omitted));
+    }
+    for omitted in [
+        WALLET_READ_TRANSPARENT_OUTPUTS_V1,
+        WALLET_READ_TRANSPARENT_SPENDS_V1,
+        WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+        WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
+    ] {
+        assert!(!server_info.has(omitted));
+    }
+    let snapshot = OwnedChainSnapshot::capture(Arc::clone(&chain_index)).await?;
+    let mut unspent_outputs = snapshot
+        .transparent_address_unspent_outputs(address_script_hash, BlockHeight::new(0))
+        .await?;
+    let mut unspent_count = 0;
+    while let Some(output) = unspent_outputs.next().await {
+        let output = output?;
+        assert_eq!(output.chain_epoch, snapshot.chain_epoch());
+        unspent_count += 1;
+    }
+    assert_eq!(unspent_count, 3);
 
-    let mut replacement_store = WalletServingStoreFixture::from_chain_after_live_append(
-        &replacement_chain,
-        activations.as_ref(),
-    )?;
-    let (replacement_canonical, replacement_wallet) = replacement_store.take_readers()?;
-    let replacement_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(replacement_canonical),
-        Arc::new(replacement_wallet),
-    )?);
-    let replacement_epoch_id = replacement_pair.canonical_fence().chain_epoch_id();
-    assert!(replacement_epoch_id.value() > initial_epoch_id.value());
-    serving_slot.store(replacement_pair);
-    assert_eq!(chain_index.current_epoch().await?.id, replacement_epoch_id);
-
-    let stale_read = snapshot.visible_tip_block().await;
-    let Err(error) = stale_read else {
-        return Err(eyre!(
-            "the released serving query served a stale snapshot after pair publication"
-        ));
-    };
-
-    assert!(matches!(error, IndexerError::ChainEpochPinUnavailable));
-    assert_eq!(error.retry_policy(), RetryPolicy::RefreshChainEpoch);
-    let stale_artifact_read = snapshot.compact_block_at(initial_tip.height).await;
-    let Err(artifact_error) = stale_artifact_read else {
-        return Err(eyre!(
-            "the released serving query served a stale snapshot artifact"
-        ));
-    };
-    assert!(matches!(
-        artifact_error,
-        IndexerError::ChainEpochPinUnavailable
-    ));
+    let mut first_page = snapshot
+        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsQuery {
+            address_script_hash,
+            start_height: BlockHeight::new(0),
+            end_height: BlockHeight::new(3),
+            max_entries: Some(NonZeroU32::new(2).ok_or_else(|| eyre!("two is non-zero"))?),
+            from_cursor: None,
+            descending: false,
+            at_epoch_id: None,
+        })
+        .await?;
+    let first = first_page
+        .next()
+        .await
+        .ok_or_else(|| eyre!("first history page omitted height one"))??;
+    let second = first_page
+        .next()
+        .await
+        .ok_or_else(|| eyre!("first history page omitted height two"))??;
+    assert!(first_page.next().await.is_none());
     assert_eq!(
-        artifact_error.retry_policy(),
-        RetryPolicy::RefreshChainEpoch
+        [first.artifact.block_height, second.artifact.block_height],
+        [BlockHeight::new(1), BlockHeight::new(2)]
     );
-    assert_ne!(chain_index.visible_tip_block(None).await?, initial_tip);
+    assert_eq!(first.chain_epoch, snapshot.chain_epoch());
+    assert_eq!(second.chain_epoch, snapshot.chain_epoch());
+    assert!(first.cursor.is_none());
+    let cursor = second
+        .cursor
+        .ok_or_else(|| eyre!("first history page omitted its continuation"))?;
+
+    let mut second_page = snapshot
+        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsQuery {
+            address_script_hash,
+            start_height: BlockHeight::new(0),
+            end_height: BlockHeight::new(3),
+            max_entries: Some(NonZeroU32::new(2).ok_or_else(|| eyre!("two is non-zero"))?),
+            from_cursor: Some(cursor),
+            descending: false,
+            at_epoch_id: None,
+        })
+        .await?;
+    let third = second_page
+        .next()
+        .await
+        .ok_or_else(|| eyre!("second history page omitted height three"))??;
+    assert!(second_page.next().await.is_none());
+    assert_eq!(third.artifact.block_height, BlockHeight::new(3));
+    assert_eq!(third.chain_epoch, snapshot.chain_epoch());
+    assert!(third.cursor.is_none());
+
+    let mut empty_page = snapshot
+        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsQuery {
+            address_script_hash: TransparentAddressScriptHash::from_bytes([0x52; 32]),
+            start_height: BlockHeight::new(0),
+            end_height: BlockHeight::new(3),
+            max_entries: None,
+            from_cursor: None,
+            descending: false,
+            at_epoch_id: None,
+        })
+        .await?;
+    assert!(empty_page.next().await.is_none());
+
+    let mut expired_page = chain_index
+        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsQuery {
+            address_script_hash,
+            start_height: BlockHeight::new(0),
+            end_height: BlockHeight::new(3),
+            max_entries: None,
+            from_cursor: None,
+            descending: false,
+            at_epoch_id: Some(zinder_client::ChainEpochId::new(
+                snapshot.chain_epoch().id.value() + 1,
+            )),
+        })
+        .await?;
+    assert!(matches!(
+        expired_page.next().await,
+        Some(Err(zinder_client::IndexerError::ChainEpochPinUnavailable))
+    ));
+
     Ok(())
 }
 
@@ -437,6 +521,7 @@ async fn spawn_wallet_query<QueryApi>(
     grpc_adapter: WalletQueryGrpcAdapter<QueryApi>,
 ) -> eyre::Result<String>
 where
+    QueryApi: WalletQueryApi,
     WalletQueryGrpcAdapter<QueryApi>: zinder_proto::v1::wallet::wallet_query_server::WalletQuery,
 {
     let listener = TcpListener::bind("127.0.0.1:0").await?;

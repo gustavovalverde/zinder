@@ -4,7 +4,7 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     ChainEpochId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootArtifact,
-    UnixTimestampMillis,
+    TransactionLocation, UnixTimestampMillis,
 };
 
 use super::{
@@ -266,7 +266,11 @@ impl PreparedLiveAppendCommit {
                 "expected canonical event fence is stale",
             ));
         }
-        validate_live_block(store.workload, &append.block)?;
+        validate_live_block(
+            store.workload,
+            store.build_plan.raw_blob_retention(),
+            &append.block,
+        )?;
         let visible_tip = validate_live_block_extension(&store.ready_evidence, &append.block)?;
         validate_live_checkpoint_transition(&anchor, &append.block, network_upgrade_activations)?;
         let tip_metadata = append.block.tip_metadata;
@@ -672,7 +676,7 @@ impl PreparedLiveBlockRows {
             block_hash_record[..32].to_vec(),
             block_hash_record[32..].to_vec(),
         ));
-        append_transaction_rows(&mut rows, height, transaction_blobs)?;
+        append_transaction_rows(&mut rows, &facts, transaction_blobs)?;
         if let Some(block_blob) = block_blob {
             rows.push(PreparedLiveRow::new(
                 BLOCK_BLOB_COLUMN_FAMILY,
@@ -740,13 +744,33 @@ impl PreparedLiveBlockRows {
 
 fn append_transaction_rows(
     rows: &mut Vec<PreparedLiveRow>,
-    height: zinder_core::BlockHeight,
+    facts: &zinder_core::CanonicalBlockFacts,
     transaction_blobs: Vec<zinder_core::TransactionBlobArtifact>,
 ) -> Result<(), CanonicalStoreError> {
-    for (transaction_index, transaction_blob) in transaction_blobs.into_iter().enumerate() {
+    let height = facts.block_header.height;
+    for (transaction_index, transaction) in facts.transactions.iter().enumerate() {
         let transaction_index = u32::try_from(transaction_index).map_err(|_| {
             CanonicalStoreError::live_commit(format!(
                 "block {} transaction count exceeds u32::MAX",
+                height.value()
+            ))
+        })?;
+        let location_record = encode_transaction_location(TransactionLocation::new(
+            transaction.public_facts.transaction_id,
+            height,
+            facts.block_header.block_hash,
+            transaction_index,
+        ));
+        rows.push(PreparedLiveRow::new(
+            TRANSACTION_LOCATION_COLUMN_FAMILY,
+            location_record[..32].to_vec(),
+            location_record[32..].to_vec(),
+        ));
+    }
+    for (transaction_index, transaction_blob) in transaction_blobs.into_iter().enumerate() {
+        let transaction_index = u32::try_from(transaction_index).map_err(|_| {
+            CanonicalStoreError::live_commit(format!(
+                "block {} transaction blob count exceeds u32::MAX",
                 height.value()
             ))
         })?;
@@ -754,12 +778,6 @@ fn append_transaction_rows(
             TRANSACTION_BLOB_COLUMN_FAMILY,
             encode_transaction_position(height, transaction_index).to_vec(),
             transaction_blob.raw_transaction_bytes,
-        ));
-        let location_record = encode_transaction_location(transaction_blob.location);
-        rows.push(PreparedLiveRow::new(
-            TRANSACTION_LOCATION_COLUMN_FAMILY,
-            location_record[..32].to_vec(),
-            location_record[32..].to_vec(),
         ));
     }
     Ok(())

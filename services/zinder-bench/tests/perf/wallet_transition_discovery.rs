@@ -30,7 +30,7 @@ use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
     CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
     CanonicalRetainedEvent, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
-    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence,
@@ -314,6 +314,7 @@ fn prepare_fixture() -> Result<PreparedFixture> {
         &activations,
         0,
         baseline_tip,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(SUPPORTED_REORG_DEPTH)?,
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
@@ -409,6 +410,7 @@ fn prepare_fixture() -> Result<PreparedFixture> {
         temporary.path().join("canonical-secondary"),
         &activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(SUPPORTED_REORG_DEPTH)?,
         CANONICAL_READER_BUDGET,
     )?;

@@ -7,20 +7,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use zinder_core::{
-    BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId,
-    CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionBlobArtifact, TransactionId, TransactionLocation,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch,
+    ChainEpochId, CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact,
+    SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
 };
 use zinder_query::{
-    CanonicalReader, QueryError, WalletProjectionReader, WalletQueryApi, WalletServingQuery,
-    WalletServingReadPair,
+    CanonicalReader, QueryError, WalletProjectionReader, WalletQueryApi, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{
-    CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
+    BlockHashLookup, CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope,
+    ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
+    EventStreamStartPosition, RawBlobRetention,
 };
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
@@ -37,13 +37,13 @@ async fn wallet_serving_reads_leave_the_reactor_free() -> eyre::Result<()> {
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let reactor_gate = Arc::new(ReactorGate::default());
     let query = WalletServingQuery::from_serving_pair_slot(
-        Arc::new(ArcSwap::from(Arc::new(WalletServingReadPair::new(
+        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
             Arc::new(GatedCanonicalReader {
                 canonical_reader,
                 reactor_gate: Arc::clone(&reactor_gate),
             }) as Arc<dyn CanonicalReader>,
             Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
-        )?))),
+        )?)),
         (),
         Arc::clone(&activations),
     );
@@ -75,10 +75,10 @@ async fn compact_block_range_is_capped_before_any_canonical_read() -> eyre::Resu
     )?;
     let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
     let query = WalletServingQuery::from_serving_pair_slot(
-        Arc::new(ArcSwap::from(Arc::new(WalletServingReadPair::new(
+        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
             Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
             Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
-        )?))),
+        )?)),
         (),
         Arc::clone(&activations),
     );
@@ -92,7 +92,7 @@ async fn compact_block_range_is_capped_before_any_canonical_read() -> eyre::Resu
     assert!(
         matches!(
             over_cap,
-            Err(QueryError::CompactBlockRangeTooLarge {
+            Err(QueryError::BlockRangeTooLarge {
                 requested: 1001,
                 maximum: 1000
             })
@@ -157,6 +157,10 @@ struct GatedCanonicalReader {
 }
 
 impl CanonicalReader for GatedCanonicalReader {
+    fn raw_blob_retention(&self) -> RawBlobRetention {
+        self.canonical_reader.raw_blob_retention()
+    }
+
     fn network(&self) -> Network {
         self.canonical_reader.network()
     }
@@ -181,6 +185,13 @@ impl CanonicalReader for GatedCanonicalReader {
         self.canonical_reader.block_header_at(height)
     }
 
+    fn block_hash_lookup(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<BlockHashLookup, CanonicalStoreError> {
+        self.canonical_reader.block_hash_lookup(block_hash)
+    }
+
     fn compact_block_at(
         &self,
         height: BlockHeight,
@@ -193,6 +204,20 @@ impl CanonicalReader for GatedCanonicalReader {
         range: BlockHeightRange,
     ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
         self.canonical_reader.compact_blocks_in_range(range)
+    }
+
+    fn block_blob_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError> {
+        self.canonical_reader.block_blob_at(height)
+    }
+
+    fn block_blobs_in_range(
+        &self,
+        range: BlockHeightRange,
+    ) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError> {
+        self.canonical_reader.block_blobs_in_range(range)
     }
 
     fn transaction_location(

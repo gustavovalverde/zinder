@@ -20,8 +20,8 @@ use super::{
         create_fresh_directory, initialize_store_identity, validate_resource_budget,
     },
     subtree_load::{
-        CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence, load_subtree_roots,
-        required_subtree_root_ranges,
+        CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadEvidence,
+        load_complete_subtree_root_prefix, load_subtree_roots, required_subtree_root_ranges,
     },
 };
 
@@ -49,8 +49,9 @@ pub struct RocksDbCanonicalBuilder {
 impl RocksDbCanonicalBuilder {
     /// Creates an unpublished canonical store at a path that does not exist.
     ///
-    /// Identity, schema version, network, workload, source range, and cursor
-    /// authentication material are synced before any data family is created.
+    /// Identity, schema version, network, workload, raw-blob retention, source
+    /// range, and cursor authentication material are synced before any data
+    /// family is created.
     pub fn create_fresh(
         path: impl AsRef<std::path::Path>,
         workload: CanonicalStoreWorkload,
@@ -122,6 +123,12 @@ impl RocksDbCanonicalBuilder {
     #[must_use]
     pub const fn workload(&self) -> CanonicalStoreWorkload {
         self.workload
+    }
+
+    /// Returns the immutable raw-blob retention persisted by this build.
+    #[must_use]
+    pub const fn raw_blob_retention(&self) -> crate::RawBlobRetention {
+        self.build_plan.raw_blob_retention()
     }
 
     /// Returns the immutable activation-table identity persisted by this build.
@@ -219,6 +226,36 @@ impl RocksDbCanonicalBuilder {
             .as_ref()
             .ok_or(CanonicalStoreError::CanonicalBlocksNotLoaded)?;
         let loaded = load_subtree_roots(
+            &self.bounded_open.db,
+            &self.build_plan,
+            block_evidence,
+            subtree_roots,
+        )?;
+        self.subtree_root_evidence = Some(loaded.evidence);
+        self.trusted_fresh_subtree_family_evidence = Some(loaded.family_evidence);
+        Ok(loaded.evidence)
+    }
+
+    /// Loads a caller-authenticated complete subtree-root prefix for a fresh build.
+    ///
+    /// Every protocol must cover exactly index zero through the completed count
+    /// at the fixed tip. Roots completed before retained history carry their
+    /// exact source-authenticated block identity; the store preserves that
+    /// identity but does not claim to authenticate a block header it does not
+    /// retain. Completion blocks inside retained history are checked against
+    /// the retained canonical header before any rows are written.
+    pub fn load_complete_subtree_root_prefix(
+        &mut self,
+        subtree_roots: impl IntoIterator<Item = zinder_core::SubtreeRootArtifact>,
+    ) -> Result<CanonicalSubtreeRootLoadEvidence, CanonicalStoreError> {
+        if self.subtree_root_evidence.is_some() {
+            return Err(CanonicalStoreError::SubtreeRootLoadAlreadyLoaded);
+        }
+        let block_evidence = self
+            .canonical_block_evidence
+            .as_ref()
+            .ok_or(CanonicalStoreError::CanonicalBlocksNotLoaded)?;
+        let loaded = load_complete_subtree_root_prefix(
             &self.bounded_open.db,
             &self.build_plan,
             block_evidence,
@@ -381,7 +418,8 @@ mod tests {
         },
     };
     use crate::{
-        CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildState, RocksDbCanonicalStore,
+        CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildState, RawBlobRetention,
+        RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     };
 
     const PUBLICATION_FAILPOINT_ENV: &str = "ZINDER_TEST_CANONICAL_PUBLICATION_FAILPOINT";
@@ -540,6 +578,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -585,7 +624,7 @@ mod tests {
 
         assert_ready_construction_manifest_binding(&store_path, &published)?;
         let manifest =
-            fs::read_to_string(store_path.join("canonical-construction-manifest.v2.json"))?;
+            fs::read_to_string(store_path.join("canonical-construction-manifest.v4.json"))?;
         assert!(manifest.contains("\"evidence_provenance\":\"cold-certification\""));
 
         assert_eq!(published.ready_evidence().visible_epoch.value(), 1);
@@ -609,6 +648,7 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(101)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -624,6 +664,7 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -644,6 +685,119 @@ mod tests {
         assert_eq!(
             replayed_blocks[1].facts().block_header.block_hash,
             BlockHash::from_bytes([2; 32])
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end proof keeps publication, fail-closed readmission, batch reads, and secondary admission together"
+    )]
+    fn wallet_all_retention_survives_publication_reopen_and_secondary_batch_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let build_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            build_tip,
+            RawBlobRetention::All,
+            CanonicalReorgPolicy::new(100)?,
+        )?;
+        let mut builder = RocksDbCanonicalBuilder::create_fresh(
+            &store_path,
+            CanonicalStoreWorkload::Wallet,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let first = canonical_build_block_with_block_blob(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+            vec![11],
+        );
+        let mut second =
+            canonical_build_block_with_block_blob(BlockHeight::new(2), [2; 32], [1; 32], vec![22]);
+        add_tree_state_checkpoint(&mut second)?;
+        builder.bulk_load_blocks([
+            Ok::<_, std::io::Error>(first),
+            Ok::<_, std::io::Error>(second),
+        ])?;
+        builder.load_subtree_roots(std::iter::empty())?;
+        builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
+            build_tip,
+            2,
+            crate::canonical_store::test_checkpoint_frontiers(&activations, BlockHeight::new(2)),
+        ))?;
+        let validated = builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let published = validated.publish_baseline(publication)?;
+        assert_eq!(published.raw_blob_retention(), RawBlobRetention::All);
+        assert_eq!(
+            published
+                .block_blob_at(BlockHeight::new(1))?
+                .ok_or("published block blob must be retained")?
+                .raw_block_bytes,
+            vec![11]
+        );
+        drop(published);
+
+        let mismatch = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("raw blob retention mismatch must fail closed")?;
+        assert!(mismatch.to_string().contains(
+            "persisted raw blob retention all does not equal requested raw blob retention transactions"
+        ));
+
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::All,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            reopened
+                .block_blobs_in_range(zinder_core::BlockHeightRange::inclusive(
+                    BlockHeight::new(1),
+                    BlockHeight::new(2),
+                ))?
+                .into_iter()
+                .map(|blob| blob.map(|blob| blob.raw_block_bytes))
+                .collect::<Vec<_>>(),
+            vec![Some(vec![11]), Some(vec![22])]
+        );
+        let secondary = RocksDbCanonicalSecondary::open_ready(
+            &store_path,
+            temporary.path().join("canonical-secondary"),
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::All,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(secondary.raw_blob_retention(), RawBlobRetention::All);
+        assert_eq!(
+            secondary
+                .block_blob_at(BlockHeight::new(2))?
+                .ok_or("secondary block blob must be retained")?
+                .raw_block_bytes,
+            vec![22]
         );
         Ok(())
     }
@@ -721,7 +875,7 @@ mod tests {
                 .contains("zinder_store_canonical_publication_family_scan")
         );
         let manifest =
-            fs::read_to_string(store_path.join("canonical-construction-manifest.v2.json"))?;
+            fs::read_to_string(store_path.join("canonical-construction-manifest.v4.json"))?;
         assert!(manifest.contains("\"evidence_provenance\":\"trusted-fresh-writer\""));
         assert_eq!(published.ready_evidence().visible_block_count, 2);
         assert_eq!(
@@ -752,7 +906,7 @@ mod tests {
         let binding = published.ready_evidence().construction_manifest_sha256;
         drop(published);
 
-        let manifest_path = store_path.join("canonical-construction-manifest.v2.json");
+        let manifest_path = store_path.join("canonical-construction-manifest.v4.json");
         std::fs::remove_file(&manifest_path)?;
         std::fs::write(
             store_path.join("canonical-construction-manifest.v1.json"),
@@ -764,6 +918,7 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -772,7 +927,7 @@ mod tests {
         assert!(
             missing
                 .to_string()
-                .contains("canonical-construction-manifest.v2.json")
+                .contains("canonical-construction-manifest.v4.json")
         );
 
         std::fs::write(&manifest_path, b"{}")?;
@@ -780,12 +935,29 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
         .ok_or("READY admission must reject a tampered construction manifest")?;
         assert!(tampered.to_string().contains("construction manifest"));
+        let secondary_tampered = RocksDbCanonicalSecondary::open_ready(
+            &store_path,
+            temporary.path().join("canonical-secondary"),
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .err()
+        .ok_or("secondary admission must reject a tampered construction manifest")?;
+        assert!(
+            secondary_tampered
+                .to_string()
+                .contains("construction manifest")
+        );
         assert_ne!(binding, [0; 32]);
         Ok(())
     }
@@ -1135,6 +1307,7 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1163,6 +1336,7 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1259,6 +1433,7 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(2)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1349,6 +1524,7 @@ mod tests {
                     &store_path,
                     &activations,
                     CanonicalStoreWorkload::Wallet,
+                    RawBlobRetention::Transactions,
                     CanonicalReorgPolicy::new(2)?,
                     RocksDbResourceBudget::for_local_tests(),
                 )
@@ -1384,6 +1560,7 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1422,6 +1599,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1456,6 +1634,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1513,6 +1692,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1581,6 +1761,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1638,6 +1819,7 @@ mod tests {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1691,6 +1873,7 @@ mod tests {
             &before_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1703,6 +1886,7 @@ mod tests {
             &after_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1746,6 +1930,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1799,6 +1984,7 @@ mod tests {
             &committed_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1843,6 +2029,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1900,6 +2087,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1939,6 +2127,7 @@ mod tests {
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1956,6 +2145,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
@@ -2014,6 +2204,47 @@ mod tests {
     }
 
     #[test]
+    fn no_blob_bulk_load_counts_semantic_locations_independently_from_optional_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            RawBlobRetention::None,
+            CanonicalReorgPolicy::new(100)?,
+        )?;
+        let mut store = RocksDbCanonicalBuilder::create_fresh(
+            &store_path,
+            CanonicalStoreWorkload::Wallet,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let mut block = canonical_build_block_with_raw_blobs(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        block.transaction_blobs.clear();
+        block.block_blob = None;
+        add_tree_state_checkpoint(&mut block)?;
+
+        let evidence = store.bulk_load_blocks([Ok::<_, std::io::Error>(block)])?;
+
+        assert_eq!(evidence.transaction_count, 1);
+        assert_eq!(evidence.transaction_location_count, 1);
+        assert_eq!(evidence.transaction_blob_count, 0);
+        assert_eq!(evidence.block_blob_count, 0);
+        assert_eq!(evidence.transaction_location_logical_bytes, 32 + 40);
+        assert_eq!(evidence.transaction_blob_logical_bytes, 0);
+        assert_eq!(evidence.block_blob_logical_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
     fn bulk_load_blocks_merges_tiny_reverse_index_runs_in_key_order()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
@@ -2024,6 +2255,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([2; 32])),
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
@@ -2216,6 +2448,7 @@ mod tests {
                 &activations,
                 0,
                 tip,
+                RawBlobRetention::Transactions,
                 CanonicalReorgPolicy::new(100)?,
             )?,
             RocksDbResourceBudget::for_local_tests(),
@@ -2242,6 +2475,7 @@ mod tests {
                 &activations,
                 0,
                 tip,
+                RawBlobRetention::Transactions,
                 CanonicalReorgPolicy::new(100)?,
             )?,
             RocksDbResourceBudget::for_local_tests(),
@@ -2375,6 +2609,7 @@ mod tests {
                         ),
                     ),
                     BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
+                    RawBlobRetention::Transactions,
                     CanonicalReorgPolicy::new(100)?,
                 )?
             }
@@ -2404,7 +2639,7 @@ mod tests {
         );
         assert!(
             store_path
-                .join("canonical-construction-manifest.v2.json")
+                .join("canonical-construction-manifest.v4.json")
                 .is_file()
         );
         let manifest_binding =
@@ -2464,6 +2699,7 @@ mod tests {
                 build_tip_height,
                 BlockHash::from_bytes([build_tip_byte; 32]),
             ),
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(reorg_window_blocks)?,
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
@@ -2547,6 +2783,7 @@ mod tests {
             store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -2582,6 +2819,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
         )?)
     }
@@ -2603,6 +2841,7 @@ mod tests {
             store_path,
             activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(2)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2842,6 +3081,29 @@ mod tests {
             ),
             raw_transaction_bytes,
         ));
+        block.block_blob = Some(zinder_core::BlockBlobArtifact::new(
+            height,
+            block.facts.block_header.block_hash,
+            block.facts.block_header.parent_hash,
+            raw_block_bytes,
+        ));
+        block.replay_envelope = encode_canonical_block_replay(
+            &block.facts,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
+        );
+        block
+    }
+
+    fn canonical_build_block_with_block_blob(
+        height: BlockHeight,
+        block_hash: [u8; 32],
+        parent_hash: [u8; 32],
+        raw_block_bytes: Vec<u8>,
+    ) -> crate::CanonicalBuildBlock {
+        let mut block = canonical_build_block(height, block_hash, parent_hash);
+        block.facts.serialized_bytes_digest =
+            SerializedBytesDigest::from_serialized_bytes(&raw_block_bytes);
         block.block_blob = Some(zinder_core::BlockBlobArtifact::new(
             height,
             block.facts.block_header.block_hash,

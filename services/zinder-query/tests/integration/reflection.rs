@@ -14,7 +14,7 @@ use tonic_reflection::pb::v1::{
     server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
 };
 use zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET;
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
 use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 
 const EXPECTED_SERVICE: &str = "zinder.v1.wallet.WalletQuery";
@@ -27,7 +27,7 @@ async fn server_reflection_lists_wallet_query_service() -> Result<()> {
         (),
         Arc::new(sample_regtest_upgrade_activations()),
     );
-    let adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(ZINDER_V1_FILE_DESCRIPTOR_SET)
         .build_v1()?;

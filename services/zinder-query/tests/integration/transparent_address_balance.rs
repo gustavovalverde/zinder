@@ -9,7 +9,7 @@ use eyre::eyre;
 use tonic::{Code, Request};
 use tonic_types::StatusExt;
 use zinder_core::{
-    ChainEpochId, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    ChainEpochId, Network, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
     TransparentOutputArtifact,
 };
 use zinder_proto::v1::ops::ErrorReason;
@@ -18,11 +18,14 @@ use zinder_proto::v1::wallet::{
     wallet_query_server::WalletQuery as WalletQueryService,
 };
 use zinder_query::{
-    MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, ServerInfoSettings, WalletQuery,
-    WalletQueryGrpcAdapter,
+    CanonicalReader, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, WalletEndpointMetadata,
+    WalletProjectionReader, WalletQuery, WalletQueryGrpcAdapter, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::PrimaryChainStore;
-use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    ChainFixture, StoreFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
+};
 
 use crate::common::{chain_epoch_artifacts_with_transparent_facts, synthetic_chain_epoch};
 
@@ -48,7 +51,7 @@ async fn transparent_address_balance_sums_confirmed_unspent_across_addresses() -
     let value_a = commit_unspent_outputs(&store, ChainEpochId::new(1), &[address_a, address_b])?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let response = WalletQueryService::transparent_address_balance(
         &grpc_adapter,
@@ -87,7 +90,7 @@ async fn transparent_address_balance_rejects_an_empty_address_list() -> eyre::Re
     )?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let status = match WalletQueryService::transparent_address_balance(
         &grpc_adapter,
@@ -116,7 +119,7 @@ async fn transparent_address_balance_rejects_more_addresses_than_the_cap() -> ey
     )?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let over_cap = MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES + 1;
     let addresses = (0..over_cap)
@@ -153,6 +156,42 @@ async fn transparent_address_balance_rejects_more_addresses_than_the_cap() -> ey
         ),
         "the cap rejection carries the typed reason"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn release_balance_is_unavailable_before_request_parsing_or_store_reads() -> eyre::Result<()>
+{
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
+        Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+    )?);
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(serving_pair),
+        (),
+        ingest_control,
+        activations,
+    );
+    let grpc_adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
+    let status = WalletQueryService::transparent_address_balance(
+        &grpc_adapter,
+        Request::new(TransparentAddressBalanceRequest {
+            addresses: Vec::new(),
+            at_epoch_id: None,
+        }),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("release balance unexpectedly accepted an over-cap request"))?;
+
+    assert_eq!(status.code(), Code::FailedPrecondition);
     Ok(())
 }
 

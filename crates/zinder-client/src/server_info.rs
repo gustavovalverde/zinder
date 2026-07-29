@@ -1,7 +1,5 @@
 //! Client-owned wallet endpoint metadata.
 
-use std::time::Duration;
-
 use zinder_core::{ArtifactSchemaVersion, Network};
 
 use crate::{Capability, CapabilityDescriptor};
@@ -16,7 +14,7 @@ pub struct NodeServerInfo {
     pub capabilities: Vec<String>,
 }
 
-/// Wallet endpoint identity, capability, retention, and schema metadata.
+/// Wallet endpoint identity, capability, and schema metadata.
 ///
 /// This is a client-owned representation. Generated protobuf messages remain
 /// private to the remote transport conversion.
@@ -43,12 +41,6 @@ pub struct ServerInfo {
     pub schema_version: ArtifactSchemaVersion,
     /// Configured canonical reorg window depth in blocks.
     pub reorg_window_blocks: u32,
-    /// Chain-event retention duration; `None` means unbounded retention.
-    pub chain_event_retention: Option<Duration>,
-    /// Retention duration for mined mempool entries; `None` means not retained.
-    pub mempool_mined_retention: Option<Duration>,
-    /// Retention duration for invalidated mempool entries; `None` means not retained.
-    pub mempool_invalidated_retention: Option<Duration>,
     /// Upstream node metadata, when the endpoint has a source snapshot.
     pub node: Option<NodeServerInfo>,
 }
@@ -58,13 +50,5 @@ impl CapabilityDescriptor for ServerInfo {
         self.capabilities
             .iter()
             .any(|advertised| advertised.as_str() == capability)
-    }
-}
-
-pub(crate) const fn optional_duration(seconds: u64) -> Option<Duration> {
-    if seconds == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(seconds))
     }
 }

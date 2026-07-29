@@ -32,6 +32,7 @@ use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSour
 mod canonical_replay_storage_command;
 mod rocksdb_canonical_fixture_replay;
 mod rocksdb_compact_block_range;
+mod rocksdb_raw_blob_retention_comparison;
 mod rocksdb_storage_lifecycle;
 mod rocksdb_wallet_rebuild;
 
@@ -40,6 +41,9 @@ use rocksdb_canonical_fixture_replay::{
     RocksDbCanonicalFixtureReplayArgs, run_rocksdb_canonical_fixture_replay,
 };
 use rocksdb_compact_block_range::{RocksDbCompactBlockRangeArgs, run_rocksdb_compact_block_range};
+use rocksdb_raw_blob_retention_comparison::{
+    RocksDbRawBlobRetentionComparisonArgs, run_rocksdb_raw_blob_retention_comparison,
+};
 use rocksdb_storage_lifecycle::{RocksDbStorageLifecycleArgs, run_rocksdb_storage_lifecycle};
 use rocksdb_wallet_rebuild::{RocksDbWalletRebuildArgs, run_rocksdb_wallet_rebuild};
 
@@ -76,6 +80,9 @@ enum Command {
     /// Replay an authenticated fixture into a fresh canonical `RocksDB` store.
     #[command(name = "rocksdb-canonical-fixture-replay")]
     RocksDbCanonicalFixtureReplay(RocksDbCanonicalFixtureReplayArgs),
+    /// Compare transaction-only and complete raw-blob retention over one fixture.
+    #[command(name = "rocksdb-raw-blob-retention-comparison")]
+    RocksDbRawBlobRetentionComparison(RocksDbRawBlobRetentionComparisonArgs),
     /// Serve an immutable canonical fixture through JSON-RPC and indexer gRPC.
     #[command(name = "serve-canonical-fixture-transports")]
     ServeCanonicalFixtureTransports(ServeCanonicalFixtureTransportsArgs),
@@ -280,6 +287,10 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             let output = run_rocksdb_canonical_fixture_replay(args).await?;
             emit_report(&output.report, output.report_path.as_deref())?;
             output.report.validate()
+        }
+        Command::RocksDbRawBlobRetentionComparison(args) => {
+            let output = run_rocksdb_raw_blob_retention_comparison(args).await?;
+            emit_report(&output.report, output.report_path.as_deref())
         }
         Command::ServeCanonicalFixtureTransports(args) => {
             let max_response_bytes = u32::try_from(args.max_response_bytes).map_err(|_| {
@@ -584,6 +595,31 @@ mod tests {
     }
 
     #[test]
+    fn rocksdb_raw_blob_retention_comparison_command_spelling_is_stable()
+    -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from([
+            "zinder-bench",
+            "rocksdb-raw-blob-retention-comparison",
+            "--fixture",
+            "fixture",
+            "--transactions-canonical-store",
+            "transactions-canonical",
+            "--transactions-secondary-root",
+            "transactions-secondary",
+            "--all-canonical-store",
+            "all-canonical",
+            "--all-secondary-root",
+            "all-secondary",
+        ])?;
+
+        assert!(matches!(
+            cli.command,
+            Command::RocksDbRawBlobRetentionComparison(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn capture_canonical_fixture_checkpoints_command_spelling_is_stable()
     -> Result<(), Box<dyn Error>> {
         let cli = Cli::try_parse_from([
@@ -617,6 +653,8 @@ mod tests {
             "canonical",
             "--wallet-store",
             "wallet",
+            "--raw-blob-retention",
+            "all",
         ])?;
 
         assert!(matches!(cli.command, Command::RocksDbWalletRebuild(_)));

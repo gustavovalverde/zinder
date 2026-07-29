@@ -50,7 +50,8 @@ The request shape failed validation. Retry disposition: **NonRetryable**. Carrie
 | Reason | What it means | Example metadata |
 | --- | --- | --- |
 | `INVALID_BLOCK_RANGE` | `start_height` exceeds `end_height` | `field_violations[start_height, end_height]` |
-| `COMPACT_BLOCK_RANGE_TOO_LARGE` | Requested range exceeds the per-deployment cap | `field_violations[end_height]` |
+| `BLOCK_RANGE_TOO_LARGE` | Requested compact- or full-block range exceeds the per-deployment cap | `field_violations[end_height]` |
+| `SUBTREE_ROOT_RANGE_TOO_LARGE` | Requested subtree-root count exceeds the public 1,024-entry per-request cap | `field_violations[max_entries]` |
 | `CHAIN_EVENT_CURSOR_INVALID` | Cursor bytes failed to parse, are for a different network / store / stream family, or a non-default request family disagrees with the cursor's encoded family | `field_violations[from_cursor]` |
 | `ADDRESS_OUTPUT_CURSOR_INVALID` | Same as above for address-output streams | `field_violations[from_cursor]` |
 | `TRANSPARENT_HISTORY_CURSOR_INVALID` | Same as above for transparent-history streams | `field_violations[from_cursor]` |
@@ -79,19 +80,20 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `CHAIN_EPOCH_CONFLICT` | Detected chain-epoch contention between writer and reader | — |
 | `CHAIN_EPOCH_NETWORK_MISMATCH` | Store opened against the wrong `network` | — |
 | `MATERIALIZED_VIEW_UNAVAILABLE` | A required wallet projection or explorer materialized view is not configured for this deployment | `type=MATERIALIZED_VIEW_UNAVAILABLE, subject=<capability>` |
+| `ENDPOINT_CAPABILITY_UNAVAILABLE` | The admitted wallet endpoint does not expose the capability required by this operation | `type=ENDPOINT_CAPABILITY_UNAVAILABLE, subject=<capability>` |
 | `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical store, a materialized view, or a wallet-query endpoint) is not wired on this deployment | — |
 | `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires; the operator must reconfigure the node | — |
 | `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state | — |
 
 ### `NOT_FOUND` family
 
-The requested resource does not exist. Retry disposition: **RetryAfterBackoff** (the resource may appear after a future commit). Some reasons carry `ResourceInfo` naming the family/key. The `resource_type` is the on-wire artifact-family label (the `zinder_core::artifact_family` constants such as `compact_block`, `chain_epoch`); clients read it directly without a Rust-side translation table.
+The requested resource is not available in the visible query state. Retry disposition: **RetryAfterBackoff** (the resource may appear after a future commit). Some reasons carry `ResourceInfo` naming the family/key. The `resource_type` is the on-wire artifact-family label (the `zinder_core::artifact_family` constants such as `compact_block`, `chain_epoch`); clients read it directly without a Rust-side translation table.
 
 | Reason | What it means | Example metadata |
 | --- | --- | --- |
 | `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch (also raised by explorer reads for a not-yet-materialized materialized-view row) | `resource_type=<family>, resource_name=<key>` |
 | `CHAIN_EPOCH_MISSING` | Chain epoch is not retained (often: pruned) | `resource_type=chain_epoch, resource_name=chain_epoch:<id>` |
-| `BLOCK_NOT_IN_BEST_CHAIN` | The requested block exists but is not on the visible best chain | — |
+| `BLOCK_NOT_IN_BEST_CHAIN` | No block matching the requested selector is visible in the best chain; unknown and reorged-out selectors share this reason | — |
 
 ### `DATA_LOSS` family
 
@@ -115,6 +117,7 @@ Service is reachable but a dependency is not, or the operation is not yet suppor
 | `UNSUPPORTED_BLOCK_SELECTOR` | The requested selector shape cannot be represented |
 | `UNSUPPORTED_TRANSACTION_STATUS` | The received transaction-status variant cannot be decoded |
 | `UPSTREAM_UNREACHABLE` | A configured federated endpoint (for example the explorer's wallet-query endpoint) is temporarily unreachable |
+| `SERVICE_NOT_READY` | The process is alive but its shared readiness gate is closed; `ErrorInfo.metadata["readiness_cause"]` contains the stable readiness label and `/readyz` carries any structured detail |
 | `NO_VISIBLE_CHAIN_EPOCH` | No visible chain epoch has been committed yet (the store is empty or still bootstrapping) |
 
 ### `UNIMPLEMENTED` family
@@ -136,7 +139,7 @@ A self-inflicted failure that needs investigation. Retry disposition: **NonRetry
 
 ### Sentinel
 
-`ERROR_REASON_UNSPECIFIED = 0` is the default scalar. It is never emitted intentionally; if a client receives it, treat as a Zinder bug and report it. Clients with `IndexerError::reason() == None` for an error carried over the wire have hit a server that omitted `ErrorInfo` or emitted `Unspecified`.
+`ERROR_REASON_UNSPECIFIED = 0` is the default scalar. It is never emitted intentionally; if a client receives it, treat it as a Zinder bug and report it. The Rust client preserves an explicitly received `Unspecified` reason through `IndexerError::RemoteFailure`. Do not infer a missing wire reason from `IndexerError::reason() == None`: deliberately coarser variants such as `IndexerError::NotFound` do not retain their originating reason.
 
 ## Stability
 
@@ -146,5 +149,4 @@ The set above is the v1 contract. Existing reasons' semantics are stable within 
 
 - [`crates/zinder-proto/proto/zinder/v1/ops/error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto)
 - [`crates/zinder-client/src/error.rs`](../../crates/zinder-client/src/error.rs)
-- [Server-side wallet pattern](server-side-wallet-pattern.md)
 - [Public interfaces](../architecture/public-interfaces.md)

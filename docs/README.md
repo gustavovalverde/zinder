@@ -41,7 +41,6 @@ Extension guides:
 - [Error vocabulary](reference/error-vocabulary.md)
 - [Integration surfaces](reference/integration-surfaces.md)
 - [Lightwalletd compatibility](reference/lightwalletd-compatibility.md)
-- [Server-side wallet pattern](reference/server-side-wallet-pattern.md)
 
 ## Runbooks
 

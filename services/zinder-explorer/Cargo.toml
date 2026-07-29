@@ -24,6 +24,7 @@ tokio-util.workspace = true
 toml.workspace = true
 tonic = { workspace = true, features = ["server", "transport"] }
 tonic-reflection.workspace = true
+tonic-types.workspace = true
 tracing.workspace = true
 zebra-chain.workspace = true
 zinder-core.workspace = true
