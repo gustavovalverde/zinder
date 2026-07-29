@@ -1,10 +1,13 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 
 use eyre::Result;
 use http_body_util::BodyExt;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::net::TcpListener;
-use zinder_runtime::{OpsServer, Readiness, ReadinessState, spawn_ops_endpoint};
+use zinder_runtime::{
+    OpsServer, OpsServerError, Readiness, ReadinessState, RuntimeService,
+    install_metrics_recorder_for_service, spawn_ops_endpoint,
+};
 
 async fn get_json(listen_addr: SocketAddr, path: &str) -> Result<(u16, serde_json::Value)> {
     let client = Client::builder(TokioExecutor::new()).build_http::<String>();
@@ -36,6 +39,9 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
     let listen_addr: SocketAddr = listener.local_addr()?;
     drop(listener);
 
+    install_metrics_recorder_for_service(RuntimeService::Query, "0.0.0", "zcash-regtest")?;
+    metrics::counter!("zinder_runtime_metrics_emitted_before_ops_spawn_total").increment(7);
+
     let readiness = Readiness::new(ReadinessState::ready(Some(7)));
     let server_handle = spawn_ops_endpoint(
         listen_addr,
@@ -43,13 +49,13 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
             service_name: "zinder-test",
             service_version: "0.0.0",
             network_name: "zcash-regtest",
-            advertised_capabilities: vec![
+            advertised_capabilities: Arc::from([
                 zinder_proto::capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1,
-            ],
+            ]),
         },
         readiness.clone(),
-    );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    )
+    .await?;
 
     let (status, healthz_value) = get_json(listen_addr, "/healthz").await?;
     assert_eq!(status, 200);
@@ -118,8 +124,44 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
         metrics_text.contains("zinder_readiness_replica_lag_chain_epochs"),
         "{metrics_text}"
     );
+    assert!(
+        metrics_text
+            .lines()
+            .any(|line| line == "zinder_runtime_metrics_emitted_before_ops_spawn_total 7"),
+        "{metrics_text}"
+    );
 
-    server_handle.shutdown().await;
+    server_handle.shutdown().await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_ops_endpoint_fails_before_returning_when_port_is_occupied() -> Result<()> {
+    let occupied_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = occupied_listener.local_addr()?;
+
+    let spawn_result = spawn_ops_endpoint(
+        listen_addr,
+        OpsServer {
+            service_name: "zinder-test",
+            service_version: "0.0.0",
+            network_name: "zcash-regtest",
+            advertised_capabilities: Arc::from([]),
+        },
+        Readiness::default(),
+    )
+    .await;
+
+    let Err(OpsServerError::Bind {
+        listen_addr: failed_addr,
+        ..
+    }) = spawn_result
+    else {
+        return Err(eyre::eyre!(
+            "occupied operational listen address must fail before a handle is returned"
+        ));
+    };
+    assert_eq!(failed_addr, listen_addr);
     Ok(())
 }

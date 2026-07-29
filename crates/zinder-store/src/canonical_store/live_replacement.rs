@@ -458,7 +458,11 @@ fn validate_replacement_blocks(
     })?;
     let mut expected_parent = parent_id;
     for replacement in blocks {
-        validate_live_block(store.workload, &replacement.block)?;
+        validate_live_block(
+            store.workload,
+            store.build_plan.raw_blob_retention(),
+            &replacement.block,
+        )?;
         let header = &replacement.block.facts.block_header;
         let expected_height = expected_parent.height.next().ok_or_else(|| {
             CanonicalStoreError::live_commit("replacement height exceeds u32::MAX")
@@ -701,17 +705,20 @@ fn capture_displaced_blocks(
             })
             .transpose()
             .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
+            if raw_block_bytes.is_some()
+                != store.build_plan.raw_blob_retention().retains_block_blobs()
+            {
+                return Err(CanonicalStoreError::live_commit(
+                    "canonical suffix raw block rows do not match admitted retention",
+                ));
+            }
             match store.workload {
-                CanonicalStoreWorkload::Wallet
-                    if raw_block_bytes.is_some() || final_note_commitment_roots.is_some() =>
-                {
+                CanonicalStoreWorkload::Wallet if final_note_commitment_roots.is_some() => {
                     return Err(CanonicalStoreError::live_commit(
                         "wallet canonical suffix contains explorer-only rows",
                     ));
                 }
-                CanonicalStoreWorkload::Explorer
-                    if raw_block_bytes.is_none() || final_note_commitment_roots.is_none() =>
-                {
+                CanonicalStoreWorkload::Explorer if final_note_commitment_roots.is_none() => {
                     return Err(CanonicalStoreError::live_commit(
                         "explorer canonical suffix is missing archive facts",
                     ));

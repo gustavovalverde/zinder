@@ -2,10 +2,10 @@
 
 | Field | Value |
 | ----- | ----- |
-| Status | Accepted |
+| Status | Accepted encoding; runtime admission withdrawn by ADR-0038 |
 | Product | Zinder |
 | Domain | Wire format, UTXO-set accounting, public proto contract, capability discovery |
-| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0011](0011-explorer-freshness-envelope.md), [ADR-0018](0018-capability-gated-optional-payload-fields.md), [ADR-0024](0024-wire-format-rpc-byte-order.md), [ADR-0029](0029-durable-transparent-outpoint-spend-projection.md), [Public interfaces §Wire Conventions](../architecture/public-interfaces.md#wire-conventions) |
+| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0011](0011-explorer-freshness-envelope.md), [ADR-0018](0018-capability-gated-optional-payload-fields.md), [ADR-0024](0024-wire-format-rpc-byte-order.md), [ADR-0029](0029-durable-transparent-outpoint-spend-projection.md), [ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md), [Public interfaces §Wire Conventions](../architecture/public-interfaces.md#wire-conventions) |
 
 ## Context
 
@@ -60,7 +60,17 @@ The accumulator is folded inside the existing `read_transparent_utxo_set_aggrega
 
 ### Capability gating
 
-The fold has real per-output CPU cost, so it is operator opt-in rather than always-on. `wallet.read.transparent_utxo_set_commitment_v1` gates the `commitment` field on `TransparentUtxoSetSummaryResponse` and is advertised only when the operator enables the fold (default off). The explorer mirror `explorer.utxo_set.commitment_v1` gates the field on `UtxoSetSummaryResponse` and is advertised when a `WalletQuery` endpoint is wired; the explorer forwards whatever the wallet populated, so a present field always carries real bytes. Absent commitment is `None`, with no new error vocabulary, following [ADR-0018].
+The fold has real per-output CPU cost. The original implementation exposed an
+operator boolean that independently enabled
+`wallet.read.transparent_utxo_set_commitment_v1`; no current production
+composition or named consumer owned that switch. ADR-0038 removes the boolean.
+The temporary generic query always omits the capability and field, and the
+release serving-pair query does not implement the summary. Removal of the
+unowned generic surface is tracked in
+[issue #63](https://github.com/gustavovalverde/zinder/issues/63). Retaining or
+reintroducing the commitment requires a concrete production consumer,
+authenticated admission evidence, and an enforced resource budget; a manual
+support flag is not valid evidence.
 
 ## Consequences
 

@@ -26,6 +26,8 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "sync"] }
 tokio-stream.workspace = true
+tokio-util.workspace = true
+tonic = { workspace = true, features = ["server", "transport"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zcash_address = { workspace = true, features = ["std"] }
@@ -34,6 +36,7 @@ zcash_protocol = { workspace = true, features = ["local-consensus", "std"] }
 zcash_transparent = { workspace = true, features = ["transparent-inputs", "std"] }
 zinder-core.workspace = true
 zinder-materialized-views.workspace = true
+zinder-proto.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
 zinder-wallet-rocksdb.workspace = true

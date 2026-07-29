@@ -28,7 +28,7 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
-    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_testkit::sample_regtest_upgrade_activations;
 
@@ -118,8 +118,11 @@ impl NodeSource for SingleBlockSource {
 #[tokio::test]
 async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metadata()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (temporary, store_path, outcome, expected_tip_metadata) =
-        load_ironwood_fixture(CanonicalStoreWorkload::Wallet).await?;
+    let (temporary, store_path, outcome, expected_tip_metadata) = load_ironwood_fixture(
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+    )
+    .await?;
     let CanonicalBlockLoadOutcome { builder, evidence } = outcome;
 
     assert_eq!(evidence.block_count, 1);
@@ -142,6 +145,7 @@ async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metada
         &store_path,
         &regtest_activations(),
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -156,7 +160,7 @@ async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metada
 async fn explorer_canonical_blocks_add_block_blob_retention()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_temporary, _store_path, outcome, expected_tip_metadata) =
-        load_ironwood_fixture(CanonicalStoreWorkload::Explorer).await?;
+        load_ironwood_fixture(CanonicalStoreWorkload::Explorer, RawBlobRetention::All).await?;
 
     assert_eq!(outcome.evidence.block_count, 1);
     assert_eq!(outcome.evidence.block_blob_count, 1);
@@ -171,8 +175,22 @@ async fn explorer_canonical_blocks_add_block_blob_retention()
     Ok(())
 }
 
+#[tokio::test]
+async fn wallet_all_retention_keeps_block_blobs_without_explorer_families()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temporary, _store_path, outcome, expected_tip_metadata) =
+        load_ironwood_fixture(CanonicalStoreWorkload::Wallet, RawBlobRetention::All).await?;
+
+    assert_eq!(outcome.evidence.block_count, 1);
+    assert_eq!(outcome.evidence.block_blob_count, 1);
+    assert_eq!(outcome.evidence.block_final_note_commitment_roots_count, 0);
+    assert_eq!(outcome.evidence.tip_metadata, expected_tip_metadata);
+    Ok(())
+}
+
 async fn load_ironwood_fixture(
     workload: CanonicalStoreWorkload,
+    raw_blob_retention: RawBlobRetention,
 ) -> Result<
     (
         TempDir,
@@ -202,6 +220,7 @@ async fn load_ironwood_fixture(
             predecessor_frontiers,
         ),
         fixed_tip,
+        raw_blob_retention,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let temporary = TempDir::new()?;
@@ -241,6 +260,7 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
         &activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
@@ -277,6 +297,7 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
         &store_path,
         &regtest_activations(),
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -312,6 +333,7 @@ async fn canonical_source_families_authenticate_empty_subtree_ranges_and_fixed_t
         &activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
@@ -357,6 +379,7 @@ async fn canonical_construction_rejects_source_blocks_from_another_network()
         &activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
@@ -419,6 +442,7 @@ async fn canonical_construction_rejects_activation_mismatch_before_source_work()
         &store_activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;

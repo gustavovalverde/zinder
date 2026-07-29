@@ -687,7 +687,8 @@ pub struct NetworkUpgradeActivationsResponse {
     #[prost(message, repeated, tag = "1")]
     pub activations: ::prost::alloc::vec::Vec<NetworkUpgradeActivation>,
 }
-/// Inclusive-start bounded subtree-root request.
+/// Inclusive-start bounded subtree-root request. One request may return at
+/// most 1024 subtree roots.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SubtreeRootsRequest {
     /// Shielded protocol to read.
@@ -696,7 +697,9 @@ pub struct SubtreeRootsRequest {
     /// First requested subtree-root index.
     #[prost(uint32, tag = "2")]
     pub start_index: u32,
-    /// Maximum number of subtree-root entries to return.
+    /// Maximum number of subtree-root entries to return. Must be in 1..=1024;
+    /// larger values fail with INVALID_ARGUMENT and
+    /// SUBTREE_ROOT_RANGE_TOO_LARGE.
     #[prost(uint32, tag = "3")]
     pub max_entries: u32,
     /// Optional chain-epoch id that must be used to answer the request. When
@@ -974,8 +977,8 @@ pub mod chain_event_envelope {
 /// `common` carries the cross-service identity and capability set defined
 /// in \[`zinder.v1.ops.ServerInfo`\]. The wallet-specific fields below
 /// describe operator configuration that constrains a wallet consumer's
-/// behavior (retention windows, reorg depth, upstream-node capability
-/// snapshot and canonical artifact schema version).
+/// behavior (reorg depth, upstream-node capability snapshot and canonical
+/// artifact schema version).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WalletServerInfo {
     /// Cross-service identity and capability descriptor.
@@ -988,16 +991,6 @@ pub struct WalletServerInfo {
     /// settled prefix (settled_tip_height) once it is buried at least this deep.
     #[prost(uint32, tag = "4")]
     pub reorg_window_blocks: u32,
-    /// Chain-event retention window in seconds. 0 indicates unbounded retention
-    /// (development mode; rejected by --print-config in production).
-    #[prost(uint64, tag = "5")]
-    pub chain_event_retention_seconds: u64,
-    /// Mempool retention windows in seconds. 0 indicates the corresponding event
-    /// family is not retained on this deployment.
-    #[prost(uint64, tag = "6")]
-    pub mempool_mined_retention_seconds: u64,
-    #[prost(uint64, tag = "7")]
-    pub mempool_invalidated_retention_seconds: u64,
     /// Upstream node capabilities detected by zinder-source.
     #[prost(message, optional, tag = "8")]
     pub node: ::core::option::Option<NodeCapabilitiesDescriptor>,
@@ -2357,7 +2350,7 @@ pub mod wallet_query_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        /// Return shielded subtree roots.
+        /// Return at most 1024 shielded subtree roots per request.
         pub async fn subtree_roots(
             &mut self,
             request: impl tonic::IntoRequest<super::SubtreeRootsRequest>,
@@ -3045,7 +3038,7 @@ pub mod wallet_query_server {
             tonic::Response<super::TreeStateResponse>,
             tonic::Status,
         >;
-        /// Return shielded subtree roots.
+        /// Return at most 1024 shielded subtree roots per request.
         async fn subtree_roots(
             &self,
             request: tonic::Request<super::SubtreeRootsRequest>,

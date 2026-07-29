@@ -335,6 +335,10 @@ The aggregate is taken at the resolved chain epoch's settled tip, and `summarize
 
 The totals count every unspent transparent output, including non-standard and provably-unspendable scripts (OP_RETURN, bare data outputs). The current-UTXO projection keys outputs by the hash of their raw `scriptPubKey` and never inspects the script template, so it does not apply zcashd's `IsUnspendable` filter. The two totals can therefore sit slightly above a zcashd `gettxoutsetinfo` that excludes the unspendable class.
 
+## Overview snapshot optional fields
+
+`ExplorerQuery.OverviewSnapshot` requires an admitted wallet tip to anchor its coherent bundle, while its `mempool` and `value_pools` fields are optional. When WalletQuery returns the typed `ENDPOINT_CAPABILITY_UNAVAILABLE` precondition for the exact field capability, `mempool` stays absent or `value_pools` stays empty and `freshness.unavailable` records the corresponding `mempool` or `value_pools` field path with `UNAVAILABLE_UPSTREAM_NOT_SUPPORTED`. The unavailable marker distinguishes structural absence from an observed empty mempool or value-pool list. Transient upstream failures and preconditions whose structured reason, domain, violation type, or capability subject do not match continue to fail the Overview request.
+
 ## Capability namespace
 
 The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:
@@ -406,14 +410,14 @@ secondary_path = "/var/lib/zinder/explorer-secondary"
 [explorer]
 listen_addr = "127.0.0.1:9068"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
-wallet_query_endpoint = "https://zinder.example:9102"   # optional native WalletQuery gRPC adapter
+wallet_query_endpoint = "https://zinder.example:9102"   # optional zinder-query gRPC endpoint
 
 [explorer.freshness]
 max_lag_blocks = 16              # response carries UNAVAILABLE_STALE beyond this
 warn_lag_blocks = 4              # readiness cause flips at this threshold
 ```
 
-When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The explorer's `wallet_query_endpoint` config points to an optional deployment that embeds the native `WalletQuery` adapter for its wallet-composed reads (transaction detail, block views, search, mempool activity, and value pools).
+When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The explorer's `wallet_query_endpoint` config points to an optional `zinder-query` endpoint for its wallet-composed reads (transaction detail, block views, search, mempool activity, and value pools).
 
 Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-specific fields, plus the shared `ZINDER_OPS__*` prefix for the universal operational endpoint:
 
@@ -429,7 +433,11 @@ Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-s
 The explorer plane fails independently from canonical state.
 
 - An explorer service crash does not stop `zinder-ingest`. Ingest continues writing canonical artifacts and ChainEvents.
-- An explorer service crash does not stop a separately deployed native `WalletQuery` adapter. Its wallet primitives, including `WalletQuery.TransparentAddressBalance`, remain independent of explorer state: the balance reads the canonical unspent-output index and overlays live mempool data through the configured `IngestControl` endpoint.
+- An explorer service crash does not stop a separately deployed
+  `zinder-query` runtime. Its admitted wallet primitives remain independent of
+  explorer state. The current release endpoint omits
+  `WalletQuery.TransparentAddressBalance`; Explorer cannot depend on that
+  primitive without a coherent canonical-and-mempool snapshot.
 - An explorer materialized view becoming inconsistent does not corrupt canonical state. Operators drop the materialized-view store and rebuild from retained canonical events. When the materialized-view store is absent, `zinder-explorer` starts with materialized-view-backed capabilities omitted.
 - Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
 
@@ -466,7 +474,7 @@ The explorer may parse transaction bytes through `zinder-source` and poll an opt
 3. The fact lands in `SourceBlock`, a typed `Source*` value, a source-backed control primitive, or a new canonical artifact family per [Extending artifacts](extending-artifacts.md).
 4. The explorer consumer subscribes to the new event or artifact, or composes through the new `WalletQuery` primitive when the fact is intentionally live-source-backed.
 
-Chain value pools (the `ValuePoolSummary` view) is the first source-boundary extension that stays live-source-backed. `zinder-source` parses `getblockchaininfo.valuePools` together with that response's `blocks` and `bestblockhash`, `IngestControl` owns the writer-side source handle, `WalletQuery.ChainValuePoolsAtTip` proxies the hash-bound snapshot through that control plane, and `ExplorerQuery.ValuePoolSummary` wraps the wallet response in `ExplorerFreshness`.
+Chain value pools (the `ValuePoolSummary` view) is the first source-boundary extension that stays live-source-backed. `zinder-source` parses `getblockchaininfo.valuePools` together with that response's `blocks` and `bestblockhash`; the admitted `WalletQuery` owns the same probed source handle that justified its capability claim and uses it to serve the hash-bound snapshot; and `ExplorerQuery.ValuePoolSummary` wraps the wallet response in `ExplorerFreshness`.
 
 Final note-commitment roots use the durable variant of this pattern.
 `zinder-source` parses the post-block Sapling, Orchard, and Ironwood roots from

@@ -1,6 +1,6 @@
 //! Cipherscan-compatible REST adapter entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::Parser;
 use tokio::net::TcpListener;
@@ -90,6 +90,10 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "adapter startup and shutdown stay together so listener admission and operational endpoint error precedence remain auditable"
+)]
 async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
     let load_config_phase = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
@@ -113,8 +117,9 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(cipherscan_config.network),
         readiness.clone(),
-        Vec::new(),
-    );
+        Arc::from([]),
+    )
+    .await?;
 
     let explorer_channel = connect_zinder_grpc(
         &cipherscan_config.explorer_query_endpoint,
@@ -171,11 +176,25 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
         "Cipherscan-compatible REST adapter stopped"
     );
 
-    if let Some(handle) = ops_handle {
-        handle.shutdown().await;
-    }
+    let ops_shutdown_result = match ops_handle {
+        Some(handle) => handle.shutdown().await,
+        None => Ok(()),
+    };
 
-    serve_result.map_err(CipherscanConfigError::Serve)
+    match serve_result {
+        Err(error) => {
+            if let Err(ops_error) = ops_shutdown_result {
+                tracing::warn!(
+                    target: "zinder::compat::cipherscan",
+                    event = "ops_endpoint_shutdown_failed",
+                    error = %ops_error,
+                    "operational endpoint shutdown also failed"
+                );
+            }
+            Err(CipherscanConfigError::Serve(error))
+        }
+        Ok(()) => ops_shutdown_result.map_err(CipherscanConfigError::from),
+    }
 }
 
 fn emit_runtime_error(error: &CipherscanConfigError) -> ExitCode {

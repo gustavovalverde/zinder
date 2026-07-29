@@ -6,27 +6,28 @@ use std::{
     sync::Arc,
 };
 
-use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
+use tokio::sync::mpsc;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion, ChainEpoch,
-    ChainEpochId, MinedTransaction, MinedTransactionChainContext, NetworkUpgradeActivations,
-    RawTransactionBytes, ShieldedProtocol, TransactionId, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentUnspentOutput,
-    TxStatus,
+    ChainEpochId, ChainValuePoolsAtTip, MinedTransaction, MinedTransactionChainContext,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, TransactionId,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentUnspentOutput, TxStatus,
 };
 use zinder_proto::capabilities::{
+    WALLET_BROADCAST_TRANSACTION_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
     WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
     WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
     WALLET_READ_TRANSPARENT_SPENDS_V1, WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-    WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
+    WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
 };
-use zinder_source::{TransactionBroadcaster, TreeStateUpstream};
+use zinder_source::{NodeCapability, NodeSource, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
-    ArtifactFamily, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
-    EventStreamStartPosition, StreamCursorTokenV1,
+    ArtifactFamily, BlockHashLookup, ChainEventHistoryRequest, ChainEventStreamFamily,
+    ChainEventStreamResume, EventStreamStartPosition, StreamCursorTokenV1,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -34,12 +35,15 @@ use zinder_wallet_projection::{
 };
 
 use crate::{
-    ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
-    DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, QueryError, RawTransaction,
-    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
+    AdmittedIngestControl, ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents,
+    CompactBlock, CompactBlockRange, DEFAULT_MAX_COMPACT_BLOCK_RANGE, DEFAULT_MAX_FULL_BLOCK_RANGE,
+    FULL_BLOCK_STREAM_CHANNEL_CAPACITY, FULL_BLOCK_STREAM_SUB_READ_BLOCKS, FullBlock,
+    FullBlockStream, NativeWalletEndpointCapabilities, QueryError, RawTransaction, SettledTipBlock,
+    SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, VisibleTipBlock, WalletQueryApi,
-    WalletServingReadPair, join_blocking, validate_block_range,
+    TransparentAddressUnspentOutputsRequest, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
+    WalletQueryApi, WalletServingPairSlot, WalletServingReadPair, join_blocking,
+    validate_block_range, validate_subtree_root_range,
 };
 
 const WALLET_READ_PAGE_SIZE: NonZeroU16 = NonZeroU16::MAX;
@@ -365,14 +369,17 @@ mod tests {
 /// miss is a synchronous `pread`; keeping one on a reactor thread would stall
 /// the ops listener and the gRPC connection drivers sharing that runtime.
 #[derive(Clone)]
-pub struct WalletServingQuery<Broadcaster> {
-    serving_pair_slot: Arc<ArcSwap<WalletServingReadPair>>,
+pub struct WalletServingQuery<Broadcaster, NativeIngest = ()> {
+    serving_pair_slot: WalletServingPairSlot,
     broadcaster: Broadcaster,
+    native_ingest: NativeIngest,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     tree_state_upstream: Option<Arc<dyn TreeStateUpstream>>,
+    native_endpoint_capabilities: NativeWalletEndpointCapabilities,
+    upstream_node_capabilities: Option<UpstreamNodeCapabilities>,
 }
 
-impl<Broadcaster> std::fmt::Debug for WalletServingQuery<Broadcaster> {
+impl<Broadcaster, NativeIngest> std::fmt::Debug for WalletServingQuery<Broadcaster, NativeIngest> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let pair = self.capture_pair();
         formatter
@@ -380,6 +387,10 @@ impl<Broadcaster> std::fmt::Debug for WalletServingQuery<Broadcaster> {
             .field("canonical_fence", &pair.canonical_fence())
             .field("wallet_fence", &pair.wallet_source())
             .field("tree_state_upstream", &self.tree_state_upstream.is_some())
+            .field(
+                "native_endpoint_capabilities",
+                &self.native_endpoint_capabilities,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -392,27 +403,66 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
     /// changing the canonical or wallet reader observed by an in-flight request.
     #[must_use]
     pub fn from_serving_pair_slot(
-        serving_pair_slot: Arc<ArcSwap<WalletServingReadPair>>,
+        serving_pair_slot: WalletServingPairSlot,
         broadcaster: Broadcaster,
         network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     ) -> Self {
+        let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
+        let native_endpoint_capabilities =
+            NativeWalletEndpointCapabilities::for_wallet_serving_pair(
+                raw_blob_retention,
+                zinder_source::NodeCapabilities::default(),
+            );
         Self {
             serving_pair_slot,
             broadcaster,
+            native_ingest: (),
             network_upgrade_activations,
             tree_state_upstream: None,
+            native_endpoint_capabilities,
+            upstream_node_capabilities: None,
+        }
+    }
+}
+
+impl<Broadcaster> WalletServingQuery<Broadcaster, AdmittedIngestControl> {
+    /// Builds the native query from an exact pair and admitted ingest control.
+    ///
+    /// The resulting type is the only exact-pair instantiation accepted by the
+    /// standard native gRPC adapter.
+    #[must_use]
+    pub fn from_admitted_native_serving_pair(
+        serving_pair_slot: WalletServingPairSlot,
+        broadcaster: Broadcaster,
+        ingest_control: AdmittedIngestControl,
+        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    ) -> Self {
+        let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
+        let native_endpoint_capabilities =
+            NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+                raw_blob_retention,
+                zinder_source::NodeCapabilities::default(),
+                &ingest_control,
+            );
+        Self {
+            serving_pair_slot,
+            broadcaster,
+            native_ingest: ingest_control,
+            network_upgrade_activations,
+            tree_state_upstream: None,
+            native_endpoint_capabilities,
+            upstream_node_capabilities: None,
         }
     }
 
-    /// Attaches the node-backed sparse tree-state fill path.
-    #[must_use]
-    pub fn with_tree_state_upstream(mut self, upstream: Arc<dyn TreeStateUpstream>) -> Self {
-        self.tree_state_upstream = Some(upstream);
-        self
+    pub(crate) fn admitted_native_ingest(&self) -> &AdmittedIngestControl {
+        &self.native_ingest
     }
+}
 
+impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
     fn capture_pair(&self) -> Arc<WalletServingReadPair> {
-        self.serving_pair_slot.load_full()
+        self.serving_pair_slot.capture()
     }
 
     fn chain_epoch(
@@ -447,10 +497,13 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
             BlockSelector::Height(height) if height <= chain_epoch.visible_tip_height => {
                 Self::block_id_at(pair, height)?
             }
-            BlockSelector::Hash(hash) if hash == chain_epoch.visible_tip_hash => {
-                BlockId::new(chain_epoch.visible_tip_height, hash)
-            }
-            BlockSelector::Height(_) | BlockSelector::Hash(_) => {
+            BlockSelector::Hash(hash) => match pair.canonical().block_hash_lookup(hash)? {
+                BlockHashLookup::Resolved(block_id) => block_id,
+                BlockHashLookup::NotInBestChain | BlockHashLookup::NotIndexed => {
+                    return Err(QueryError::BlockNotInBestChain);
+                }
+            },
+            BlockSelector::Height(_) => {
                 return Err(QueryError::BlockNotInBestChain);
             }
             _ => {
@@ -466,13 +519,129 @@ impl<Broadcaster> WalletServingQuery<Broadcaster> {
     }
 }
 
+impl<Source> WalletServingQuery<Source>
+where
+    Source: Clone + NodeSource + TransactionBroadcaster + TreeStateUpstream,
+{
+    /// Builds the shared exact-pair query from one probed node source.
+    ///
+    /// This state is suitable for the compatibility adapter. The native
+    /// endpoint instead requires `from_admitted_native_sources`.
+    pub fn from_probed_node_source(
+        serving_pair_slot: WalletServingPairSlot,
+        source: Source,
+        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    ) -> Result<Self, QueryError> {
+        let node_capabilities = source.capabilities();
+        if !node_capabilities.supports(NodeCapability::OpenRpcDiscovery) {
+            return Err(QueryError::Node(
+                zinder_source::SourceError::NodeCapabilityMissing {
+                    capability: NodeCapability::OpenRpcDiscovery,
+                },
+            ));
+        }
+        let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
+        let native_endpoint_capabilities =
+            NativeWalletEndpointCapabilities::for_wallet_serving_pair(
+                raw_blob_retention,
+                node_capabilities,
+            );
+        if native_endpoint_capabilities.has_node_backed_capabilities()
+            && !node_capabilities.supports(NodeCapability::TipId)
+        {
+            return Err(QueryError::Node(
+                zinder_source::SourceError::NodeCapabilityMissing {
+                    capability: NodeCapability::TipId,
+                },
+            ));
+        }
+        let shared_source = Arc::new(source.clone());
+        let tree_state_upstream: Arc<dyn TreeStateUpstream> = shared_source;
+        Ok(Self {
+            serving_pair_slot,
+            broadcaster: source,
+            native_ingest: (),
+            network_upgrade_activations,
+            tree_state_upstream: Some(tree_state_upstream),
+            native_endpoint_capabilities,
+            upstream_node_capabilities: Some(UpstreamNodeCapabilities::from_probed(
+                node_capabilities,
+            )),
+        })
+    }
+}
+
+impl<Source> WalletServingQuery<Source, AdmittedIngestControl>
+where
+    Source: Clone + NodeSource + TransactionBroadcaster + TreeStateUpstream,
+{
+    /// Builds the native release query from its exact admitted sources.
+    pub fn from_admitted_native_sources(
+        serving_pair_slot: WalletServingPairSlot,
+        source: Source,
+        ingest_control: AdmittedIngestControl,
+        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    ) -> Result<Self, QueryError> {
+        let node_capabilities = source.capabilities();
+        if !node_capabilities.supports(NodeCapability::OpenRpcDiscovery) {
+            return Err(QueryError::Node(
+                zinder_source::SourceError::NodeCapabilityMissing {
+                    capability: NodeCapability::OpenRpcDiscovery,
+                },
+            ));
+        }
+        let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
+        let native_endpoint_capabilities =
+            NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+                raw_blob_retention,
+                node_capabilities,
+                &ingest_control,
+            );
+        if native_endpoint_capabilities.has_node_backed_capabilities()
+            && !node_capabilities.supports(NodeCapability::TipId)
+        {
+            return Err(QueryError::Node(
+                zinder_source::SourceError::NodeCapabilityMissing {
+                    capability: NodeCapability::TipId,
+                },
+            ));
+        }
+        let shared_source = Arc::new(source.clone());
+        let tree_state_upstream: Arc<dyn TreeStateUpstream> = shared_source;
+        Ok(Self {
+            serving_pair_slot,
+            broadcaster: source,
+            native_ingest: ingest_control,
+            network_upgrade_activations,
+            tree_state_upstream: Some(tree_state_upstream),
+            native_endpoint_capabilities,
+            upstream_node_capabilities: Some(UpstreamNodeCapabilities::from_probed(
+                node_capabilities,
+            )),
+        })
+    }
+}
+
 #[async_trait]
-impl<Broadcaster> WalletQueryApi for WalletServingQuery<Broadcaster>
+impl<Broadcaster, NativeIngest> WalletQueryApi for WalletServingQuery<Broadcaster, NativeIngest>
 where
     Broadcaster: TransactionBroadcaster + Clone,
+    NativeIngest: Send + Sync + 'static,
 {
+    fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
+        &self.native_endpoint_capabilities
+    }
+
+    fn upstream_node_capabilities(&self) -> Option<&UpstreamNodeCapabilities> {
+        self.upstream_node_capabilities.as_ref()
+    }
+
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
         Ok((*self.network_upgrade_activations).clone())
+    }
+
+    async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, QueryError> {
+        Err(unavailable(WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1))
     }
 
     async fn visible_tip_block(
@@ -583,18 +752,52 @@ where
 
     async fn full_block_at(
         &self,
-        _height: BlockHeight,
-        _at_epoch_id: Option<ChainEpochId>,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<FullBlock, QueryError> {
-        Err(unavailable(WALLET_READ_FULL_BLOCK_AT_V1))
+        let pair = self.capture_pair();
+        join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            if !pair.canonical().raw_blob_retention().retains_block_blobs() {
+                return Err(unavailable(WALLET_READ_FULL_BLOCK_AT_V1));
+            }
+            let block_blob = pair
+                .canonical()
+                .block_blob_at(height)?
+                .ok_or_else(|| artifact_unavailable(ArtifactFamily::BlockBlob, height))?;
+            Ok(FullBlock {
+                chain_epoch,
+                block_blob,
+            })
+        }))
+        .await
     }
 
     async fn full_blocks_in_range(
         &self,
-        _block_range: BlockHeightRange,
-        _at_epoch_id: Option<ChainEpochId>,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<FullBlockStream, QueryError> {
-        Err(unavailable(WALLET_READ_FULL_BLOCK_RANGE_V1))
+        validate_block_range(block_range, DEFAULT_MAX_FULL_BLOCK_RANGE)?;
+        let pair = self.capture_pair();
+        let (pair, chain_epoch) = join_blocking(tokio::task::spawn_blocking(move || {
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            if !pair.canonical().raw_blob_retention().retains_block_blobs() {
+                return Err(unavailable(WALLET_READ_FULL_BLOCK_RANGE_V1));
+            }
+            Ok((pair, chain_epoch))
+        }))
+        .await?;
+        let (blocks, receiver) = mpsc::channel(FULL_BLOCK_STREAM_CHANNEL_CAPACITY);
+        tokio::spawn(drive_serving_pair_full_block_range(
+            pair,
+            block_range,
+            blocks,
+        ));
+        Ok(FullBlockStream {
+            chain_epoch,
+            blocks: receiver,
+        })
     }
 
     async fn transaction(
@@ -606,10 +809,12 @@ where
         let network_upgrade_activations = Arc::clone(&self.network_upgrade_activations);
         join_blocking(tokio::task::spawn_blocking(move || {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            // READY admission requires the construction manifest's transaction-location
-            // and transaction-blob row counts to equal the authenticated source count;
-            // live append and replacement update both families in the canonical atomic
-            // batch. Under that admitted coverage contract, absence is a real miss.
+            // READY admission requires transaction-location coverage to equal
+            // the authenticated source count for every retention mode. Blob
+            // coverage equals that count only under Transactions/All and is
+            // zero under None; live append and replacement update the retained
+            // families in one canonical batch. Under that admitted contract,
+            // absence is a real miss.
             let Some(location) = pair.canonical().transaction_location(transaction_id)? else {
                 return Ok(TransactionStatus {
                     chain_epoch,
@@ -648,7 +853,9 @@ where
         _tx_index: u64,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Transaction, QueryError> {
-        Err(unavailable(WALLET_READ_TRANSACTION_BY_ID_V2))
+        Err(QueryError::MaterializedViewUnavailable {
+            capability: WALLET_READ_TRANSACTION_BY_ID_V2,
+        })
     }
 
     async fn raw_transaction(
@@ -803,15 +1010,19 @@ where
         addresses: Vec<TransparentAddressScriptHash>,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressBalance, QueryError> {
+        let requested_address_count = addresses.len();
+        let address_count = u32::try_from(requested_address_count)
+            .ok()
+            .filter(|count| (1..=crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES).contains(count));
+        if address_count.is_none() {
+            return Err(QueryError::TransparentBalanceAddressCountExceeded {
+                requested: requested_address_count,
+                maximum: crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+            });
+        }
         let pair = self.capture_pair();
         join_blocking(tokio::task::spawn_blocking(move || {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            if addresses.is_empty() {
-                return Err(QueryError::TransparentBalanceAddressCountExceeded {
-                    requested: 0,
-                    maximum: crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
-                });
-            }
             let addresses: HashSet<_> = addresses.into_iter().collect();
             let mut confirmed_zat = 0_u64;
             for address in &addresses {
@@ -831,7 +1042,6 @@ where
     async fn transparent_utxo_set_summary(
         &self,
         _at_epoch_id: Option<ChainEpochId>,
-        _commitment_enabled: bool,
     ) -> Result<zinder_core::TransparentUtxoSetSummary, QueryError> {
         Err(unavailable(WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1))
     }
@@ -841,6 +1051,12 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
+        if !self
+            .native_endpoint_capabilities
+            .contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2)
+        {
+            return Err(unavailable(WALLET_READ_TREE_STATE_AT_HEIGHT_V2));
+        }
         let pair = self.capture_pair();
         let resolved = join_blocking(tokio::task::spawn_blocking(move || {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
@@ -929,6 +1145,7 @@ where
         subtree_root_range: zinder_core::SubtreeRootRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SubtreeRoots, QueryError> {
+        validate_subtree_root_range(subtree_root_range)?;
         let pair = self.capture_pair();
         join_blocking(tokio::task::spawn_blocking(move || {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
@@ -1009,6 +1226,12 @@ where
         &self,
         raw_transaction: RawTransactionBytes,
     ) -> Result<zinder_core::TransactionBroadcastOutcome, QueryError> {
+        if !self
+            .native_endpoint_capabilities
+            .contains(WALLET_BROADCAST_TRANSACTION_V1)
+        {
+            return Err(unavailable(WALLET_BROADCAST_TRANSACTION_V1));
+        }
         let _pair = self.capture_pair();
         if raw_transaction.len() > zinder_core::MAX_RAW_TRANSACTION_BYTES {
             return Err(QueryError::BroadcastTransactionTooLarge {
@@ -1023,8 +1246,90 @@ where
     }
 }
 
+/// Streams one range while retaining the exact admitted pair captured by the
+/// request. Each `RocksDB` multi-get runs in a short blocking task; client
+/// backpressure is bounded by the response channel.
+async fn drive_serving_pair_full_block_range(
+    pair: Arc<WalletServingReadPair>,
+    block_range: BlockHeightRange,
+    block_sender: mpsc::Sender<Result<zinder_core::BlockBlobArtifact, QueryError>>,
+) {
+    let last_height = block_range.end.value();
+    let mut sub_read_start = block_range.start.value();
+    loop {
+        let sub_read_end = sub_read_start
+            .saturating_add(FULL_BLOCK_STREAM_SUB_READ_BLOCKS - 1)
+            .min(last_height);
+        let sub_range = BlockHeightRange::inclusive(
+            BlockHeight::new(sub_read_start),
+            BlockHeight::new(sub_read_end),
+        );
+        let pair_for_read = Arc::clone(&pair);
+        let block_blobs = match tokio::task::spawn_blocking(move || {
+            pair_for_read.canonical().block_blobs_in_range(sub_range)
+        })
+        .await
+        {
+            Ok(Ok(block_blobs)) => block_blobs,
+            Ok(Err(error)) => {
+                let _ = block_sender
+                    .send(Err(QueryError::CanonicalStore(error)))
+                    .await;
+                return;
+            }
+            Err(error) => {
+                let _ = block_sender
+                    .send(Err(QueryError::BlockingTaskFailed {
+                        reason: error.to_string(),
+                    }))
+                    .await;
+                return;
+            }
+        };
+        if !forward_serving_pair_full_block_sub_range(&block_sender, sub_range, block_blobs).await {
+            return;
+        }
+        if sub_read_end == last_height {
+            return;
+        }
+        sub_read_start = sub_read_end.saturating_add(1);
+    }
+}
+
+async fn forward_serving_pair_full_block_sub_range(
+    block_sender: &mpsc::Sender<Result<zinder_core::BlockBlobArtifact, QueryError>>,
+    sub_range: BlockHeightRange,
+    block_blobs: Vec<Option<zinder_core::BlockBlobArtifact>>,
+) -> bool {
+    let expected_count = sub_range.into_iter().len();
+    if block_blobs.len() != expected_count {
+        let _ = block_sender
+            .send(Err(QueryError::ArtifactCorrupt {
+                family: ArtifactFamily::BlockBlob,
+                reason: format!(
+                    "full-block range returned {} rows for {expected_count} requested heights",
+                    block_blobs.len()
+                ),
+            }))
+            .await;
+        return false;
+    }
+    for (height, block_blob) in sub_range.into_iter().zip(block_blobs) {
+        let Some(block_blob) = block_blob else {
+            let _ = block_sender
+                .send(Err(artifact_unavailable(ArtifactFamily::BlockBlob, height)))
+                .await;
+            return false;
+        };
+        if block_sender.send(Ok(block_blob)).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 fn unavailable(capability: &'static str) -> QueryError {
-    QueryError::MaterializedViewUnavailable { capability }
+    QueryError::EndpointCapabilityUnavailable { capability }
 }
 
 #[allow(

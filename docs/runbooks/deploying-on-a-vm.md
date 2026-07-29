@@ -170,7 +170,7 @@ or compatibility. Canonical checkpoint requests accept only an opaque candidate
 identifier beneath that root; the projector prepares the candidate directory,
 ingest creates the fixed `canonical.rocksdb` child through its owner queue, and
 cold admission runs off the writer queue. The current capture foundation can add
-the exact-fence wallet checkpoint and publish a format-1 `state-bundle.json`
+the exact-fence wallet checkpoint and publish a format-2 `state-bundle.json`
 manifest last. It can also create and byte-admit a fixed-layout sealed recovery
 directory whose outer manifest is published last and binds every payload file,
 both checkpoint identities, and the canonical construction-manifest sidecar.
@@ -272,16 +272,18 @@ with all of the following distinct from lane A:
 
 - `wallet.path`;
 - projector `storage.canonical_secondary_path`;
+- native-query canonical and wallet secondary roots;
 - compatibility canonical and wallet secondary roots;
 - projector build-owner identity;
+- native-query gRPC and ops ports;
 - compatibility gRPC and ops ports.
 
 Both projector lanes may read the same canonical primary and hold independent
-retention leases. Start lane B, wait for its projector and compatibility
-`/readyz` endpoints, run parity and client probes against lane B, then move
-the reverse-proxy upstream atomically. Keep lane A running until in-flight
-requests drain. Only then stop lane A and reclaim its wallet and secondary
-paths.
+retention leases. Start lane B, wait for its projector, native query, and
+compatibility `/readyz` endpoints, run parity and client probes against lane B,
+then move the reverse-proxy upstream atomically. Keep lane A running until
+in-flight requests drain. Only then stop lane A and reclaim its wallet and
+secondary paths.
 
 If lane B reports an expired event cursor or a source-fence mismatch, leave
 lane A serving and rebuild lane B from a newly captured canonical fence. Do not
@@ -297,6 +299,8 @@ docker compose --env-file /etc/zinder/env \
   -f /opt/zinder/deploy/docker-compose.yml restart zinder-ingest
 docker compose --env-file /etc/zinder/env \
   -f /opt/zinder/deploy/docker-compose.yml restart zinder-projector
+docker compose --env-file /etc/zinder/env \
+  -f /opt/zinder/deploy/docker-compose.yml restart zinder-query
 docker compose --env-file /etc/zinder/env \
   -f /opt/zinder/deploy/docker-compose.yml restart zinder-compat-lightwalletd
 ```

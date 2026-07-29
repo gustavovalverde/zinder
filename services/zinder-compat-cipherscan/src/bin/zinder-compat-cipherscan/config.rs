@@ -8,8 +8,8 @@ use zinder_compat_cipherscan::CipherscanMarketPriceEndpoints;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenConnectError, BearerTokenError, ConfigError, ConfigLoader,
-    InvalidZinderGrpcEndpoint, NetworkSection, NetworkToml, OpsSection, OpsToml, RuntimeService,
-    SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
+    InvalidZinderGrpcEndpoint, NetworkSection, NetworkToml, OpsSection, OpsServerError, OpsToml,
+    RuntimeService, SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
     load_bearer_token, parse_socket_addr, require_field, resolve_allow_public_bind,
     resolve_ops_listen_addr, validate_zinder_grpc_endpoint,
 };
@@ -50,6 +50,9 @@ pub(crate) struct CipherscanConfigOverrides {
 pub(crate) enum CipherscanConfigError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+
+    #[error(transparent)]
+    OpsServer(#[from] OpsServerError),
 
     #[error("invalid adapter bearer token: {0}")]
     BearerToken(#[from] BearerTokenError),

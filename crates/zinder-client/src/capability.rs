@@ -1,8 +1,9 @@
 //! Client-owned wallet capability vocabulary.
 
 use zinder_proto::capabilities::{
-    WALLET_ADDRESS_TRANSPARENT_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-    WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1, WALLET_EVENTS_MEMPOOL_V2,
+    WALLET_ADDRESS_TRANSPARENT_BALANCE_V1, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+    WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1, WALLET_BROADCAST_TRANSACTION_V1,
+    WALLET_EVENTS_CHAIN_V1, WALLET_EVENTS_MEMPOOL_V2, WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
     WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1, WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
     WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_FULL_BLOCK_AT_V1,
     WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
@@ -28,6 +29,8 @@ pub enum Capability {
     VisibleTipBlock,
     /// Settled canonical tip block.
     SettledTipBlock,
+    /// Canonical block identity resolved by height or hash selector.
+    BlockIdBySelector,
     /// Stream of compact blocks over a bounded range.
     CompactBlockRange,
     /// Ironwood fields in compact block responses.
@@ -38,10 +41,12 @@ pub enum Capability {
     SubtreeRoots,
     /// Ironwood subtree-root responses.
     SubtreeRootsIronwood,
-    /// Mined transaction lookup by transaction identifier.
+    /// Canonical-or-mempool transaction lookup by transaction identifier.
     Transaction,
     /// Transparent unspent outputs for one address.
     TransparentAddressUnspentOutputs,
+    /// Ascending transparent-address transaction history.
+    TransparentAddressHistory,
     /// Cursor-resumable chain-event stream.
     ChainEvents,
     /// Tip-certified bounded mempool snapshot.
@@ -71,6 +76,7 @@ impl Capability {
             Self::ServerInfo => WALLET_READ_SERVER_INFO_V2,
             Self::VisibleTipBlock => WALLET_READ_VISIBLE_TIP_BLOCK_V1,
             Self::SettledTipBlock => WALLET_READ_SETTLED_TIP_BLOCK_V1,
+            Self::BlockIdBySelector => WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
             Self::CompactBlockRange => WALLET_READ_COMPACT_BLOCK_RANGE_V2,
             Self::CompactBlockIronwood => WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
             Self::TreeState => WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
@@ -78,6 +84,7 @@ impl Capability {
             Self::SubtreeRootsIronwood => WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1,
             Self::Transaction => WALLET_READ_TRANSACTION_BY_ID_V2,
             Self::TransparentAddressUnspentOutputs => WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+            Self::TransparentAddressHistory => WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
             Self::ChainEvents => WALLET_EVENTS_CHAIN_V1,
             Self::MempoolSnapshot => WALLET_SNAPSHOT_MEMPOOL_V3,
             Self::MempoolEvents => WALLET_EVENTS_MEMPOOL_V2,
@@ -96,6 +103,7 @@ impl Capability {
             WALLET_READ_SERVER_INFO_V2 => Self::ServerInfo,
             WALLET_READ_VISIBLE_TIP_BLOCK_V1 => Self::VisibleTipBlock,
             WALLET_READ_SETTLED_TIP_BLOCK_V1 => Self::SettledTipBlock,
+            WALLET_READ_BLOCK_ID_BY_SELECTOR_V1 => Self::BlockIdBySelector,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2 => Self::CompactBlockRange,
             WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2 => Self::CompactBlockIronwood,
             WALLET_READ_TREE_STATE_AT_HEIGHT_V2 => Self::TreeState,
@@ -103,6 +111,7 @@ impl Capability {
             WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1 => Self::SubtreeRootsIronwood,
             WALLET_READ_TRANSACTION_BY_ID_V2 => Self::Transaction,
             WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1 => Self::TransparentAddressUnspentOutputs,
+            WALLET_ADDRESS_TRANSPARENT_HISTORY_V1 => Self::TransparentAddressHistory,
             WALLET_EVENTS_CHAIN_V1 => Self::ChainEvents,
             WALLET_SNAPSHOT_MEMPOOL_V3 => Self::MempoolSnapshot,
             WALLET_EVENTS_MEMPOOL_V2 => Self::MempoolEvents,

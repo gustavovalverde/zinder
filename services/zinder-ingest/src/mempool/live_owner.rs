@@ -23,7 +23,10 @@ use zinder_core::{
     TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
     TransparentOutPoint, TransparentOutputEntry, UnixTimestampMillis,
 };
-use zinder_proto::v1::wallet;
+use zinder_proto::{
+    status_for_reason,
+    v1::{ops::ErrorReason, wallet},
+};
 use zinder_source::{
     MempoolHydrationFailureReason, MempoolSource, MempoolSourceEvent, SourceError,
 };
@@ -184,7 +187,8 @@ impl LiveMempoolOwner {
                 let visible_tip =
                     BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
                 if source_tip != visible_tip {
-                    return Err(Status::unavailable(
+                    return Err(status_for_reason(
+                        ErrorReason::ChainEpochPinUnavailable,
                         "live mempool index is not coherent with the requested chain epoch",
                     ));
                 }
@@ -1383,6 +1387,7 @@ mod tests {
     use parking_lot::Mutex as ParkingMutex;
     use tokio_util::sync::CancellationToken;
     use tonic::Code;
+    use tonic_types::StatusExt as _;
     use zebra_chain::{
         serialization::ZcashDeserializeInto as _, transaction::Transaction as ZebraTransaction,
     };
@@ -1390,6 +1395,7 @@ mod tests {
         AuthDigest, ChainEpoch, CompactTransactionData, MempoolEntry, MempoolEvictionReason,
         MempoolObservation, RawTransactionBytes, TransactionId, UnixTimestampMillis,
     };
+    use zinder_proto::v1::ops::ErrorReason;
     use zinder_source::{MempoolSource as _, MempoolSourceEntry};
     use zinder_store::{
         MempoolEvent, MempoolEventRetentionConfig, MempoolEventRetentionStepBudget,
@@ -1592,7 +1598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn point_read_rejects_a_chain_epoch_newer_than_its_certified_source_tip()
+    async fn point_read_reports_an_expired_chain_epoch_when_the_certified_tip_has_rotated()
     -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::TempDir::new()?;
         let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
@@ -1615,10 +1621,18 @@ mod tests {
         let outcome = owner
             .entry_for(newer_chain_epoch, TransactionId::from_bytes([0xA5; 32]))
             .await;
+        let status = outcome.err().ok_or("point read unexpectedly succeeded")?;
+        let error_info = status
+            .get_error_details()
+            .error_info()
+            .cloned()
+            .ok_or("chain epoch failure omitted ErrorInfo")?;
 
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(error_info.domain, "zinder.dev");
         assert_eq!(
-            outcome.err().map(|status| status.code()),
-            Some(Code::Unavailable)
+            error_info.reason,
+            ErrorReason::ChainEpochPinUnavailable.as_str_name()
         );
         command_task.abort();
         let _ = command_task.await;

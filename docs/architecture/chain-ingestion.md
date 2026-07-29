@@ -18,21 +18,27 @@ load and validate configuration
   -> serve authenticated control commands and mempool state
 ```
 
-Store identity, network, workload, activation fingerprint, reorg policy, and
-schema are validated before a ready store is admitted. An incompatible
-non-empty path fails without mutation.
+Store identity, network, workload, activation fingerprint, raw-blob retention,
+reorg policy, construction build plan, and schema are validated before a ready
+store is admitted. The immutable construction manifest must describe the same
+typed workload and complete build plan as the store control record. An
+incompatible non-empty path fails without mutation.
 
 ## Fresh construction
 
 Fresh construction uses a sibling staging path. `CanonicalStoreBuildPlan`
-fixes the source range, checkpoint predecessor, network, workload, activation
-fingerprint, reorg policy, and construction manifest before data is loaded.
+fixes the source range, checkpoint predecessor, network, activation
+fingerprint, raw-blob retention, and reorg policy before data is loaded. The
+workload and complete build plan are bound into the construction manifest
+before publication.
 
 The source path fetches bounded connected segments. Block preparation validates
 source identity, parses each block once, and constructs `CanonicalBlockFacts`,
 retained raw blobs, compact-block material, tree commitments, and direct-index
-inputs. CPU-heavy preparation may run in parallel; commitment-tree positioning
-and publication remain ordered.
+inputs. Transaction locations are always derived from ordered canonical facts;
+transaction and block bytes are written only when the build plan retains them.
+CPU-heavy preparation may run in parallel; commitment-tree positioning and
+publication remain ordered.
 
 `CanonicalConstructionSettings` and `CanonicalPipelineLimits` bound:
 
@@ -46,6 +52,23 @@ Construction loads an inactive `RocksDbCanonicalBuilder`, validates continuity,
 manifest identity, per-block replay envelopes, and the ordered facts digest,
 then publishes `CanonicalBaselinePublication`. The candidate is not readable as
 a canonical store until publication succeeds.
+
+Subtree-root construction makes its load coverage explicit. The normal
+node-backed path loads `RetainedRange`: roots completed after the authenticated
+history predecessor. An admitted captured corpus may instead call
+`load_complete_subtree_root_prefix` with `CompletePrefix`: every root from index
+zero through each protocol's completed count at the fixed tip. This import is a
+caller-authenticated boundary, not a claim that the store can prove headers it
+does not retain. Completion blocks strictly before retained history preserve
+the captured identity; a root completing at the authenticated predecessor must
+match that predecessor hash; roots completing in retained history must match
+retained headers.
+
+`CanonicalSubtreeRootLoadCoverage`, sequence-digest version 2, and the exact
+ordered root rows are bound into construction-manifest format 4. Cold
+publication readback recomputes the same coverage-aware digest and repeats the
+available predecessor and retained-header checks. Coverage is never inferred
+from row counts.
 
 On restart, a ready staging store is installed and cold-opened at the configured
 path. An unpublished or invalid staging store is removed and reconstructed. A
@@ -101,7 +124,8 @@ reader a canonical write handle.
 The release writer uses these sections:
 
 - `[network]` and `[node]` select and authenticate the upstream source;
-- `[storage]` selects the canonical path and RocksDB resource budget;
+- `[storage]` selects the canonical path, immutable raw-blob retention, and
+  RocksDB resource budget;
 - `[ingest.construction]` bounds fresh construction;
 - `[ingest.follow]` controls polling and readiness lag;
 - `[ingest.run_overrides]` supplies an optional checkpoint or target height;

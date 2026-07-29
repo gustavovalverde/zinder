@@ -49,6 +49,10 @@ const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one live proof keeps writer construction, Zebra invalidation, and canonical reorg observation together"
+)]
 async fn canonical_writer_publishes_visible_reorg_for_invalidated_zebra_suffix() -> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
@@ -80,6 +84,7 @@ async fn canonical_writer_publishes_visible_reorg_for_invalidated_zebra_suffix()
             network_upgrade_activations: Arc::clone(&activations),
         },
         checkpoint_height: Some(checkpoint_height),
+        raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
         reorg_window_blocks: REORG_WINDOW_BLOCKS,
         follow: CanonicalFollowConfig {
             request_timeout: env.target.request_timeout,

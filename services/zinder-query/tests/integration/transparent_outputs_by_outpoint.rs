@@ -12,7 +12,7 @@ use zinder_core::{
     TransparentOutputArtifact,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
-use zinder_query::{ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
+use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter};
 use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ReorgWindowChange};
 use zinder_testkit::{
     StoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
@@ -141,44 +141,6 @@ async fn transparent_outputs_by_outpoint_returns_none_for_out_of_bounds_index() 
 }
 
 #[tokio::test]
-async fn transparent_mempool_outputs_by_outpoint_grpc_rejects_coinbase_sentinel() -> eyre::Result<()>
-{
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
-
-    let request = Request::new(wallet::TransparentMempoolOutputsByOutpointRequest {
-        outpoints: vec![wallet::OutPoint {
-            transaction_id: "00".repeat(32),
-            output_index: u32::MAX,
-        }],
-    });
-    let outcome = grpc_adapter
-        .transparent_mempool_outputs_by_outpoint(request)
-        .await;
-    let status = match outcome {
-        Ok(response) => {
-            return Err(eyre!(
-                "expected coinbase sentinel rejection, got {response:?}"
-            ));
-        }
-        Err(status) => status,
-    };
-    assert_eq!(status.code(), Code::InvalidArgument);
-    assert!(status.message().contains("coinbase sentinel"));
-    Ok(())
-}
-
-#[tokio::test]
 async fn transparent_outputs_by_outpoint_grpc_rejects_coinbase_sentinel() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
@@ -191,7 +153,7 @@ async fn transparent_outputs_by_outpoint_grpc_rejects_coinbase_sentinel() -> eyr
         vec![compact_block],
     ))?;
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let request = Request::new(wallet::TransparentOutputsByOutpointRequest {
         outpoints: vec![wallet::OutPoint {

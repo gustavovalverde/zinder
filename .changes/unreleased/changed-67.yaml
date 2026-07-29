@@ -1,0 +1,6 @@
+kind: changed
+body: Derive native WalletQuery capabilities from admitted storage and providers, fail invalid compositions before serving, and support the Regtest-certified source-built Zallet backend. Regtest JSON-RPC health treats a successful node tip observation as ready because the isolated chain has no public-network tip. Native contract revision 5 removes unauthenticated retention-duration fields from WalletServerInfo and replaces COMPACT_BLOCK_RANGE_TOO_LARGE with BLOCK_RANGE_TOO_LARGE; generated native clients must be regenerated.
+time: 2026-07-29T14:25:26Z
+custom:
+  Bump: minor
+  PR: "67"

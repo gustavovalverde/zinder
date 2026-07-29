@@ -162,8 +162,9 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         env!("CARGO_PKG_VERSION"),
         encode_zinder_native_chain_name(explorer_config.network),
         readiness.clone(),
-        advertised_capabilities,
-    );
+        Arc::from(advertised_capabilities),
+    )
+    .await?;
     describe_request_metrics();
 
     start_api_phase.complete();
@@ -190,14 +191,27 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         "explorer query gRPC server stopped"
     );
 
-    shutdown_background_tasks(
+    let background_shutdown_result = shutdown_background_tasks(
         ops_handle,
         upstream_observation_handle,
         materialized_view_catchup_handle,
     )
     .await;
 
-    server_result.map_err(ExplorerConfigError::Transport)
+    match server_result {
+        Err(error) => {
+            if let Err(ops_error) = background_shutdown_result {
+                tracing::warn!(
+                    target: "zinder::explorer",
+                    event = "ops_endpoint_shutdown_failed",
+                    error = %ops_error,
+                    "operational endpoint shutdown also failed"
+                );
+            }
+            Err(ExplorerConfigError::Transport(error))
+        }
+        Ok(()) => background_shutdown_result.map_err(ExplorerConfigError::from),
+    }
 }
 
 fn report_materialized_view_workload(
@@ -223,16 +237,18 @@ async fn shutdown_background_tasks(
     ops_handle: Option<OpsEndpointHandle>,
     upstream_observation_handle: Option<JoinHandle<()>>,
     materialized_view_catchup_handle: Option<JoinHandle<()>>,
-) {
-    if let Some(handle) = ops_handle {
-        handle.shutdown().await;
-    }
+) -> Result<(), zinder_runtime::OpsServerError> {
+    let ops_shutdown_result = match ops_handle {
+        Some(handle) => handle.shutdown().await,
+        None => Ok(()),
+    };
     if let Some(handle) = upstream_observation_handle {
         let _ = handle.await;
     }
     if let Some(handle) = materialized_view_catchup_handle {
         let _ = handle.await;
     }
+    ops_shutdown_result
 }
 
 fn spawn_upstream_observation_probe(

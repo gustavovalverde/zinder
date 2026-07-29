@@ -1232,6 +1232,18 @@ impl ZebraJsonRpcSource {
         let progress = snapshot_fields.verification_progress;
         let committed = snapshot_fields.blocks;
         let estimated = snapshot_fields.estimated_height.unwrap_or(committed);
+        if self.network == Network::ZcashRegtest {
+            // Regtest has no external network tip to synchronize against.
+            // Zebra can still report a Mainnet-shaped estimated height here,
+            // so applying public-network gap thresholds would permanently
+            // reject an otherwise usable operator-controlled chain.
+            return Ok(UpstreamHealthSnapshot::ready(
+                UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK,
+                Some(committed),
+                Some(estimated),
+                progress,
+            ));
+        }
         let gap = estimated.saturating_sub(committed);
 
         if let Some(progress_value) = progress

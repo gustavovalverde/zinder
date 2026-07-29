@@ -35,7 +35,8 @@ use zinder_source::{
 use zinder_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
     CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_SCHEMA_VERSION, WALLET_PROJECTION_VALUE_ENCODING_VERSION,
@@ -216,6 +217,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &network_upgrade_activations,
         genesis.block_time_seconds,
         fixed_build_tip,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
     )?;
     let canonical_store_initialization_started = Instant::now();
@@ -266,6 +268,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &validated.canonical_store,
         &network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         canonical_resource_budget,
     )?;
@@ -302,6 +305,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &validated.canonical_store,
         &network_upgrade_activations,
         CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         canonical_resource_budget,
     )?;

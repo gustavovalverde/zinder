@@ -36,6 +36,7 @@ use crate::{
         position_canonical_block, prepare_canonical_block,
     },
     chain_ingest::IngestError,
+    writer::raw_blob_policy_for_retention,
 };
 use source_fetch::{
     CanonicalSourceFetchConfig, SourceBlockChunk, SourceSegmentSizer, build_source_block_stream,
@@ -345,8 +346,8 @@ pub async fn load_fresh_canonical_blocks<Source>(
 where
     Source: NodeSource + Clone,
 {
+    register_prohibited_read_metrics();
     let build_plan = builder.build_plan().clone();
-    let workload = builder.workload();
     validate_construction_identity(&build_plan, config)?;
     let block_queue_capacity =
         usize::try_from(config.pipeline_limits.block_prepare_concurrency.get())
@@ -356,7 +357,7 @@ where
         source,
         &build_plan,
         config,
-        raw_blob_policy_for_workload(workload),
+        raw_blob_policy_for_retention(builder.raw_blob_retention()),
     );
     drive_block_loader(
         builder,
@@ -439,7 +440,6 @@ pub async fn load_fresh_canonical<Source>(
 where
     Source: NodeSource + Clone,
 {
-    register_prohibited_read_metrics();
     let block_outcome = load_fresh_canonical_blocks(builder, source, config).await?;
     load_fresh_canonical_source_families(block_outcome, source, config).await
 }
@@ -447,13 +447,6 @@ where
 pub(crate) fn register_prohibited_read_metrics() {
     metrics::counter!("zinder_ingest_canonical_historical_prevout_reads_total").absolute(0);
     metrics::counter!("zinder_ingest_canonical_cross_block_wallet_reads_total").absolute(0);
-}
-
-const fn raw_blob_policy_for_workload(workload: CanonicalStoreWorkload) -> RawBlobPolicy {
-    match workload {
-        CanonicalStoreWorkload::Wallet => RawBlobPolicy::Transactions,
-        CanonicalStoreWorkload::Explorer => RawBlobPolicy::All,
-    }
 }
 
 fn validate_construction_identity(

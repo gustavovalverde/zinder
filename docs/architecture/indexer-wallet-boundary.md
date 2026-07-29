@@ -22,7 +22,7 @@ Zinder exposes the same indexed chain through 2 contracts. The native contract i
 
 ### Native Zinder contract
 
-`WalletQuery` and the Rust `zinder-client` expose typed errors, capability discovery, epoch-pinned reads, resumable chain events, transaction broadcast outcomes, mempool views, and transparent-address artifacts. An integration that deploys the native adapter should prefer this contract when it needs explicit consistency or Zinder-specific features.
+`WalletQuery` and the Rust `zinder-client` expose typed errors, capability discovery, epoch-pinned reads, resumable chain events, transaction broadcast outcomes, mempool views, and transparent-address artifacts. An integration that uses `zinder-query` should prefer this contract when it needs explicit consistency or Zinder-specific features.
 
 The public Rust SDK is remote-first. Its default `RemoteChainIndex` uses gRPC to reach `zinder-query` across a process or host boundary and implements `ChainIndex` for immutable network metadata plus canonical and wallet-projection reads. Operations that require a live endpoint, including broadcast and live subscriptions, use the `EndpointBackedIndex` extension. Zinder's serving runtimes read storage through the service-internal `WalletServingQuery` over an admitted `WalletServingReadPair`; that composition is not a public client adapter.
 
@@ -39,7 +39,7 @@ The main architectural choice is who owns the indexed chain view and how many co
 | Option | Chain-data owner | Strongest fit | Main tradeoff |
 | --- | --- | --- | --- |
 | Zebra directly | The validator | A consumer needs node RPC data and can own any indexing, consistency, and reorg logic itself | Minimal additional infrastructure, but application-specific indexing and reconciliation stay in each consumer |
-| Zaino embedded | The wallet process | One wallet benefits from an in-process indexer and wants its lifecycle coupled to the wallet | Simple process-local integration, but indexed state and operational lifecycle remain tied to that consumer |
+| Embedded indexer | The wallet process | One wallet benefits from an in-process indexer and wants its lifecycle coupled to the wallet | Simple process-local integration, but indexed state and operational lifecycle remain tied to that consumer |
 | Zinder shared service | A separate indexer deployment | Multiple processes or products need one durable chain view, or chain data must outlive any individual consumer | Adds an operated service and storage layer, while centralizing indexing, consistency, and reuse |
 | Lightwalletd-compatible serving | A lightwalletd server or Zinder's compatibility service | Existing light clients already speak `CompactTxStreamer` and should keep that integration contract | Preserves the established wallet protocol, but does not expose every native Zinder capability |
 
@@ -56,8 +56,8 @@ Zinder owns facts whose answers are the same for every caller at a given chain e
 - Compact-block range reads.
 - Sapling, Orchard, and Ironwood tree-state reads where supported by the active network upgrade.
 - Shielded subtree-root reads for batched scanning.
-- Transparent-address unspent outputs, transaction history, and confirmed balance.
-- Canonical and live-mempool transparent prevout resolution.
+- Transparent-address unspent outputs and transaction history.
+- Admitted live-mempool outputs-by-address and spends-by-outpoint.
 - Transaction lookup and broadcast.
 - Mempool snapshots and change events.
 - Cursor-resumable committed and reorged chain events.
@@ -120,5 +120,4 @@ A proposed per-user table inside Zinder usually signals that wallet state has cr
 - [ADR-0005: Consumer-neutral wallet data plane](../adrs/0005-consumer-neutral-wallet-data-plane.md)
 - [Wallet data plane](wallet-data-plane.md)
 - [Protocol boundary](protocol-boundary.md)
-- [Server-side wallet pattern](../reference/server-side-wallet-pattern.md)
 - [Integration surfaces](../reference/integration-surfaces.md)

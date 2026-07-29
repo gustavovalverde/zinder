@@ -52,3 +52,10 @@ pub const SHIELDED_RECEIVER_TESTNET_NO_HISTORY: &str =
 /// receiver, so the explorer has nothing publicly indexable to route to.
 pub const UNIFIED_ADDRESS_NO_TRANSPARENT_RECEIVER: &str =
     "Unified address: no transparent receiver to route to public history";
+
+/// An optional explorer field whose required wallet capability is absent.
+///
+/// Used with `UnavailableReason::UNAVAILABLE_UPSTREAM_NOT_SUPPORTED`; the
+/// accompanying `UnavailableField.field_path` identifies the affected field.
+pub const WALLET_QUERY_CAPABILITY_NOT_SUPPORTED: &str =
+    "The wallet query does not support this field.";

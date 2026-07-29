@@ -122,9 +122,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .tmp
-          # raw_blob_policy is a writer-only storage knob; the compat shim's
-          # storage config rejects it, so scope it to the ingest process rather
-          # than the step env both binaries inherit.
+          # Every canonical-store opener must state the same persisted
+          # raw-blob retention identity. Scope it to each process so unrelated
+          # commands in this step keep their own defaults.
           ZINDER_STORAGE__RAW_BLOB_POLICY=all ./target/release/zinder-ingest --network zcash-regtest \
             --storage-path .tmp/parity-store > .tmp/ingest.log 2>&1 &
           echo "ingest=$!" > .tmp/parity.pids
@@ -156,6 +156,7 @@ jobs:
           ./target/release/zinder-bench rocksdb-wallet-rebuild \
             --network zcash-regtest \
             --json-rpc-addr "${ZEBRA_RPC_URL}" \
+            --raw-blob-retention all \
             --canonical-store .tmp/parity-store \
             --wallet-store .tmp/parity-wallet-store > .tmp/wallet-rebuild.json
 
@@ -176,7 +177,8 @@ jobs:
             exit 1
           fi
 
-          ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
+          ZINDER_STORAGE__RAW_BLOB_POLICY=all \
+            ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
             --canonical-primary-path .tmp/parity-store \
             --canonical-secondary-root .tmp/parity-secondary-compat-canonical \
             --wallet-primary-path .tmp/parity-wallet-store \
@@ -186,14 +188,17 @@ jobs:
           echo "compat=$!" >> .tmp/parity.pids
           compat_ready=""
           for _ in $(seq 1 30); do
-            if grep -q "compat_started" .tmp/compat.log; then
+            if curl -sf http://127.0.0.1:9107/readyz >/dev/null; then
               compat_ready=yes
               break
             fi
             sleep 1
           done
           if [ -z "${compat_ready}" ]; then
-            echo "compat did not become ready in time; last compat log lines:" >&2
+            echo "compat did not admit traffic in time; readiness response:" >&2
+            curl -s http://127.0.0.1:9107/readyz >&2 || true
+            echo >&2
+            echo "last compat log lines:" >&2
             tail -n 50 .tmp/compat.log >&2 || true
             exit 1
           fi

@@ -185,6 +185,12 @@ impl IndexerError {
         };
 
         if status.code() == Code::NotFound
+            && matches!(&zinder_reason, ErrorReason::BlockNotInBestChain)
+        {
+            return Self::NotFound { resource: "block" };
+        }
+
+        if status.code() == Code::NotFound
             && matches!(&zinder_reason, ErrorReason::ArtifactUnavailable)
             && let Some(resource_info) = details.resource_info()
         {
@@ -215,16 +221,16 @@ impl IndexerError {
 
     /// Returns the typed [`ErrorReason`] attached to the failure, when known.
     ///
-    /// Returns `Some` for errors that originated at a gRPC boundary carrying
-    /// a `google.rpc.ErrorInfo` with `domain = "zinder.dev"`. Returns `None`
-    /// for client-side validation errors that never crossed a Zinder gRPC
-    /// boundary.
+    /// Returns `Some` when this variant preserves one exact wire reason.
+    /// Returns `None` for client-side failures and for deliberately coarser
+    /// domain variants such as [`IndexerError::NotFound`], which do not retain
+    /// the originating wire reason.
     #[must_use]
     #[cfg(feature = "remote")]
     pub fn reason(&self) -> Option<ErrorReason> {
-        // Rich recovery variants have a one-to-one wire reason. Generic
-        // remote failures retain the exact parsed reason instead of inferring
-        // from a gRPC code shared by several reasons.
+        // Rich recovery variants have a one-to-one wire reason. Generic remote
+        // failures retain the exact parsed reason; coarser domain variants do
+        // not infer or reconstruct a reason from their local shape.
         match self {
             Self::ChainEpochPinUnavailable => Some(ErrorReason::ChainEpochPinUnavailable),
             Self::ChainEventCursorExpired { .. } => Some(ErrorReason::ChainEventCursorExpired),
@@ -313,7 +319,8 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         ErrorReason::ChainEpochPinUnavailable => RetryPolicy::RefreshChainEpoch,
         ErrorReason::ChainEventCursorExpired => RetryPolicy::RestartFromEarliestRetained,
         ErrorReason::InvalidBlockRange
-        | ErrorReason::CompactBlockRangeTooLarge
+        | ErrorReason::BlockRangeTooLarge
+        | ErrorReason::SubtreeRootRangeTooLarge
         | ErrorReason::ChainEventCursorInvalid
         | ErrorReason::AddressOutputCursorInvalid
         | ErrorReason::TransparentHistoryCursorInvalid
@@ -338,6 +345,7 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::EntropyUnavailable
         | ErrorReason::ExplorerInternal
         | ErrorReason::MaterializedViewUnavailable
+        | ErrorReason::EndpointCapabilityUnavailable
         | ErrorReason::NodeCapabilityMissing
         | ErrorReason::ExplorerPreconditionUnsatisfied
         | ErrorReason::ExplorerMethodDisabled
@@ -354,7 +362,8 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::StorageUnavailable
         | ErrorReason::UnsupportedWalletEncoding
         | ErrorReason::NoVisibleChainEpoch
-        | ErrorReason::UpstreamUnreachable => RetryPolicy::RetryWithBackoff,
+        | ErrorReason::UpstreamUnreachable
+        | ErrorReason::ServiceNotReady => RetryPolicy::RetryWithBackoff,
         ErrorReason::Unknown(_) => retry_policy_for_status(code),
     }
 }
@@ -382,6 +391,35 @@ mod tests {
         assert!(matches!(error, IndexerError::ChainEpochPinUnavailable));
         assert_eq!(error.reason(), Some(ErrorReason::ChainEpochPinUnavailable));
         assert_eq!(error.retry_policy(), RetryPolicy::RefreshChainEpoch);
+    }
+
+    #[test]
+    fn non_best_chain_block_maps_only_not_found_status_to_block_absence() {
+        let not_found =
+            zinder_query::status_from_query_error(&zinder_query::QueryError::BlockNotInBestChain);
+        let unavailable = tonic::Status::with_error_details(
+            Code::Unavailable,
+            "block lookup is unavailable",
+            ErrorDetails::with_error_info(
+                ErrorReason::BlockNotInBestChain.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+
+        let block_not_found = IndexerError::from_status(not_found);
+        assert_eq!(block_not_found.reason(), None);
+        assert!(matches!(
+            block_not_found,
+            IndexerError::NotFound { resource: "block" }
+        ));
+        assert!(matches!(
+            IndexerError::from_status(unavailable),
+            IndexerError::RemoteFailure {
+                reason: ErrorReason::BlockNotInBestChain,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -423,6 +461,22 @@ mod tests {
         let error = IndexerError::from_status(status);
 
         assert_eq!(error.reason(), Some(ErrorReason::InvalidAddress));
+        assert_eq!(error.retry_policy(), RetryPolicy::ClientError);
+        assert!(matches!(error, IndexerError::RemoteFailure { .. }));
+    }
+
+    #[test]
+    fn subtree_root_range_limit_is_a_client_error() {
+        let status = zinder_query::status_from_query_error(
+            &zinder_query::QueryError::SubtreeRootRangeTooLarge {
+                requested: zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1),
+                maximum: zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST,
+            },
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(error.reason(), Some(ErrorReason::SubtreeRootRangeTooLarge));
         assert_eq!(error.retry_policy(), RetryPolicy::ClientError);
         assert!(matches!(error, IndexerError::RemoteFailure { .. }));
     }

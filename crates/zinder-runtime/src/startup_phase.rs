@@ -44,6 +44,8 @@ pub enum StartupPhase {
     CheckSchema,
     /// Establish the upstream node connection and probe capabilities.
     ConnectNode,
+    /// Authenticate and structurally admit the ingest-control service.
+    AdmitIngestControl,
     /// Recover in-flight state (replay pending epochs, hydrate mempool, etc.).
     RecoverState,
     /// Start the public API surface (gRPC, ops endpoint).
@@ -62,6 +64,7 @@ impl StartupPhase {
             Self::OpenStorage => "open_storage",
             Self::CheckSchema => "check_schema",
             Self::ConnectNode => "connect_node",
+            Self::AdmitIngestControl => "admit_ingest_control",
             Self::RecoverState => "recover_state",
             Self::StartApi => "start_api",
             Self::Ready => "ready",
@@ -183,6 +186,10 @@ mod tests {
         assert_eq!(StartupPhase::OpenStorage.as_str(), "open_storage");
         assert_eq!(StartupPhase::CheckSchema.as_str(), "check_schema");
         assert_eq!(StartupPhase::ConnectNode.as_str(), "connect_node");
+        assert_eq!(
+            StartupPhase::AdmitIngestControl.as_str(),
+            "admit_ingest_control"
+        );
         assert_eq!(StartupPhase::RecoverState.as_str(), "recover_state");
         assert_eq!(StartupPhase::StartApi.as_str(), "start_api");
         assert_eq!(StartupPhase::Ready.as_str(), "ready");

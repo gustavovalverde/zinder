@@ -1302,6 +1302,7 @@ fn checkpoint_build_plan_message(
                 }),
         }),
         build_tip: Some(checkpoint_block_id_message(build_plan.build_tip())),
+        raw_blob_retention: build_plan.raw_blob_retention().as_kebab_case().to_owned(),
     }
 }
 
@@ -1787,6 +1788,7 @@ pub(crate) mod test_support {
             .build_plan
             .ok_or("checkpoint response omitted build-plan identity")?;
         assert_eq!(build_plan.activation_fingerprint_version, 1);
+        assert_eq!(build_plan.raw_blob_retention, "transactions");
         assert_eq!(build_plan.reorg_window_blocks, 1);
         assert_eq!(
             build_plan
@@ -2106,6 +2108,7 @@ pub(crate) mod test_support {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2257,6 +2260,7 @@ pub(crate) mod test_support {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2286,6 +2290,7 @@ pub(crate) mod test_support {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2336,6 +2341,7 @@ pub(crate) mod test_support {
             &store_path,
             &activations,
             CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2684,8 +2690,13 @@ pub(crate) mod test_support {
     ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
         let activations = fixture_activations()?;
         let tip = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32]));
-        let plan =
-            CanonicalStoreBuildPlan::complete(&activations, 0, tip, CanonicalReorgPolicy::new(1)?)?;
+        let plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            tip,
+            zinder_store::RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(1)?,
+        )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
             CanonicalStoreWorkload::Wallet,

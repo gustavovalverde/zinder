@@ -19,9 +19,6 @@ use zinder_core::{
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_materialized_views::MaterializedViewPreset;
-use zinder_proto::capabilities::{
-    self, CapabilitySurface, WalletAdvertiseInputs, capabilities_for_surface,
-};
 use zinder_proto::v1::{ops, wallet};
 use zinder_proto::wire::{
     compact_block_message, encode_transparent_utxo_set_commitment, mempool_entry_message,
@@ -29,10 +26,11 @@ use zinder_proto::wire::{
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
-    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, FullBlock, QueryError,
-    SettledTipBlock, SubtreeRoots, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, VisibleTipBlock, WalletQueryApi,
+    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, FullBlock,
+    NativeWalletEndpointCapabilities, QueryError, SettledTipBlock, SubtreeRoots, TransactionStatus,
+    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
+    UpstreamNodeCapabilities, VisibleTipBlock, WalletQueryApi,
 };
 pub(crate) use zinder_store::chain_view_message as build_chain_view_message;
 use zinder_store::{
@@ -59,16 +57,36 @@ pub async fn network_upgrade_activations_response<Q: WalletQueryApi + ?Sized>(
     })
 }
 
-/// Operator-configured snapshot used to build the `WalletServerInfo` descriptor.
+/// Reads and encodes chain-wide value-pool totals from the query's admitted
+/// node source.
+pub async fn chain_value_pools_at_tip_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+) -> Result<wallet::ChainValuePoolsAtTipResponse, QueryError> {
+    let response = query_api.chain_value_pools_at_tip().await?;
+    Ok(wallet::ChainValuePoolsAtTipResponse {
+        chain_view: Some(build_chain_view_message(response.chain_epoch)),
+        source_tip: Some(wallet::BlockTip {
+            height: response.source_tip.height.value(),
+            hash: encode_rpc_block_hash_hex(response.source_tip.hash),
+        }),
+        pools: response
+            .pools
+            .into_iter()
+            .map(|pool| wallet::ChainValuePool {
+                id: pool.id,
+                monitored: pool.monitored,
+                chain_value_zat: pool.chain_value_zat,
+            })
+            .collect(),
+    })
+}
+
+/// Descriptive endpoint metadata used to build `WalletServerInfo`.
 ///
-/// Populated once at startup; the adapter does not call config-rs on each
-/// `ServerInfo` request.
+/// Structural support is deliberately absent. The admitted query owns the
+/// immutable capability set used by both native and operational discovery.
 #[derive(Clone, Debug)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "Each bool is an independent advertisement or retention gate read once at startup, not a state machine."
-)]
-pub struct ServerInfoSettings {
+pub struct WalletEndpointMetadata {
     /// Network identifier such as `"zcash-mainnet"` or `"zcash-regtest"`.
     pub network: String,
     /// Semver of the running binary, sourced from `CARGO_PKG_VERSION`.
@@ -79,125 +97,15 @@ pub struct ServerInfoSettings {
     pub schema_version: u32,
     /// Configured reorg window depth in blocks.
     pub reorg_window_blocks: u32,
-    /// Whether this deployment has a transaction broadcaster configured.
-    pub transaction_broadcast_enabled: bool,
-    /// Whether this deployment serves the chain-event stream.
-    pub chain_events_enabled: bool,
-    /// Chain-event retention window in seconds. Zero means unbounded retention.
-    pub chain_event_retention_seconds: u64,
-    /// Mempool retention windows in seconds. Zero means the corresponding event
-    /// family is not retained on this deployment.
-    pub mempool_mined_retention_seconds: u64,
-    /// Mempool invalidated-event retention window in seconds.
-    pub mempool_invalidated_retention_seconds: u64,
-    /// Upstream-node capability snapshot captured by the source probe.
-    ///
-    /// `None` for storage-only deployments that have no source handle
-    /// (e.g. a query service running purely off a `RocksDB` secondary).
-    /// When `Some`, the contents are surfaced through the `node` field of
-    /// the `WalletServerInfo` response and used to compute the
-    /// cross-service `ops.ServerInfo.upstream_node_fingerprint`.
-    pub upstream_node_capabilities: Option<UpstreamNodeCapabilities>,
-    /// Whether this deployment can proxy chain value-pool reads through the
-    /// ingest writer's source handle.
-    pub chain_value_pools_enabled: bool,
-    /// Whether the store retains full block blobs (ingest `raw_blob_policy`
-    /// is `all`).
-    pub block_blobs_retained: bool,
-    /// Whether the store retains transaction blobs (ingest `raw_blob_policy`
-    /// in `{transactions, all}`).
-    pub transaction_blobs_retained: bool,
-    /// Whether the operator opted into the transparent UTXO-set commitment
-    /// fold on `TransparentUtxoSetSummary`.
-    pub utxo_set_commitment_enabled: bool,
-    /// Whether transparent-address transaction history is available.
-    pub transparent_address_history_available: bool,
-    /// Whether durable transparent spender resolution is available.
-    pub transparent_outpoint_spend_available: bool,
     /// Closed materialized-view workload when this service has an attached store.
     pub materialized_view_preset: Option<MaterializedViewPreset>,
-    /// Typed implementation profile applied before deployment-specific gates.
-    pub capability_profile: WalletCapabilityProfile,
 }
 
-/// Native wallet capability implementation profile.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum WalletCapabilityProfile {
-    /// Complete native query implementation used by the primary-store composition.
-    #[default]
-    Complete,
-    /// Exact-pair secondary implementation used by the standalone native runtime.
-    ExactPair,
-}
-
-impl WalletCapabilityProfile {
-    /// Returns the implementation support decision for a registered wallet capability.
-    ///
-    /// `None` means the central table gained a capability without an explicit
-    /// decision for the exact-pair profile. Descriptor construction fails
-    /// closed by treating that capability as unsupported.
-    #[must_use]
-    pub fn supports(self, capability: &str) -> Option<bool> {
-        if self == Self::Complete {
-            return Some(true);
-        }
-        match capability {
-            capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1
-            | capabilities::WALLET_READ_SETTLED_TIP_BLOCK_V1
-            | capabilities::WALLET_READ_BLOCK_ID_BY_SELECTOR_V1
-            | capabilities::WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1
-            | capabilities::WALLET_READ_COMPACT_BLOCK_AT_V2
-            | capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V2
-            | capabilities::WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2
-            | capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2
-            | capabilities::WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2
-            | capabilities::WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1
-            | capabilities::WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1
-            | capabilities::WALLET_READ_TRANSACTION_BY_ID_V2
-            | capabilities::WALLET_READ_TRANSACTION_BYTES_V1
-            | capabilities::WALLET_READ_SERVER_INFO_V2
-            | capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1
-            | capabilities::WALLET_BROADCAST_TRANSACTION_V1
-            | capabilities::WALLET_SNAPSHOT_MEMPOOL_V3
-            | capabilities::WALLET_EVENTS_MEMPOOL_V2
-            | capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1
-            | capabilities::WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1
-            | capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1
-            | capabilities::WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1
-            | capabilities::WALLET_ADDRESS_TRANSPARENT_BALANCE_V1
-            | capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1
-            | capabilities::WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1
-            | capabilities::WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1
-            | capabilities::WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
-            | capabilities::WALLET_EVENTS_CHAIN_V1 => Some(true),
-            capabilities::WALLET_READ_FULL_BLOCK_AT_V1
-            | capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
-            | capabilities::WALLET_READ_TRANSPARENT_OUTPUTS_V1
-            | capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1
-            | capabilities::WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1 => Some(false),
-            _ => None,
-        }
-    }
-}
-
-/// Snapshot of the upstream-node capability probe used by `ServerInfo`.
-///
-/// Kept in this crate to avoid pulling the `zinder-source` crate's
-/// `NodeCapability` enum across every consumer of `ServerInfoSettings`.
-/// The serving composition sets this from its startup-time live probe.
-#[derive(Clone, Debug, Default)]
-pub struct UpstreamNodeCapabilities {
-    /// Node-reported semantic version when available.
-    pub version: Option<String>,
-    /// Stable capability names observed on the upstream node.
-    pub capabilities: Vec<String>,
-}
-
-impl Default for ServerInfoSettings {
+impl Default for WalletEndpointMetadata {
     /// Returns development-mode defaults safe for tests and local composition.
     ///
     /// Production deployments replace these through the runtime config loader,
-    /// whose default retention window is bounded.
+    /// whose default canonical reorg window is bounded.
     fn default() -> Self {
         Self {
             network: "zcash-regtest".to_owned(),
@@ -205,101 +113,46 @@ impl Default for ServerInfoSettings {
             build_git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
             schema_version: u32::from(zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value()),
             reorg_window_blocks: 100,
-            transaction_broadcast_enabled: false,
-            chain_events_enabled: true,
-            chain_event_retention_seconds: 0,
-            mempool_mined_retention_seconds: 0,
-            mempool_invalidated_retention_seconds: 0,
-            upstream_node_capabilities: None,
-            chain_value_pools_enabled: false,
-            block_blobs_retained: false,
-            transaction_blobs_retained: false,
-            utxo_set_commitment_enabled: false,
-            transparent_address_history_available: false,
-            transparent_outpoint_spend_available: false,
             materialized_view_preset: None,
-            capability_profile: WalletCapabilityProfile::Complete,
         }
     }
 }
 
-/// Builds the `WalletServerInfo` descriptor from operator settings.
+/// Builds the `WalletServerInfo` descriptor from admitted query evidence.
 ///
-/// Embeds the cross-service [`ops::ServerInfo`] shape every Zinder gRPC
-/// surface returns, with capabilities folded from the shared capability table
-/// and filtered against the operator settings.
+/// The capability set is passed through verbatim from the query that owns the
+/// concrete handlers. Metadata cannot add or suppress support.
 #[must_use]
-pub fn build_wallet_server_info(settings: &ServerInfoSettings) -> wallet::WalletServerInfo {
-    wallet::WalletServerInfo {
-        common: Some(build_ops_server_info(settings)),
-        schema_version: settings.schema_version,
-        reorg_window_blocks: settings.reorg_window_blocks,
-        chain_event_retention_seconds: settings.chain_event_retention_seconds,
-        mempool_mined_retention_seconds: settings.mempool_mined_retention_seconds,
-        mempool_invalidated_retention_seconds: settings.mempool_invalidated_retention_seconds,
-        node: Some(build_node_capabilities_descriptor(
-            settings.upstream_node_capabilities.as_ref(),
-        )),
-    }
-}
-
-/// Builds the cross-service [`ops::ServerInfo`] descriptor for `zinder-query`.
-///
-/// Capability strings are filtered against the operator settings (e.g.
-/// broadcast is only advertised when a broadcaster is configured).
-#[must_use]
-fn build_ops_server_info(settings: &ServerInfoSettings) -> ops::ServerInfo {
-    ops::ServerInfo {
-        network: settings.network.clone(),
+pub fn build_wallet_server_info(
+    metadata: WalletEndpointMetadata,
+    capabilities: &NativeWalletEndpointCapabilities,
+    upstream: Option<&UpstreamNodeCapabilities>,
+) -> wallet::WalletServerInfo {
+    let materialized_view_preset = metadata.materialized_view_preset;
+    let common = ops::ServerInfo {
+        network: metadata.network,
         service_name: env!("CARGO_PKG_NAME").to_owned(),
-        service_version: settings.service_version.clone(),
-        build_git_commit: settings.build_git_commit.clone(),
+        service_version: metadata.service_version,
+        build_git_commit: metadata.build_git_commit,
         contract_revision: zinder_proto::CONTRACT_REVISION,
-        capabilities: wallet_capability_strings(settings)
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        materialized_view_preset: settings
-            .materialized_view_preset
+        capabilities: capabilities.iter().map(str::to_owned).collect(),
+        materialized_view_preset: materialized_view_preset
             .map_or_else(String::new, |preset| preset.as_str().to_owned()),
-        materialized_view_identities: settings.materialized_view_preset.map_or_else(
-            Vec::new,
-            |preset| {
-                preset
-                    .consumer_schemas()
-                    .iter()
-                    .map(|schema| schema.name.as_str().to_owned())
-                    .collect()
-            },
-        ),
-    }
-}
+        materialized_view_identities: materialized_view_preset.map_or_else(Vec::new, |preset| {
+            preset
+                .consumer_schemas()
+                .iter()
+                .map(|schema| schema.name.as_str().to_owned())
+                .collect()
+        }),
+    };
 
-/// Returns the exact capability snapshot advertised by a wallet runtime.
-#[must_use]
-pub fn wallet_capability_strings(settings: &ServerInfoSettings) -> Vec<&'static str> {
-    capabilities_for_surface(CapabilitySurface::Wallet)
-        .filter(|spec| {
-            settings
-                .capability_profile
-                .supports(spec.string)
-                .unwrap_or(false)
-        })
-        .filter(|spec| {
-            spec.policy.wallet_satisfied(WalletAdvertiseInputs {
-                broadcaster_enabled: settings.transaction_broadcast_enabled,
-                chain_events_enabled: settings.chain_events_enabled,
-                chain_value_pools_enabled: settings.chain_value_pools_enabled,
-                block_blobs_retained: settings.block_blobs_retained,
-                transaction_blobs_retained: settings.transaction_blobs_retained,
-                utxo_set_commitment_enabled: settings.utxo_set_commitment_enabled,
-                transparent_address_history_available: settings
-                    .transparent_address_history_available,
-                transparent_outpoint_spend_available: settings.transparent_outpoint_spend_available,
-            })
-        })
-        .map(|spec| spec.string)
-        .collect()
+    wallet::WalletServerInfo {
+        common: Some(common),
+        schema_version: metadata.schema_version,
+        reorg_window_blocks: metadata.reorg_window_blocks,
+        node: Some(build_node_capabilities_descriptor(upstream)),
+    }
 }
 
 fn build_node_capabilities_descriptor(
@@ -312,7 +165,7 @@ fn build_node_capabilities_descriptor(
         },
         |capabilities| wallet::NodeCapabilitiesDescriptor {
             version: capabilities.version.clone(),
-            capabilities: capabilities.capabilities.clone(),
+            capabilities: capabilities.names().map(str::to_owned).collect(),
         },
     )
 }
@@ -349,10 +202,9 @@ pub(super) async fn settled_tip_block_response<Q: WalletQueryApi + ?Sized>(
 pub(super) async fn transparent_utxo_set_summary_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     at_epoch_id: Option<ChainEpochId>,
-    commitment_enabled: bool,
 ) -> Result<wallet::TransparentUtxoSetSummaryResponse, QueryError> {
     query_api
-        .transparent_utxo_set_summary(at_epoch_id, commitment_enabled)
+        .transparent_utxo_set_summary(at_epoch_id)
         .await
         .and_then(|summary| build_transparent_utxo_set_summary_response(&summary))
 }
@@ -1053,37 +905,61 @@ fn native_shielded_protocol(
 #[cfg(test)]
 mod server_info_tests {
     use zinder_proto::capabilities::{
-        CAPABILITIES, CapabilitySurface, WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
-        WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_FULL_BLOCK_AT_V1,
-        WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+        WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_MEMPOOL_V2,
+        WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
+        WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1, WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
+        WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, WALLET_READ_COMPACT_BLOCK_RANGE_V2,
+        WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
+        WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1, WALLET_READ_SERVER_INFO_V2,
         WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
         WALLET_READ_TRANSACTION_BYTES_V1, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-        WALLET_READ_TRANSPARENT_SPENDS_V1, WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-        WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+        WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+        WALLET_READ_VISIBLE_TIP_BLOCK_V1, WALLET_SNAPSHOT_MEMPOOL_V3,
     };
+    use zinder_source::{NodeCapabilities, NodeCapability};
+    use zinder_store::RawBlobRetention;
+    use zinder_testkit::IngestControlFixture;
 
     use super::{
-        MaterializedViewPreset, ServerInfoSettings, UpstreamNodeCapabilities,
-        WalletCapabilityProfile, build_wallet_server_info,
+        MaterializedViewPreset, NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
+        WalletEndpointMetadata, build_wallet_server_info,
     };
+    use crate::AdmittedIngestControl;
 
-    #[test]
-    fn build_wallet_server_info_populates_node_when_upstream_known() {
-        let settings = ServerInfoSettings {
-            upstream_node_capabilities: Some(UpstreamNodeCapabilities {
-                version: Some("2.4.0".to_owned()),
-                capabilities: vec!["tx_broadcast".to_owned(), "subtree_roots".to_owned()],
-            }),
-            ..ServerInfoSettings::default()
-        };
+    #[tokio::test]
+    async fn build_wallet_server_info_populates_node_when_upstream_known()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture =
+            IngestControlFixture::spawn(zinder_core::Network::ZcashRegtest).await?;
+        let admitted_ingest_control = AdmittedIngestControl::connect(
+            ingest_fixture.endpoint(),
+            None,
+            zinder_core::Network::ZcashRegtest,
+        )
+        .await?;
+        let metadata = WalletEndpointMetadata::default();
+        let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+            RawBlobRetention::Transactions,
+            NodeCapabilities::default(),
+            &admitted_ingest_control,
+        );
+        let mut upstream = UpstreamNodeCapabilities::from_probed(NodeCapabilities::new([
+            NodeCapability::SubtreeRoots,
+            NodeCapability::TransactionBroadcast,
+        ])?);
+        upstream.version = Some("2.4.0".to_owned());
 
-        let descriptor = build_wallet_server_info(&settings);
+        let descriptor = build_wallet_server_info(metadata, &capabilities, Some(&upstream));
         let Some(node) = descriptor.node else {
             unreachable!("node field must always be set")
         };
         assert_eq!(node.version.as_deref(), Some("2.4.0"));
         assert_eq!(node.capabilities.len(), 2);
-        assert!(node.capabilities.iter().any(|cap| cap == "tx_broadcast"));
+        assert!(
+            node.capabilities
+                .iter()
+                .any(|cap| cap == NodeCapability::TransactionBroadcast.name())
+        );
 
         let Some(common) = descriptor.common else {
             unreachable!("common ops.ServerInfo field must always be set")
@@ -1093,15 +969,31 @@ mod server_info_tests {
         assert!(!common.capabilities.is_empty());
         assert!(common.materialized_view_preset.is_empty());
         assert!(common.materialized_view_identities.is_empty());
+        ingest_fixture.shutdown().await?;
+        Ok(())
     }
 
-    #[test]
-    fn server_info_reports_the_effective_wallet_workload() {
-        let settings = ServerInfoSettings {
+    #[tokio::test]
+    async fn server_info_reports_the_effective_wallet_workload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture =
+            IngestControlFixture::spawn(zinder_core::Network::ZcashRegtest).await?;
+        let admitted_ingest_control = AdmittedIngestControl::connect(
+            ingest_fixture.endpoint(),
+            None,
+            zinder_core::Network::ZcashRegtest,
+        )
+        .await?;
+        let metadata = WalletEndpointMetadata {
             materialized_view_preset: Some(MaterializedViewPreset::Wallet),
-            ..ServerInfoSettings::default()
+            ..WalletEndpointMetadata::default()
         };
-        let common = build_wallet_server_info(&settings)
+        let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+            RawBlobRetention::Transactions,
+            NodeCapabilities::default(),
+            &admitted_ingest_control,
+        );
+        let common = build_wallet_server_info(metadata, &capabilities, None)
             .common
             .unwrap_or_default();
 
@@ -1114,12 +1006,28 @@ mod server_info_tests {
                 .map(|schema| schema.name.as_str().to_owned())
                 .collect::<Vec<_>>()
         );
+        ingest_fixture.shutdown().await?;
+        Ok(())
     }
 
-    #[test]
-    fn build_wallet_server_info_emits_empty_node_when_no_upstream() {
-        let settings = ServerInfoSettings::default();
-        let descriptor = build_wallet_server_info(&settings);
+    #[tokio::test]
+    async fn build_wallet_server_info_emits_empty_node_when_no_upstream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture =
+            IngestControlFixture::spawn(zinder_core::Network::ZcashRegtest).await?;
+        let admitted_ingest_control = AdmittedIngestControl::connect(
+            ingest_fixture.endpoint(),
+            None,
+            zinder_core::Network::ZcashRegtest,
+        )
+        .await?;
+        let metadata = WalletEndpointMetadata::default();
+        let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+            RawBlobRetention::Transactions,
+            NodeCapabilities::default(),
+            &admitted_ingest_control,
+        );
+        let descriptor = build_wallet_server_info(metadata, &capabilities, None);
         let Some(node) = descriptor.node else {
             unreachable!("node field must always be set")
         };
@@ -1130,126 +1038,85 @@ mod server_info_tests {
             unreachable!("common ops.ServerInfo field must always be set")
         };
         assert_eq!(common.network, "zcash-regtest");
+        ingest_fixture.shutdown().await?;
+        Ok(())
     }
 
-    fn advertised_capabilities(
-        block_blobs_retained: bool,
-        transaction_blobs_retained: bool,
-    ) -> Vec<String> {
-        let settings = ServerInfoSettings {
-            block_blobs_retained,
-            transaction_blobs_retained,
-            ..ServerInfoSettings::default()
-        };
-        let descriptor = build_wallet_server_info(&settings);
-        let Some(common) = descriptor.common else {
-            unreachable!("common ops.ServerInfo field must always be set")
-        };
-        common.capabilities
-    }
-
-    fn advertises(capabilities: &[String], capability: &str) -> bool {
-        capabilities
-            .iter()
-            .any(|advertised| advertised == capability)
-    }
-
-    #[test]
-    fn server_info_gates_blob_capabilities_on_retention() {
-        for (block_retained, transaction_retained) in [(false, false), (false, true), (true, true)]
-        {
-            let capabilities = advertised_capabilities(block_retained, transaction_retained);
-            assert_eq!(
-                advertises(&capabilities, WALLET_READ_FULL_BLOCK_AT_V1),
-                block_retained
-            );
-            assert_eq!(
-                advertises(&capabilities, WALLET_READ_FULL_BLOCK_RANGE_V1),
-                block_retained
-            );
-            assert_eq!(
-                advertises(&capabilities, WALLET_READ_TRANSACTION_BYTES_V1),
-                transaction_retained
-            );
-            assert!(advertises(&capabilities, WALLET_READ_TRANSACTION_BY_ID_V2));
-        }
-    }
-
-    #[test]
-    fn server_info_defaults_do_not_advertise_unwired_wallet_projections() {
-        let capabilities = build_wallet_server_info(&ServerInfoSettings::default())
-            .common
-            .map(|common| common.capabilities)
-            .unwrap_or_default();
-        assert!(!advertises(
-            &capabilities,
-            WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
-        ));
-        assert!(!advertises(
-            &capabilities,
-            WALLET_READ_TRANSPARENT_SPENDS_V1
-        ));
-    }
-
-    #[test]
-    fn exact_pair_profile_advertises_implemented_sync_methods() {
-        let settings = ServerInfoSettings {
-            capability_profile: WalletCapabilityProfile::ExactPair,
-            transparent_address_history_available: true,
-            ..ServerInfoSettings::default()
-        };
-        let capabilities = build_wallet_server_info(&settings)
-            .common
-            .map(|common| common.capabilities)
-            .unwrap_or_default();
-
-        assert!(advertises(&capabilities, WALLET_READ_VISIBLE_TIP_BLOCK_V1));
-        assert!(advertises(&capabilities, WALLET_READ_SETTLED_TIP_BLOCK_V1));
-        assert!(advertises(
-            &capabilities,
-            WALLET_READ_COMPACT_BLOCK_RANGE_V2
-        ));
-        assert!(advertises(
-            &capabilities,
-            WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1
-        ));
-        assert!(advertises(&capabilities, WALLET_READ_TRANSACTION_BY_ID_V2));
-        assert!(!advertises(
-            &capabilities,
-            WALLET_READ_TRANSPARENT_OUTPUTS_V1
-        ));
-        assert!(!advertises(
-            &capabilities,
-            WALLET_READ_TRANSPARENT_SPENDS_V1
-        ));
-        assert!(!advertises(
-            &capabilities,
-            WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1
-        ));
-        assert!(!advertises(&capabilities, WALLET_READ_FULL_BLOCK_AT_V1));
-        assert!(!advertises(&capabilities, WALLET_READ_FULL_BLOCK_RANGE_V1));
-        assert!(advertises(
-            &capabilities,
-            WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
-        ));
-    }
-
-    #[test]
-    fn exact_pair_profile_decides_every_registered_wallet_capability() {
-        let undecided = CAPABILITIES
-            .iter()
-            .filter(|spec| spec.surface == CapabilitySurface::Wallet)
-            .filter(|spec| {
-                WalletCapabilityProfile::ExactPair
-                    .supports(spec.string)
-                    .is_none()
-            })
-            .map(|spec| spec.string)
-            .collect::<Vec<_>>();
-
-        assert!(
-            undecided.is_empty(),
-            "exact-pair capability profile lacks decisions for {undecided:?}"
+    #[tokio::test]
+    async fn wallet_serving_capabilities_come_from_composed_service_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture =
+            IngestControlFixture::spawn(zinder_core::Network::ZcashRegtest).await?;
+        let admitted_ingest_control = AdmittedIngestControl::connect(
+            ingest_fixture.endpoint(),
+            None,
+            zinder_core::Network::ZcashRegtest,
+        )
+        .await?;
+        let transactions = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+            RawBlobRetention::Transactions,
+            NodeCapabilities::default(),
+            &admitted_ingest_control,
         );
+        for always_supported in [
+            WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+            WALLET_READ_SETTLED_TIP_BLOCK_V1,
+            WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+            WALLET_READ_COMPACT_BLOCK_RANGE_V2,
+            WALLET_READ_SERVER_INFO_V2,
+            WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+            WALLET_READ_TRANSACTION_BY_ID_V2,
+            WALLET_READ_TRANSACTION_BYTES_V1,
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+            WALLET_EVENTS_MEMPOOL_V2,
+            WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
+            WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
+        ] {
+            assert!(transactions.contains(always_supported));
+        }
+        for structurally_absent in [
+            WALLET_READ_FULL_BLOCK_AT_V1,
+            WALLET_READ_FULL_BLOCK_RANGE_V1,
+            WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+            WALLET_BROADCAST_TRANSACTION_V1,
+            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
+            WALLET_READ_TRANSPARENT_OUTPUTS_V1,
+            WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
+        ] {
+            assert!(!transactions.contains(structurally_absent));
+        }
+
+        let probed_node = NodeCapabilities::new([
+            NodeCapability::OpenRpcDiscovery,
+            NodeCapability::TreeState,
+            NodeCapability::TransactionBroadcast,
+        ])?;
+        let all = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+            RawBlobRetention::All,
+            probed_node,
+            &admitted_ingest_control,
+        );
+        for evidence_backed in [
+            WALLET_READ_FULL_BLOCK_AT_V1,
+            WALLET_READ_FULL_BLOCK_RANGE_V1,
+            WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+            WALLET_BROADCAST_TRANSACTION_V1,
+            WALLET_READ_TRANSACTION_BY_ID_V2,
+            WALLET_READ_TRANSACTION_BYTES_V1,
+            WALLET_SNAPSHOT_MEMPOOL_V3,
+            WALLET_EVENTS_MEMPOOL_V2,
+            WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
+            WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
+        ] {
+            assert!(all.contains(evidence_backed));
+        }
+        for still_absent in [
+            WALLET_READ_TRANSPARENT_OUTPUTS_V1,
+            WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
+        ] {
+            assert!(!all.contains(still_absent));
+        }
+        ingest_fixture.shutdown().await?;
+        Ok(())
     }
 }

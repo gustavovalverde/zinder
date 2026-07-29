@@ -42,7 +42,8 @@ macro_rules! define_error_reasons {
 define_error_reasons! {
     Unspecified => "ERROR_REASON_UNSPECIFIED",
     InvalidBlockRange => "INVALID_BLOCK_RANGE",
-    CompactBlockRangeTooLarge => "COMPACT_BLOCK_RANGE_TOO_LARGE",
+    BlockRangeTooLarge => "BLOCK_RANGE_TOO_LARGE",
+    SubtreeRootRangeTooLarge => "SUBTREE_ROOT_RANGE_TOO_LARGE",
     ChainEventCursorInvalid => "CHAIN_EVENT_CURSOR_INVALID",
     AddressOutputCursorInvalid => "ADDRESS_OUTPUT_CURSOR_INVALID",
     TransparentHistoryCursorInvalid => "TRANSPARENT_HISTORY_CURSOR_INVALID",
@@ -79,12 +80,14 @@ define_error_reasons! {
     EntropyUnavailable => "ENTROPY_UNAVAILABLE",
     ExplorerInternal => "EXPLORER_INTERNAL",
     MaterializedViewUnavailable => "MATERIALIZED_VIEW_UNAVAILABLE",
+    EndpointCapabilityUnavailable => "ENDPOINT_CAPABILITY_UNAVAILABLE",
     NodeCapabilityMissing => "NODE_CAPABILITY_MISSING",
     ExplorerPreconditionUnsatisfied => "EXPLORER_PRECONDITION_UNSATISFIED",
     NoVisibleChainEpoch => "NO_VISIBLE_CHAIN_EPOCH",
     ExplorerMethodDisabled => "EXPLORER_METHOD_DISABLED",
     DependencyNotConfigured => "DEPENDENCY_NOT_CONFIGURED",
     UpstreamUnreachable => "UPSTREAM_UNREACHABLE",
+    ServiceNotReady => "SERVICE_NOT_READY",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -98,7 +101,8 @@ mod tests {
         let generated_reasons = [
             WireErrorReason::Unspecified,
             WireErrorReason::InvalidBlockRange,
-            WireErrorReason::CompactBlockRangeTooLarge,
+            WireErrorReason::BlockRangeTooLarge,
+            WireErrorReason::SubtreeRootRangeTooLarge,
             WireErrorReason::ChainEventCursorInvalid,
             WireErrorReason::AddressOutputCursorInvalid,
             WireErrorReason::TransparentHistoryCursorInvalid,
@@ -135,12 +139,14 @@ mod tests {
             WireErrorReason::EntropyUnavailable,
             WireErrorReason::ExplorerInternal,
             WireErrorReason::MaterializedViewUnavailable,
+            WireErrorReason::EndpointCapabilityUnavailable,
             WireErrorReason::NodeCapabilityMissing,
             WireErrorReason::ExplorerPreconditionUnsatisfied,
             WireErrorReason::NoVisibleChainEpoch,
             WireErrorReason::ExplorerMethodDisabled,
             WireErrorReason::DependencyNotConfigured,
             WireErrorReason::UpstreamUnreachable,
+            WireErrorReason::ServiceNotReady,
         ];
 
         for generated in generated_reasons {

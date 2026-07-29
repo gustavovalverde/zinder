@@ -56,7 +56,9 @@ enum ReadinessCause {
   // and wallet pair, but the pair is still within its staleness ceiling and
   // remains exactly what the writer last attested, so it keeps serving.
   READINESS_CAUSE_SERVING_PAIR_STALE = 17;
-
+  // The authenticated ingest-control channel or one of its required live
+  // health RPCs is temporarily unavailable.
+  READINESS_CAUSE_INGEST_CONTROL_UNAVAILABLE = 18;
 }
 
 // Snapshot of the current readiness state surfaced to operators and orchestrators.

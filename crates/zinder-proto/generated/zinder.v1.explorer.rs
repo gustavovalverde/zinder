@@ -3070,12 +3070,13 @@ pub struct OverviewSnapshotRequest {
 }
 /// `ExplorerQuery.OverviewSnapshot` response.
 ///
-/// All sub-fields are read against the snapshot identified by
-/// `freshness.chain_epoch`; the bundle never spans two tips. The handler
-/// reads the wallet tip once and every materialized-view field once, in one
-/// pass, then assembles the single freshness envelope. Consumers compare
-/// `freshness.chain_epoch` (and the higher-level `tip_hash` they derive
-/// from it) across responses to detect snapshot boundary crosses.
+/// All present sub-fields are read against the snapshot identified by
+/// `freshness.chain_view.chain_epoch`; the bundle never spans two tips. Optional
+/// fields whose wallet capability is structurally unavailable are identified in
+/// `freshness.unavailable`. The handler reads the wallet tip once and every
+/// materialized-view field once, in one pass, then assembles the single
+/// freshness envelope. Consumers compare the chain epoch's `chain_epoch_id` and
+/// `visible_tip` across responses to detect snapshot boundary crosses.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OverviewSnapshotResponse {
     /// Cross-cutting envelope (field tag 1 per ADR-0011). Single freshness
@@ -3089,7 +3090,9 @@ pub struct OverviewSnapshotResponse {
     #[prost(int64, tag = "2")]
     pub tip_block_time_unix_seconds: i64,
     /// Mempool snapshot (counts and freshness extremes) at the bundle's
-    /// observation instant.
+    /// observation instant. Absent when the wallet query structurally lacks
+    /// `wallet.snapshot.mempool_v3`; `freshness.unavailable` then contains the
+    /// field path `mempool`.
     #[prost(message, optional, tag = "3")]
     pub mempool: ::core::option::Option<OverviewMempool>,
     /// Rolling counts of mempool events over a sliding window ending at the
@@ -3102,7 +3105,10 @@ pub struct OverviewSnapshotResponse {
     pub fee_summary: ::core::option::Option<OverviewFeeSummary>,
     /// Chain-wide value pool totals at the snapshot's tip. Preserves
     /// upstream order so unknown future pools flow through without a wire
-    /// shape change.
+    /// shape change. When the wallet query structurally lacks
+    /// `wallet.read.chain_value_pools_at_tip_v1`, this list is empty and
+    /// `freshness.unavailable` contains the field path `value_pools`, which
+    /// distinguishes unavailable data from an observed empty list.
     #[prost(message, repeated, tag = "6")]
     pub value_pools: ::prost::alloc::vec::Vec<super::wallet::ChainValuePool>,
     /// Top-K block summaries ending at the snapshot's tip, ordered by
@@ -3202,7 +3208,7 @@ pub enum UnavailableReason {
     UnavailablePrivateByDesign = 1,
     /// Computation depends on prevouts that could not be resolved.
     UnavailablePrevoutsMissing = 2,
-    /// The upstream node does not expose the fact this field needs.
+    /// An upstream dependency does not expose the fact this field needs.
     UnavailableUpstreamNotSupported = 3,
     /// The derived index does not yet contain this entity.
     UnavailableNotIndexed = 4,

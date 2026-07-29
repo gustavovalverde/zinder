@@ -1,9 +1,10 @@
 # Integration Surfaces
 
 This page starts after a client has chosen Zinder. It maps each client shape to
-the smallest suitable contract, then uses existing wallet codebases to show
-which methods an adapter would require. For the architectural choice between
-Zebra, Zaino, Zinder, and lightwalletd, see
+the smallest suitable contract and records the boundary between protocol
+coverage and consumer certification. For the architectural choice between
+direct node access, an embedded indexer, a shared Zinder deployment, and
+lightwalletd-compatible serving, see
 [Indexer/wallet boundary](../architecture/indexer-wallet-boundary.md).
 
 ## Pick a surface
@@ -11,22 +12,21 @@ Zebra, Zaino, Zinder, and lightwalletd, see
 | Client shape | Integration surface | Constraint |
 | --- | --- | --- |
 | Existing lightwalletd client | `zinder-compat-lightwalletd` | The client already speaks `CompactTxStreamer`; changing the endpoint should not require a protocol rewrite. |
-| Rust wallet or service that needs live events or broadcast | `zinder-client::RemoteChainIndex` | The consumer can link the Zinder Rust crates and reach a deployment that embeds the native `WalletQuery` adapter over gRPC. |
+| Rust wallet or service that needs live events or broadcast | `zinder-client::RemoteChainIndex` | The consumer can link the Zinder Rust crates and reach a `zinder-query` deployment over gRPC. |
 | Client that cannot link `zinder-client` | Vendored `WalletQuery` protos | The consumer generates a native gRPC client with its own language and toolchain. |
 | Explorer or analytics application | `ExplorerQuery`, with `WalletQuery` where required | The consumer needs derived views rather than only wallet-sync artifacts. |
 
-## Method mapping from existing wallets
+## Current consumer boundaries
 
-The wallet codebases below demonstrate integration seams and method demand; they are not a Zinder support matrix. The mapping describes what an adapter could call on Zinder `main`, without assuming that a wallet-specific adapter has landed or passed end-to-end certification.
+Method coverage proves that Zinder has an appropriate public primitive. A
+support claim additionally requires the consumer's create or import, sync,
+recovery, send, mempool, and reorg flows against a selected release and
+network.
 
-| Wallet codebase | Existing seam | Zinder methods or method families | Integration shape |
-| --- | --- | --- | --- |
-| [ZODL](https://github.com/zodl-inc/zodl-android) | Zcash Android SDK `LightWalletEndpoint` | `GetLightdInfo`, `GetLatestBlock`, `GetBlockRange`, `GetTreeState`, `GetSubtreeRoots`, `GetTransaction`, `GetAddressUtxosStream`, `GetTaddressTxids`, `SendTransaction`, `GetMempoolTx`, and `GetMempoolStream` | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; no native Zinder adapter is required. |
-| [Vizor](https://github.com/chainapsis/vizor-wallet) | librustzcash `lightwalletd-tonic` client with a configurable endpoint | `GetLightdInfo`, latest block and block ranges, tree state, subtree roots, transaction lookup, transparent receiver discovery, `SendTransaction`, and mempool methods through librustzcash's sync engine | Point the existing `CompactTxStreamer` client at `zinder-compat-lightwalletd`; public deployments also need trusted TLS in front of Zinder. |
-| [Zallet](https://github.com/zcash/zallet) | Backend-neutral `Chain` and snapshot-scoped `ChainView` traits | `ServerInfo`, `VisibleTipBlock`, `FullBlocksInRange`, block headers, `SubtreeRoots`, `Transaction`, transparent output and spend lookups, `ChainEvents`, `MempoolSnapshot`, `MempoolEvents`, and `BroadcastTransaction` | Implement a new native `WalletQuery` adapter behind the existing traits. This mapping does not claim that Zallet integration exists on Zinder `main`. |
-| [Zally](https://github.com/gustavovalverde/zally) | `ChainSource` for reads and events, plus `Submitter` for broadcast | `SettledTipBlock`, `VisibleTipBlock`, `CompactBlocksInRange`, `TreeState`, `SubtreeRoots`, `Transaction`, `TransparentAddressUnspentOutputs`, `ChainEvents`, and `BroadcastTransaction` | Map the traits to public `RemoteChainIndex` and `EndpointBackedIndex`. |
-
-Method coverage proves that Zinder has an appropriate public primitive. A support claim additionally requires the wallet's create or import, sync, recovery, send, mempool, and reorg flows against the selected wallet release and network.
+| Consumer | Contract | Current claim |
+| --- | --- | --- |
+| [Zallet](https://github.com/zcash/zallet) | Native `WalletQuery` through the backend-neutral `Chain` and snapshot-scoped `ChainView` traits | The current source-built default Zinder backend is Regtest-certified for server metadata, network-upgrade activations, visible tip, block selectors and headers, full blocks, tree state, Sapling, Orchard, and Ironwood subtree roots, transaction lookup, transparent-address UTXOs and ascending history, chain events, mempool snapshot and events, and broadcast. Official Zallet packaging remains tracked in [Zallet #696](https://github.com/zcash/zallet/issues/696). |
+| [ZODL](https://github.com/zodl-inc/zodl-android) | Zcash Android SDK `LightWalletEndpoint` over `CompactTxStreamer` | The protocol shape maps to `zinder-compat-lightwalletd`, but current ZODL and SDK certification over an Android-trusted TLS route is still required before Zinder claims support. |
 
 ## Lightwalletd compatibility
 
@@ -67,11 +67,23 @@ Public deployments terminate TLS, authentication, rate limiting, and quota contr
 The contract is split across two async traits so the compiler expresses which calls a handle can serve:
 
 - `ChainIndex` carries immutable network metadata plus canonical and wallet-projection reads. `RemoteChainIndex` implements the typed client contract; consumers preflight advertised capabilities before relying on optional reads.
-- `EndpointBackedIndex` carries the reads that need a live ingest-control/broadcast endpoint: transaction broadcast, the chain-event stream, live-mempool snapshot/events/overlays, chain value-pools, and the wallet-plane server descriptor. Only `RemoteChainIndex` implements it.
+- `EndpointBackedIndex` carries operations that need live endpoint-owned
+  collaborators: transaction broadcast and chain value-pools require an
+  admitted upstream source; the chain-event stream and live-mempool
+  snapshot/events/overlays require the writer control boundary; and the
+  wallet-plane server descriptor describes the endpoint itself. Only
+  `RemoteChainIndex` implements it. The release query currently omits the
+  chain-value-pools capability because method discovery alone does not prove
+  the required payload or retained liveness semantics.
 
 A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
 
-The public traits and protocol include full-block and transparent-outpoint methods for consumer compatibility, but the released exact-pair `WalletServingQuery` returns `Unavailable` for those reads and `zinder-query` does not advertise their capabilities. Method presence is not a deployment support claim.
+The public traits and protocol include optional full-block and
+transparent-outpoint methods. The admitted wallet-serving query advertises
+full-block reads only when authenticated canonical retention is `all`.
+Transparent-outpoint reads remain omitted until their concrete serving-pair
+resolvers are implemented. Method presence is not a deployment support claim;
+consumers must preflight exact capability strings.
 
 Capture calls `current_epoch` once. A remote serving pair that has advanced
 returns `IndexerError::ChainEpochPinUnavailable`; its
@@ -141,15 +153,39 @@ At connect time, call `ServerInfo` and check:
 2. `contract_revision` meets the consumer's minimum.
 3. Every capability the consumer requires is present in `capabilities`.
 
-One caveat: the wallet-plane mempool capabilities (`wallet.snapshot.mempool_v3`, `wallet.events.mempool_v2`, the `wallet.mempool.*` reads) are always-on and advertised whether or not the deployment wires the ingest-control proxy that feeds them. Snapshot and point reads return `UNAVAILABLE` unless the mempool source tip exactly matches the canonical visible tip. Native `MempoolEvents` remains a tip-agnostic durable lifecycle stream; consumers combine it with `ChainEvents` when they need a tip-coherent view. `wallet.events.chain_v1` is gated on the deployment actually serving the chain-event stream, so a consumer that needs live-plane data probes that capability or issues a live call (for example `MempoolSnapshot`) and handles the failure.
+The release `zinder-query` composition admits one authenticated
+`IngestControl` identity before opening storage or binding traffic. Admission
+validates the exact service name, network, contract revision, and the seven
+control methods required for pair publication, transaction lookup, mempool
+snapshot and events, and the two admitted transparent mempool primitives. The query,
+serving-pair publisher, live wallet handlers, and readiness probe all clone the
+same admitted channel. The probe checks `WriterStatus` plus a bounded,
+tip-coherent `MempoolSnapshot`; it does not repeat structural `ServerInfo`
+discovery.
+
+The native endpoint therefore advertises transaction lookup, mempool snapshot
+and events, transparent mempool outputs-by-address and
+spends-by-outpoint from that concrete composition. It omits
+`wallet.address.transparent_balance_v1`: the legacy composite performs multiple
+canonical and live calls without one authenticated mempool snapshot, so
+provider presence alone is not sufficient admission evidence. Transaction-byte
+support additionally requires authenticated transaction-blob retention.
+Temporary ingest-control failure drains readiness without rewriting the
+immutable capability set. Methods with no admitted provider or coherent
+snapshot, including transparent mempool outputs-by-outpoint and transparent
+balance, remain omitted and fail their capability guard before provider
+access. These Zinder contract claims do not replace current Zallet or ZODL
+consumer certification.
+`wallet.events.chain_v1` remains independently derived from the admitted
+serving pair.
 
 ## Server-side wallets
 
-Server-side wallets can pair `zinder-client` with a higher-level wallet library
-or directly with librustzcash crates. Zinder owns chain reads and broadcast; the
-wallet process owns keys, trial decryption, note state, account state,
-transaction building, and proving. See
-[Server-side wallet pattern](server-side-wallet-pattern.md).
+Server-side wallets can pair `zinder-client` with a higher-level wallet
+library. Zinder owns consumer-neutral chain reads and broadcast; the wallet
+process owns keys, trial decryption, note state, account state, transaction
+building, and proving. Keep that boundary explicit instead of embedding a
+wallet model in the chain-data service.
 
 ## Explorer and analytics views
 
@@ -167,4 +203,3 @@ touching canonical chain state.
 - [Wallet data plane](../architecture/wallet-data-plane.md)
 - [Materialized-view plane](../architecture/materialized-view-plane.md)
 - [Protocol boundary](../architecture/protocol-boundary.md)
-- [Server-side wallet pattern](server-side-wallet-pattern.md)

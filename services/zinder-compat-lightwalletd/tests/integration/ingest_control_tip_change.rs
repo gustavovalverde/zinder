@@ -155,6 +155,7 @@ impl CanonicalWriterTask {
                 self.activations.clone(),
             ),
             checkpoint_height: Some(BlockHeight::new(1)),
+            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
             reorg_window_blocks: 100,
             follow: CanonicalFollowConfig {
                 request_timeout: Duration::from_secs(5),

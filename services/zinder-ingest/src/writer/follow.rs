@@ -20,7 +20,7 @@ use zinder_store::{
 
 use crate::{
     CanonicalBlockConstructionError, CanonicalConstructionError, CommitmentTreeSizes, IngestError,
-    MempoolReadyGate, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
+    MempoolReadyGate, position_canonical_block, prepare_canonical_block,
     source_recovery::{
         SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
         detail_for_ongoing_outage,
@@ -31,6 +31,7 @@ use crate::{
     writer::control::{
         CanonicalControlCommand, CanonicalControlScheduling, apply_canonical_control_command,
     },
+    writer::raw_blob_policy_for_retention,
 };
 
 /// Polling and bounded-source settings for canonical following.
@@ -611,6 +612,7 @@ where
     )
     .await?;
     let predecessor_checkpoint = anchor.tip_checkpoint().clone();
+    let raw_blob_retention = store.raw_blob_retention();
     let preparation_started = std::time::Instant::now();
     let activations_for_prepare = Arc::clone(&network_upgrade_activations);
     let (block, next_tip_metadata) = tokio::task::spawn_blocking(move || {
@@ -619,6 +621,7 @@ where
             &predecessor_checkpoint,
             &source_checkpoint,
             activations_for_prepare.as_ref(),
+            raw_blob_retention,
         )
     })
     .await
@@ -753,6 +756,7 @@ where
 
     let mut predecessor_checkpoint =
         store.replacement_parent_checkpoint(common_parent, network_upgrade_activations.as_ref())?;
+    let raw_blob_retention = store.raw_blob_retention();
     let mut previous_tip_metadata = predecessor_checkpoint.tip_metadata();
     let mut replacement_blocks = Vec::new();
     let mut height = Some(first_replacement_height);
@@ -796,6 +800,7 @@ where
                 &predecessor_for_prepare,
                 &checkpoint_for_prepare,
                 activations_for_prepare.as_ref(),
+                raw_blob_retention,
             )
         })
         .await
@@ -884,12 +889,13 @@ fn prepare_live_block(
     predecessor_checkpoint: &CommitmentTreeCheckpoint,
     source_checkpoint: &CommitmentTreeCheckpoint,
     network_upgrade_activations: &NetworkUpgradeActivations,
+    raw_blob_retention: zinder_store::RawBlobRetention,
 ) -> Result<(CanonicalBuildBlock, ChainTipMetadata), CanonicalFollowError> {
     let height = source_block.height;
     let prepared = prepare_canonical_block(
         source_block,
         network_upgrade_activations,
-        RawBlobPolicy::Transactions,
+        raw_blob_policy_for_retention(raw_blob_retention),
     )?;
     let commitments = compact_block_commitments(&prepared)?;
     let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(

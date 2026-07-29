@@ -1,50 +1,35 @@
-//! Zallet-shaped consumer assertions.
+//! Frozen P1 Zallet bounded-scan contract assertions.
 //!
-//! These checks model the typed shape a wallet adapter needs without claiming
-//! downstream certification. Base canonical reads live on `ChainIndex`; broadcast,
-//! standalone mempool presence, and the chain-event stream need a live
-//! endpoint, so they live on `EndpointBackedIndex` and a consumer that calls
-//! them bounds its handle `T: ChainIndex + EndpointBackedIndex`. Renaming or
-//! removing any referenced method makes this module fail to compile.
+//! This fixture proves the public client shape used by the unshippable P1
+//! tracer. It deliberately excludes the selector, transaction, mempool,
+//! event, broadcast, transparent, and whole-sync behavior assigned to later
+//! slices. Real current-Zallet execution remains separate certification.
 
-use eyre::eyre;
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
+
+use tokio_stream::StreamExt as _;
 use zinder_client::{
-    BlockHeight, BlockSelector, ChainIndex, EndpointBackedIndex, OwnedChainSnapshot,
-    RemoteChainIndex, TransactionId, TxStatus,
+    BlockHeight, BlockHeightRange, Capability, CapabilityDescriptor, ChainIndex,
+    EndpointBackedIndex, OwnedChainSnapshot, RemoteChainIndex, ShieldedProtocol, SubtreeRootIndex,
+    SubtreeRootRange,
 };
-use zinder_testkit::FixtureTransactionRows;
+use zinder_store::RawBlobRetention;
 
 use super::{open_remote_chain_index, parity_chain_fixture};
 
 #[test]
-fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
+fn bounded_scan_surface_compiles_for_the_p1_zallet_tracer() {
     fn assert_base_compiles<T: ChainIndex>() {
-        // typed BlockId from visible_tip_block
+        let _ = T::current_epoch;
         let _ = T::visible_tip_block;
-        // typed BlockSelector resolver
-        let _ = T::block_id_by_selector;
-        // typed BlockHeader
-        let _ = T::block_header_by_selector;
-        // typed TxStatus envelope (mined / mempool / not found)
-        let _ = T::transaction_by_id;
-        // immutable network metadata used to choose consensus branch ids
         let _ = T::network_upgrade_activations;
-        // typed raw full-block artifact reads
         let _ = T::full_block_at;
         let _ = T::full_blocks_in_range;
-        // tree_state_at with Option<ChainEpoch>
         let _ = T::tree_state_at;
-        // typed SubtreeRootHash + ShieldedProtocol enum
         let _ = T::subtree_roots_in_range;
     }
     fn assert_endpoint_compiles<T: EndpointBackedIndex>() {
-        // standalone is_in_mempool boolean check
-        let _ = T::is_in_mempool;
-        // typed RawTransactionBytes
-        let _ = T::broadcast_transaction;
-        // ChainCommitted as a typed signal in chain_events
-        let _ = T::chain_events;
+        let _ = T::server_info;
     }
     fn assert_storable_chain_view<View: Clone + Send + Sync + 'static>() {}
 
@@ -58,26 +43,28 @@ fn parity_chain_index_surface_compiles_for_zallet_native_contract() {
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "The Zallet-shaped remote snapshot scenario keeps capability preflight and epoch-bound reads in one consumer flow."
+    reason = "The frozen P1 tracer scenario keeps exact capability preflight and every bounded epoch-bound read in one consumer flow."
 )]
-async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
-    let transaction_id = TransactionId::from_bytes([0x42; 32]);
-    let base_fixture = parity_chain_fixture(2);
-    let transaction_block = base_fixture
-        .block_at(BlockHeight::new(2))
-        .ok_or_else(|| eyre!("fixture must contain block 2"))?;
-    let transaction_block_height = transaction_block.height;
-    let transaction_block_hash = transaction_block.hash;
-    let transaction_rows = FixtureTransactionRows::from_raw_transaction(
-        transaction_id,
-        transaction_block_height,
-        transaction_block_hash,
-        0,
-        b"zallet-transaction-payload".to_vec(),
-    );
-    let transaction_location = transaction_rows.location;
-    let chain_fixture = base_fixture.with_transaction_rows(transaction_rows);
+async fn serves_the_frozen_p1_bounded_scan_from_release_composition() -> eyre::Result<()> {
+    let chain_fixture = parity_chain_fixture(2).with_raw_blob_retention(RawBlobRetention::All);
     let chain_index = open_remote_chain_index(&chain_fixture).await?;
+    let server_info = chain_index.server_info().await?;
+    for required in [
+        Capability::ServerInfo,
+        Capability::NetworkUpgradeActivations,
+        Capability::VisibleTipBlock,
+        Capability::TreeState,
+        Capability::SubtreeRoots,
+        Capability::SubtreeRootsIronwood,
+        Capability::FullBlock,
+        Capability::FullBlockRange,
+    ] {
+        assert!(
+            server_info.supports(required.clone()),
+            "release fixture omitted frozen P1 tracer capability {}",
+            required.as_str()
+        );
+    }
     let activations = chain_index.network_upgrade_activations().await?;
     assert_eq!(
         activations,
@@ -88,43 +75,41 @@ async fn reads_epoch_bound_shape_from_fixture() -> eyre::Result<()> {
     let chain_view = OwnedChainSnapshot::capture(chain_index).await?;
 
     let visible_tip_block = chain_view.visible_tip_block().await?;
-    let resolved_by_height = chain_view
-        .block_id_by_selector(BlockSelector::Height(BlockHeight::new(2)))
-        .await?;
-    let resolved_by_hash = chain_view
-        .block_id_by_selector(BlockSelector::Hash(transaction_block_hash))
-        .await?;
-    let tree_state = chain_view.tree_state_at(BlockHeight::new(2)).await?;
-    let mined_status = chain_view.transaction_by_id(transaction_id).await?;
-    let missing_status = chain_view
-        .transaction_by_id(TransactionId::from_bytes([0x24; 32]))
-        .await?;
+    assert_eq!(visible_tip_block.height, BlockHeight::new(2));
+    let tree_state = chain_view.tree_state_at(BlockHeight::new(1)).await?;
+    assert_eq!(tree_state.height, BlockHeight::new(1));
 
-    assert_eq!(visible_tip_block, resolved_by_height);
-    assert_eq!(visible_tip_block, resolved_by_hash);
-    assert_eq!(tree_state.height, BlockHeight::new(2));
-    assert_eq!(tree_state.block_hash, transaction_block_hash);
-    let TxStatus::Mined(mined) = mined_status else {
-        return Err(eyre!("expected mined transaction, got {mined_status:?}"));
-    };
+    let full_block = chain_view.full_block_at(BlockHeight::new(1)).await?;
+    assert_eq!(full_block.height, BlockHeight::new(1));
+    let mut full_blocks = chain_view
+        .full_blocks_in_range(BlockHeightRange::inclusive(
+            BlockHeight::new(1),
+            BlockHeight::new(2),
+        ))
+        .await?;
+    let mut full_block_heights = Vec::new();
+    while let Some(block) = full_blocks.next().await {
+        full_block_heights.push(block?.height);
+    }
     assert_eq!(
-        mined.location.transaction_id,
-        transaction_location.transaction_id
+        full_block_heights,
+        vec![BlockHeight::new(1), BlockHeight::new(2)]
     );
-    assert_eq!(
-        mined.location.block_height,
-        transaction_location.block_height
-    );
-    assert_eq!(mined.location.block_hash, transaction_location.block_hash);
-    assert_eq!(mined.location.tx_index_in_block, 0);
-    assert_eq!(mined.chain_context.confirmations, 1);
-    assert_eq!(
-        mined.raw_transaction_bytes,
-        Some(b"zallet-transaction-payload".to_vec()),
-        "the mined arm carries serialized bytes; a getrawtransaction-verbose \
-         consumer reads bytes, location, and confirmations from one response",
-    );
-    assert_eq!(missing_status, TxStatus::NotFound);
+
+    for protocol in [
+        ShieldedProtocol::Sapling,
+        ShieldedProtocol::Orchard,
+        ShieldedProtocol::Ironwood,
+    ] {
+        let roots = chain_view
+            .subtree_roots_in_range(SubtreeRootRange::new(
+                protocol,
+                SubtreeRootIndex::new(0),
+                NonZeroU32::MIN,
+            ))
+            .await?;
+        assert!(roots.len() <= 1);
+    }
 
     Ok(())
 }

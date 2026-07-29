@@ -208,6 +208,8 @@ message CanonicalOwnerCheckpointBuildPlanEvidence {
   CanonicalCheckpointBlockId history_preceding_checkpoint = 4;
   CanonicalCheckpointHistoryPredecessor history_predecessor = 5;
   CanonicalCheckpointBlockId build_tip = 6;
+  // Exact persisted raw-blob retention: none, transactions, or all.
+  string raw_blob_retention = 7;
 }
 
 // Complete READY evidence cold-read from one owner-created canonical

@@ -213,10 +213,10 @@ separate decision that names the deployment shape it serves.
 - The interceptors plug into `tonic::service::interceptor::InterceptedService`
   on the server (`CanonicalIngestControlGrpcAdapter::into_server`) and into
   `IngestControlClient::with_interceptor` on every consumer.
-- Consumers thread an `Option<BearerToken>` through their public
-  builders: `WriterStatusConfig.bearer_token`,
-  `WalletQueryGrpcAdapter::with_ingest_control_bearer_token`,
-  `IngestControlMempoolSurface::with_bearer_token`,
+- Consumers thread an `Option<BearerToken>` through the exact connection they
+  own: `AdmittedIngestControl::connect`,
+  `WalletServingPairPublisher::bootstrap_from_writer_status_endpoint`,
+  `IngestControlMempoolSurface::with_bearer_token`, and
   `spawn_ingest_control_tip_change_publisher(_, bearer_token, _)`.
 
 ## Out of Scope

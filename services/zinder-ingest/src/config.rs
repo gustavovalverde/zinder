@@ -23,12 +23,13 @@ use zinder_ingest::{
 };
 use zinder_runtime::{
     ConfigError, ConfigLoader, IngestControlSection, IngestControlWriterToml, NetworkSection,
-    NetworkToml, NodeToml, OpsSection, OpsToml, ResolvedIngestControlWriter, ResolvedRetention,
-    RetentionSection, RetentionToml, RuntimeService, SecuritySection, SecurityToml,
-    StorageRoleSection, StorageRoleToml, duration_as_millis_u64, guard_optional_serving_bind,
-    require_field, resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
-    resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer,
-    resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr, resolve_retention,
+    NetworkToml, NodeToml, OpsSection, OpsServerError, OpsToml, ResolvedIngestControlWriter,
+    ResolvedRetention, RetentionSection, RetentionToml, RuntimeService, SecuritySection,
+    SecurityToml, StorageRoleSection, StorageRoleToml, duration_as_millis_u64,
+    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
+    resolve_canonical_reader_rocksdb_budget, resolve_canonical_writer_rocksdb_budget,
+    resolve_ingest_control_writer, resolve_materialized_view_writer_rocksdb_budget,
+    resolve_ops_listen_addr, resolve_retention,
 };
 use zinder_source::{
     DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
@@ -187,6 +188,9 @@ pub(crate) struct CanonicalReplayVerificationConfigOverrides {
 pub(crate) enum IngestConfigError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+
+    #[error(transparent)]
+    OpsServer(#[from] OpsServerError),
 
     #[error(transparent)]
     Ingest(#[from] IngestError),

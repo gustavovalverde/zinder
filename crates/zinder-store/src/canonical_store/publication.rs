@@ -305,6 +305,7 @@ impl PublicationContext {
             &bounded_open.db,
             &self.build_plan,
             &self.block_evidence,
+            self.subtree_root_evidence,
         )?;
         let persisted_subtree_evidence = persisted_subtree_validation.evidence;
         if persisted_subtree_evidence != self.subtree_root_evidence {

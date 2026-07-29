@@ -243,6 +243,7 @@ fn canonical_writer_config(
             network_upgrade_activations: activations,
         },
         checkpoint_height: Some(checkpoint_height),
+        raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
         reorg_window_blocks: 100,
         follow: CanonicalFollowConfig {
             request_timeout: env.target.request_timeout,

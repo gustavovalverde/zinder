@@ -1835,7 +1835,8 @@ mod tests {
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventHistoryRequest,
         CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreWorkload,
-        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+        RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+        RocksDbResourceBudget,
     };
     use zinder_wallet_projection::{
         WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest,
@@ -1893,6 +1894,7 @@ mod tests {
             &activations,
             CommitmentTreeCheckpoint::new(predecessor, 99, CommitmentTreeFrontiers::default()),
             checkpoint_block,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
         )?;
         let mut canonical_builder = RocksDbCanonicalBuilder::create_fresh(
@@ -2011,6 +2013,7 @@ mod tests {
             temporary.path().join("canonical-secondary"),
             &activations,
             CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;

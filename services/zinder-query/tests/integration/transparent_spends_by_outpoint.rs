@@ -17,7 +17,7 @@ use zinder_materialized_views::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    QueryError, ServerInfoSettings, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
+    QueryError, WalletEndpointMetadata, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
 };
 use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
 use zinder_testkit::{
@@ -537,7 +537,7 @@ async fn transparent_spends_by_outpoint_grpc_rejects_coinbase_sentinel() -> eyre
         vec![compact_block],
     ))?;
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let request = Request::new(wallet::TransparentSpendsByOutpointRequest {
         outpoints: vec![wallet::OutPoint {
@@ -567,7 +567,7 @@ async fn transparent_spends_by_outpoint_grpc_projects_block_location() -> eyre::
     let (spent_outpoint, spend) = commit_spent_outpoint_fixture(&store)?;
 
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, ServerInfoSettings::default());
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let request = Request::new(wallet::TransparentSpendsByOutpointRequest {
         outpoints: vec![wallet::OutPoint {

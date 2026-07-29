@@ -259,6 +259,9 @@ pub enum ReadinessCause {
     /// and wallet pair, but the pair is still within its staleness ceiling and
     /// remains exactly what the writer last attested, so it keeps serving.
     ServingPairStale = 17,
+    /// The authenticated ingest-control channel or one of its required live
+    /// health RPCs is temporarily unavailable.
+    IngestControlUnavailable = 18,
 }
 impl ReadinessCause {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -282,6 +285,9 @@ impl ReadinessCause {
             Self::ShuttingDown => "READINESS_CAUSE_SHUTTING_DOWN",
             Self::UpstreamNotReady => "READINESS_CAUSE_UPSTREAM_NOT_READY",
             Self::ServingPairStale => "READINESS_CAUSE_SERVING_PAIR_STALE",
+            Self::IngestControlUnavailable => {
+                "READINESS_CAUSE_INGEST_CONTROL_UNAVAILABLE"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -306,6 +312,9 @@ impl ReadinessCause {
             "READINESS_CAUSE_SHUTTING_DOWN" => Some(Self::ShuttingDown),
             "READINESS_CAUSE_UPSTREAM_NOT_READY" => Some(Self::UpstreamNotReady),
             "READINESS_CAUSE_SERVING_PAIR_STALE" => Some(Self::ServingPairStale),
+            "READINESS_CAUSE_INGEST_CONTROL_UNAVAILABLE" => {
+                Some(Self::IngestControlUnavailable)
+            }
             _ => None,
         }
     }
@@ -317,8 +326,10 @@ impl ReadinessCause {
 /// `tonic_types::ErrorDetails` shapes (`ResourceInfo`, `PreconditionFailure`,
 /// `BadRequest`).
 ///
-/// New reasons are additive only and must reserve a new scalar code;
-/// existing reasons' semantics are stable within a major version.
+/// Additive reasons reserve a new scalar code. Renaming, removing, or changing
+/// an existing reason's semantics is a breaking native-contract change: bump
+/// `WalletServerInfo.contract_revision`, reserve any removed name and scalar,
+/// and cut controlled consumers over with the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ErrorReason {
@@ -326,7 +337,7 @@ pub enum ErrorReason {
     Unspecified = 0,
     /// INVALID_ARGUMENT family.
     InvalidBlockRange = 1,
-    CompactBlockRangeTooLarge = 2,
+    BlockRangeTooLarge = 2,
     ChainEventCursorInvalid = 3,
     AddressOutputCursorInvalid = 4,
     TransparentHistoryCursorInvalid = 5,
@@ -338,6 +349,7 @@ pub enum ErrorReason {
     TransparentBalanceAddressCountExceeded = 43,
     SnapshotPageCursorInvalid = 44,
     BroadcastTransactionTooLarge = 46,
+    SubtreeRootRangeTooLarge = 49,
     /// FAILED_PRECONDITION family.
     BroadcastDisabled = 11,
     ChainEventCursorExpired = 12,
@@ -371,6 +383,7 @@ pub enum ErrorReason {
     MaterializedViewUnavailable = 34,
     NodeCapabilityMissing = 36,
     ExplorerPreconditionUnsatisfied = 40,
+    EndpointCapabilityUnavailable = 48,
     /// UNAVAILABLE family.
     NoVisibleChainEpoch = 38,
     /// UNIMPLEMENTED family.
@@ -384,6 +397,11 @@ pub enum ErrorReason {
     /// A configured federated endpoint is temporarily unreachable (cold start,
     /// restart, or transient network fault). Retrying with backoff clears it.
     UpstreamUnreachable = 42,
+    /// UNAVAILABLE family.
+    /// The process is alive but its shared readiness gate is closed. ErrorInfo
+    /// metadata carries the stable `readiness_cause` label; `/readyz` carries
+    /// any structured cause detail.
+    ServiceNotReady = 50,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -394,7 +412,7 @@ impl ErrorReason {
         match self {
             Self::Unspecified => "ERROR_REASON_UNSPECIFIED",
             Self::InvalidBlockRange => "INVALID_BLOCK_RANGE",
-            Self::CompactBlockRangeTooLarge => "COMPACT_BLOCK_RANGE_TOO_LARGE",
+            Self::BlockRangeTooLarge => "BLOCK_RANGE_TOO_LARGE",
             Self::ChainEventCursorInvalid => "CHAIN_EVENT_CURSOR_INVALID",
             Self::AddressOutputCursorInvalid => "ADDRESS_OUTPUT_CURSOR_INVALID",
             Self::TransparentHistoryCursorInvalid => "TRANSPARENT_HISTORY_CURSOR_INVALID",
@@ -408,6 +426,7 @@ impl ErrorReason {
             }
             Self::SnapshotPageCursorInvalid => "SNAPSHOT_PAGE_CURSOR_INVALID",
             Self::BroadcastTransactionTooLarge => "BROADCAST_TRANSACTION_TOO_LARGE",
+            Self::SubtreeRootRangeTooLarge => "SUBTREE_ROOT_RANGE_TOO_LARGE",
             Self::BroadcastDisabled => "BROADCAST_DISABLED",
             Self::ChainEventCursorExpired => "CHAIN_EVENT_CURSOR_EXPIRED",
             Self::MempoolEventCursorExpired => "MEMPOOL_EVENT_CURSOR_EXPIRED",
@@ -435,10 +454,12 @@ impl ErrorReason {
             Self::MaterializedViewUnavailable => "MATERIALIZED_VIEW_UNAVAILABLE",
             Self::NodeCapabilityMissing => "NODE_CAPABILITY_MISSING",
             Self::ExplorerPreconditionUnsatisfied => "EXPLORER_PRECONDITION_UNSATISFIED",
+            Self::EndpointCapabilityUnavailable => "ENDPOINT_CAPABILITY_UNAVAILABLE",
             Self::NoVisibleChainEpoch => "NO_VISIBLE_CHAIN_EPOCH",
             Self::ExplorerMethodDisabled => "EXPLORER_METHOD_DISABLED",
             Self::DependencyNotConfigured => "DEPENDENCY_NOT_CONFIGURED",
             Self::UpstreamUnreachable => "UPSTREAM_UNREACHABLE",
+            Self::ServiceNotReady => "SERVICE_NOT_READY",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -446,7 +467,7 @@ impl ErrorReason {
         match value {
             "ERROR_REASON_UNSPECIFIED" => Some(Self::Unspecified),
             "INVALID_BLOCK_RANGE" => Some(Self::InvalidBlockRange),
-            "COMPACT_BLOCK_RANGE_TOO_LARGE" => Some(Self::CompactBlockRangeTooLarge),
+            "BLOCK_RANGE_TOO_LARGE" => Some(Self::BlockRangeTooLarge),
             "CHAIN_EVENT_CURSOR_INVALID" => Some(Self::ChainEventCursorInvalid),
             "ADDRESS_OUTPUT_CURSOR_INVALID" => Some(Self::AddressOutputCursorInvalid),
             "TRANSPARENT_HISTORY_CURSOR_INVALID" => {
@@ -462,6 +483,7 @@ impl ErrorReason {
             }
             "SNAPSHOT_PAGE_CURSOR_INVALID" => Some(Self::SnapshotPageCursorInvalid),
             "BROADCAST_TRANSACTION_TOO_LARGE" => Some(Self::BroadcastTransactionTooLarge),
+            "SUBTREE_ROOT_RANGE_TOO_LARGE" => Some(Self::SubtreeRootRangeTooLarge),
             "BROADCAST_DISABLED" => Some(Self::BroadcastDisabled),
             "CHAIN_EVENT_CURSOR_EXPIRED" => Some(Self::ChainEventCursorExpired),
             "MEMPOOL_EVENT_CURSOR_EXPIRED" => Some(Self::MempoolEventCursorExpired),
@@ -491,10 +513,14 @@ impl ErrorReason {
             "EXPLORER_PRECONDITION_UNSATISFIED" => {
                 Some(Self::ExplorerPreconditionUnsatisfied)
             }
+            "ENDPOINT_CAPABILITY_UNAVAILABLE" => {
+                Some(Self::EndpointCapabilityUnavailable)
+            }
             "NO_VISIBLE_CHAIN_EPOCH" => Some(Self::NoVisibleChainEpoch),
             "EXPLORER_METHOD_DISABLED" => Some(Self::ExplorerMethodDisabled),
             "DEPENDENCY_NOT_CONFIGURED" => Some(Self::DependencyNotConfigured),
             "UPSTREAM_UNREACHABLE" => Some(Self::UpstreamUnreachable),
+            "SERVICE_NOT_READY" => Some(Self::ServiceNotReady),
             _ => None,
         }
     }

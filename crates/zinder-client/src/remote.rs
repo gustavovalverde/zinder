@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroU32;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +43,6 @@ use zinder_proto::wire::{
 };
 
 use crate::error::ZINDER_ERROR_DOMAIN;
-use crate::server_info::optional_duration;
 use crate::{
     BlockId, Capability, CapabilityDescriptor, ChainEpochCommitted, ChainEvent, ChainEventCursor,
     ChainEventEnvelope, ChainEventStream, ChainEventStreamFamily, ChainIndex, ChainRangeReverted,
@@ -117,7 +115,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 /// Oldest native wallet contract revision this client can safely consume.
-pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 4;
+pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 5;
 
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.
@@ -310,7 +308,7 @@ impl ChainIndex for RemoteChainIndex {
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
-        block_id_from_message(response.block_id)
+        block_id_from_selector_response(self.network, at_epoch_id, selector, response)
     }
 
     async fn block_header_by_selector(
@@ -327,10 +325,7 @@ impl ChainIndex for RemoteChainIndex {
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
-        let header_message = response
-            .block_header
-            .ok_or_else(|| IndexerError::malformed("block_header", "field is missing"))?;
-        block_header_from_message(header_message)
+        block_header_from_selector_response(self.network, at_epoch_id, selector, response)
     }
 
     async fn compact_block_at(
@@ -667,14 +662,11 @@ impl ChainIndex for RemoteChainIndex {
         {
             Ok(response) => response.into_inner(),
             Err(status) if status.code() == tonic::Code::NotFound => {
-                if at_epoch_id.is_some() {
-                    return Ok(TxStatus::NotFound);
-                }
-                return self.lookup_in_mempool(transaction_id).await;
+                return Ok(TxStatus::NotFound);
             }
             Err(status) => return Err(self.map_status(status)),
         };
-        tx_status_from_message(self.network, at_epoch_id, response)
+        tx_status_from_message(self.network, transaction_id, at_epoch_id, response)
     }
 
     async fn transparent_address_unspent_outputs(
@@ -734,6 +726,7 @@ impl ChainIndex for RemoteChainIndex {
         query: TransparentAddressTxIdsQuery,
     ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
         let address_script_hash = query.address_script_hash;
+        let expected_epoch_id = query.at_epoch_id;
         let request = wallet::TransparentAddressTxIdsInRangeRequest {
             address: Some(wallet::AddressLookup {
                 selector: Some(wallet::address_lookup::Selector::ScriptHash(
@@ -757,23 +750,24 @@ impl ChainIndex for RemoteChainIndex {
             .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
-        // The leading header pins the chain epoch for the whole stream; the
-        // closure captures it and drops the header (yielding no item).
-        let mut pinned_chain_epoch: Option<ChainEpoch> = None;
-        let stream = response.into_inner().filter_map(move |chunk_result| {
-            chunk_result
-                .map_err(|status| recovery.map_status(status))
-                .and_then(|chunk| {
-                    transparent_address_tx_ids_stream_item(
-                        expected_network,
-                        address_script_hash,
-                        &mut pinned_chain_epoch,
-                        chunk,
-                    )
-                })
-                .transpose()
-        });
-        Ok(Box::pin(stream))
+        let header_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let history_stream_state = TransparentHistoryStreamState {
+            expected_network,
+            expected_epoch_id,
+            address_script_hash,
+            pinned_chain_epoch: None,
+            header_seen: std::sync::Arc::clone(&header_seen),
+            stream_failed: std::sync::Arc::clone(&stream_failed),
+        };
+        let wire_stream =
+            tokio_stream::StreamExt::map(response.into_inner(), move |chunk_result| {
+                chunk_result.map_err(|status| recovery.map_status(status))
+            });
+        Ok(transparent_address_tx_ids_stream(
+            Box::pin(wire_stream),
+            history_stream_state,
+        ))
     }
 
     async fn transparent_address_balance(
@@ -894,6 +888,18 @@ fn missing_transparent_unspent_header_error(header_seen: bool) -> Option<Indexer
     (!header_seen).then(|| {
         IndexerError::malformed(
             "transparent_unspent_outputs.header",
+            "stream ended before the required chain-view header",
+        )
+    })
+}
+
+fn missing_transparent_history_header_error(
+    header_seen: bool,
+    stream_failed: bool,
+) -> Option<IndexerError> {
+    (!header_seen && !stream_failed).then(|| {
+        IndexerError::malformed(
+            "transparent_address_tx_ids.header",
             "stream ended before the required chain-view header",
         )
     })
@@ -1241,11 +1247,6 @@ fn server_info_from_message(
         build_git_commit: common.build_git_commit,
         schema_version: ArtifactSchemaVersion::new(schema_version),
         reorg_window_blocks: wallet_info.reorg_window_blocks,
-        chain_event_retention: optional_duration(wallet_info.chain_event_retention_seconds),
-        mempool_mined_retention: optional_duration(wallet_info.mempool_mined_retention_seconds),
-        mempool_invalidated_retention: optional_duration(
-            wallet_info.mempool_invalidated_retention_seconds,
-        ),
         node: wallet_info.node.map(|node| NodeServerInfo {
             version: node.version,
             capabilities: node.capabilities,
@@ -1599,64 +1600,6 @@ fn transparent_mempool_spend_from_message(
         .map_err(wallet_decode_error_to_indexer_error)
 }
 
-impl RemoteChainIndex {
-    async fn lookup_in_mempool(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Result<TxStatus, IndexerError> {
-        let mut found_entry: Option<MempoolEntry> = None;
-        self.for_each_mempool_entry(|entry| {
-            if entry.transaction_id() == transaction_id {
-                found_entry = Some(entry);
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .await?;
-        Ok(found_entry.map_or(TxStatus::NotFound, TxStatus::InMempool))
-    }
-
-    /// Walks the live mempool one server-bounded page at a time, applying
-    /// `visitor` to every entry until the visitor returns
-    /// [`ControlFlow::Break`] or the writer returns no `next_cursor`.
-    ///
-    /// Each page is bounded by the server's `MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE`
-    /// (1024 entries today). For typical mempool sizes this is one
-    /// round-trip; iterating callers pay O(mempool-size) by design, since
-    /// `MempoolSnapshot` is the only public mempool enumeration surface.
-    /// Per-txid presence checks should call [`ChainIndex::is_in_mempool`]
-    /// rather than walk the snapshot.
-    async fn for_each_mempool_entry<Visitor>(
-        &self,
-        mut visitor: Visitor,
-    ) -> Result<(), IndexerError>
-    where
-        Visitor: FnMut(MempoolEntry) -> ControlFlow<()>,
-    {
-        let mut from_cursor: Option<MempoolSnapshotCursor> = None;
-        loop {
-            let snapshot = self
-                .mempool_snapshot(MempoolSnapshotRequest {
-                    // 0 asks the writer for its default page size; the
-                    // writer caps at MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE.
-                    max_entries: 0,
-                    from_cursor,
-                })
-                .await?;
-            for entry in snapshot.entries {
-                if visitor(entry) == ControlFlow::Break(()) {
-                    return Ok(());
-                }
-            }
-            match snapshot.next_cursor {
-                Some(cursor) => from_cursor = Some(cursor),
-                None => return Ok(()),
-            }
-        }
-    }
-}
-
 fn ensure_network_name(expected: Network, actual_name: &str) -> Result<(), IndexerError> {
     let Some(actual) = decode_zinder_native_chain_name(actual_name).ok() else {
         return Err(IndexerError::NetworkMismatch {
@@ -1786,26 +1729,84 @@ fn subtree_root_from_message(
 /// is captured in `pinned_chain_epoch` and yields no item (`Ok(None)`). Every
 /// later item is bound to that captured epoch. An item before the header, or a
 /// second header, is a protocol violation.
-fn transparent_address_tx_ids_stream_item(
+struct TransparentHistoryStreamState {
     expected_network: Network,
+    expected_epoch_id: Option<ChainEpochId>,
     address_script_hash: TransparentAddressScriptHash,
-    pinned_chain_epoch: &mut Option<ChainEpoch>,
+    pinned_chain_epoch: Option<ChainEpoch>,
+    header_seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stream_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn transparent_address_tx_ids_stream(
+    wire_stream: IndexStream<wallet::TransparentAddressTxIdsChunk>,
+    state: TransparentHistoryStreamState,
+) -> TransparentAddressTxIdsStream {
+    let header_seen = std::sync::Arc::clone(&state.header_seen);
+    let stream_failed = std::sync::Arc::clone(&state.stream_failed);
+    let decoded = futures_util::stream::unfold(
+        (wire_stream, state, false),
+        |(mut wire_stream, mut state, is_terminated)| async move {
+            if is_terminated {
+                return None;
+            }
+            let message_result = futures_util::StreamExt::next(&mut wire_stream).await?;
+            let decoded = message_result
+                .and_then(|message| transparent_address_tx_ids_stream_item(&mut state, message))
+                .transpose();
+            let is_terminated = decoded.as_ref().is_some_and(Result::is_err);
+            if is_terminated {
+                state
+                    .stream_failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            Some((decoded, (wire_stream, state, is_terminated)))
+        },
+    );
+    let items = futures_util::StreamExt::filter_map(decoded, |decoded| async move { decoded });
+    let terminal = futures_util::StreamExt::filter_map(
+        futures_util::stream::once(async move {
+            missing_transparent_history_header_error(
+                header_seen.load(std::sync::atomic::Ordering::Acquire),
+                stream_failed.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .map(Err)
+        }),
+        |terminal_outcome| async move { terminal_outcome },
+    );
+    Box::pin(futures_util::StreamExt::chain(items, terminal))
+}
+
+fn transparent_address_tx_ids_stream_item(
+    state: &mut TransparentHistoryStreamState,
     message: wallet::TransparentAddressTxIdsChunk,
 ) -> Result<Option<TransparentAddressTransactionChunk>, IndexerError> {
     match message.body.ok_or_else(|| {
         IndexerError::malformed("transparent_address_tx_ids_chunk.body", "field is missing")
     })? {
         wallet::transparent_address_tx_ids_chunk::Body::Header(chain_view) => {
-            stream_header_chain_epoch(expected_network, pinned_chain_epoch, Some(chain_view))?;
+            stream_header_chain_epoch(
+                state.expected_network,
+                &mut state.pinned_chain_epoch,
+                Some(chain_view),
+            )?;
+            if state.expected_epoch_id.is_some_and(|expected| {
+                state.pinned_chain_epoch.as_ref().map(|epoch| epoch.id) != Some(expected)
+            }) {
+                return Err(IndexerError::ChainEpochPinUnavailable);
+            }
+            state
+                .header_seen
+                .store(true, std::sync::atomic::Ordering::Release);
             Ok(None)
         }
         wallet::transparent_address_tx_ids_chunk::Body::Item(entry) => {
-            let chain_epoch = stream_item_chain_epoch(pinned_chain_epoch.as_ref())?;
+            let chain_epoch = stream_item_chain_epoch(state.pinned_chain_epoch.as_ref())?;
             let transaction_id =
                 transaction_id_from_rpc_hex("transaction_id", &entry.transaction_id)?;
             let block_hash = block_hash_from_rpc_hex("block_hash", &entry.block_hash)?;
             let artifact = TransparentAddressTxIndexArtifact::new(
-                address_script_hash,
+                state.address_script_hash,
                 BlockHeight::new(entry.block_height),
                 entry.tx_index_in_block,
                 transaction_id,
@@ -1924,10 +1925,7 @@ fn mined_block_location_from_message(
     message: wallet::MinedBlockLocation,
 ) -> Result<TransactionLocation, IndexerError> {
     Ok(TransactionLocation::new(
-        transaction_id_from_rpc_hex(
-            "mined_block_location.transaction_id",
-            &message.transaction_id,
-        )?,
+        transaction_id_from_rpc_hex("mined.location.transaction_id", &message.transaction_id)?,
         BlockHeight::new(message.block_height),
         block_hash_from_rpc_hex("mined_block_location.block_hash", &message.block_hash)?,
         message.tx_index_in_block,
@@ -2341,6 +2339,7 @@ fn block_selector_to_message(
 )]
 fn tx_status_from_message(
     expected_network: Network,
+    expected_transaction_id: TransactionId,
     expected_epoch_id: Option<ChainEpochId>,
     response: wallet::TransactionStatusResponse,
 ) -> Result<TxStatus, IndexerError> {
@@ -2365,6 +2364,12 @@ fn tx_status_from_message(
                 mined_block_location_from_message(mined.location.ok_or_else(|| {
                     IndexerError::malformed("mined.location", "field is missing")
                 })?)?;
+            if location.transaction_id != expected_transaction_id {
+                return Err(IndexerError::malformed(
+                    "mined.location.transaction_id",
+                    "response transaction id does not match requested transaction id",
+                ));
+            }
             let chain_context_message = mined.chain_context.ok_or_else(|| {
                 IndexerError::malformed("mined.chain_context", "field is missing")
             })?;
@@ -2385,6 +2390,12 @@ fn tx_status_from_message(
             let entry = mempool_entry_from_message(in_mempool)
                 .map_err(wallet_decode_error_to_indexer_error)?;
             ensure_mempool_entry_network(expected_network, &entry)?;
+            if entry.transaction_id() != expected_transaction_id {
+                return Err(IndexerError::malformed(
+                    "location.in_mempool.transaction_id",
+                    "response transaction id does not match requested transaction id",
+                ));
+            }
             Ok(TxStatus::InMempool(entry))
         }
     }
@@ -2398,6 +2409,78 @@ fn block_id_from_message(block_id: Option<wallet::BlockId>) -> Result<BlockId, I
         BlockHeight::new(block_id_message.height),
         block_hash,
     ))
+}
+
+fn block_id_from_selector_response(
+    expected_network: Network,
+    expected_epoch_id: Option<ChainEpochId>,
+    requested_selector: BlockSelector,
+    response: wallet::BlockIdResponse,
+) -> Result<BlockId, IndexerError> {
+    let chain_epoch = chain_epoch_from_chain_view_with_pin(
+        expected_network,
+        expected_epoch_id,
+        response.chain_view,
+    )?;
+    let block_id = block_id_from_message(response.block_id)?;
+    ensure_block_id_matches_selector_and_visible_tip(
+        "block_id",
+        requested_selector,
+        block_id,
+        BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash),
+    )?;
+    Ok(block_id)
+}
+
+fn block_header_from_selector_response(
+    expected_network: Network,
+    expected_epoch_id: Option<ChainEpochId>,
+    requested_selector: BlockSelector,
+    response: wallet::BlockHeaderResponse,
+) -> Result<BlockHeader, IndexerError> {
+    let chain_epoch = chain_epoch_from_chain_view_with_pin(
+        expected_network,
+        expected_epoch_id,
+        response.chain_view,
+    )?;
+    let header_message = response
+        .block_header
+        .ok_or_else(|| IndexerError::malformed("block_header", "field is missing"))?;
+    let header = block_header_from_message(header_message)?;
+    ensure_block_id_matches_selector_and_visible_tip(
+        "block_header.block_id",
+        requested_selector,
+        header.block_id,
+        BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash),
+    )?;
+    Ok(header)
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "BlockSelector is #[non_exhaustive]; new selector variants require an explicit response-validation contract"
+)]
+fn ensure_block_id_matches_selector_and_visible_tip(
+    field: &'static str,
+    requested_selector: BlockSelector,
+    block_id: BlockId,
+    visible_tip: BlockId,
+) -> Result<(), IndexerError> {
+    let matches_selector = match requested_selector {
+        BlockSelector::Height(requested_height) => block_id.height == requested_height,
+        BlockSelector::Hash(requested_hash) => block_id.hash == requested_hash,
+        _ => false,
+    };
+    let is_at_or_below_visible_tip = block_id.height <= visible_tip.height;
+    let has_coherent_visible_tip_identity =
+        (block_id.height == visible_tip.height) == (block_id.hash == visible_tip.hash);
+    if !matches_selector || !is_at_or_below_visible_tip || !has_coherent_visible_tip_identity {
+        return Err(IndexerError::malformed(
+            field,
+            "resolved block identity does not match the requested selector or response visible tip",
+        ));
+    }
+    Ok(())
 }
 
 fn block_header_from_message(message: wallet::BlockHeader) -> Result<BlockHeader, IndexerError> {
@@ -2607,8 +2690,9 @@ fn mempool_eviction_reason_from_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::IndexerError;
+    use crate::{ErrorReason, IndexerError};
     use tonic::{Code, Status};
+    use tonic_types::ErrorDetails;
 
     const EXPECTED_NETWORK: Network = Network::ZcashRegtest;
     const MISMATCHED_NETWORK: Network = Network::ZcashMainnet;
@@ -2656,6 +2740,68 @@ mod tests {
             upstream_tip: None,
             materialized_views: None,
         }
+    }
+
+    fn synthetic_block_id(height: u32, hash_byte: u8) -> wallet::BlockId {
+        wallet::BlockId {
+            height,
+            block_hash: format!("{hash_byte:02x}").repeat(32),
+        }
+    }
+
+    fn synthetic_block_id_response(
+        chain_view: wallet::ChainView,
+        block_id: wallet::BlockId,
+    ) -> wallet::BlockIdResponse {
+        wallet::BlockIdResponse {
+            chain_view: Some(chain_view),
+            block_id: Some(block_id),
+        }
+    }
+
+    fn synthetic_block_header_response(
+        chain_view: wallet::ChainView,
+        block_id: wallet::BlockId,
+    ) -> wallet::BlockHeaderResponse {
+        wallet::BlockHeaderResponse {
+            chain_view: Some(chain_view),
+            block_header: Some(wallet::BlockHeader {
+                block_id: Some(block_id),
+                previous_block_hash: "55".repeat(32),
+                merkle_root_hash: "66".repeat(32),
+                commitment_bytes: vec![0x77; 32],
+                block_time: 1_774_670_400,
+                bits: 0x1f07_ffff,
+                nonce: vec![0x88; 32],
+                version: 4,
+            }),
+        }
+    }
+
+    fn synthetic_selector_response_results(
+        expected_network: Network,
+        expected_epoch_id: Option<ChainEpochId>,
+        requested_selector: BlockSelector,
+        chain_view: wallet::ChainView,
+        block_id: wallet::BlockId,
+    ) -> (
+        Result<BlockId, IndexerError>,
+        Result<BlockHeader, IndexerError>,
+    ) {
+        (
+            block_id_from_selector_response(
+                expected_network,
+                expected_epoch_id,
+                requested_selector,
+                synthetic_block_id_response(chain_view.clone(), block_id.clone()),
+            ),
+            block_header_from_selector_response(
+                expected_network,
+                expected_epoch_id,
+                requested_selector,
+                synthetic_block_header_response(chain_view, block_id),
+            ),
+        )
     }
 
     fn synthetic_mempool_entry(network: Network) -> wallet::MempoolEntry {
@@ -2798,13 +2944,222 @@ mod tests {
     }
 
     #[test]
-    fn contract_revision_four_is_the_minimum() {
+    fn contract_revision_five_is_the_minimum() {
         assert!(matches!(
-            ensure_supported_contract_revision(3),
+            ensure_supported_contract_revision(4),
             Err(IndexerError::FailedPrecondition { .. })
         ));
-        assert!(ensure_supported_contract_revision(4).is_ok());
         assert!(ensure_supported_contract_revision(5).is_ok());
+        assert!(ensure_supported_contract_revision(6).is_ok());
+    }
+
+    #[test]
+    fn block_selector_responses_reject_the_wrong_network() {
+        let (block_id_result, block_header_result) = synthetic_selector_response_results(
+            EXPECTED_NETWORK,
+            None,
+            BlockSelector::Height(BlockHeight::new(41)),
+            synthetic_chain_view(MISMATCHED_NETWORK),
+            synthetic_block_id(41, 0x33),
+        );
+        assert!(matches!(
+            block_id_result,
+            Err(IndexerError::NetworkMismatch { expected, .. })
+                if expected == EXPECTED_NETWORK
+        ));
+        assert!(matches!(
+            block_header_result,
+            Err(IndexerError::NetworkMismatch { expected, .. })
+                if expected == EXPECTED_NETWORK
+        ));
+    }
+
+    #[test]
+    fn block_selector_responses_reject_the_wrong_pinned_epoch() {
+        let (block_id_result, block_header_result) = synthetic_selector_response_results(
+            EXPECTED_NETWORK,
+            Some(ChainEpochId::new(8)),
+            BlockSelector::Height(BlockHeight::new(41)),
+            synthetic_chain_view(EXPECTED_NETWORK),
+            synthetic_block_id(41, 0x33),
+        );
+        assert!(matches!(
+            block_id_result,
+            Err(IndexerError::MalformedResponse {
+                field: "chain_view.chain_epoch.chain_epoch_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            block_header_result,
+            Err(IndexerError::MalformedResponse {
+                field: "chain_view.chain_epoch.chain_epoch_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn block_selector_responses_reject_the_wrong_requested_height() {
+        let (block_id_result, block_header_result) = synthetic_selector_response_results(
+            EXPECTED_NETWORK,
+            None,
+            BlockSelector::Height(BlockHeight::new(41)),
+            synthetic_chain_view(EXPECTED_NETWORK),
+            synthetic_block_id(40, 0x33),
+        );
+        assert!(matches!(
+            block_id_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            block_header_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_header.block_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn block_selector_responses_reject_the_wrong_requested_hash() {
+        let (block_id_result, block_header_result) = synthetic_selector_response_results(
+            EXPECTED_NETWORK,
+            None,
+            BlockSelector::Hash(BlockHash::from_bytes([0x44; 32])),
+            synthetic_chain_view(EXPECTED_NETWORK),
+            synthetic_block_id(41, 0x33),
+        );
+        assert!(matches!(
+            block_id_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            block_header_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_header.block_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn block_selector_responses_reject_an_identity_above_the_visible_tip() {
+        let (block_id_result, block_header_result) = synthetic_selector_response_results(
+            EXPECTED_NETWORK,
+            None,
+            BlockSelector::Height(BlockHeight::new(43)),
+            synthetic_chain_view(EXPECTED_NETWORK),
+            synthetic_block_id(43, 0x33),
+        );
+        assert!(matches!(
+            block_id_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            block_header_result,
+            Err(IndexerError::MalformedResponse {
+                field: "block_header.block_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn block_selector_responses_reject_a_conflicting_visible_tip_hash() {
+        for selector in [
+            BlockSelector::Height(BlockHeight::new(42)),
+            BlockSelector::Hash(BlockHash::from_bytes([0x33; 32])),
+        ] {
+            let (block_id_result, block_header_result) = synthetic_selector_response_results(
+                EXPECTED_NETWORK,
+                None,
+                selector,
+                synthetic_chain_view(EXPECTED_NETWORK),
+                synthetic_block_id(42, 0x33),
+            );
+            assert!(matches!(
+                block_id_result,
+                Err(IndexerError::MalformedResponse {
+                    field: "block_id",
+                    ..
+                })
+            ));
+            assert!(matches!(
+                block_header_result,
+                Err(IndexerError::MalformedResponse {
+                    field: "block_header.block_id",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn block_selector_responses_reject_the_visible_tip_hash_at_a_lower_height() {
+        for selector in [
+            BlockSelector::Height(BlockHeight::new(41)),
+            BlockSelector::Hash(BlockHash::from_bytes([0x11; 32])),
+        ] {
+            let (block_id_result, block_header_result) = synthetic_selector_response_results(
+                EXPECTED_NETWORK,
+                None,
+                selector,
+                synthetic_chain_view(EXPECTED_NETWORK),
+                synthetic_block_id(41, 0x11),
+            );
+            assert!(matches!(
+                block_id_result,
+                Err(IndexerError::MalformedResponse {
+                    field: "block_id",
+                    ..
+                })
+            ));
+            assert!(matches!(
+                block_header_result,
+                Err(IndexerError::MalformedResponse {
+                    field: "block_header.block_id",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn block_selector_responses_accept_matching_height_and_hash_identities()
+    -> Result<(), IndexerError> {
+        for (selector, wire_block_id, expected_block_id) in [
+            (
+                BlockSelector::Height(BlockHeight::new(41)),
+                synthetic_block_id(41, 0x33),
+                BlockId::new(BlockHeight::new(41), BlockHash::from_bytes([0x33; 32])),
+            ),
+            (
+                BlockSelector::Hash(BlockHash::from_bytes([0x11; 32])),
+                synthetic_block_id(42, 0x11),
+                BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x11; 32])),
+            ),
+        ] {
+            let (block_id_result, block_header_result) = synthetic_selector_response_results(
+                EXPECTED_NETWORK,
+                Some(ChainEpochId::new(7)),
+                selector,
+                synthetic_chain_view(EXPECTED_NETWORK),
+                wire_block_id,
+            );
+            assert_eq!(block_id_result?, expected_block_id);
+            assert_eq!(block_header_result?.block_id, expected_block_id);
+        }
+        Ok(())
     }
 
     #[test]
@@ -2979,6 +3334,7 @@ mod tests {
     fn transaction_in_mempool_rejects_mismatched_network() {
         let outcome = tx_status_from_message(
             EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x33; 32]),
             None,
             transaction_in_mempool_message(MISMATCHED_NETWORK),
         );
@@ -2996,6 +3352,7 @@ mod tests {
     fn transaction_in_mempool_accepts_matching_network() {
         let outcome = tx_status_from_message(
             EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x33; 32]),
             None,
             transaction_in_mempool_message(EXPECTED_NETWORK),
         );
@@ -3008,9 +3365,28 @@ mod tests {
     }
 
     #[test]
+    fn transaction_in_mempool_rejects_a_different_transaction_id() {
+        let outcome = tx_status_from_message(
+            EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x44; 32]),
+            None,
+            transaction_in_mempool_message(EXPECTED_NETWORK),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(IndexerError::MalformedResponse {
+                field: "location.in_mempool.transaction_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn mined_transaction_rejects_mismatched_network() {
         let outcome = tx_status_from_message(
             EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x33; 32]),
             None,
             mined_transaction_message(MISMATCHED_NETWORK),
         );
@@ -3019,9 +3395,28 @@ mod tests {
     }
 
     #[test]
+    fn mined_transaction_rejects_a_different_transaction_id() {
+        let outcome = tx_status_from_message(
+            EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x44; 32]),
+            None,
+            mined_transaction_message(EXPECTED_NETWORK),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(IndexerError::MalformedResponse {
+                field: "mined.location.transaction_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn transaction_status_rejects_a_response_from_another_epoch() {
         let outcome = tx_status_from_message(
             EXPECTED_NETWORK,
+            TransactionId::from_bytes([0x33; 32]),
             Some(ChainEpochId::new(8)),
             transaction_in_mempool_message(EXPECTED_NETWORK),
         );
@@ -3053,6 +3448,106 @@ mod tests {
             Err(IndexerError::MalformedResponse { .. })
         ));
         assert!(!header_seen.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn transparent_history_header_rejects_a_response_from_another_epoch() {
+        let header_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut state = TransparentHistoryStreamState {
+            expected_network: EXPECTED_NETWORK,
+            expected_epoch_id: Some(ChainEpochId::new(8)),
+            address_script_hash: TransparentAddressScriptHash::from_bytes([0x51; 32]),
+            pinned_chain_epoch: None,
+            header_seen: Arc::clone(&header_seen),
+            stream_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let outcome = transparent_address_tx_ids_stream_item(
+            &mut state,
+            wallet::TransparentAddressTxIdsChunk {
+                body: Some(wallet::transparent_address_tx_ids_chunk::Body::Header(
+                    synthetic_chain_view(EXPECTED_NETWORK),
+                )),
+            },
+        );
+
+        assert!(matches!(
+            &outcome,
+            Err(IndexerError::ChainEpochPinUnavailable)
+        ));
+        assert_eq!(
+            outcome.as_ref().err().map(IndexerError::retry_policy),
+            Some(crate::RetryPolicy::RefreshChainEpoch)
+        );
+        assert!(!header_seen.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn transparent_history_stream_terminates_after_epoch_mismatch() {
+        let state = TransparentHistoryStreamState {
+            expected_network: EXPECTED_NETWORK,
+            expected_epoch_id: Some(ChainEpochId::new(8)),
+            address_script_hash: TransparentAddressScriptHash::from_bytes([0x51; 32]),
+            pinned_chain_epoch: None,
+            header_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stream_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let mismatched_header = wallet::TransparentAddressTxIdsChunk {
+            body: Some(wallet::transparent_address_tx_ids_chunk::Body::Header(
+                synthetic_chain_view(EXPECTED_NETWORK),
+            )),
+        };
+        let later_item = wallet::TransparentAddressTxIdsChunk {
+            body: Some(wallet::transparent_address_tx_ids_chunk::Body::Item(
+                wallet::TransparentAddressTxId {
+                    transaction_id: encode_rpc_transaction_id_hex(TransactionId::from_bytes(
+                        [0x31; 32],
+                    )),
+                    block_height: 42,
+                    tx_index_in_block: 0,
+                    block_hash: "11".repeat(32),
+                    cursor: Vec::new(),
+                },
+            )),
+        };
+        let wire_stream = futures_util::stream::iter([Ok(mismatched_header), Ok(later_item)]);
+        let mut history_stream = transparent_address_tx_ids_stream(Box::pin(wire_stream), state);
+
+        assert!(matches!(
+            history_stream.next().await,
+            Some(Err(IndexerError::ChainEpochPinUnavailable))
+        ));
+        assert!(
+            history_stream.next().await.is_none(),
+            "an epoch mismatch must terminate before later items or terminal checks"
+        );
+    }
+
+    #[test]
+    fn empty_transparent_history_stream_requires_one_valid_header() {
+        assert!(missing_transparent_history_header_error(false, false).is_some());
+        assert!(missing_transparent_history_header_error(false, true).is_none());
+
+        let header_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut state = TransparentHistoryStreamState {
+            expected_network: EXPECTED_NETWORK,
+            expected_epoch_id: Some(ChainEpochId::new(7)),
+            address_script_hash: TransparentAddressScriptHash::from_bytes([0x51; 32]),
+            pinned_chain_epoch: None,
+            header_seen: Arc::clone(&header_seen),
+            stream_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let outcome = transparent_address_tx_ids_stream_item(
+            &mut state,
+            wallet::TransparentAddressTxIdsChunk {
+                body: Some(wallet::transparent_address_tx_ids_chunk::Body::Header(
+                    synthetic_chain_view(EXPECTED_NETWORK),
+                )),
+            },
+        );
+
+        assert!(matches!(outcome, Ok(None)));
+        assert!(header_seen.load(std::sync::atomic::Ordering::Acquire));
+        assert!(missing_transparent_history_header_error(true, false).is_none());
     }
 
     #[test]
@@ -3292,5 +3787,39 @@ mod tests {
             before, after,
             "application-level errors with InvalidArgument must not rebuild the channel"
         );
+    }
+
+    #[tokio::test]
+    async fn map_status_keeps_channel_on_typed_readiness_unavailable() {
+        let index = build_index();
+        let before = current_client_ptr(&index);
+        let status = Status::with_error_details(
+            Code::Unavailable,
+            "service readiness is closed",
+            ErrorDetails::with_error_info(
+                ErrorReason::ServiceNotReady.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                std::collections::HashMap::from([(
+                    "readiness_cause".to_owned(),
+                    "ingest_control_unavailable".to_owned(),
+                )]),
+            ),
+        );
+
+        let error = index.map_status(status);
+
+        let after = current_client_ptr(&index);
+        assert_eq!(
+            before, after,
+            "typed readiness failures must not be mistaken for poisoned transport"
+        );
+        assert!(matches!(
+            error,
+            IndexerError::RemoteFailure {
+                reason: ErrorReason::ServiceNotReady,
+                retry_policy: crate::RetryPolicy::RetryWithBackoff,
+                ..
+            }
+        ));
     }
 }
