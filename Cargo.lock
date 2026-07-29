@@ -6163,6 +6163,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "zinderctl"
+version = "0.5.0-rc.8"
+dependencies = [
+ "async-trait",
+ "clap",
+ "eyre",
+ "futures-util",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "zinder-core",
+ "zinder-ingest",
+ "zinder-projector",
+ "zinder-proto",
+ "zinder-runtime",
+ "zinder-source",
+ "zinder-store",
+ "zinder-testkit",
+ "zinder-wallet-rocksdb",
+]
+
+[[package]]
 name = "zip32"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

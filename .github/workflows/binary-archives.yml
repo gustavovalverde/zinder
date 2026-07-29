@@ -12,6 +12,7 @@ on:
       - "crates/**"
       - "deploy/Dockerfile"
       - "deploy/release-images.json"
+      - "deploy/release-binaries.json"
       - "rust-toolchain.toml"
       - "scripts/build-release-binary-archive.sh"
       - "scripts/check-release-binary-archive.sh"
@@ -20,6 +21,7 @@ on:
       - "scripts/test-release-binary-archive.sh"
       - "scripts/test-release-sbom.sh"
       - "services/**"
+      - "tools/zinderctl/**"
   workflow_dispatch:
 
 permissions:

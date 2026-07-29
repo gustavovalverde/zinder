@@ -18,6 +18,7 @@ members = [
     "services/zinder-ingest",
     "services/zinder-projector",
     "services/zinder-query",
+    "tools/zinderctl",
     "tools/zinder-proto-codegen",
     "vendor/postgres-protocol",
 ]

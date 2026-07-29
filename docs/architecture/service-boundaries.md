@@ -17,6 +17,10 @@ each serve process-owned immutable readers admitted at one exact fence.
 services. They compile, but the release workflow and checked single-host
 composition do not publish or start them.
 
+`zinderctl` is a release operator tool, not a fifth runtime. It coordinates
+checkpoint packaging, verification, download, restore, and logical replay
+through the existing ownership and admission boundaries.
+
 ## Ownership rules
 
 The services may share domain types from `zinder-core`, protocol definitions

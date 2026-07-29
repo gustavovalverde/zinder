@@ -6,6 +6,8 @@ database has one primary owner, exact identity and schema admission, bounded
 resources, and read-only secondary roles.
 
 [ADR-0035](../adrs/0035-canonical-storage-topologies.md) owns the topology.
+[ADR-0038](../adrs/0038-state-portability-and-schema-migration.md) owns
+physical snapshot restore and cross-schema logical migration.
 [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md) owns epoch-bound
 reads and secondary behavior.
 

@@ -79,13 +79,15 @@ jq -e \
       "zinder-compat-lightwalletd",
       "zinder-ingest",
       "zinder-projector",
-      "zinder-query"
+      "zinder-query",
+      "zinderctl"
     ]
     and ([.files[].fileName] | sort) == [
       "./bin/zinder-compat-lightwalletd",
       "./bin/zinder-ingest",
       "./bin/zinder-projector",
-      "./bin/zinder-query"
+      "./bin/zinder-query",
+      "./bin/zinderctl"
     ]
     and any(.packages[]; .name == "rust-librocksdb-sys" and .versionInfo == $rocksdb_version)
     and any(.packages[]; any(.externalRefs[]?; .referenceType == "purl" and (.referenceLocator | startswith("pkg:cargo/"))))

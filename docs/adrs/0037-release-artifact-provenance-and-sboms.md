@@ -25,7 +25,7 @@ immutable GitHub Releases, and post-publication verification fails closed if
 the resulting Release is not immutable.
 
 Each deterministic GNU/Linux archive is accompanied by 1 SPDX 2.3 JSON SBOM.
-The SBOM binds the archive digest, exact 4-binary catalog, release platform,
+The SBOM binds the archive digest, exact 5-binary catalog, release platform,
 source commit, Cargo package URLs, and the locked `rust-librocksdb-sys` package
 version. The binaries are built with `cargo-auditable`, allowing Syft to recover
 their linked Rust dependency graph. The SBOM names the Rust `-sys` crate that

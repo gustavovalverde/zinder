@@ -71,7 +71,8 @@ expected_members="$({
     "$archive_root/bin/zinder-compat-lightwalletd" \
     "$archive_root/bin/zinder-ingest" \
     "$archive_root/bin/zinder-projector" \
-    "$archive_root/bin/zinder-query"
+    "$archive_root/bin/zinder-query" \
+    "$archive_root/bin/zinderctl"
 })"
 actual_members="$(LC_ALL=C sort <<< "$member_list")"
 expected_members="$(LC_ALL=C sort <<< "$expected_members")"
@@ -105,7 +106,8 @@ expected_files="$({
     bin/zinder-compat-lightwalletd \
     bin/zinder-ingest \
     bin/zinder-projector \
-    bin/zinder-query
+    bin/zinder-query \
+    bin/zinderctl
 })"
 actual_files="$(find "$staging_root" -type f -printf '%P\n' | LC_ALL=C sort)"
 [[ "$actual_files" == "$expected_files" ]] || {
@@ -183,7 +185,8 @@ jq -e \
       "zinder-compat-lightwalletd",
       "zinder-ingest",
       "zinder-projector",
-      "zinder-query"
+      "zinder-query",
+      "zinderctl"
     ]
   ' "$build_info" >/dev/null
 

@@ -1,0 +1,46 @@
+[package]
+name = "zinderctl"
+version.workspace = true
+description = "Operator CLI for portable Zinder state"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "operations"]
+categories = ["command-line-utilities"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+async-trait.workspace = true
+eyre.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util.workspace = true
+tracing.workspace = true
+zinder-core.workspace = true
+zinder-ingest.workspace = true
+zinder-projector.workspace = true
+zinder-proto.workspace = true
+zinder-runtime.workspace = true
+zinder-source.workspace = true
+zinder-store.workspace = true
+zinder-wallet-rocksdb.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+zinder-testkit.workspace = true
+
+[[bin]]
+name = "zinderctl"
+path = "src/main.rs"
+
+[lints]
+workspace = true

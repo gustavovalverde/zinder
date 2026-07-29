@@ -1,0 +1,6 @@
+kind: added
+body: Export, verify, download, and restore portable Zinder state snapshots with `zinderctl`, or replay logical archives into deployments that use a newer storage schema.
+time: 2026-07-27T12:17:08Z
+custom:
+  Bump: minor
+  PR: "58"
