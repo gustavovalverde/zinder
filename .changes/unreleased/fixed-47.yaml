@@ -1,6 +1,0 @@
-kind: fixed
-body: Bind GitHub Release publication to the validated repository when the publication job runs without a checkout.
-time: 2026-07-25T01:14:15Z
-custom:
-  Bump: patch
-  PR: "47"

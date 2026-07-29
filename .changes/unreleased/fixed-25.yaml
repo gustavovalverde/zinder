@@ -1,6 +1,0 @@
-kind: fixed
-body: Keep the ingest operations endpoint available after a reorg exceeds the configured window so operators can inspect the drained state and rebuild or restore without a crash loop.
-time: 2026-07-22T00:19:41Z
-custom:
-  Bump: patch
-  PR: "25"

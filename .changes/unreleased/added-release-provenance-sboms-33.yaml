@@ -1,6 +1,0 @@
-kind: added
-body: Publish keyless signatures, SLSA provenance, and SPDX 2.3 SBOMs for Zinder GNU/Linux bundles and release images.
-time: 2026-07-22T15:11:35Z
-custom:
-  Bump: minor
-  PR: "33"

@@ -1,6 +1,0 @@
-kind: changed
-body: Cut wallet serving over to canonical facts, projection-aware readiness, and native operational controls.
-time: 2026-07-18T13:49:33Z
-custom:
-  Bump: minor
-  PR: "18"

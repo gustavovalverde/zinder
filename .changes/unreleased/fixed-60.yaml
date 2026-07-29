@@ -1,6 +1,0 @@
-kind: fixed
-body: Keep the native WalletQuery service responsive under concurrent range reads; syncing wallets no longer lose their streams, and readiness stays answerable while a wallet catches up.
-time: 2026-07-28T22:41:50Z
-custom:
-  Bump: patch
-  PR: "60"

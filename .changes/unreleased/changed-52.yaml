@@ -1,6 +1,0 @@
-kind: changed
-body: Build the explorer materialized views inside the ingest runtime from canonical storage. The view store is built from genesis on first start, the `[storage.materialized_views]` RocksDB budget now also applies to `zinder-ingest`, and stores built with a checkpoint height do not host materialized views.
-time: 2026-07-25T18:00:00Z
-custom:
-  Bump: minor
-  PR: "52"

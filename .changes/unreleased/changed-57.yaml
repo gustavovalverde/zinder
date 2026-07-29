@@ -1,6 +1,0 @@
-kind: changed
-body: Certify live regtest and lightwalletd parity behavior against Zebra 6.2.2, including its current RPC consistency and security fixes.
-time: 2026-07-27T12:06:13Z
-custom:
-  Bump: patch
-  PR: "57"

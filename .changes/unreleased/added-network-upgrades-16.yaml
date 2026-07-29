@@ -1,6 +1,0 @@
-kind: added
-body: Expose network upgrade activations through the native query API.
-time: 2026-07-12T23:20:37Z
-custom:
-  Bump: minor
-  PR: "16"

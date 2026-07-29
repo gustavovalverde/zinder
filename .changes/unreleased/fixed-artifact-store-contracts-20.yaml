@@ -1,6 +1,0 @@
-kind: fixed
-body: Preserve configured artifact-store contracts when canonical ingest opens or rebuilds storage.
-time: 2026-07-20T21:23:58Z
-custom:
-  Bump: patch
-  PR: "20"

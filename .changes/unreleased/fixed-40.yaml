@@ -1,6 +1,0 @@
-kind: fixed
-body: Keep deployment admission aligned with the strict release image attestation verifier.
-time: 2026-07-24T20:22:20Z
-custom:
-  Bump: patch
-  PR: "40"

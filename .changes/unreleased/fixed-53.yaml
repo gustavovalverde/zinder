@@ -1,6 +1,0 @@
-kind: fixed
-body: Expose typed wallet-sync capabilities through zinder-client, preserve cold admission when a block hash is displaced repeatedly, and provide a current-contract ExplorerQuery overlay that serves transaction detail and transparent activity without opening the canonical store.
-time: 2026-07-27T02:13:41Z
-custom:
-  Bump: patch
-  PR: "53"
