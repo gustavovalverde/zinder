@@ -1,6 +1,0 @@
-kind: added
-body: Ship the native WalletQuery API alongside the lightwalletd compatibility service.
-time: 2026-07-21T13:04:21Z
-custom:
-  Bump: minor
-  PR: "22"

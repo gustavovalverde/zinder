@@ -1,6 +1,0 @@
-kind: added
-body: Prepare `zinder-core`, `zinder-proto`, and `zinder-client` as a registry-ready Rust SDK catalog with hermetic protocol artifacts and standalone package verification.
-time: 2026-07-22T13:22:35Z
-custom:
-  Bump: minor
-  PR: "30"

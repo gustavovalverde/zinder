@@ -1,6 +1,0 @@
-kind: added
-body: Publish guarded amd64 and arm64 runtime images, API artifacts, and lockstep GitHub Releases from validated tags.
-time: 2026-07-21T18:32:51Z
-custom:
-  Bump: minor
-  PR: "24"

@@ -1,6 +1,0 @@
-kind: fixed
-body: Prevent the single-host ingest runtime from exhausting file descriptors while opening the canonical and Explorer materialized-view stores.
-time: 2026-07-27T08:21:34Z
-custom:
-  Bump: patch
-  PR: "54"

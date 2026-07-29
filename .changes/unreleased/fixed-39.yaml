@@ -1,6 +1,0 @@
-kind: fixed
-body: Make release image publication wait for GHCR tag convergence and verify attestations with compatible strict identity constraints.
-time: 2026-07-24T20:07:03Z
-custom:
-  Bump: patch
-  PR: "39"

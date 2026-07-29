@@ -1,6 +1,0 @@
-kind: added
-body: Run the canonical writer, the wallet projector, and the native WalletQuery reader as one supervised container against a single volume, for hosts that attach one volume per service.
-time: 2026-07-28T22:41:50Z
-custom:
-  Bump: minor
-  PR: "60"

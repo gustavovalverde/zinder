@@ -1,6 +1,0 @@
-kind: fixed
-body: Correct six documented identifiers that no longer matched the shipped API, including the mempool cursor error, the subtree roots RPC, and the capability table name.
-time: 2026-07-25T12:00:00Z
-custom:
-  Bump: patch
-  PR: "50"
