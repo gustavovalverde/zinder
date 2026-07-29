@@ -413,13 +413,13 @@ reads. The Rust `ChainIndex` trait carries the same surface:
 `transparent_address_unspent_outputs(query)` keyed by the typed
 `TransparentAddressScriptHash`, with `query.at_epoch_id:
 Option<ChainEpochId>` threading the pin. The release `zinder-query` composition
-does not advertise `wallet.address.transparent_unspent_outputs_v1`: the current
-query contract materializes the complete set before the gRPC adapter starts
-streaming, so an address with many outputs can consume unbounded server memory.
-P2b must change the query/adapter boundary to read and emit bounded pages at one
-pinned epoch before admitting this capability. Until then, native requests fail
-the capability guard before reading storage. Compatibility runtimes own their
-separate lightwalletd admission and resource bounds.
+advertises `wallet.address.transparent_unspent_outputs_v1`: its admitted wallet
+projection serves the complete ascending set from the same immutable
+`WalletServingReadPair` as the canonical epoch header. The current query
+materializes that complete set before gRPC emission; end-to-end incremental
+delivery remains tracked in
+[#62](https://github.com/gustavovalverde/zinder/issues/62). Compatibility
+runtimes own their separate lightwalletd admission and resource bounds.
 
 `TransparentAddressTxIdsInRange` streams `TransparentAddressTxIdsChunk`
 messages with the same one-shot header shape: one leading `ChainView` header
@@ -460,23 +460,17 @@ Transaction-history reads return the txids that touch a given transparent
 address within an inclusive height range. The native surface is
 `WalletQuery.TransparentAddressTxIdsInRange`, a server-streamed page-bounded
 read; the matching Rust API is
-`ChainIndex::transparent_address_tx_ids_in_range`. This native path is backed by
-the materialized-view-owned transparent-address transaction-history consumer.
-It is a current read model, so callers use the `chain_view.chain_epoch` returned
-with each chunk as the response binding instead of supplying an `at_epoch_id`
-pin. Canonical ingest writes typed transaction, transparent-output, and
-transparent-spend facts; the materialized-view tailer writes one row per
-`(address, transaction)` pair after the corresponding chain event is durable.
+`ChainIndex::transparent_address_tx_ids_in_range`. Its `at_epoch_id` is a
+client-side response expectation rather than a wire field. The client rejects
+a mandatory stream header from another epoch with
+`ChainEpochPinUnavailable`; snapshots set the expectation from their captured
+epoch, including for empty pages.
 
-Capability `wallet.address.transparent_history_v1` is advertised only when the
-query service can open a materialized-view store whose history-consumer cursor
-exactly matches the canonical visible-chain event fence. The handler reads that
-cursor and the history rows from one materialized-view snapshot, so a
-same-height reorg or secondary catch-up race fails closed instead of mixing
-branches. Cursor-based pagination binds the opaque cursor to the same visible
-chain fence; resuming after a reorg fails with `FAILED_PRECONDITION`. The
-`descending` bit selects newest-first iteration, and only the terminal chunk
-carries a non-empty resume cursor.
+The release query advertises `wallet.address.transparent_history_v1` for its
+ascending, page-bounded wallet-projection read. Its opaque cursor carries the
+exact `WalletCanonicalSourceIdentity` that issued the page, so pair replacement
+fails with `FAILED_PRECONDITION`. The capability does not admit newest-first
+iteration. Only the terminal chunk carries a non-empty resume cursor.
 
 The compatibility adapter implements `GetTaddressTxids` and
 `GetTaddressTransactions` through `WalletServingQuery`. That path reads

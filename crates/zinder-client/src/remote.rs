@@ -726,6 +726,7 @@ impl ChainIndex for RemoteChainIndex {
         query: TransparentAddressTxIdsQuery,
     ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
         let address_script_hash = query.address_script_hash;
+        let expected_epoch_id = query.at_epoch_id;
         let request = wallet::TransparentAddressTxIdsInRangeRequest {
             address: Some(wallet::AddressLookup {
                 selector: Some(wallet::address_lookup::Selector::ScriptHash(
@@ -749,23 +750,24 @@ impl ChainIndex for RemoteChainIndex {
             .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
-        // The leading header pins the chain epoch for the whole stream; the
-        // closure captures it and drops the header (yielding no item).
-        let mut pinned_chain_epoch: Option<ChainEpoch> = None;
-        let stream = response.into_inner().filter_map(move |chunk_result| {
-            chunk_result
-                .map_err(|status| recovery.map_status(status))
-                .and_then(|chunk| {
-                    transparent_address_tx_ids_stream_item(
-                        expected_network,
-                        address_script_hash,
-                        &mut pinned_chain_epoch,
-                        chunk,
-                    )
-                })
-                .transpose()
-        });
-        Ok(Box::pin(stream))
+        let header_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let history_stream_state = TransparentHistoryStreamState {
+            expected_network,
+            expected_epoch_id,
+            address_script_hash,
+            pinned_chain_epoch: None,
+            header_seen: std::sync::Arc::clone(&header_seen),
+            stream_failed: std::sync::Arc::clone(&stream_failed),
+        };
+        let wire_stream =
+            tokio_stream::StreamExt::map(response.into_inner(), move |chunk_result| {
+                chunk_result.map_err(|status| recovery.map_status(status))
+            });
+        Ok(transparent_address_tx_ids_stream(
+            Box::pin(wire_stream),
+            history_stream_state,
+        ))
     }
 
     async fn transparent_address_balance(
@@ -886,6 +888,18 @@ fn missing_transparent_unspent_header_error(header_seen: bool) -> Option<Indexer
     (!header_seen).then(|| {
         IndexerError::malformed(
             "transparent_unspent_outputs.header",
+            "stream ended before the required chain-view header",
+        )
+    })
+}
+
+fn missing_transparent_history_header_error(
+    header_seen: bool,
+    stream_failed: bool,
+) -> Option<IndexerError> {
+    (!header_seen && !stream_failed).then(|| {
+        IndexerError::malformed(
+            "transparent_address_tx_ids.header",
             "stream ended before the required chain-view header",
         )
     })
@@ -1715,26 +1729,84 @@ fn subtree_root_from_message(
 /// is captured in `pinned_chain_epoch` and yields no item (`Ok(None)`). Every
 /// later item is bound to that captured epoch. An item before the header, or a
 /// second header, is a protocol violation.
-fn transparent_address_tx_ids_stream_item(
+struct TransparentHistoryStreamState {
     expected_network: Network,
+    expected_epoch_id: Option<ChainEpochId>,
     address_script_hash: TransparentAddressScriptHash,
-    pinned_chain_epoch: &mut Option<ChainEpoch>,
+    pinned_chain_epoch: Option<ChainEpoch>,
+    header_seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stream_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn transparent_address_tx_ids_stream(
+    wire_stream: IndexStream<wallet::TransparentAddressTxIdsChunk>,
+    state: TransparentHistoryStreamState,
+) -> TransparentAddressTxIdsStream {
+    let header_seen = std::sync::Arc::clone(&state.header_seen);
+    let stream_failed = std::sync::Arc::clone(&state.stream_failed);
+    let decoded = futures_util::stream::unfold(
+        (wire_stream, state, false),
+        |(mut wire_stream, mut state, is_terminated)| async move {
+            if is_terminated {
+                return None;
+            }
+            let message_result = futures_util::StreamExt::next(&mut wire_stream).await?;
+            let decoded = message_result
+                .and_then(|message| transparent_address_tx_ids_stream_item(&mut state, message))
+                .transpose();
+            let is_terminated = decoded.as_ref().is_some_and(Result::is_err);
+            if is_terminated {
+                state
+                    .stream_failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            Some((decoded, (wire_stream, state, is_terminated)))
+        },
+    );
+    let items = futures_util::StreamExt::filter_map(decoded, |decoded| async move { decoded });
+    let terminal = futures_util::StreamExt::filter_map(
+        futures_util::stream::once(async move {
+            missing_transparent_history_header_error(
+                header_seen.load(std::sync::atomic::Ordering::Acquire),
+                stream_failed.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .map(Err)
+        }),
+        |terminal_outcome| async move { terminal_outcome },
+    );
+    Box::pin(futures_util::StreamExt::chain(items, terminal))
+}
+
+fn transparent_address_tx_ids_stream_item(
+    state: &mut TransparentHistoryStreamState,
     message: wallet::TransparentAddressTxIdsChunk,
 ) -> Result<Option<TransparentAddressTransactionChunk>, IndexerError> {
     match message.body.ok_or_else(|| {
         IndexerError::malformed("transparent_address_tx_ids_chunk.body", "field is missing")
     })? {
         wallet::transparent_address_tx_ids_chunk::Body::Header(chain_view) => {
-            stream_header_chain_epoch(expected_network, pinned_chain_epoch, Some(chain_view))?;
+            stream_header_chain_epoch(
+                state.expected_network,
+                &mut state.pinned_chain_epoch,
+                Some(chain_view),
+            )?;
+            if state.expected_epoch_id.is_some_and(|expected| {
+                state.pinned_chain_epoch.as_ref().map(|epoch| epoch.id) != Some(expected)
+            }) {
+                return Err(IndexerError::ChainEpochPinUnavailable);
+            }
+            state
+                .header_seen
+                .store(true, std::sync::atomic::Ordering::Release);
             Ok(None)
         }
         wallet::transparent_address_tx_ids_chunk::Body::Item(entry) => {
-            let chain_epoch = stream_item_chain_epoch(pinned_chain_epoch.as_ref())?;
+            let chain_epoch = stream_item_chain_epoch(state.pinned_chain_epoch.as_ref())?;
             let transaction_id =
                 transaction_id_from_rpc_hex("transaction_id", &entry.transaction_id)?;
             let block_hash = block_hash_from_rpc_hex("block_hash", &entry.block_hash)?;
             let artifact = TransparentAddressTxIndexArtifact::new(
-                address_script_hash,
+                state.address_script_hash,
                 BlockHeight::new(entry.block_height),
                 entry.tx_index_in_block,
                 transaction_id,
@@ -3376,6 +3448,106 @@ mod tests {
             Err(IndexerError::MalformedResponse { .. })
         ));
         assert!(!header_seen.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn transparent_history_header_rejects_a_response_from_another_epoch() {
+        let header_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut state = TransparentHistoryStreamState {
+            expected_network: EXPECTED_NETWORK,
+            expected_epoch_id: Some(ChainEpochId::new(8)),
+            address_script_hash: TransparentAddressScriptHash::from_bytes([0x51; 32]),
+            pinned_chain_epoch: None,
+            header_seen: Arc::clone(&header_seen),
+            stream_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let outcome = transparent_address_tx_ids_stream_item(
+            &mut state,
+            wallet::TransparentAddressTxIdsChunk {
+                body: Some(wallet::transparent_address_tx_ids_chunk::Body::Header(
+                    synthetic_chain_view(EXPECTED_NETWORK),
+                )),
+            },
+        );
+
+        assert!(matches!(
+            &outcome,
+            Err(IndexerError::ChainEpochPinUnavailable)
+        ));
+        assert_eq!(
+            outcome.as_ref().err().map(IndexerError::retry_policy),
+            Some(crate::RetryPolicy::RefreshChainEpoch)
+        );
+        assert!(!header_seen.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn transparent_history_stream_terminates_after_epoch_mismatch() {
+        let state = TransparentHistoryStreamState {
+            expected_network: EXPECTED_NETWORK,
+            expected_epoch_id: Some(ChainEpochId::new(8)),
+            address_script_hash: TransparentAddressScriptHash::from_bytes([0x51; 32]),
+            pinned_chain_epoch: None,
+            header_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stream_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let mismatched_header = wallet::TransparentAddressTxIdsChunk {
+            body: Some(wallet::transparent_address_tx_ids_chunk::Body::Header(
+                synthetic_chain_view(EXPECTED_NETWORK),
+            )),
+        };
+        let later_item = wallet::TransparentAddressTxIdsChunk {
+            body: Some(wallet::transparent_address_tx_ids_chunk::Body::Item(
+                wallet::TransparentAddressTxId {
+                    transaction_id: encode_rpc_transaction_id_hex(TransactionId::from_bytes(
+                        [0x31; 32],
+                    )),
+                    block_height: 42,
+                    tx_index_in_block: 0,
+                    block_hash: "11".repeat(32),
+                    cursor: Vec::new(),
+                },
+            )),
+        };
+        let wire_stream = futures_util::stream::iter([Ok(mismatched_header), Ok(later_item)]);
+        let mut history_stream = transparent_address_tx_ids_stream(Box::pin(wire_stream), state);
+
+        assert!(matches!(
+            history_stream.next().await,
+            Some(Err(IndexerError::ChainEpochPinUnavailable))
+        ));
+        assert!(
+            history_stream.next().await.is_none(),
+            "an epoch mismatch must terminate before later items or terminal checks"
+        );
+    }
+
+    #[test]
+    fn empty_transparent_history_stream_requires_one_valid_header() {
+        assert!(missing_transparent_history_header_error(false, false).is_some());
+        assert!(missing_transparent_history_header_error(false, true).is_none());
+
+        let header_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut state = TransparentHistoryStreamState {
+            expected_network: EXPECTED_NETWORK,
+            expected_epoch_id: Some(ChainEpochId::new(7)),
+            address_script_hash: TransparentAddressScriptHash::from_bytes([0x51; 32]),
+            pinned_chain_epoch: None,
+            header_seen: Arc::clone(&header_seen),
+            stream_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let outcome = transparent_address_tx_ids_stream_item(
+            &mut state,
+            wallet::TransparentAddressTxIdsChunk {
+                body: Some(wallet::transparent_address_tx_ids_chunk::Body::Header(
+                    synthetic_chain_view(EXPECTED_NETWORK),
+                )),
+            },
+        );
+
+        assert!(matches!(outcome, Ok(None)));
+        assert!(header_seen.load(std::sync::atomic::Ordering::Acquire));
+        assert!(missing_transparent_history_header_error(true, false).is_none());
     }
 
     #[test]

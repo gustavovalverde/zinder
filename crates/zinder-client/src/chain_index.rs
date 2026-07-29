@@ -328,6 +328,9 @@ pub struct TransparentAddressTxIdsQuery {
     pub from_cursor: Option<TransparentHistoryCursor>,
     /// Iterate newest-first when true.
     pub descending: bool,
+    /// Optional expected response epoch. `None` accepts the server's current
+    /// epoch; `Some(id)` rejects a response header from any other epoch.
+    pub at_epoch_id: Option<ChainEpochId>,
 }
 
 /// One streamed tx-history chunk.
@@ -391,11 +394,12 @@ impl TransparentUtxoSetSummaryView {
     }
 }
 
-/// Borrowed canonical-chain view pinned to one [`ChainEpoch`].
+/// Borrowed chain view pinned to one [`ChainEpoch`].
 ///
-/// Capture resolves [`ChainIndex::current_epoch`] exactly once. Every read on
-/// this view forwards that captured epoch id, so a multi-call operation either
-/// remains on one canonical branch or receives
+/// Capture resolves [`ChainIndex::current_epoch`] exactly once. Canonical
+/// requests forward that epoch id; address-history streams validate their
+/// mandatory response header against it. A multi-call operation either
+/// remains on one chain view or receives
 /// [`IndexerError::ChainEpochPinUnavailable`] after the serving implementation
 /// stops retaining that epoch.
 pub struct ChainSnapshot<'a, I: ChainIndex + ?Sized> {
@@ -561,6 +565,20 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
             .await
     }
 
+    /// Streams address transaction history from the captured epoch.
+    ///
+    /// The snapshot replaces `query.at_epoch_id` with its captured epoch so
+    /// the mandatory stream header makes a replaced serving pair fail closed.
+    pub async fn transparent_address_tx_ids_in_range(
+        &self,
+        mut query: TransparentAddressTxIdsQuery,
+    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
+        query.at_epoch_id = Some(self.chain_epoch.id);
+        self.chain_index
+            .transparent_address_tx_ids_in_range(query)
+            .await
+    }
+
     /// Requests canonical transparent outputs from the captured epoch when the
     /// implementation advertises the corresponding capability.
     pub async fn transparent_outputs_by_outpoint(
@@ -604,7 +622,7 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
     }
 }
 
-/// Owned canonical-chain view pinned to one [`ChainEpoch`].
+/// Owned chain view pinned to one [`ChainEpoch`].
 ///
 /// This companion to [`ChainSnapshot`] is suitable for consumer APIs that
 /// must retain a cloneable, `'static` chain view. It owns an [`Arc`] to the
@@ -752,6 +770,16 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
             .await
     }
 
+    /// Streams address transaction history from the captured epoch.
+    pub async fn transparent_address_tx_ids_in_range(
+        &self,
+        query: TransparentAddressTxIdsQuery,
+    ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
+        self.borrowed()
+            .transparent_address_tx_ids_in_range(query)
+            .await
+    }
+
     /// Requests canonical transparent outputs from the captured epoch when the
     /// implementation advertises the corresponding capability.
     pub async fn transparent_outputs_by_outpoint(
@@ -809,8 +837,8 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
 ///
 /// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves
 /// to the visible chain epoch at call time; `Some(id)` pins the read to that
-/// epoch. Current materialized-view reads expose their chain epoch in stream
-/// items instead of accepting a pin.
+/// epoch. Address history uses the field as an expected response epoch and
+/// fails when the mandatory stream header names another epoch.
 ///
 /// All trait methods take and return `zinder-core` types; generated
 /// `zinder_proto::*` types appear only in adapter modules, never on this
@@ -1134,10 +1162,11 @@ pub trait ChainIndex: Send + Sync + 'static {
         query: TransparentAddressUnspentOutputsQuery,
     ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError>;
 
-    /// Streams current transparent-address tx-history index entries.
+    /// Streams ascending transparent-address tx-history index entries.
     ///
     /// The returned rows and any resume cursor are bound to the response's
-    /// visible chain epoch. A reorg invalidates a prior resume cursor rather
+    /// visible chain epoch. `query.at_epoch_id` validates that header without
+    /// adding a wire field. A reorg invalidates a prior resume cursor rather
     /// than resuming it against a different branch.
     ///
     /// # Examples
@@ -1155,6 +1184,7 @@ pub trait ChainIndex: Send + Sync + 'static {
     ///     max_entries: None,
     ///     from_cursor: None,
     ///     descending: false,
+    ///     at_epoch_id: None,
     /// };
     /// let stream = client.transparent_address_tx_ids_in_range(query).await?;
     /// # let _ = stream; Ok(()) }

@@ -154,7 +154,10 @@ pub const WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1: &str =
 /// Capability advertised for `WalletQuery.TransparentAddressUnspentOutputs`.
 pub const WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
     "wallet.address.transparent_unspent_outputs_v1";
-/// Capability advertised for `WalletQuery.TransparentAddressTxIdsInRange`.
+/// Capability advertised for ascending
+/// `WalletQuery.TransparentAddressTxIdsInRange` reads.
+///
+/// This capability does not imply that newest-first iteration is available.
 pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transparent_history_v1";
 /// Capability advertised for `WalletQuery.TransparentAddressBalance`.
 ///

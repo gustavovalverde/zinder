@@ -123,6 +123,7 @@ fn assert_owned_chain_snapshot_methods_compile<T: ChainIndex>() {
     let _ = OwnedChainSnapshot::<T>::subtree_roots_in_range;
     let _ = OwnedChainSnapshot::<T>::transaction_by_id;
     let _ = OwnedChainSnapshot::<T>::transparent_address_unspent_outputs;
+    let _ = OwnedChainSnapshot::<T>::transparent_address_tx_ids_in_range;
     let _ = OwnedChainSnapshot::<T>::transparent_outputs_by_outpoint;
     let _ = OwnedChainSnapshot::<T>::transparent_spends_by_outpoint;
     let _ = OwnedChainSnapshot::<T>::transparent_unspent_outputs_by_outpoint;

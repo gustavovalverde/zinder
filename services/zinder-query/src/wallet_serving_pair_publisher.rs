@@ -1173,10 +1173,11 @@ mod tests {
     };
     use zinder_proto::{
         capabilities::{
-            WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1, WALLET_EVENTS_CHAIN_V1,
-            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1, WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
-            WALLET_READ_COMPACT_BLOCK_AT_V2, WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
-            WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
+            WALLET_ADDRESS_TRANSPARENT_HISTORY_V1, WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+            WALLET_EVENTS_CHAIN_V1, WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
+            WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, WALLET_READ_COMPACT_BLOCK_AT_V2,
+            WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2, WALLET_READ_COMPACT_BLOCK_RANGE_V2,
+            WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2,
             WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1, WALLET_READ_SERVER_INFO_V2,
             WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
             WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
@@ -1943,24 +1944,22 @@ mod tests {
             WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
             WALLET_READ_TRANSACTION_BY_ID_V2,
             WALLET_EVENTS_CHAIN_V1,
+            WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
+            WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
         ] {
             assert!(
                 advertised.iter().any(|capability| capability == required),
                 "admitted serving-pair query omitted structural capability {required}"
             );
         }
-        for partially_implemented in [
-            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
-            WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-        ] {
-            assert!(
-                !advertised
-                    .iter()
-                    .any(|capability| capability == partially_implemented),
-                "serving-pair query advertised an operation that is not production-admitted: \
-                 {partially_implemented}"
-            );
-        }
+        let partially_implemented = WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1;
+        assert!(
+            !advertised
+                .iter()
+                .any(|capability| capability == partially_implemented),
+            "serving-pair query advertised an operation that is not production-admitted: \
+             {partially_implemented}"
+        );
         assert!(
             !advertised
                 .iter()
@@ -2059,17 +2058,43 @@ mod tests {
         let address = wallet::AddressLookup {
             selector: Some(wallet::address_lookup::Selector::ScriptHash(vec![0x51; 32])),
         };
-        let unavailable_outputs = wallet_client
+        let mut empty_outputs = wallet_client
             .transparent_address_unspent_outputs(wallet::TransparentAddressUnspentOutputsRequest {
                 address: Some(address.clone()),
                 start_height: 0,
                 at_epoch_id: Some(visible_tip.chain_epoch.id.value()),
             })
-            .await;
-        let Err(unavailable_status) = unavailable_outputs else {
-            return Err("unadmitted transparent-output stream unexpectedly opened".into());
-        };
-        assert_eq!(unavailable_status.code(), tonic::Code::FailedPrecondition);
+            .await?
+            .into_inner();
+        let output_header = empty_outputs
+            .message()
+            .await?
+            .ok_or("transparent-output stream omitted its epoch header")?;
+        assert!(matches!(
+            output_header.body,
+            Some(wallet::transparent_unspent_outputs_chunk::Body::Header(_))
+        ));
+        assert!(empty_outputs.message().await?.is_none());
+        let mut empty_history = wallet_client
+            .transparent_address_tx_ids_in_range(wallet::TransparentAddressTxIdsInRangeRequest {
+                address: Some(address),
+                start_height: 0,
+                end_height: visible_tip.height.value(),
+                max_entries: 1,
+                from_cursor: Vec::new(),
+                descending: false,
+            })
+            .await?
+            .into_inner();
+        let history_header = empty_history
+            .message()
+            .await?
+            .ok_or("transparent-history stream omitted its epoch header")?;
+        assert!(matches!(
+            history_header.body,
+            Some(wallet::transparent_address_tx_ids_chunk::Body::Header(_))
+        ));
+        assert!(empty_history.message().await?.is_none());
         let activation_response = wallet_client
             .network_upgrade_activations(wallet::NetworkUpgradeActivationsRequest {})
             .await?

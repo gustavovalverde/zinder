@@ -111,6 +111,8 @@ impl NativeWalletEndpointCapabilities {
                 | capabilities::WALLET_READ_SERVER_INFO_V2
                 | capabilities::WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1
                 | capabilities::WALLET_EVENTS_CHAIN_V1
+                | capabilities::WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1
+                | capabilities::WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
         );
         implemented_without_optional_evidence
             || (matches!(
