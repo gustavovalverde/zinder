@@ -17,18 +17,20 @@ use zinder_ingest::{
     CanonicalRunOverrides, DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
     DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE,
     DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
-    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, IngestError, IngestRuntimeConfig,
+    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, IngestError, IngestRuntimeConfig, IngestStorageConfig,
     MempoolIngestSettings, NodeSourceKind, PhaseClassificationConfig, RawBlobPolicy,
     container_memory_budget_bytes,
 };
 use zinder_runtime::{
-    ConfigError, ConfigLoader, IngestControlSection, IngestControlWriterToml, NetworkSection,
-    NetworkToml, NodeToml, OpsSection, OpsToml, ResolvedIngestControlWriter, ResolvedRetention,
-    RetentionSection, RetentionToml, RuntimeService, SecuritySection, SecurityToml,
-    StorageRoleSection, StorageRoleToml, duration_as_millis_u64, guard_optional_serving_bind,
-    require_field, resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
-    resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer,
-    resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr, resolve_retention,
+    ConfigError, ConfigLoader, DeploymentSection, DeploymentToml, DeploymentTopology,
+    IngestControlSection, IngestControlWriterToml, NetworkSection, NetworkToml, NodeToml,
+    OpsSection, OpsToml, PostgresStorageSection, PostgresStorageToml, ResolvedIngestControlWriter,
+    ResolvedRetention, RetentionSection, RetentionToml, RuntimeService, SecuritySection,
+    SecurityToml, StorageRoleSection, StorageRoleToml, duration_as_millis_u64,
+    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
+    resolve_canonical_reader_rocksdb_budget, resolve_canonical_writer_rocksdb_budget,
+    resolve_ingest_control_writer, resolve_materialized_view_writer_rocksdb_budget,
+    resolve_ops_listen_addr, resolve_retention,
 };
 use zinder_source::{
     DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
@@ -194,6 +196,10 @@ pub(crate) enum IngestConfigError {
     #[error(transparent)]
     CanonicalWriter(#[from] zinder_ingest::CanonicalWriterError),
 
+    #[cfg(feature = "postgres-topology")]
+    #[error(transparent)]
+    Postgres(#[from] zinder_postgres::CanonicalPersistenceError),
+
     #[error(transparent)]
     CanonicalReplayVerification(
         #[from] crate::replay_verification::CanonicalReplayVerificationError,
@@ -210,11 +216,10 @@ pub(crate) fn load_ingest_config(
     overrides: IngestConfigOverrides,
 ) -> Result<IngestCommandConfig, IngestConfigError> {
     let raw_config: IngestConfig = ConfigLoader::new()
-        // Storage default matches the canonical Zinder layout. The writer's
-        // primary store lives at `/var/lib/zinder/store`. Operators on
-        // non-PaaS hosts override via `ZINDER_STORAGE__PATH` env var or the
-        // `--storage-path` CLI flag.
-        .with_default("storage.path", "/var/lib/zinder/store")?
+        .with_default(
+            "deployment.topology",
+            DeploymentTopology::RocksDbSingleHost.as_str(),
+        )?
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
             "ingest.mempool.max_transaction_count",
@@ -407,6 +412,7 @@ pub(crate) fn redacted_canonical_replay_verification_config_toml(
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct IngestConfig {
+    deployment: DeploymentSection,
     network: NetworkSection,
     ops: OpsSection,
     node: NodeSection,
@@ -422,6 +428,7 @@ struct IngestConfig {
 struct IngestPrimaryStorageSection {
     path: Option<PathBuf>,
     secondary_path: Option<PathBuf>,
+    postgres: Option<PostgresStorageSection>,
     canonical: StorageRoleSection,
     materialized_views: StorageRoleSection,
     raw_blob_policy: Option<RawBlobPolicy>,
@@ -549,6 +556,7 @@ fn available_logical_core_count() -> NonZeroU32 {
     reason = "the phase-driven ingest resolver composes the network, source, storage, phase, bulk-catchup, tip-follow, and modifier knobs in one auditable validation sequence."
 )]
 fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, IngestConfigError> {
+    let deployment_topology = config.deployment.resolve()?;
     let network = config.network.resolve()?;
     let node_target = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
     let resolved_pipeline_limits = CanonicalPipelineLimits::resolve(
@@ -563,11 +571,34 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         .unwrap_or_else(|| node_source_name(NodeSourceKind::ZebraJsonRpc).to_owned());
     let node_source = parse_node_source(&node_source_text)?;
     let configured_raw_blob_policy = config.storage.raw_blob_policy;
-    let storage_path = require_field(config.storage.path, "storage.path")?;
-    let canonical_rocksdb_budget =
-        resolve_canonical_writer_rocksdb_budget(config.storage.canonical.rocksdb)?;
-    let materialized_view_rocksdb_budget =
-        resolve_materialized_view_writer_rocksdb_budget(config.storage.materialized_views.rocksdb)?;
+    let storage = match deployment_topology {
+        DeploymentTopology::RocksDbSingleHost => {
+            reject_postgres_storage_fields(&config.storage)?;
+            IngestStorageConfig::RocksDbSingleHost {
+                storage_path: config
+                    .storage
+                    .path
+                    .unwrap_or_else(|| PathBuf::from("/var/lib/zinder/store")),
+                canonical_rocksdb_budget: resolve_canonical_writer_rocksdb_budget(
+                    config.storage.canonical.rocksdb,
+                )?,
+                materialized_view_rocksdb_budget: resolve_materialized_view_writer_rocksdb_budget(
+                    config.storage.materialized_views.rocksdb,
+                )?,
+            }
+        }
+        DeploymentTopology::PostgresHorizontal => {
+            reject_postgres_tracer_unsupported_fields(&config.storage, &config.retention)?;
+            let postgres = require_field(config.storage.postgres, "storage.postgres")?.resolve()?;
+            IngestStorageConfig::PostgresHorizontal(postgres)
+        }
+        _ => {
+            return Err(ConfigError::invalid(
+                "deployment.topology is not supported by zinder-ingest",
+            )
+            .into());
+        }
+    };
 
     let reorg_window_blocks = require_field(
         config.ingest.reorg_window_blocks,
@@ -775,11 +806,10 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     };
 
     let runtime_config = IngestRuntimeConfig {
+        deployment_topology,
         node: node_target,
         node_source,
-        storage_path,
-        canonical_rocksdb_budget,
-        materialized_view_rocksdb_budget,
+        storage,
         raw_blob_policy,
         reorg_window_blocks,
         phase_classification: PhaseClassificationConfig {
@@ -821,6 +851,37 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         allow_public_bind,
         retention,
     })
+}
+
+fn reject_postgres_storage_fields(
+    storage: &IngestPrimaryStorageSection,
+) -> Result<(), ConfigError> {
+    if storage.postgres.is_some() {
+        Err(ConfigError::invalid(
+            "storage.postgres is not valid for deployment.topology = \"rocksdb-single-host\"",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_postgres_tracer_unsupported_fields(
+    storage: &IngestPrimaryStorageSection,
+    retention: &RetentionSection,
+) -> Result<(), ConfigError> {
+    if storage.path.is_some()
+        || storage.secondary_path.is_some()
+        || storage.raw_blob_policy.is_some()
+        || !storage.canonical.is_empty()
+        || !storage.materialized_views.is_empty()
+        || !retention.is_empty()
+    {
+        Err(ConfigError::invalid(
+            "storage.path, storage.secondary_path, storage.raw_blob_policy, storage.canonical, storage.materialized_views, and retention overrides are not valid for the unreleased postgres-horizontal tracer",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn guard_ingest_control_bearer_token(
@@ -874,6 +935,7 @@ fn resolve_raw_blob_policy(
 
 #[derive(Serialize)]
 struct RedactedIngestConfigToml {
+    deployment: DeploymentToml,
     network: NetworkToml,
     ops: OpsToml,
     security: SecurityToml,
@@ -897,19 +959,35 @@ impl RedactedIngestConfigToml {
     )]
     fn from_ingest_config(config: &IngestCommandConfig) -> Self {
         let runtime_config = &config.runtime_config;
+        let storage = match &runtime_config.storage {
+            IngestStorageConfig::RocksDbSingleHost {
+                storage_path,
+                canonical_rocksdb_budget,
+                materialized_view_rocksdb_budget,
+            } => IngestStorageToml {
+                path: Some(storage_path.display().to_string()),
+                postgres: None,
+                raw_blob_policy: Some(runtime_config.raw_blob_policy),
+                canonical: Some(StorageRoleToml::from_resolved(*canonical_rocksdb_budget)),
+                materialized_views: Some(StorageRoleToml::from_resolved(
+                    *materialized_view_rocksdb_budget,
+                )),
+            },
+            IngestStorageConfig::PostgresHorizontal(postgres) => IngestStorageToml {
+                path: None,
+                postgres: Some(PostgresStorageToml::redacted(postgres)),
+                raw_blob_policy: None,
+                canonical: None,
+                materialized_views: None,
+            },
+        };
         Self {
+            deployment: DeploymentToml::from_resolved(runtime_config.deployment_topology),
             network: NetworkToml::from_network(runtime_config.node.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             node: NodeToml::from_node_target(&runtime_config.node),
-            storage: IngestStorageToml {
-                path: runtime_config.storage_path.display().to_string(),
-                raw_blob_policy: runtime_config.raw_blob_policy,
-                canonical: StorageRoleToml::from_resolved(runtime_config.canonical_rocksdb_budget),
-                materialized_views: StorageRoleToml::from_resolved(
-                    runtime_config.materialized_view_rocksdb_budget,
-                ),
-            },
+            storage,
             ingest: IngestToml {
                 source: node_source_name(runtime_config.node_source),
                 reorg_window_blocks: runtime_config.reorg_window_blocks,
@@ -1052,10 +1130,16 @@ struct IngestMempoolToml {
 
 #[derive(Serialize)]
 struct IngestStorageToml {
-    path: String,
-    raw_blob_policy: RawBlobPolicy,
-    canonical: StorageRoleToml,
-    materialized_views: StorageRoleToml,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    postgres: Option<PostgresStorageToml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_blob_policy: Option<RawBlobPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical: Option<StorageRoleToml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    materialized_views: Option<StorageRoleToml>,
 }
 
 #[derive(Serialize)]
@@ -1168,5 +1252,57 @@ mod tests {
             None,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn postgres_topology_rejects_every_unsupported_storage_and_retention_field() {
+        let retention = RetentionSection::default();
+        let mut storage = IngestPrimaryStorageSection {
+            path: Some("/var/lib/zinder/store".into()),
+            ..IngestPrimaryStorageSection::default()
+        };
+        assert!(reject_postgres_tracer_unsupported_fields(&storage, &retention).is_err());
+
+        storage = IngestPrimaryStorageSection {
+            secondary_path: Some("/var/lib/zinder/secondary".into()),
+            ..IngestPrimaryStorageSection::default()
+        };
+        assert!(reject_postgres_tracer_unsupported_fields(&storage, &retention).is_err());
+
+        storage = IngestPrimaryStorageSection {
+            raw_blob_policy: Some(RawBlobPolicy::Transactions),
+            ..IngestPrimaryStorageSection::default()
+        };
+        assert!(reject_postgres_tracer_unsupported_fields(&storage, &retention).is_err());
+
+        storage = IngestPrimaryStorageSection::default();
+        storage.canonical.rocksdb.block_cache_bytes = Some(1);
+        assert!(reject_postgres_tracer_unsupported_fields(&storage, &retention).is_err());
+
+        storage = IngestPrimaryStorageSection::default();
+        storage.materialized_views.rocksdb.block_cache_bytes = Some(1);
+        assert!(reject_postgres_tracer_unsupported_fields(&storage, &retention).is_err());
+
+        storage = IngestPrimaryStorageSection::default();
+        let retention = RetentionSection {
+            chain_event_retention_hours: Some(1),
+            ..RetentionSection::default()
+        };
+        assert!(reject_postgres_tracer_unsupported_fields(&storage, &retention).is_err());
+    }
+
+    #[test]
+    fn rocksdb_topology_rejects_postgres_storage_fields() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let storage: IngestPrimaryStorageSection = toml::from_str(
+            r#"
+[postgres]
+database_url_path = "/run/secrets/database-url"
+tls = "loopback-plaintext"
+"#,
+        )?;
+
+        assert!(reject_postgres_storage_fields(&storage).is_err());
+        Ok(())
     }
 }

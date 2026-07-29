@@ -56,7 +56,7 @@ pub use mempool::{
 pub use phase::{classify_phase, current_chain_height};
 pub use runtime_config::{
     CanonicalConstructionSettings, CanonicalFollowSettings, CanonicalRunOverrides,
-    HistoricalWorkGate, IngestRuntimeConfig, MaterializedViewReplayConfig,
+    HistoricalWorkGate, IngestRuntimeConfig, IngestStorageConfig, MaterializedViewReplayConfig,
     MaterializedViewReplayPolicy, MempoolIngestSettings, PhaseClassificationConfig,
 };
 pub use tip_follow::{

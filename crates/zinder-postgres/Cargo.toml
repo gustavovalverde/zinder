@@ -1,0 +1,30 @@
+[package]
+name = "zinder-postgres"
+version.workspace = true
+description = "PostgreSQL data plane for the Zinder horizontal deployment topology"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "postgresql"]
+categories = ["database"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+zinder-core.workspace = true
+zinder-runtime.workspace = true
+
+[dev-dependencies]
+eyre.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+zinder-testkit.workspace = true
+
+[lints]
+workspace = true

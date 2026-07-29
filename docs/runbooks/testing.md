@@ -11,6 +11,7 @@ runner profiles, live-node gates, and consumer-facing certification evidence.
 | T0 unit | `#[cfg(test)] mod tests in src/` | `default-filter` of `default`/`ci` | Every commit | Logic regressions in the unit under test |
 | T1 integration | `tests/integration/` | `default-filter` of `default`/`ci` | Every commit | Cross-module wiring, gRPC adapter shape, store/proto round-trips |
 | T1 PostgreSQL integration | `services/zinder-bench/tests/integration/postgres_canonical_replay.rs` | `ci-postgres` | Every pull request with disposable PostgreSQL | SCRAM connection, binary COPY, transaction, reconnect, and persisted read-back through the diagnostic driver |
+| T1 PostgreSQL tracer integration | `crates/zinder-postgres/tests/integration/migration.rs` | Explicit ignored test | PostgreSQL tracer changes | Migration idempotence, identity and role admission, atomic rollback, idempotent append, stale predecessor rejection, and concurrent-writer serialization |
 | T2 perf | `tests/perf/` | `ci-perf` | Every commit | Latency budget regressions per the published budgets |
 | Consumer parity | `crates/zinder-client/tests/parity/` | `ci-parity` | Consumer contract changes / release certification | Consumer-shaped request and error-shape regressions against production serving compositions |
 | T3 live | `tests/live/` | `ci-live` | Manual / scheduled CI | Real upstream-node behavior (Zebra JSON-RPC, indexer gRPC) |
@@ -31,6 +32,12 @@ cannot connect to an accidental local service. Pull-request CI supplies a fresh
 SCRAM-configured PostgreSQL service and runs `ci-postgres` with
 `--run-ignored=all`; developers use the same profile with an explicit
 `ZINDER_TEST_POSTGRES_DATABASE_URL`.
+
+The tracer integration also remains `#[ignore]`. It requires separate
+migration and writer URLs so the test can prove that application credentials
+cannot act as schema owner. `ZINDER_TEST_POSTGRES_TLS_ROOT_CERTIFICATE_PATH`
+selects verified TLS; omitting it is allowed only for an explicitly
+loopback-local disposable database.
 
 ## Lightwalletd certification
 
@@ -117,6 +124,46 @@ real TCP password-authenticated connection, binary COPY, commit, deferred index
 creation, complete read-back, completion publication, reconnect, WAL/storage
 measurement, and safe existing-schema rejection. Start and clean the disposable
 database with the commands in [Storage benchmark environment](../../deploy/storage-benchmark.md#run-the-postgresql-driver-integration-gate).
+
+## PostgreSQL tracer integration gate
+
+Run after changing `zinder-postgres`, `zinder-migrate`, PostgreSQL ingest
+composition, schema admission, or transport policy. Use a fresh disposable
+database whose owner URL is supplied separately from the pre-provisioned
+`zinder_ingest` writer role:
+
+```bash
+ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://migration-owner:password@localhost:55433/zinder' \
+ZINDER_TEST_POSTGRES_WRITER_DATABASE_URL='postgresql://zinder_ingest:password@localhost:55433/zinder' \
+ZINDER_TEST_POSTGRES_TLS_ROOT_CERTIFICATE_PATH='/path/to/postgres-ca.pem' \
+  cargo test -p zinder-postgres --test acceptance \
+    migration_is_idempotent_and_binds_database_identity -- --ignored
+```
+
+A passing run proves the schema authority is idempotent, database identity is
+network-bound, the runtime role has only the required DML privileges, failed
+commits roll back fully, replay is idempotent, stale predecessors fail, and two
+connections cannot both publish the same transition.
+
+The outer T3 proof additionally requires the standard Regtest environment and
+the same three PostgreSQL test variables:
+
+```bash
+ZINDER_TEST_LIVE=1 \
+ZINDER_NETWORK=zcash-regtest \
+ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://migration-owner:password@localhost:55433/zinder' \
+ZINDER_TEST_POSTGRES_WRITER_DATABASE_URL='postgresql://zinder_ingest:password@localhost:55433/zinder' \
+ZINDER_TEST_POSTGRES_TLS_ROOT_CERTIFICATE_PATH='/path/to/postgres-ca.pem' \
+  cargo test -p zinder-ingest --test acceptance \
+    writer_exit_preserves_one_postgres_transition_for_fresh_probe \
+    --features postgres-topology -- --ignored
+```
+
+This slice uses Regtest because it exercises one current block append and
+process-boundary durability without relying on historical upgrade behavior.
+Use Testnet when a later slice adds long-history construction, activation-era
+parsing, realistic reorg recovery, or another property that Regtest cannot
+represent with comparable confidence.
 
 ## Consumer parity gate (consumer-shaped fixtures)
 

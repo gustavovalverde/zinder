@@ -67,6 +67,23 @@ PostgreSQL modules under `zinder-bench` persist canonical replay records as a
 benchmark corpus for diagnostics. They do not establish a runtime service,
 wallet-store implementation, replication contract, or supported deployment.
 
+## Unreleased PostgreSQL tracer boundary
+
+The reserved `postgres-horizontal` path is an implementation tracer, not a
+fifth release runtime or a supported topology. `zinder-migrate` is its
+one-shot schema authority and is the only tracer process allowed to execute
+DDL. The feature-gated `zinder-ingest` composition uses a separately
+provisioned `zinder_ingest` role to admit database identity and commit one
+bounded canonical append from a real Zebra source. A fresh ingest probe can
+then read the committed identity and tip.
+
+The tracer does not own wallet projection, serving, compatibility, mempool,
+continuous following, reorg, takeover, recovery, or release behavior. Adding
+those capabilities requires complete domain-shaped vertical slices; no reader
+or projection runtime may infer support merely because the deployment name and
+canonical tables exist. RocksDB storage ownership and all four release-runtime
+boundaries above remain unchanged.
+
 ## Optional explorer boundary
 
 `zinder-explorer` owns `ExplorerQuery` translation and reads the

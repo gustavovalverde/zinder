@@ -49,6 +49,8 @@ topology, migration, or backend label.
 | `zinder-compat-cipherscan` | Optional Cipherscan REST and WebSocket adapter |
 | `zinder-materialized-views` | Explorer materialized-view SDK and store |
 | `zinder-rocksdb-bulk-load` | RocksDB sorted-file bulk-load support |
+| `zinder-postgres` | Unreleased PostgreSQL connection, migration, and canonical tracer mechanics |
+| `zinder-migrate` | One-shot schema authority for the unreleased PostgreSQL tracer |
 
 Modules name the domain behavior they contain. Current examples are
 `canonical_replay_storage`, `wallet_serving_pair`, `wallet_serving_query`,
@@ -190,10 +192,17 @@ Configuration precedence is compiled defaults, TOML, `ZINDER_*` environment
 variables, then CLI overrides. Unknown fields fail. Cross-field invariants are
 validated before storage opens or listeners bind.
 
+`DeploymentTopology` has two stable configuration names:
+`rocksdb-single-host` is the supported release topology and default;
+`postgres-horizontal` is reserved for an unreleased certification tracer.
+Catalog membership is not a support claim. The PostgreSQL name becomes a
+production option only after its complete writer, projection, serving,
+recovery, packaging, and certification contracts pass.
+
 Release configuration is grouped by owner:
 
-- `[network]`, `[node]`, `[node.auth]`, `[ops]`, and `[security]` are shared
-  sections;
+- `[deployment]`, `[network]`, `[node]`, `[node.auth]`, `[ops]`, and
+  `[security]` are shared sections;
 - `[storage]`, `[ingest]`, `[ingest.construction]`, `[ingest.mempool]`,
   `[ingest.follow]`, `[ingest.run_overrides]`, `[retention]`, and
   `[ingest_control]` configure the canonical writer;
@@ -206,6 +215,7 @@ Nested environment names use double underscores, for example:
 
 ```text
 ZINDER_NETWORK__NAME
+ZINDER_DEPLOYMENT__TOPOLOGY
 ZINDER_NODE__JSON_RPC_ADDR
 ZINDER_NODE__AUTH__METHOD
 ZINDER_INGEST__CONSTRUCTION__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS
@@ -213,12 +223,21 @@ ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES
 ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS
 ZINDER_PROJECTOR__BUILD_OWNER_HEX
 ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS
+ZINDER_STORAGE__POSTGRES__DATABASE_URL_PATH
 ```
 
 The service's `--print-config` output is the authoritative field and default
 inventory for its current binary. It must show explicit redaction markers for
 secrets and raw authorization material. Examples under `deploy/config/` must
 stay synchronized with it.
+
+The unreleased PostgreSQL tracer accepts `[storage.postgres]` only with
+`deployment.topology = "postgres-horizontal"`. `database_url_path` names a
+secret file and is itself redacted. `tls = "verify-full"` requires
+`tls_root_certificate_path`; `tls = "loopback-plaintext"` is restricted to
+loopback hosts and host addresses. The supported RocksDB topology rejects this
+section, and the tracer rejects RocksDB paths, retention policy, and resource
+budgets rather than silently ignoring them.
 
 ### Environment-variable reference
 
@@ -250,6 +269,10 @@ stay synchronized with it.
 | `ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR` | zinder-projector | Optional | `projector_control.listen_addr` | Loopback-only private ProjectorControl gRPC endpoint for coherent capture. Empty or unset disables it; an enabled endpoint requires projector_control.bearer_token_path. |
 | `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH` | zinder-projector | When `projector control is enabled` | `projector_control.bearer_token_path` | Path to the token required by ProjectorControl and presented as the canonical checkpoint capability. Mount it only into projector and ingest; query and compatibility never read it. |
 | `ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT` | zinder-projector | Optional | `projector_control.checkpoint_staging_root` | Shared candidate root whose realpath must match ingest_control.checkpoint_staging_root. The projector sends only a SHA-256 root binding to canonical control, never a path. |
+| `ZINDER_DEPLOYMENT__TOPOLOGY` | zinder-ingest, zinder-migrate | Optional | `deployment.topology` | Deployment shape: `rocksdb-single-host` (the supported default) or `postgres-horizontal` (an unreleased certification tracer). `zinder-migrate` accepts only the latter and requires it explicitly. |
+| `ZINDER_STORAGE__POSTGRES__DATABASE_URL_PATH` | zinder-ingest, zinder-migrate | When `ZINDER_DEPLOYMENT__TOPOLOGY=postgres-horizontal` | `storage.postgres.database_url_path` | Path to a secret file containing the PostgreSQL connection URI. The migration and writer processes use separately provisioned roles. The path and file contents are redacted from printed configuration and logs. (sensitive; redacted) |
+| `ZINDER_STORAGE__POSTGRES__TLS` | zinder-ingest, zinder-migrate | When `ZINDER_DEPLOYMENT__TOPOLOGY=postgres-horizontal` | `storage.postgres.tls` | PostgreSQL transport posture: `verify-full` for certificate and hostname verification, or `loopback-plaintext` only when every configured host and host address is loopback-local. |
+| `ZINDER_STORAGE__POSTGRES__TLS_ROOT_CERTIFICATE_PATH` | zinder-ingest, zinder-migrate | When `ZINDER_STORAGE__POSTGRES__TLS=verify-full` | `storage.postgres.tls_root_certificate_path` | Path to the PEM trust root used for PostgreSQL certificate-chain and hostname verification. Rejected with `loopback-plaintext`. |
 | `ZINDER_STORAGE__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.path` | Canonical RocksDB store path. Writers open it as primary; readers open it as a secondary. |
 | `ZINDER_STORAGE__SECONDARY_PATH` | zinder-ingest (verify-canonical-replay only), zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `storage.secondary_path` | Process-unique RocksDB secondary metadata directory. Never share this path across reader processes. |
 | `ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS` | zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `storage.initial_catchup_timeout_ms` | Maximum startup RocksDB secondary catchup duration before a reader starts with the opened secondary and lets /readyz report replica lag. Defaults to 30000. |

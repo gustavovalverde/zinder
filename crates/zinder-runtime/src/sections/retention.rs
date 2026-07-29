@@ -49,6 +49,31 @@ pub struct RetentionSection {
     pub mempool_event_retention_max_encoded_bytes_per_step: Option<u64>,
 }
 
+impl RetentionSection {
+    /// Returns whether the operator configured no retention override.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        let Self {
+            chain_event_retention_hours,
+            chain_event_retention_check_interval_ms,
+            cursor_at_risk_warning_hours,
+            mempool_mined_retention_minutes,
+            mempool_invalidated_retention_hours,
+            mempool_event_retention_check_interval_ms,
+            mempool_event_retention_max_events_per_step,
+            mempool_event_retention_max_encoded_bytes_per_step,
+        } = self;
+        chain_event_retention_hours.is_none()
+            && chain_event_retention_check_interval_ms.is_none()
+            && cursor_at_risk_warning_hours.is_none()
+            && mempool_mined_retention_minutes.is_none()
+            && mempool_invalidated_retention_hours.is_none()
+            && mempool_event_retention_check_interval_ms.is_none()
+            && mempool_event_retention_max_events_per_step.is_none()
+            && mempool_event_retention_max_encoded_bytes_per_step.is_none()
+    }
+}
+
 /// Fully resolved retention configuration with all defaults applied.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolvedRetention {

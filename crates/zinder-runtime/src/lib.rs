@@ -8,7 +8,8 @@
 //!   ([`spawn_ops_endpoint`], [`serve_ops_endpoint`]).
 //! - The shared configuration error type, fluent layered loader, and shared
 //!   schema/redacted-render mirrors ([`ConfigError`], [`ConfigLoader`],
-//!   [`NetworkSection`], [`NetworkToml`], [`NodeAuthToml`], [`NodeToml`],
+//!   [`DeploymentSection`], [`DeploymentToml`], [`DeploymentTopology`], [`NetworkSection`],
+//!   [`NetworkToml`], [`NodeAuthToml`], [`NodeToml`],
 //!   [`zinder_environment_source`], [`require_field`], [`duration_as_millis_u64`])
 //!   that every service binary uses to honor the
 //!   `defaults -> file -> ZINDER_* env -> CLI overrides` precedence.
@@ -65,7 +66,9 @@ pub use readiness::{
 pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
 pub use sections::{
     CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, DEFAULT_ALLOW_PUBLIC_BIND,
-    IngestControlReaderToml, IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml,
+    DeploymentSection, DeploymentToml, DeploymentTopology, IngestControlReaderToml,
+    IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml, PostgresStorageConfig,
+    PostgresStorageSection, PostgresStorageToml, PostgresTlsMode, PostgresTlsPolicy,
     ProjectorControlSection, ProjectorControlToml, ResolvedCanonicalSecondaryStorage,
     ResolvedIngestControlReader, ResolvedIngestControlWriter, ResolvedProjectorControl,
     ResolvedRetention, ResolvedSecondaryStorage, RetentionSection, RetentionToml,
