@@ -49,6 +49,7 @@ Extension guides:
 - [Bulk-catchup resource tuning](runbooks/bulk-catchup-resource-tuning.md)
 - [Deploying on a VM](runbooks/deploying-on-a-vm.md)
 - [Deploying on Railway](runbooks/deploying-on-railway.md)
+- [Wallet-serving deployment (single-volume hosts)](runbooks/deploying-wallet-serving.md)
 - [Cipherscan adapter verification](runbooks/cipherscan-adapter-verification.md)
 - [Releasing Zinder](runbooks/releasing.md)
 - [Testing](runbooks/testing.md)

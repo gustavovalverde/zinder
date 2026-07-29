@@ -1620,7 +1620,10 @@ fn map_epoch_pin_store_error(error: StoreError, chain_epoch_id: ChainEpochId) ->
 
 /// Awaits a `spawn_blocking` task and flattens the join error into a
 /// `QueryError` so callers see one consistent error vocabulary.
-async fn join_blocking<Output>(
+///
+/// Every query composition in this crate routes its storage reads through
+/// this helper, so no `RocksDB` read ever runs on a reactor thread.
+pub(crate) async fn join_blocking<Output>(
     handle: tokio::task::JoinHandle<Result<Output, QueryError>>,
 ) -> Result<Output, QueryError> {
     match handle.await {
@@ -2523,7 +2526,7 @@ fn map_height_artifact_store_error(
     }
 }
 
-fn validate_block_range(
+pub(crate) fn validate_block_range(
     block_range: BlockHeightRange,
     max_blocks: NonZeroU32,
 ) -> Result<(), QueryError> {

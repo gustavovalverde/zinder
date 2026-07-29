@@ -175,6 +175,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             replica_lag_threshold_chain_epochs: query_config
                 .storage
                 .secondary_replica_lag_threshold_chain_epochs,
+            serving_pair_staleness_ceiling: query_config.storage.serving_pair_staleness_ceiling,
         },
         readiness.clone(),
         &query_config.ingest_control_addr,

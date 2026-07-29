@@ -1,0 +1,585 @@
+#!/bin/sh
+
+set -eu
+
+# RocksDB opens the canonical primary, the in-process canonical secondary, the
+# materialized-view store, and both reader secondaries from one process table.
+nofile_limit=65536
+
+poll_interval_seconds=15
+probe_connect_timeout_seconds=2
+probe_max_time_seconds=5
+unready_report_interval_seconds=300
+
+# Railway drains this container for 30 seconds. The runtime processes get a
+# strictly shorter window so a flush that needs the full budget still finishes
+# before the platform sends SIGKILL.
+shutdown_grace_seconds=20
+
+# The three phase deadlines sum below Railway's healthcheck window, so a stalled
+# phase names itself in the logs before the platform reports a generic timeout.
+canonical_construction_deadline_seconds=10800
+wallet_construction_deadline_seconds=7200
+wallet_serving_deadline_seconds=1800
+
+# Upstream outages and sync lag clear on their own; a plane that stays unready
+# past this window ends the container so the platform restarts a clean set.
+serving_unready_tolerance_seconds=3600
+
+# A plane that flips ready/unready every 60-330s never trips the tolerance
+# above: any single all-ready poll resets it to zero. This budget escalates
+# on the flap pattern itself instead of on contiguous downtime: too many
+# episodes, or too much cumulative unready time, before the plane manages a
+# sustained recovery.
+recurrence_clear_window_seconds=600
+recurrence_episode_budget=6
+recurrence_cumulative_unready_seconds_budget=900
+
+ingest_ops_addr="127.0.0.1:9105"
+projector_ops_addr="127.0.0.1:9110"
+query_ops_addr="127.0.0.1:9106"
+
+ingest_control_token_path="/var/run/zinder-control/ingest.token"
+checkpoint_token_path="/var/run/zinder-checkpoint/checkpoint.token"
+
+ingest_pid=""
+projector_pid=""
+query_pid=""
+sleep_pid=""
+
+# Per-plane recurrence counters. `*_flap_unready_since_epoch` is 0 while the
+# plane is ready; nonzero marks the start of the episode in progress.
+ingest_episode_count=0
+ingest_flap_unready_since_epoch=0
+ingest_cumulative_unready_seconds=0
+ingest_flap_ready_since_epoch=0
+
+projector_episode_count=0
+projector_flap_unready_since_epoch=0
+projector_cumulative_unready_seconds=0
+projector_flap_ready_since_epoch=0
+
+query_episode_count=0
+query_flap_unready_since_epoch=0
+query_cumulative_unready_seconds=0
+query_flap_ready_since_epoch=0
+
+probe_http_status=""
+probe_body=""
+probe_cause=""
+probe_exit_code=0
+probe_connect_seconds=""
+probe_failure_class=""
+probe_report=""
+
+# curl writes the status code and connect time after the body; a newline
+# separates them because JSON escapes newlines inside strings.
+response_separator='
+'
+
+log() {
+  printf '%s zinder-wallet-serving-runtime: %s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
+}
+
+stop_processes() {
+  signal_name="$1"
+
+  for runtime_pid in "$query_pid" "$projector_pid" "$ingest_pid"; do
+    if [ -n "$runtime_pid" ]; then
+      kill -s "$signal_name" "$runtime_pid" 2>/dev/null || true
+    fi
+  done
+}
+
+alive_process_labels() {
+  labels=""
+
+  if [ -n "$ingest_pid" ] && kill -0 "$ingest_pid" 2>/dev/null; then
+    labels="$labels zinder-ingest($ingest_pid)"
+  fi
+  if [ -n "$projector_pid" ] && kill -0 "$projector_pid" 2>/dev/null; then
+    labels="$labels zinder-projector($projector_pid)"
+  fi
+  if [ -n "$query_pid" ] && kill -0 "$query_pid" 2>/dev/null; then
+    labels="$labels zinder-query($query_pid)"
+  fi
+
+  printf '%s' "${labels# }"
+}
+
+any_process_alive() {
+  [ -n "$(alive_process_labels)" ]
+}
+
+# Sleeps in a child process so a signal reaches the trap immediately, and
+# reaps every runtime process that exited during the interval so the
+# liveness checks observe exits instead of unreaped entries.
+sleep_interruptibly() {
+  sleep "$1" &
+  sleep_pid="$!"
+  wait "$sleep_pid" 2>/dev/null || true
+  sleep_pid=""
+}
+
+# Returns non-zero when the grace window expires with a runtime process still
+# holding a RocksDB instance open on the shared volume.
+await_processes_exit() {
+  remaining_seconds="$shutdown_grace_seconds"
+
+  while [ "$remaining_seconds" -gt 0 ] && any_process_alive; do
+    sleep_interruptibly 1
+    remaining_seconds=$((remaining_seconds - 1))
+  done
+
+  survivors="$(alive_process_labels)"
+  if [ -n "$survivors" ]; then
+    log "grace window expired with these processes still running: $survivors"
+    return 1
+  fi
+
+  return 0
+}
+
+fail() {
+  log "$*"
+  stop_processes TERM
+  await_processes_exit || true
+  exit 1
+}
+
+# ShellCheck cannot see function references embedded in trap actions.
+# shellcheck disable=SC2329
+forward_signal() {
+  signal_name="$1"
+
+  trap - INT TERM
+  log "forwarding SIG${signal_name} to the runtime processes"
+  stop_processes "$signal_name"
+  if [ -n "$sleep_pid" ]; then
+    kill -s TERM "$sleep_pid" 2>/dev/null || true
+  fi
+  if await_processes_exit; then
+    exit 0
+  fi
+
+  exit 1
+}
+
+trap 'forward_signal INT' INT
+trap 'forward_signal TERM' TERM
+
+materialize_token() {
+  token_path="$1"
+  token_value="$2"
+
+  if [ -z "$token_value" ]; then
+    token_value="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
+
+  mkdir -p "$(dirname "$token_path")"
+  printf '%s\n' "$token_value" >"$token_path"
+  chown zinder:zinder "$token_path"
+  chmod 0400 "$token_path"
+}
+
+# Names the curl failure behind an unreachable plane. `/readyz` always answers
+# with a JSON body, so a probe that carries no body proves the ops listener
+# never completed the exchange rather than that the plane refused traffic.
+# curl reports both timeouts as exit 28; a zero connect time separates the two.
+classify_probe_failure() {
+  case "$probe_exit_code" in
+    7)
+      probe_failure_class="connection_refused"
+      ;;
+    28)
+      case "$probe_connect_seconds" in
+        *[1-9]*) probe_failure_class="total_timeout" ;;
+        *) probe_failure_class="connect_timeout" ;;
+      esac
+      ;;
+    52)
+      probe_failure_class="empty_reply"
+      ;;
+    56)
+      probe_failure_class="connection_reset"
+      ;;
+    *)
+      probe_failure_class="curl_error"
+      ;;
+  esac
+}
+
+# This probes only the ops `/readyz` listener, never the data-plane gRPC port
+# (`query.listen_addr` and its ingest/projector counterparts). A data-plane
+# probe, such as a `grpc.health.v1.Health` check or a round trip through the
+# existing `ServerInfo` RPC, would catch a wedged serving loop that keeps
+# answering `/readyz`, which is the blind spot that hid the outage this
+# detector responds to. Adding one is out of scope here: none of the three
+# gRPC servers register a health or reflection service yet
+# (zinder-proto/src/lib.rs documents reflection as unwired), and this image
+# ships curl but no gRPC-aware client. A bare TCP connect to the data-plane
+# port would not close the gap either; a saturated tokio executor still
+# completes a TCP handshake without ever reaching the handler that a real
+# request would exercise. Closing this requires a server-side health service
+# plus a client the image can run, both belonging in a follow-up outside this
+# entrypoint.
+#
+# Reads one plane's readiness into `probe_http_status`, `probe_body`,
+# `probe_cause`, and `probe_report`. Both timeouts are bounded so a saturated
+# tokio runtime that accepted the connection cannot hold the foreground
+# command, and with it the signal traps, indefinitely.
+#
+# Callers log `probe_report`: it carries the served body when there is one and
+# the classified curl failure when there is not.
+probe_readiness() {
+  ops_addr="$1"
+
+  probe_exit_code=0
+  probe_response="$(
+    curl -s \
+      --connect-timeout "$probe_connect_timeout_seconds" \
+      --max-time "$probe_max_time_seconds" \
+      -w "${response_separator}%{http_code} %{time_connect}" \
+      "http://$ops_addr/readyz"
+  )" || probe_exit_code="$?"
+
+  probe_trailer="${probe_response##*"$response_separator"}"
+  probe_body="${probe_response%"$response_separator"*}"
+  probe_http_status="${probe_trailer%% *}"
+  probe_connect_seconds="${probe_trailer##* }"
+  probe_cause="unreachable"
+  probe_failure_class=""
+
+  if [ "$probe_exit_code" -ne 0 ]; then
+    probe_http_status=""
+    probe_body=""
+    classify_probe_failure
+    probe_report="unreachable: $probe_failure_class (curl exit $probe_exit_code)"
+    return 0
+  fi
+
+  cause_fragment="${probe_body#*'"cause":'}"
+  if [ "$cause_fragment" != "$probe_body" ]; then
+    cause_fragment="${cause_fragment#'{'}"
+    cause_fragment="${cause_fragment#'"'}"
+    probe_cause="${cause_fragment%%'"'*}"
+  fi
+
+  probe_report="http $probe_http_status: $probe_body"
+}
+
+# `/readyz` reports one 503 for causes that clear with time and causes that
+# never clear. Only the latter belong here: waiting on them burns the phase
+# deadline and, once serving, the whole Railway healthcheck window.
+readiness_cause_is_terminal() {
+  case "$1" in
+    schema_mismatch | node_capability_missing | reorg_window_exceeded)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+assert_started_processes_alive() {
+  if [ -n "$ingest_pid" ] && ! kill -0 "$ingest_pid" 2>/dev/null; then
+    fail "zinder-ingest exited"
+  fi
+  if [ -n "$projector_pid" ] && ! kill -0 "$projector_pid" 2>/dev/null; then
+    fail "zinder-projector exited"
+  fi
+  if [ -n "$query_pid" ] && ! kill -0 "$query_pid" 2>/dev/null; then
+    fail "zinder-query exited"
+  fi
+}
+
+# Waits for one plane to admit traffic. Every already-started process is
+# checked on each iteration: a plane reads canonical through a secondary of the
+# store the previous plane writes, so a dead upstream makes the awaited
+# readiness unreachable while the awaited process itself stays alive.
+await_readiness() {
+  role="$1"
+  ops_addr="$2"
+  phase_deadline_seconds="$3"
+
+  phase_started_epoch="$(date +%s)"
+  deadline_epoch=$((phase_started_epoch + phase_deadline_seconds))
+  next_report_epoch=$((phase_started_epoch + unready_report_interval_seconds))
+
+  while true; do
+    assert_started_processes_alive
+    probe_readiness "$ops_addr"
+    if [ "$probe_http_status" = "200" ]; then
+      return 0
+    fi
+
+    if readiness_cause_is_terminal "$probe_cause"; then
+      fail "$role reports $probe_cause, which no amount of waiting clears: $probe_report"
+    fi
+
+    probe_epoch="$(date +%s)"
+    if [ "$probe_epoch" -ge "$deadline_epoch" ]; then
+      fail "$role stayed unready for ${phase_deadline_seconds}s: $probe_report"
+    fi
+    if [ "$probe_epoch" -ge "$next_report_epoch" ]; then
+      log "$role unready after $((probe_epoch - phase_started_epoch))s: $probe_report"
+      next_report_epoch=$((probe_epoch + unready_report_interval_seconds))
+    fi
+
+    sleep_interruptibly "$poll_interval_seconds"
+  done
+}
+
+# Records the first plane that stops admitting traffic in `unready_plane` and
+# returns non-zero, so the caller can time how long the condition persists.
+observe_plane_readiness() {
+  role="$1"
+  ops_addr="$2"
+
+  probe_readiness "$ops_addr"
+  if [ "$probe_http_status" = "200" ]; then
+    return 0
+  fi
+  if readiness_cause_is_terminal "$probe_cause"; then
+    fail "$role reports $probe_cause, which no amount of waiting clears: $probe_report"
+  fi
+
+  return 1
+}
+
+# Folds one plane's readiness observation from this poll into its recurrence
+# counters and reports the updated state on stdout as "<episode_count>
+# <flap_unready_since_epoch> <cumulative_unready_seconds>
+# <flap_ready_since_epoch> <total_unready_seconds> <escalate>", so the caller
+# can persist the counters into its own variables with `set --`. Escalation
+# is reported rather than acted on here: this function runs inside a command
+# substitution, so calling fail() from it would only exit that subshell and
+# leave the container running.
+update_plane_recurrence() {
+  role="$1"
+  is_ready="$2"
+  now_epoch="$3"
+  episode_count="$4"
+  flap_unready_since_epoch="$5"
+  cumulative_unready_seconds="$6"
+  flap_ready_since_epoch="$7"
+  report="$8"
+
+  if [ "$is_ready" -eq 1 ]; then
+    if [ "$flap_unready_since_epoch" -ne 0 ]; then
+      episode_seconds=$((now_epoch - flap_unready_since_epoch))
+      cumulative_unready_seconds=$((cumulative_unready_seconds + episode_seconds))
+      log "$role recovered after ${episode_seconds}s unready: episode $episode_count ended, ${cumulative_unready_seconds}s unready in the current recurrence window"
+      flap_unready_since_epoch=0
+      flap_ready_since_epoch="$now_epoch"
+    elif [ "$episode_count" -gt 0 ] \
+      && [ $((now_epoch - flap_ready_since_epoch)) -ge "$recurrence_clear_window_seconds" ]; then
+      log "$role stayed ready for ${recurrence_clear_window_seconds}s, clearing $episode_count recorded episode(s) (${cumulative_unready_seconds}s unready)"
+      episode_count=0
+      cumulative_unready_seconds=0
+    fi
+  elif [ "$flap_unready_since_epoch" -eq 0 ]; then
+    episode_count=$((episode_count + 1))
+    flap_unready_since_epoch="$now_epoch"
+    log "$role flap episode $episode_count began: $report"
+  fi
+
+  if [ "$flap_unready_since_epoch" -ne 0 ]; then
+    total_unready_seconds=$((cumulative_unready_seconds + now_epoch - flap_unready_since_epoch))
+  else
+    total_unready_seconds="$cumulative_unready_seconds"
+  fi
+
+  # Escalation is computed from completed episodes only
+  # (cumulative_unready_seconds), never the in-progress one folded into
+  # total_unready_seconds above: a single contiguous outage would otherwise
+  # cross this budget well before serving_unready_tolerance_seconds, making
+  # that tolerance unreachable for the exact case it exists to govern.
+  escalate=0
+  if [ "$episode_count" -ge "$recurrence_episode_budget" ] \
+    || [ "$cumulative_unready_seconds" -ge "$recurrence_cumulative_unready_seconds_budget" ]; then
+    escalate=1
+  fi
+
+  printf '%s %s %s %s %s %s\n' \
+    "$episode_count" "$flap_unready_since_epoch" "$cumulative_unready_seconds" \
+    "$flap_ready_since_epoch" "$total_unready_seconds" "$escalate"
+}
+
+# Railway mounts the persistent volume after the image filesystem is
+# materialized, so the mount root is owned by root instead of the runtime UID.
+# Repair only the Zinder volume before dropping privileges. Fresh construction
+# still requires the final store paths to be absent.
+mkdir -p \
+  /var/lib/zinder/checkpoints \
+  /var/lib/zinder/projector/canonical-secondary \
+  /var/lib/zinder/query/canonical-secondary \
+  /var/lib/zinder/query/wallet-secondary
+chown -R zinder:zinder /var/lib/zinder
+
+# The runtime shell implements the open-file resource POSIX leaves undefined.
+# shellcheck disable=SC3045
+ulimit -n "$nofile_limit" \
+  || fail "could not raise the open-file limit to $nofile_limit"
+
+materialize_token "$ingest_control_token_path" "${INGEST_CONTROL_BEARER_TOKEN:-}"
+materialize_token "$checkpoint_token_path" "${CHECKPOINT_BEARER_TOKEN:-}"
+
+if [ -n "${ZINDER_INGEST__REORG_WINDOW_BLOCKS:-}" ]; then
+  ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS="$ZINDER_INGEST__REORG_WINDOW_BLOCKS"
+  ZINDER_QUERY__REORG_WINDOW_BLOCKS="$ZINDER_INGEST__REORG_WINDOW_BLOCKS"
+  export ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS ZINDER_QUERY__REORG_WINDOW_BLOCKS
+fi
+
+# Every binary rejects an unknown `ZINDER_*` section, so each process starts
+# without the role-scoped variables and the bearer secrets it does not own.
+log "starting canonical construction"
+env \
+  -u ZINDER_PROJECTOR__BUILD_OWNER_HEX \
+  -u ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS \
+  -u ZINDER_QUERY__REORG_WINDOW_BLOCKS \
+  -u INGEST_CONTROL_BEARER_TOKEN \
+  -u CHECKPOINT_BEARER_TOKEN \
+  setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
+  /usr/local/bin/zinder-ingest --config /etc/zinder/ingest.toml &
+ingest_pid="$!"
+await_readiness zinder-ingest "$ingest_ops_addr" \
+  "$canonical_construction_deadline_seconds"
+
+log "starting wallet construction"
+env \
+  -u ZINDER_INGEST__REORG_WINDOW_BLOCKS \
+  -u ZINDER_QUERY__REORG_WINDOW_BLOCKS \
+  -u INGEST_CONTROL_BEARER_TOKEN \
+  -u CHECKPOINT_BEARER_TOKEN \
+  setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
+  /usr/local/bin/zinder-projector --config /etc/zinder/projector.toml &
+projector_pid="$!"
+await_readiness zinder-projector "$projector_ops_addr" \
+  "$wallet_construction_deadline_seconds"
+
+log "starting wallet serving"
+env \
+  -u ZINDER_INGEST__REORG_WINDOW_BLOCKS \
+  -u ZINDER_PROJECTOR__BUILD_OWNER_HEX \
+  -u ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS \
+  -u INGEST_CONTROL_BEARER_TOKEN \
+  -u CHECKPOINT_BEARER_TOKEN \
+  setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
+  /usr/local/bin/zinder-query --config /etc/zinder/query.toml &
+query_pid="$!"
+await_readiness zinder-query "$query_ops_addr" "$wallet_serving_deadline_seconds"
+
+log "wallet serving is ready"
+
+startup_completed_epoch="$(date +%s)"
+ingest_flap_ready_since_epoch="$startup_completed_epoch"
+projector_flap_ready_since_epoch="$startup_completed_epoch"
+query_flap_ready_since_epoch="$startup_completed_epoch"
+
+# A surviving subset of the topology answers requests it cannot satisfy, so one
+# exit terminates the container and the orchestrator restarts a clean set.
+# Liveness alone does not prove the topology advances: a canonical writer parked
+# on an oversized reorg keeps its process, its readers, and their published pair
+# perfectly self-consistent at a frozen height, so readiness carries the signal
+# that liveness cannot.
+unready_since_epoch=0
+
+while true; do
+  sleep_interruptibly "$poll_interval_seconds"
+  assert_started_processes_alive
+
+  now_epoch="$(date +%s)"
+
+  # Every plane is probed every iteration regardless of its siblings, so a
+  # plane's own flap history stays accurate even in polls where another plane
+  # is also unready.
+  ingest_ready=0
+  if observe_plane_readiness zinder-ingest "$ingest_ops_addr"; then
+    ingest_ready=1
+  fi
+  ingest_report="$probe_report"
+
+  projector_ready=0
+  if observe_plane_readiness zinder-projector "$projector_ops_addr"; then
+    projector_ready=1
+  fi
+  projector_report="$probe_report"
+
+  query_ready=0
+  if observe_plane_readiness zinder-query "$query_ops_addr"; then
+    query_ready=1
+  fi
+  query_report="$probe_report"
+
+  # shellcheck disable=SC2046 # word-splitting the fixed-width numeric fields update_plane_recurrence prints is intentional; see its own comment.
+  set -- $(update_plane_recurrence zinder-ingest "$ingest_ready" "$now_epoch" \
+    "$ingest_episode_count" "$ingest_flap_unready_since_epoch" \
+    "$ingest_cumulative_unready_seconds" "$ingest_flap_ready_since_epoch" "$ingest_report")
+  ingest_episode_count="$1"
+  ingest_flap_unready_since_epoch="$2"
+  ingest_cumulative_unready_seconds="$3"
+  ingest_flap_ready_since_epoch="$4"
+  ingest_total_unready_seconds="$5"
+  ingest_escalate="$6"
+
+  # shellcheck disable=SC2046 # word-splitting the fixed-width numeric fields update_plane_recurrence prints is intentional; see its own comment.
+  set -- $(update_plane_recurrence zinder-projector "$projector_ready" "$now_epoch" \
+    "$projector_episode_count" "$projector_flap_unready_since_epoch" \
+    "$projector_cumulative_unready_seconds" "$projector_flap_ready_since_epoch" "$projector_report")
+  projector_episode_count="$1"
+  projector_flap_unready_since_epoch="$2"
+  projector_cumulative_unready_seconds="$3"
+  projector_flap_ready_since_epoch="$4"
+  projector_total_unready_seconds="$5"
+  projector_escalate="$6"
+
+  # shellcheck disable=SC2046 # word-splitting the fixed-width numeric fields update_plane_recurrence prints is intentional; see its own comment.
+  set -- $(update_plane_recurrence zinder-query "$query_ready" "$now_epoch" \
+    "$query_episode_count" "$query_flap_unready_since_epoch" \
+    "$query_cumulative_unready_seconds" "$query_flap_ready_since_epoch" "$query_report")
+  query_episode_count="$1"
+  query_flap_unready_since_epoch="$2"
+  query_cumulative_unready_seconds="$3"
+  query_flap_ready_since_epoch="$4"
+  query_total_unready_seconds="$5"
+  query_escalate="$6"
+
+  if [ "$ingest_escalate" -eq 1 ]; then
+    fail "zinder-ingest recurrence budget exceeded: $ingest_episode_count episode(s), ${ingest_total_unready_seconds}s unready without a sustained recovery: $ingest_report"
+  fi
+  if [ "$projector_escalate" -eq 1 ]; then
+    fail "zinder-projector recurrence budget exceeded: $projector_episode_count episode(s), ${projector_total_unready_seconds}s unready without a sustained recovery: $projector_report"
+  fi
+  if [ "$query_escalate" -eq 1 ]; then
+    fail "zinder-query recurrence budget exceeded: $query_episode_count episode(s), ${query_total_unready_seconds}s unready without a sustained recovery: $query_report"
+  fi
+
+  if [ "$ingest_ready" -eq 1 ] && [ "$projector_ready" -eq 1 ] && [ "$query_ready" -eq 1 ]; then
+    if [ "$unready_since_epoch" -ne 0 ]; then
+      log "every plane admits traffic again"
+      unready_since_epoch=0
+    fi
+    continue
+  fi
+
+  if [ "$ingest_ready" -eq 0 ]; then
+    hard_down_plane="zinder-ingest"
+    hard_down_report="$ingest_report"
+  elif [ "$projector_ready" -eq 0 ]; then
+    hard_down_plane="zinder-projector"
+    hard_down_report="$projector_report"
+  else
+    hard_down_plane="zinder-query"
+    hard_down_report="$query_report"
+  fi
+
+  if [ "$unready_since_epoch" -eq 0 ]; then
+    unready_since_epoch="$now_epoch"
+    log "$hard_down_plane stopped admitting traffic: $hard_down_report"
+  elif [ $((now_epoch - unready_since_epoch)) -ge "$serving_unready_tolerance_seconds" ]; then
+    fail "$hard_down_plane has not admitted traffic for $((now_epoch - unready_since_epoch))s: $hard_down_report"
+  fi
+done

@@ -1,11 +1,12 @@
 # Railway canonical-writer validation
 
-Railway is not a wallet-serving topology. The supported RocksDB composition
-requires canonical and wallet owners plus readers on one shared host
-filesystem. The checked Railway target runs only `zinder-ingest` for isolated
-canonical correctness, restart, or performance validation.
+This Railway target runs only `zinder-ingest`, for isolated canonical
+correctness, restart, or performance validation. It projects no wallet state
+and serves no client protocol.
 
-Use [Deploying on a VM](deploying-on-a-vm.md) for wallet serving.
+Use [Deploying on a VM](deploying-on-a-vm.md) for the complete topology, or
+[Wallet-serving deployment (single-volume hosts)](deploying-wallet-serving.md)
+for the native `WalletQuery` service.
 
 ## Target admission
 
@@ -48,7 +49,8 @@ the required diagnostic evidence is captured.
 ## Boundaries
 
 - Do not label this target as a production wallet deployment.
-- Do not add query or compatibility processes to the same container.
+- Do not add projection or serving processes to this image; the wallet-serving
+  Railway topology is a separate target with its own volume and service.
 - Do not use Railway service volumes as cross-service RocksDB replication.
 - Do not infer full-topology capacity from the canonical directory alone.
 

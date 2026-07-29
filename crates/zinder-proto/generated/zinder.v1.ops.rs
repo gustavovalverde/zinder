@@ -73,7 +73,7 @@ pub struct ReadinessReport {
 /// malformed.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadinessCauseDetail {
-    #[prost(oneof = "readiness_cause_detail::Payload", tags = "1, 2, 3, 4, 5, 8, 9")]
+    #[prost(oneof = "readiness_cause_detail::Payload", tags = "1, 2, 3, 4, 5, 8, 9, 10")]
     pub payload: ::core::option::Option<readiness_cause_detail::Payload>,
 }
 /// Nested message and enum types in `ReadinessCauseDetail`.
@@ -94,6 +94,8 @@ pub mod readiness_cause_detail {
         NodeUnavailable(super::NodeUnavailableDetail),
         #[prost(message, tag = "9")]
         UpstreamNotReady(super::UpstreamNotReadyDetail),
+        #[prost(message, tag = "10")]
+        ServingPairStale(super::ServingPairStaleDetail),
     }
 }
 /// Detail for READINESS_CAUSE_SYNCING.
@@ -136,6 +138,22 @@ pub struct CursorAtRiskDetail {
     /// Configured retention window, rounded down to whole hours.
     #[prost(uint64, tag = "2")]
     pub retention_hours: u64,
+}
+/// Detail for READINESS_CAUSE_SERVING_PAIR_STALE.
+///
+/// Carries the two numbers that bound continued serving: how far the writer
+/// has moved past the published pair, and how long the pair has gone without
+/// a writer attestation. The reader stops admitting traffic once the staleness
+/// crosses its configured ceiling.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ServingPairStaleDetail {
+    /// Chain-epoch distance between the writer and the published pair at the
+    /// last successful writer-status fetch.
+    #[prost(uint64, tag = "1")]
+    pub lag_chain_epochs: u64,
+    /// Seconds since the writer last attested the published pair.
+    #[prost(uint64, tag = "2")]
+    pub staleness_seconds: u64,
 }
 /// Detail for READINESS_CAUSE_NODE_UNAVAILABLE.
 ///
@@ -237,6 +255,10 @@ pub enum ReadinessCause {
     /// `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
     /// See ADR-0015.
     UpstreamNotReady = 16,
+    /// A wallet-serving reader cannot refresh or match its published canonical
+    /// and wallet pair, but the pair is still within its staleness ceiling and
+    /// remains exactly what the writer last attested, so it keeps serving.
+    ServingPairStale = 17,
 }
 impl ReadinessCause {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -259,6 +281,7 @@ impl ReadinessCause {
             Self::CursorAtRisk => "READINESS_CAUSE_CURSOR_AT_RISK",
             Self::ShuttingDown => "READINESS_CAUSE_SHUTTING_DOWN",
             Self::UpstreamNotReady => "READINESS_CAUSE_UPSTREAM_NOT_READY",
+            Self::ServingPairStale => "READINESS_CAUSE_SERVING_PAIR_STALE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -282,6 +305,7 @@ impl ReadinessCause {
             "READINESS_CAUSE_CURSOR_AT_RISK" => Some(Self::CursorAtRisk),
             "READINESS_CAUSE_SHUTTING_DOWN" => Some(Self::ShuttingDown),
             "READINESS_CAUSE_UPSTREAM_NOT_READY" => Some(Self::UpstreamNotReady),
+            "READINESS_CAUSE_SERVING_PAIR_STALE" => Some(Self::ServingPairStale),
             _ => None,
         }
     }

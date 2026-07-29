@@ -134,6 +134,11 @@ fence, and wallet digest.
 | native query | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair is published |
 | compatibility | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair is published |
 
+After the first publication, a reader that loses writer status or falls behind
+reports `serving_pair_stale` and keeps answering from its published pair until
+the staleness ceiling passes; only then does it fall back to
+`writer_status_unavailable` or `replica_lagging` and stop admitting traffic.
+
 `node_unavailable` and `upstream_not_ready` are recoverable source conditions.
 `schema_mismatch`, `reorg_window_exceeded`, corrupt store errors, and source
 identity mismatches require operator action.
