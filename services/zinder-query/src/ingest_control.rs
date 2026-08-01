@@ -3,13 +3,14 @@
 use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
-use tonic::Request;
+use tonic::{Code, Request};
+use tonic_types::StatusExt as _;
 use zinder_core::{
-    Network,
+    ChainEpoch, Network,
     wire::{decode_rpc_block_hash_hex, encode_zinder_native_chain_name},
 };
 use zinder_proto::{
-    CONTRACT_REVISION,
+    CONTRACT_REVISION, ZINDER_ERROR_DOMAIN,
     capabilities::{
         INGEST_CONTROL_MEMPOOL_EVENTS_V2, INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
         INGEST_CONTROL_MEMPOOL_TRANSACTION_V2, INGEST_CONTROL_SERVER_INFO_V1,
@@ -19,13 +20,12 @@ use zinder_proto::{
     v1::ingest::{
         ServerInfoRequest, WriterStatusRequest, ingest_control_client::IngestControlClient,
     },
-    v1::wallet,
+    v1::{ops::ErrorReason, wallet},
     wire::chain_epoch_from_message,
 };
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, RuntimeService, connect_zinder_grpc,
 };
-
 /// Bound applied to native wallet unary ingest-control calls and stream establishment.
 pub(crate) const WALLET_INGEST_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUIRED_CAPABILITIES: [&str; 7] = [
@@ -132,7 +132,8 @@ impl AdmittedIngestControl {
             .await
             .map_err(IngestControlHealthError::WriterStatusRpc)?
             .into_inner();
-        let snapshot = self
+        let writer_epoch = validate_writer_status(&writer_status, self.network_name)?;
+        let snapshot = match self
             .client()
             .mempool_snapshot(wallet_ingest_control_request(
                 wallet::MempoolSnapshotRequest {
@@ -141,9 +142,12 @@ impl AdmittedIngestControl {
                 },
             ))
             .await
-            .map_err(IngestControlHealthError::MempoolSnapshotRpc)?
-            .into_inner();
-        validate_health_observation(&writer_status, &snapshot, self.network_name)
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if is_stale_mempool_snapshot_status(&status) => return Ok(()),
+            Err(status) => return Err(IngestControlHealthError::MempoolSnapshotRpc(status)),
+        };
+        validate_snapshot_observation(&writer_epoch, &snapshot, self.network_name)
     }
 }
 
@@ -153,11 +157,20 @@ pub(crate) fn wallet_ingest_control_request<T>(message: T) -> Request<T> {
     request
 }
 
+#[cfg(test)]
 fn validate_health_observation(
     writer_status: &zinder_proto::v1::ingest::WriterStatusResponse,
     snapshot: &wallet::MempoolSnapshotResponse,
     expected_network: &str,
 ) -> Result<(), IngestControlHealthError> {
+    let writer_epoch = validate_writer_status(writer_status, expected_network)?;
+    validate_snapshot_observation(&writer_epoch, snapshot, expected_network)
+}
+
+fn validate_writer_status(
+    writer_status: &zinder_proto::v1::ingest::WriterStatusResponse,
+    expected_network: &str,
+) -> Result<ChainEpoch, IngestControlHealthError> {
     let writer_epoch_message = writer_status
         .chain_view
         .as_ref()
@@ -174,7 +187,14 @@ fn validate_health_observation(
     if writer_epoch.id.value() == 0 || writer_epoch.artifact_schema_version.value() == 0 {
         return Err(IngestControlHealthError::WriterStatusInvalid);
     }
+    Ok(writer_epoch)
+}
 
+fn validate_snapshot_observation(
+    writer_epoch: &ChainEpoch,
+    snapshot: &wallet::MempoolSnapshotResponse,
+    expected_network: &str,
+) -> Result<(), IngestControlHealthError> {
     let snapshot_epoch_message = snapshot
         .chain_view
         .as_ref()
@@ -208,6 +228,17 @@ fn validate_health_observation(
         return Err(IngestControlHealthError::MempoolSnapshotWriterFenceMismatch);
     }
     Ok(())
+}
+
+fn is_stale_mempool_snapshot_status(status: &tonic::Status) -> bool {
+    status.code() == Code::FailedPrecondition
+        && status
+            .get_error_details()
+            .error_info()
+            .is_some_and(|error_info| {
+                error_info.domain == ZINDER_ERROR_DOMAIN
+                    && error_info.reason == ErrorReason::ChainEpochPinUnavailable.as_str_name()
+            })
 }
 
 #[derive(Debug, Error)]
@@ -290,17 +321,20 @@ pub enum IngestControlAdmissionError {
 mod tests {
     use std::time::Duration;
 
+    use tonic::{Code, Status};
+    use tonic_types::{ErrorDetails, StatusExt as _};
     use zinder_core::Network;
     use zinder_proto::v1::{
         ingest::{WriterPhase, WriterStatusResponse},
         ops::UpstreamNotReadyDetail,
         wallet,
     };
+    use zinder_proto::{ZINDER_ERROR_DOMAIN, status_for_reason};
     use zinder_testkit::IngestControlFixture;
 
     use super::{
         AdmittedIngestControl, IngestControlHealthError, WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
-        validate_health_observation,
+        is_stale_mempool_snapshot_status, validate_health_observation,
     };
 
     const NETWORK: &str = "zcash-regtest";
@@ -418,6 +452,45 @@ mod tests {
             outcome,
             Err(IngestControlHealthError::MempoolSnapshotInvalid)
         ));
+    }
+
+    #[test]
+    fn stale_snapshot_predicate_requires_the_exact_structured_status() {
+        let exact = status_for_reason(
+            zinder_proto::v1::ops::ErrorReason::ChainEpochPinUnavailable,
+            "requested chain epoch is no longer available",
+        );
+        assert!(is_stale_mempool_snapshot_status(&exact));
+
+        let different_reason = status_for_reason(
+            zinder_proto::v1::ops::ErrorReason::ServiceNotReady,
+            "mempool is not ready",
+        );
+        assert!(!is_stale_mempool_snapshot_status(&different_reason));
+
+        let foreign_domain = Status::with_error_details(
+            Code::FailedPrecondition,
+            "foreign stale view",
+            ErrorDetails::with_error_info("CHAIN_EPOCH_PIN_UNAVAILABLE", "other.example", []),
+        );
+        assert!(!is_stale_mempool_snapshot_status(&foreign_domain));
+
+        let wrong_code = Status::with_error_details(
+            Code::Unavailable,
+            "stale view with the wrong code",
+            ErrorDetails::with_error_info("CHAIN_EPOCH_PIN_UNAVAILABLE", ZINDER_ERROR_DOMAIN, []),
+        );
+        assert!(!is_stale_mempool_snapshot_status(&wrong_code));
+
+        let absent_details = Status::failed_precondition("missing error details");
+        assert!(!is_stale_mempool_snapshot_status(&absent_details));
+
+        let malformed_details = Status::with_error_details(
+            Code::FailedPrecondition,
+            "missing ErrorInfo",
+            ErrorDetails::new(),
+        );
+        assert!(!is_stale_mempool_snapshot_status(&malformed_details));
     }
 
     #[tokio::test(start_paused = true)]

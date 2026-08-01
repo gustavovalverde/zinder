@@ -79,6 +79,44 @@ async fn ingest_control_admission_accepts_exact_runtime_identity_and_capabilitie
 }
 
 #[tokio::test]
+async fn native_mempool_snapshot_forwards_typed_stale_status_unchanged() -> eyre::Result<()> {
+    let stale_status = zinder_proto::status_for_reason(
+        zinder_proto::v1::ops::ErrorReason::ChainEpochPinUnavailable,
+        "requested chain epoch is no longer available",
+    );
+    let (adapter, _store_fixture, cancel, server_task) =
+        native_serving_adapter_with_ingest_control(
+            StaticIngestControl::new().with_mempool_snapshot_status(stale_status),
+        )
+        .await?;
+
+    let status = WalletQueryService::mempool_snapshot(
+        &adapter,
+        Request::new(wallet::MempoolSnapshotRequest {
+            max_entries: 1,
+            from_cursor: Vec::new(),
+        }),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("typed stale snapshot status was not forwarded"))?;
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    let status_details = status.get_error_details();
+    let error_info = status_details
+        .error_info()
+        .ok_or_else(|| eyre!("typed stale snapshot omitted ErrorInfo"))?;
+    assert_eq!(error_info.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+    assert_eq!(
+        error_info.reason,
+        zinder_proto::v1::ops::ErrorReason::ChainEpochPinUnavailable.as_str_name()
+    );
+
+    cancel.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn ingest_control_admission_rejects_a_different_service_identity() -> eyre::Result<()> {
     let ingest_control = StaticIngestControl::new().with_service_name("not-zinder-ingest");
     let (ingest_control_addr, cancel, server_handle) =
@@ -1469,6 +1507,7 @@ type StaticVisibleChainEventsStream =
 struct StaticIngestControl {
     server_info: Option<ops::ServerInfo>,
     transaction: Option<wallet::TransactionStatusResponse>,
+    mempool_snapshot_status: Option<Status>,
     mempool_transaction_calls: Arc<AtomicUsize>,
     mempool_events_establishment_stalled: bool,
     outputs_by_address: Option<wallet::TransparentMempoolOutputsByAddressResponse>,
@@ -1500,6 +1539,7 @@ impl StaticIngestControl {
                 materialized_view_identities: Vec::new(),
             }),
             transaction: None,
+            mempool_snapshot_status: None,
             mempool_transaction_calls: Arc::new(AtomicUsize::new(0)),
             mempool_events_establishment_stalled: false,
             outputs_by_address: None,
@@ -1512,6 +1552,11 @@ impl StaticIngestControl {
         response: wallet::TransactionStatusResponse,
     ) -> Self {
         self.transaction = Some(response);
+        self
+    }
+
+    fn with_mempool_snapshot_status(mut self, status: Status) -> Self {
+        self.mempool_snapshot_status = Some(status);
         self
     }
 
@@ -1641,6 +1686,9 @@ impl IngestControl for StaticIngestControl {
         &self,
         _request: Request<wallet::MempoolSnapshotRequest>,
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+        if let Some(status) = &self.mempool_snapshot_status {
+            return Err(status.clone());
+        }
         let chain_epoch = test_chain_epoch();
         Ok(Response::new(wallet::MempoolSnapshotResponse {
             source_tip: chain_epoch.visible_tip.clone(),
