@@ -48,6 +48,10 @@ server address. It is not an operator-level binary or configuration replacement.
 Zinder has its own ingest, storage, query, readiness, and deployment model.
 
 Public deployments terminate TLS, authentication, rate limiting, and quota controls before traffic reaches Zinder. The compatibility process speaks plaintext h2c by default and should be bound behind the operator's proxy boundary.
+For the isolated `transactions` retention route, trusted TLS, compatibility
+`/readyz` admission, external plaintext-unreachability, and ZODL endpoint
+attribution are owned by the [Trusted TLS and ZODL compatibility admission
+runbook](../runbooks/zodl-trusted-tls-certification.md).
 
 ## Native Rust clients
 

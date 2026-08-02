@@ -215,42 +215,15 @@ not route wallet traffic based on `/healthz`.
 
 ## Put TLS in front of compatibility
 
-Route the public hostname to the loopback compatibility port with h2c upstream
-transport. The following Caddy fragment demonstrates TLS termination only:
-
-```caddy
-zinder.example.org {
-    reverse_proxy {
-        to 127.0.0.1:9067
-        transport http {
-            versions h2c
-        }
-    }
-}
-```
-
-This fragment does not provide client authorization, rate limits, quotas, or
-readiness-aware routing. Supply those controls in the operator-owned proxy or
-load balancer without changing the lightwalletd wire contract. New wallet
-traffic must stop routing whenever compatibility `/readyz` returns 503; an
-already accepted request may drain against its immutable canonical/wallet
-generation.
-
-Keep the ops endpoints and control plane private. The release does not ship
-server-side TLS or public authorization. Before public cutover, retain all of
-the following operator evidence:
-
-- a successful `GetLightdInfo` call through public DNS with a publicly trusted
-  certificate, correct SNI, and HTTP/2 negotiation;
-- the exact proxy access, connection, request, stream, and rate-limit policy,
-  plus a test showing excess traffic is rejected without breaking a normal
-  wallet sync stream;
-- an external firewall scan proving that plaintext compatibility, ingest
-  control, ops, Prometheus, Grafana, and storage ports are unreachable;
-- a readiness-routing test showing new public requests are rejected or drained
-  while `http://127.0.0.1:9107/readyz` is not ready;
-- certificate issuance and renewal ownership, expiry monitoring, and the
-  rollback procedure for a failed proxy or certificate rotation.
+The published host ports remain loopback-only. Expose only the compatibility
+route through an operator-owned trusted-TLS edge; do not publish the native
+query, compatibility plaintext listener, ops, control, observability, or
+storage ports. The [Trusted TLS and ZODL compatibility admission
+runbook](zodl-trusted-tls-certification.md) owns the parameterized Caddy
+template, certificate and DNS ownership, `/readyz` routing gate, external
+unreachability proof, endpoint attribution, and rollback evidence. An already
+accepted compatibility request may drain against its immutable canonical/wallet
+generation, but new traffic must stop when compatibility `/readyz` returns 503.
 
 ## Install systemd supervision
 
