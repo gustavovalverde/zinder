@@ -8,6 +8,7 @@ use std::{
     },
 };
 
+use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tokio_stream::{Stream, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
@@ -85,6 +86,11 @@ impl IngestControlFixture {
         self.service.set_health_stalled(health_stalled);
     }
 
+    /// Controls a deterministic error returned by the mempool snapshot RPC.
+    pub fn set_mempool_snapshot_error(&self, snapshot_error: Option<Status>) {
+        self.service.set_mempool_snapshot_error(snapshot_error);
+    }
+
     /// Stops the fixture and waits for its server task.
     pub async fn shutdown(mut self) -> eyre::Result<()> {
         self.cancel.cancel();
@@ -105,6 +111,7 @@ pub struct IngestControlFixtureService {
     network: Network,
     health_available: Arc<AtomicBool>,
     health_stalled: Arc<AtomicBool>,
+    snapshot_error: Arc<Mutex<Option<Status>>>,
 }
 
 impl IngestControlFixtureService {
@@ -115,6 +122,7 @@ impl IngestControlFixtureService {
             network,
             health_available: Arc::new(AtomicBool::new(true)),
             health_stalled: Arc::new(AtomicBool::new(false)),
+            snapshot_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -127,6 +135,11 @@ impl IngestControlFixtureService {
     /// Controls whether the writer-status health RPC stalls without replying.
     pub fn set_health_stalled(&self, health_stalled: bool) {
         self.health_stalled.store(health_stalled, Ordering::SeqCst);
+    }
+
+    /// Controls a deterministic error returned by the mempool snapshot RPC.
+    pub fn set_mempool_snapshot_error(&self, snapshot_error: Option<Status>) {
+        *self.snapshot_error.lock() = snapshot_error;
     }
 }
 
@@ -196,6 +209,10 @@ impl IngestControl for IngestControlFixtureService {
         &self,
         _request: Request<wallet::MempoolSnapshotRequest>,
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
+        let snapshot_error = self.snapshot_error.lock().clone();
+        if let Some(error) = snapshot_error {
+            return Err(error);
+        }
         if !self.health_available.load(Ordering::SeqCst) {
             return Err(Status::unavailable(
                 "fixture ingest-control health is unavailable",
