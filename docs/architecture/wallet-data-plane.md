@@ -383,14 +383,17 @@ indexed state, or materializing an unbounded address result before truncating
 it. Missing indexed state is a readiness or artifact-availability failure; it
 is not a reason to bypass the wallet data plane.
 
-`GetLightdInfo.taddr_support` is `true` only when the adapter is explicitly
-configured to advertise transparent-address support, transaction blobs are
-retained, and both wallet projections cover the canonical tip. Transparent
-output reads themselves remain available from canonical artifacts when raw
-payload retention is `none`, but lightwalletd transparent transaction history
-returns raw transaction bytes and therefore requires `raw_blob_policy` to be
-`transactions` or `all`. The flag is a product contract for lightwalletd
-clients, not a way to silence Android SDK logs.
+`GetLightdInfo.taddr_support` is derived once by the admitted compatibility
+constructor. It is `true` only when the canonical pair retains transaction
+blobs with `raw_blob_policy = "transactions"` or `"all"` and the exact
+wallet-serving pair provides the transparent reads. A `none` composition fails
+before the compatibility listener binds; later pair lag or provider outage
+drains readiness without rewriting the immutable claim. Transparent output
+reads themselves remain available from canonical artifacts when raw payload
+retention is `none`, but lightwalletd transparent transaction history returns
+raw transaction bytes and therefore requires `transactions` or `all`. The flag
+is a product contract for lightwalletd clients, not a way to silence Android
+SDK logs.
 
 The native `WalletQuery` proto exposes the same artifact-backed read through
 one server-streaming RPC, `TransparentAddressUnspentOutputs`, which streams
@@ -435,14 +438,12 @@ empty bytes (stream fully drained). Clients that lose the connection mid-stream
 must restart the page rather than resume from a non-terminal item; bounded
 history pages keep that restart cost small.
 
-Operators must only publish a `zinder-compat-lightwalletd` deployment with
-`taddr_support=true` when the serving process explicitly opts in after opening
-a store with transaction blobs retained and both
-`transparent_address_transaction_history` and `transparent_outpoint_spend`
-covering the canonical tip. The wallet-serving coverage profile
-(`ingest.run_overrides.coverage = "wallet-serving"` or `zinder-ingest --wallet-serving`) is
-the supported way to select transaction retention and complete non-genesis
-canonical history. A
+Operators must publish only a `zinder-compat-lightwalletd` process whose
+constructor admitted `taddr_support=true` from transaction retention and the
+exact transparent serving pair. It is not an operator opt-in. The
+wallet-serving coverage profile (`ingest.run_overrides.coverage =
+"wallet-serving"` or `zinder-ingest --wallet-serving`) is the supported way to
+select transaction retention and complete non-genesis canonical history. A
 recent-checkpoint or tip-bootstrapped store may have the address-output index
 family enabled but still lack the historical rows needed by wallet birthdays and
 resync anchors; that deployment posture is not wallet-serving.

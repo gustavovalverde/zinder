@@ -1,0 +1,6 @@
+kind: changed
+body: Lightwalletd compatibility now derives immutable transparent-address support from the admitted wallet-serving composition and retained transaction bytes, rejects insufficient retention before binding, and includes a contract test for the current Android SDK RPC surface.
+time: 2026-08-02T12:00:00Z
+custom:
+  Bump: minor
+  PR: "70"

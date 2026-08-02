@@ -3,6 +3,7 @@
 use std::{num::NonZeroU32, pin::Pin, sync::Arc};
 
 use serde_json::Value;
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tokio_stream::{self as stream, wrappers::ReceiverStream};
@@ -29,10 +30,10 @@ use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
     DEFAULT_MAX_COMPACT_BLOCK_RANGE, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletQueryApi, WalletServingPairSlot, address_lookup_to_script_hash, status_from_query_error,
+    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
-use zinder_store::MempoolEvent;
+use zinder_store::{MempoolEvent, RawBlobRetention};
 
 use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher,
@@ -60,15 +61,13 @@ const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
 const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
 
-/// Runtime options for [`LightwalletdGrpcAdapter`].
+/// Response bounds for [`LightwalletdGrpcAdapter`].
+///
+/// These bounds limit response materialization. They do not control advertised
+/// compatibility support, which is derived only by
+/// [`LightwalletdGrpcAdapter::from_admitted_compatibility_query`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LightwalletdCompatibilityOptions {
-    /// Whether `GetLightdInfo` advertises `taddrSupport`.
-    ///
-    /// Keep this false until the serving process has wired the canonical
-    /// transparent-output index and the materialized-view-backed transparent-history
-    /// projection that the lightwalletd transparent RPCs depend on.
-    pub transparent_address_support: bool,
+pub struct LightwalletdResponseLimits {
     /// Bound used when `GetSubtreeRoots.maxEntries` is zero.
     ///
     /// Upstream lightwalletd defines zero as "all entries". Zinder keeps the
@@ -79,24 +78,36 @@ pub struct LightwalletdCompatibilityOptions {
     pub max_address_utxos: NonZeroU32,
 }
 
-impl Default for LightwalletdCompatibilityOptions {
+impl Default for LightwalletdResponseLimits {
     fn default() -> Self {
         Self {
-            transparent_address_support: false,
             max_subtree_roots: DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS,
             max_address_utxos: DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS,
         }
     }
 }
 
+/// Structural failure while composing the compatibility transparent-address claim.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum LightwalletdAdmissionError {
+    /// The admitted canonical store does not retain transaction bytes.
+    #[error(
+        "lightwalletd transparent compatibility requires transaction retention, but the admitted canonical store retains {retention}"
+    )]
+    TransactionRetentionUnavailable {
+        /// Retention authenticated by the admitted canonical serving pair.
+        retention: RawBlobRetention,
+    },
+}
+
 /// gRPC adapter from [`WalletQueryApi`] to lightwalletd `CompactTxStreamer`.
 #[derive(Clone)]
 pub struct LightwalletdGrpcAdapter<QueryApi> {
     query_api: QueryApi,
-    options: LightwalletdCompatibilityOptions,
+    response_limits: LightwalletdResponseLimits,
+    transparent_address_support: bool,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
-    serving_pair_slot: Option<WalletServingPairSlot>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
 }
 
@@ -105,10 +116,13 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
         formatter
             .debug_struct("LightwalletdGrpcAdapter")
             .field("query_api", &self.query_api)
-            .field("options", &self.options)
+            .field("response_limits", &self.response_limits)
+            .field(
+                "transparent_address_support",
+                &self.transparent_address_support,
+            )
             .field("mempool_surface", &self.mempool_surface.is_some())
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
-            .field("serving_pair_slot", &self.serving_pair_slot.is_some())
             .field(
                 "network_upgrade_activations",
                 &self.network_upgrade_activations.network(),
@@ -136,26 +150,30 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         query_api: QueryApi,
         network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     ) -> Self {
-        Self::with_options(
+        Self::with_response_limits(
             query_api,
             network_upgrade_activations,
-            LightwalletdCompatibilityOptions::default(),
+            LightwalletdResponseLimits::default(),
         )
     }
 
-    /// Creates a lightwalletd-compatible gRPC adapter with explicit options.
+    /// Creates a lightwalletd-compatible gRPC adapter with explicit response limits.
+    ///
+    /// The generic adapter does not advertise transparent-address support.
+    /// Production compatibility composition must use
+    /// [`LightwalletdGrpcAdapter::from_admitted_compatibility_query`].
     #[must_use]
-    pub const fn with_options(
+    pub const fn with_response_limits(
         query_api: QueryApi,
         network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-        options: LightwalletdCompatibilityOptions,
+        response_limits: LightwalletdResponseLimits,
     ) -> Self {
         Self {
             query_api,
-            options,
+            response_limits,
+            transparent_address_support: false,
             mempool_surface: None,
             tip_change_watcher: None,
-            serving_pair_slot: None,
             network_upgrade_activations,
         }
     }
@@ -176,31 +194,6 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         self
     }
 
-    /// Supplies the atomically swappable, immutable wallet-serving pair.
-    ///
-    /// `GetLightdInfo` captures this slot at call time rather than retaining a
-    /// startup snapshot, so its transparent-address claim cannot outlive a
-    /// canonical/wallet pair generation.
-    #[must_use]
-    pub fn with_serving_pair_slot(mut self, serving_pair_slot: WalletServingPairSlot) -> Self {
-        self.serving_pair_slot = Some(serving_pair_slot);
-        self
-    }
-
-    /// Advertises `LightdInfo.taddrSupport`.
-    ///
-    /// This is a protocol claim, not a feature flag for handlers. The
-    /// transparent RPC handlers are always present on the generated
-    /// `CompactTxStreamer` surface; this only changes whether `GetLightdInfo`
-    /// tells wallets they can rely on the transparent-address read set. The
-    /// caller must enable it only when transaction blobs are retained; the
-    /// adapter additionally verifies both wallet projections cover the tip.
-    #[must_use]
-    pub const fn with_transparent_address_support(mut self) -> Self {
-        self.options.transparent_address_support = true;
-        self
-    }
-
     /// Wraps this adapter in the generated tonic server type.
     #[must_use]
     pub fn into_server(self) -> compact_tx_streamer_server::CompactTxStreamerServer<Self>
@@ -209,6 +202,39 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     {
         compact_tx_streamer_server::CompactTxStreamerServer::new(self)
             .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES)
+    }
+}
+
+impl<Broadcaster> LightwalletdGrpcAdapter<WalletServingQuery<Broadcaster>>
+where
+    Broadcaster: zinder_source::TransactionBroadcaster + Clone,
+{
+    /// Creates a compatibility adapter from an admitted canonical and wallet
+    /// serving pair with retained transaction bytes.
+    ///
+    /// The resulting `taddrSupport` claim is fixed for this process. Later
+    /// serving-pair lag or node outage is represented by the runtime readiness
+    /// gate and never changes `GetLightdInfo`.
+    pub fn from_admitted_compatibility_query(
+        query_api: WalletServingQuery<Broadcaster>,
+        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    ) -> Result<Self, LightwalletdAdmissionError> {
+        let raw_blob_retention = query_api.admitted_raw_blob_retention();
+        if !raw_blob_retention.retains_transaction_blobs() {
+            return Err(
+                LightwalletdAdmissionError::TransactionRetentionUnavailable {
+                    retention: raw_blob_retention,
+                },
+            );
+        }
+        Ok(Self {
+            query_api,
+            response_limits: LightwalletdResponseLimits::default(),
+            transparent_address_support: true,
+            mempool_surface: None,
+            tip_change_watcher: None,
+            network_upgrade_activations,
+        })
     }
 }
 
@@ -313,7 +339,7 @@ where
         let start_height = u32::try_from(request.start_height)
             .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?;
         let max_entries =
-            NonZeroU32::new(request.max_entries).unwrap_or(self.options.max_address_utxos);
+            NonZeroU32::new(request.max_entries).unwrap_or(self.response_limits.max_address_utxos);
         let visible_tip_block = self
             .query_api
             .visible_tip_block(None)
@@ -763,7 +789,7 @@ where
         let request = request.into_inner();
         let protocol = shielded_protocol_from_request(request.shielded_protocol)?;
         let max_entries =
-            NonZeroU32::new(request.max_entries).unwrap_or(self.options.max_subtree_roots);
+            NonZeroU32::new(request.max_entries).unwrap_or(self.response_limits.max_subtree_roots);
         let subtree_roots = self
             .query_api
             .subtree_roots(
@@ -818,24 +844,10 @@ where
             ));
         }
 
-        let transparent_address_support = if !self.options.transparent_address_support {
-            false
-        } else if let Some(serving_pair_slot) = &self.serving_pair_slot {
-            let source_position = serving_pair_slot
-                .capture()
-                .wallet_source()
-                .source_position();
-            source_position.chain_epoch_id == visible_tip_block.chain_epoch.id
-                && source_position.tip.height == visible_tip_block.height
-                && source_position.tip.hash == visible_tip_block.block_hash
-        } else {
-            false
-        };
-
         Ok(Response::new(lightd_info(
             activations,
             visible_tip_block.height,
-            transparent_address_support,
+            self.transparent_address_support,
         )))
     }
 

@@ -27,7 +27,7 @@ use zinder_proto::capabilities::{
 use zinder_source::{NodeCapability, NodeSource, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, ChainEventHistoryRequest, ChainEventStreamFamily,
-    ChainEventStreamResume, EventStreamStartPosition, StreamCursorTokenV1,
+    ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention, StreamCursorTokenV1,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -463,6 +463,18 @@ impl<Broadcaster> WalletServingQuery<Broadcaster, AdmittedIngestControl> {
 impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
     fn capture_pair(&self) -> Arc<WalletServingReadPair> {
         self.serving_pair_slot.capture()
+    }
+
+    /// Returns the canonical raw-blob retention authenticated by this query's
+    /// currently admitted serving pair.
+    ///
+    /// Pair replacement is private to the serving-pair publisher, which
+    /// admits every replacement against the same process retention contract.
+    /// Consumers can therefore derive immutable startup claims from this
+    /// value without turning later readiness changes into discovery mutations.
+    #[must_use]
+    pub fn admitted_raw_blob_retention(&self) -> RawBlobRetention {
+        self.capture_pair().canonical().raw_blob_retention()
     }
 
     fn chain_epoch(

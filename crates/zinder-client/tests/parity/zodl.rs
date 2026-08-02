@@ -41,12 +41,11 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let query = WalletServingQuery::from_serving_pair_slot(
-        serving_pair_slot.clone(),
+        serving_pair_slot,
         MockTransactionBroadcaster::broadcast_disabled(),
         Arc::clone(&activations),
     );
-    let adapter =
-        LightwalletdGrpcAdapter::new(query, activations).with_serving_pair_slot(serving_pair_slot);
+    let adapter = LightwalletdGrpcAdapter::new(query, activations);
 
     let visible_tip_block = adapter
         .get_latest_block(Request::new(lightwalletd::ChainSpec {}))

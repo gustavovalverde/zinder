@@ -150,7 +150,7 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
     );
     assert!(
         !lightd_info.taddr_support,
-        "the generic adapter must not advertise transparent-address support unless the caller opts in"
+        "the generic adapter must not advertise transparent-address support"
     );
     assert!(
         !lightd_info.upgrade_name.is_empty(),
@@ -162,21 +162,6 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
         lightd_info.upgrade_height
     );
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn lightd_info_refuses_transparent_support_without_projection_readiness() -> eyre::Result<()>
-{
-    let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
-    let adapter = acceptance_adapter(&store_fixture).with_transparent_address_support();
-
-    let lightd_info = adapter
-        .get_lightd_info(Request::new(lightwalletd::Empty {}))
-        .await?
-        .into_inner();
-
-    assert!(!lightd_info.taddr_support);
     Ok(())
 }
 

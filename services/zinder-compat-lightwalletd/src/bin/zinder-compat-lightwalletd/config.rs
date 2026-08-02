@@ -8,6 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zinder_compat_lightwalletd::LightwalletdAdmissionError;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
@@ -82,6 +83,9 @@ pub(crate) enum LightwalletdConfigError {
 
     #[error(transparent)]
     Query(#[from] zinder_query::QueryError),
+
+    #[error(transparent)]
+    CompatibilityAdmission(#[from] LightwalletdAdmissionError),
 
     #[error("node source initialization failed: {0}")]
     Source(Box<zinder_source::SourceError>),

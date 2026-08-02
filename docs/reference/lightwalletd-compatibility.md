@@ -34,9 +34,12 @@ the claimed RPC set, and the highest evidence-backed level.
   roots, and transaction bytes; `zinder-projector` owns the wallet projection
   that provides transparent UTXOs and transaction history.
 
-In particular, `GetLightdInfo.taddrSupport` is an explicit serving-process
-claim. Enable it only after the wallet projection has admitted both
-transparent-output and transparent-history reads at the serving fence.
+In particular, `GetLightdInfo.taddrSupport` is an immutable serving-process
+claim derived by the compatibility constructor. Construction admits it only
+when the canonical pair retains transaction blobs (`transactions` or `all`)
+and the exact wallet-serving pair provides the transparent reads; insufficient
+retention fails before the listener binds. Later pair lag or provider outage
+changes readiness without rewriting `GetLightdInfo`.
 
 ## Certification work
 

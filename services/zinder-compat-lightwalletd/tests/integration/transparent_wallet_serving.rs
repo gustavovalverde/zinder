@@ -5,22 +5,29 @@
 
 use std::{num::NonZeroU16, sync::Arc};
 
-use tokio_stream::StreamExt as _;
-use tonic::{Code, Request};
+use tokio::{net::TcpListener, sync::oneshot};
+use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
+use tonic::{Code, Request, transport::Server};
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
-use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
+use zinder_compat_lightwalletd::{LightwalletdAdmissionError, LightwalletdGrpcAdapter};
 use zinder_core::{
     BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
     CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
     TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
     TransparentOutPoint, TransparentUnspentOutput,
 };
-use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
+use zinder_proto::compat::lightwalletd::{
+    self, compact_tx_streamer_client::CompactTxStreamerClient,
+    compact_tx_streamer_server::CompactTxStreamer,
+};
 use zinder_query::{
     CanonicalReader, WalletProjectionReader, WalletServingPairSlot, WalletServingQuery,
     WalletServingReadPair,
+};
+use zinder_runtime::{
+    NodeUnavailableDetail, Readiness, ReadinessState, TrafficReadinessInterceptor,
 };
 use zinder_store::{
     CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
@@ -187,6 +194,109 @@ async fn production_pair_serves_transparent_utxo_contract_and_support_signal() -
         .await?
         .into_inner();
     assert!(info.taddr_support);
+    Ok(())
+}
+
+#[tokio::test]
+async fn admitted_transparent_support_stays_immutable_through_readiness_recovery()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(1);
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture, activations)?;
+    let readiness = Readiness::new(ReadinessState::ready(Some(1)));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_readiness = TrafficReadinessInterceptor::new(readiness.clone());
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(tonic::service::interceptor::InterceptedService::new(
+                adapter.into_server(),
+                server_readiness,
+            ))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _shutdown_result = shutdown_rx.await;
+            })
+            .await
+    });
+    let mut client = CompactTxStreamerClient::connect(format!("http://{address}")).await?;
+
+    let initial = client
+        .get_lightd_info(lightwalletd::Empty {})
+        .await?
+        .into_inner();
+    assert!(initial.taddr_support);
+
+    readiness.set(ReadinessState::node_unavailable_with_detail(
+        NodeUnavailableDetail::first_iteration("node_unreachable", "synthetic provider outage"),
+        Some(1),
+    ));
+    let outage = match client.get_lightd_info(lightwalletd::Empty {}).await {
+        Ok(response) => {
+            return Err(eyre::eyre!(
+                "expected readiness rejection, got {response:?}"
+            ));
+        }
+        Err(status) => status,
+    };
+    assert_eq!(outage.code(), Code::Unavailable);
+
+    readiness.set(ReadinessState::ready(Some(1)));
+    let recovered = client
+        .get_lightd_info(lightwalletd::Empty {})
+        .await?
+        .into_inner();
+    assert!(
+        recovered.taddr_support,
+        "readiness recovery must not rewrite the immutable LightdInfo claim"
+    );
+
+    if shutdown_tx.send(()).is_err() {
+        return Err(eyre::eyre!(
+            "compatibility listener shutdown receiver dropped"
+        ));
+    }
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unretained_transactions_reject_compatibility_before_listener_binding() -> eyre::Result<()>
+{
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::None)
+        .extend_blocks(1);
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader),
+        Arc::new(wallet_reader),
+    )?);
+    let query = WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(serving_pair),
+        MockTransactionBroadcaster::broadcast_disabled(),
+        activations.clone(),
+    );
+    let reservation = TcpListener::bind("127.0.0.1:0").await?;
+    let address = reservation.local_addr()?;
+    drop(reservation);
+
+    let admission = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query, activations);
+    assert!(matches!(
+        admission,
+        Err(
+            LightwalletdAdmissionError::TransactionRetentionUnavailable {
+                retention: RawBlobRetention::None
+            }
+        )
+    ));
+
+    let listener = TcpListener::bind(address).await?;
+    drop(listener);
     Ok(())
 }
 
@@ -460,13 +570,12 @@ fn build_wallet_serving_adapter_from_readers(
     let serving_pair = Arc::new(WalletServingReadPair::new(canonical_reader, wallet_reader)?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let query = WalletServingQuery::from_serving_pair_slot(
-        serving_pair_slot.clone(),
+        serving_pair_slot,
         MockTransactionBroadcaster::broadcast_disabled(),
         activations.clone(),
     );
-    Ok(LightwalletdGrpcAdapter::new(query, activations)
-        .with_serving_pair_slot(serving_pair_slot)
-        .with_transparent_address_support())
+    LightwalletdGrpcAdapter::from_admitted_compatibility_query(query, activations)
+        .map_err(Into::into)
 }
 
 fn transparent_address(byte: u8) -> ZebraTransparentAddress {
