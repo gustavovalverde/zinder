@@ -209,7 +209,8 @@ impl IngestControl for IngestControlFixtureService {
         &self,
         _request: Request<wallet::MempoolSnapshotRequest>,
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
-        if let Some(error) = self.snapshot_error.lock().clone() {
+        let snapshot_error = self.snapshot_error.lock().clone();
+        if let Some(error) = snapshot_error {
             return Err(error);
         }
         if !self.health_available.load(Ordering::SeqCst) {

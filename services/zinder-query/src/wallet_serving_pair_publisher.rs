@@ -1541,7 +1541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wallet_ingest_control_probe_tolerates_only_stale_snapshot_errors()
+    async fn wallet_ingest_control_probe_preserves_stale_snapshot_as_ready()
     -> Result<(), Box<dyn std::error::Error>> {
         let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
         let stale_status = zinder_proto::status_for_reason(
@@ -1593,6 +1593,42 @@ mod tests {
             error_info.reason,
             ErrorReason::ChainEpochPinUnavailable.as_str_name()
         );
+
+        cancel.cancel();
+        handle.await?;
+        ingest_fixture.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wallet_ingest_control_probe_drains_for_hydration_and_recovers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let stale_status = zinder_proto::status_for_reason(
+            ErrorReason::ChainEpochPinUnavailable,
+            "requested chain epoch is no longer available",
+        );
+        ingest_fixture.set_mempool_snapshot_error(Some(stale_status.clone()));
+        let admitted_ingest_control =
+            AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
+                .await?;
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::awaiting_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_ingest_control_readiness_probe(
+            admitted_ingest_control,
+            readiness,
+            Duration::from_millis(5),
+            cancel.clone(),
+        );
+        wait_for_readiness_cause(&runtime, |cause| {
+            matches!(cause, zinder_runtime::ReadinessCause::Ready)
+        })
+        .await?;
+        let mut traffic_gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
+        assert!(traffic_gate.call(Request::new(())).is_ok());
 
         ingest_fixture.set_mempool_snapshot_error(Some(Status::unavailable(
             "fixture mempool hydration is unavailable",
