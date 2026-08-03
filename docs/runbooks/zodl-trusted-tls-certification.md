@@ -1,10 +1,11 @@
 # Trusted TLS and ZODL compatibility admission
 
-This runbook prepares and evaluates one public TLS route for an isolated
-`zinder-compat-lightwalletd` candidate. It does not issue a certificate, start
-Zinder or Caddy, change DNS, open a firewall, or certify ZODL. It records the
-transport and operator evidence that Gate C requires after the candidate has
-been constructed through the approved deployment process.
+This runbook prepares and evaluates one TLS route for an isolated
+`zinder-compat-lightwalletd` candidate. An Android-trusted internal route can
+certify the client boundary, while a public operator claim additionally needs
+public DNS and certificate trust, external reachability controls, rate limits,
+and operational ownership. The runbook does not issue a certificate, start
+Zinder or Caddy, change DNS, open a firewall, or certify ZODL by itself.
 
 The route is intentionally narrow: Caddy terminates trusted TLS on `:443`,
 checks compatibility readiness on a private loopback ops port, and forwards
@@ -225,16 +226,14 @@ rollback.
 
 ## Gate C boundary
 
-This runbook can supply the trusted-TLS, private-plaintext, readiness-routing,
-firewall, and endpoint-attribution evidence for Gate C. It does not pass Gate C
-or certify ZODL. Gate C also requires the exact current SDK RPC inventory
-through a bound server, a positive `RawBlobRetention::Transactions` matrix, a
-negative insufficient-retention matrix, reproducible SDK source and dependency
-inputs, initial sync by a current ZODL app configured to this explicit endpoint,
-proof that `GetMempoolTx` is not presented as ZODL proof, proof that no native
-profile, capability string, or full-block retention requirement entered compat,
-and an independent compatibility architecture and evidence audit that
-authorizes P4.
+This runbook can supply trusted-TLS, private-plaintext, readiness-routing, and
+endpoint-attribution evidence for Gate C. A public operator claim also requires
+the firewall, public certificate, rate-limit, and ownership evidence described
+above. The runbook does not pass Gate C or certify ZODL by itself: Gate C also
+requires the exact current SDK RPC inventory through a bound server, positive
+and negative retention matrices, reproducible SDK inputs, initial sync by the
+current app, accurate separation of broader lightwalletd methods, and an
+independent architecture and evidence audit.
 
 Gate D, not Gate C, covers restore, transparent history, manual send, mempool,
 mining, restart, and reorg behavior. Do not describe a successful route check,

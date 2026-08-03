@@ -648,11 +648,16 @@ The upstream Go `lightwalletd/testclient` remains smoke coverage for the basic
 compat surface. It is not a substitute for an Android SDK or Zodl bootstrap
 test when the release claim names those clients.
 
-A deployment may claim Android SDK or Zodl mempool compatibility only
-when `GetMempoolStream` and `GetMempoolTx` are mapped over the native mempool
-index and event log, and an SDK or app flow has observed mempool transactions
-against that endpoint. A sync-only Zodl proof does not establish
-pending-transaction UX.
+A deployment may claim compatibility with the current Android SDK or Zodl
+mempool flow only when `GetMempoolStream` is mapped over the native mempool
+index and event log, and the exact SDK or app observes its submitted raw
+transaction through that stream before mining. A sync-only Zodl proof does not
+establish pending-transaction UX.
+
+`GetMempoolTx` remains part of Zinder's broader lightwalletd-compatible surface,
+but the current SDK does not call it. Claims for that method therefore require
+separate protocol or consumer evidence and must not be presented as current
+Zodl certification.
 
 ## Query Consistency
 
