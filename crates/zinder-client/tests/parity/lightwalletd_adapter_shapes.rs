@@ -1,8 +1,8 @@
-//! Zodl parity assertions.
+//! Lightwalletd adapter-shape assertions.
 //!
-//! Zodl (mobile, via `zcash-android-wallet-sdk`) consumes the lightwalletd
-//! compatibility surface, not the native Rust `ChainIndex`. These fixtures
-//! exercise only the protocol adapter shape that current Zodl calls.
+//! These fixtures exercise protocol adapter shapes in isolation. Current
+//! consumer certification requires the separate bound-server contract and real
+//! application evidence.
 //!
 //! Cross-references: [Integration surfaces](../../../../docs/reference/integration-surfaces.md).
 
@@ -118,7 +118,7 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn serves_zodl_transparent_discovery_shape_from_production_pair() -> eyre::Result<()> {
+async fn serves_transparent_discovery_shape_from_production_pair() -> eyre::Result<()> {
     let mut fixture = build_transparent_address_serving_fixture()?;
     let adapter = build_transparent_address_adapter(&mut fixture)?;
     let info = adapter
@@ -155,7 +155,7 @@ async fn serves_zodl_transparent_discovery_shape_from_production_pair() -> eyre:
     let utxo = utxos
         .address_utxos
         .first()
-        .ok_or_else(|| eyre::eyre!("Zodl fixture must expose one UTXO"))?;
+        .ok_or_else(|| eyre::eyre!("transparent fixture must expose one UTXO"))?;
     assert_eq!(utxo.address, fixture.address);
     assert_eq!(utxo.txid, fixture.transaction_id.as_bytes());
     assert_eq!(utxo.script, fixture.script_pub_key);

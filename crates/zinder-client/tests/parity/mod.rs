@@ -139,9 +139,9 @@ impl TransactionBroadcaster for ParityNodeSource {
 }
 
 mod explorers;
+mod lightwalletd_adapter_shapes;
 mod lightwalletd_operators;
 mod zallet;
-mod zodl;
 
 fn parity_chain_fixture(block_count: u32) -> ChainFixture {
     ChainFixture::new(Network::ZcashRegtest)

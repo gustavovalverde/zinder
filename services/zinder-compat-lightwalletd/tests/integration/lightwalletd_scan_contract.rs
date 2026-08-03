@@ -3,15 +3,15 @@
     reason = "Integration test names describe the wallet acceptance contract."
 )]
 
-//! Wallet-SDK scan acceptance test for the lightwalletd compat shim.
+//! Compact-block scan contract for the lightwalletd compat shim.
 //!
 //! Proves a lightwalletd-compatible client can scan a regtest range from
 //! Zinder without sending viewing keys or spending keys to Zinder. The
 //! test exercises the wire contract that wallets actually consume:
 //!
 //! 1. Stand up the `LightwalletdGrpcAdapter` over a populated `PrimaryChainStore`.
-//! 2. Connect through the generated `CompactTxStreamerClient`, the same
-//!    transport `librustzcash` consumers use.
+//! 2. Connect through the generated `CompactTxStreamerClient` to exercise the
+//!    protocol transport directly.
 //! 3. Call `GetBlockRange` and decode every compact block.
 //! 4. Assert each block carries:
 //!    - a populated `vtx` list whose `txid` entries match transaction
@@ -21,11 +21,9 @@
 //! 5. Assert no viewing keys, spending keys, seed phrases, or other key
 //!    material appear in any client→server payload.
 //!
-//! The full `zcash_client_backend` SDK note-discovery test belongs in a
-//! separate `wallet-sdk-acceptance` cargo feature so the default workspace
-//! dependency graph stays clean. This file proves the contract wallets consume;
-//! the SDK test proves a specific reference wallet interprets the contract
-//! correctly.
+//! This file proves the generic compact-block wire contract. The bound current
+//! Android SDK inventory and real application run are separate certification
+//! evidence.
 
 use eyre::eyre;
 use prost::Message;

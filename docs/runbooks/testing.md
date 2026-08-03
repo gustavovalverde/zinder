@@ -156,8 +156,9 @@ cargo nextest run --profile=ci-parity
 Expected outcome: every `parity::` module exits zero and the report is archived
 with the release evidence. This profile is organized by consumer:
 
-- `parity/zodl.rs` covers the lightwalletd-compatible shapes Zodl and the
-  Android SDK hit today.
+- `parity/lightwalletd_adapter_shapes.rs` covers isolated lightwalletd adapter
+  shapes. Current ZODL proof comes from the bound ten-RPC contract and the real
+  Android application certification run.
 - `parity/zallet.rs` covers a Zallet-shaped retained chain-view contract,
   including the cloneable, `'static` owned snapshot surface. It is not a claim
   that a downstream Zallet integration has been certified.
@@ -875,18 +876,20 @@ gate on whether you actually changed trust-sensitive code.
 
 ### One-shot deterministic test
 
-Already covered by `services/zinder-compat-lightwalletd/tests/integration/wallet_sdk_scan.rs`
+Already covered by
+`services/zinder-compat-lightwalletd/tests/integration/lightwalletd_scan_contract.rs`
 in the default validation gate. It:
 
 1. Stands up `LightwalletdGrpcAdapter` over a populated `PrimaryChainStore`.
-2. Connects through the generated `CompactTxStreamerClient` (the same
-   transport `librustzcash` consumers use).
+2. Connects through the generated `CompactTxStreamerClient` to exercise the
+   protocol transport directly.
 3. Calls `GetBlockRange`, decodes every compact block, asserts `vtx`/`txid`
    alignment with stored transaction artifacts.
 4. Asserts no key material appears in any client→server payload.
 
-This test is the deterministic version of the wallet-SDK contract; running it
-under `cargo nextest run --profile=ci` is part of every commit.
+This is a deterministic generic lightwalletd scan contract, not current SDK or
+application certification. Running it under `cargo nextest run --profile=ci`
+is part of every commit.
 
 ### End-to-end with a real lightwalletd-compatible client
 
@@ -946,14 +949,15 @@ For production Android-wallet claims
 - `GetAddressUtxosStream` is backed by stored transparent output artifacts.
   Synthetic empty responses, upstream-node fallbacks, and compact-block scans do
   not satisfy the wallet-serving contract.
-- Pending-transaction UX requires both mempool surfaces: `GetMempoolTx` returns
-  the compact transaction while pending, and `GetMempoolStream` emits the raw
-  transaction before closing on the mining tip change.
+- Pending-transaction UX requires `SendTransaction` and `GetMempoolStream`
+  through the selected endpoint, followed by `GetTransaction` after mining.
+  `GetMempoolTx` remains broader lightwalletd compatibility and is not part of
+  the current Android SDK inventory.
 - Send tests record writer-tip lag at submission time. A success when the writer
   is outside the wallet expiry window is not production evidence.
 
-Reference comparison points: `zec.rocks` for public lightwalletd behavior,
-the existing `wallet_sdk_scan.rs` for the in-process baseline.
+Reference comparison points: `zec.rocks` for public lightwalletd behavior and
+`lightwalletd_scan_contract.rs` for the in-process protocol baseline.
 
 ## Public native `WalletQuery` contract
 
