@@ -3,4 +3,4 @@ body: Lightwalletd compatibility now derives immutable transparent-address suppo
 time: 2026-08-02T12:00:00Z
 custom:
   Bump: minor
-  PR: "70"
+  PR: "71"
