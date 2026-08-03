@@ -48,12 +48,12 @@ use zinder_testkit::{
     sample_regtest_upgrade_activations,
 };
 
-const SDK_SCAN_BLOCK_COUNT: u32 = 10;
-const SDK_SCAN_SAPLING_TREE_SIZE: u32 = SDK_SCAN_BLOCK_COUNT;
+const LIGHTWALLETD_SCAN_BLOCK_COUNT: u32 = 10;
+const LIGHTWALLETD_SCAN_SAPLING_TREE_SIZE: u32 = LIGHTWALLETD_SCAN_BLOCK_COUNT;
 
 #[tokio::test]
 async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> eyre::Result<()> {
-    let store_fixture = sdk_scan_store_fixture()?;
+    let store_fixture = lightwalletd_scan_store_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
     let adapter = LightwalletdGrpcAdapter::new(
@@ -83,7 +83,7 @@ async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> ey
             hash: Vec::new(),
         }),
         end: Some(lightwalletd::BlockId {
-            height: u64::from(SDK_SCAN_BLOCK_COUNT),
+            height: u64::from(LIGHTWALLETD_SCAN_BLOCK_COUNT),
             hash: Vec::new(),
         }),
         pool_types: Vec::new(),
@@ -99,10 +99,13 @@ async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> ey
         received_blocks.push(compact_block);
     }
 
-    assert_eq!(visible_tip_block.height, u64::from(SDK_SCAN_BLOCK_COUNT));
+    assert_eq!(
+        visible_tip_block.height,
+        u64::from(LIGHTWALLETD_SCAN_BLOCK_COUNT)
+    );
     assert_eq!(
         received_blocks.len(),
-        usize::try_from(SDK_SCAN_BLOCK_COUNT)?
+        usize::try_from(LIGHTWALLETD_SCAN_BLOCK_COUNT)?
     );
 
     for compact_block in &received_blocks {
@@ -118,7 +121,7 @@ async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> ey
 
 #[tokio::test]
 async fn lightwalletd_subtree_roots_request_carries_no_key_material() -> eyre::Result<()> {
-    let store_fixture = sdk_scan_store_fixture()?;
+    let store_fixture = lightwalletd_scan_store_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
     let adapter = LightwalletdGrpcAdapter::new(
@@ -157,31 +160,35 @@ async fn lightwalletd_subtree_roots_request_carries_no_key_material() -> eyre::R
     Ok(())
 }
 
-fn sdk_scan_store_fixture() -> eyre::Result<StoreFixture> {
+fn lightwalletd_scan_store_fixture() -> eyre::Result<StoreFixture> {
     let base_fixture = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
-        .extend_blocks(SDK_SCAN_BLOCK_COUNT)
-        .with_tip_metadata_override(ChainTipMetadata::new(SDK_SCAN_SAPLING_TREE_SIZE, 0, 0));
+        .extend_blocks(LIGHTWALLETD_SCAN_BLOCK_COUNT)
+        .with_tip_metadata_override(ChainTipMetadata::new(
+            LIGHTWALLETD_SCAN_SAPLING_TREE_SIZE,
+            0,
+            0,
+        ));
 
     let mut chain_fixture = base_fixture;
-    for height_value in 1..=SDK_SCAN_BLOCK_COUNT {
+    for height_value in 1..=LIGHTWALLETD_SCAN_BLOCK_COUNT {
         let height = BlockHeight::new(height_value);
         let block = chain_fixture
             .block_at(height)
             .ok_or_else(|| eyre!("fixture block missing at height"))?
             .clone();
         let mut transaction_rows = FixtureTransactionRows::from_raw_transaction(
-            TransactionId::from_bytes(sdk_scan_txid_bytes(height_value)),
+            TransactionId::from_bytes(lightwalletd_scan_txid_bytes(height_value)),
             block.height,
             block.hash,
             0,
-            sdk_scan_transaction_payload(height_value),
+            lightwalletd_scan_transaction_payload(height_value),
         );
         transaction_rows.facts.public_facts.counts = TransactionComponentCounts {
             sapling_output_count: 1,
             ..TransactionComponentCounts::EMPTY
         };
-        let compact_block = sdk_scan_compact_block(&block);
+        let compact_block = lightwalletd_scan_compact_block(&block);
         chain_fixture = chain_fixture
             .with_compact_block_artifact(compact_block)
             .with_transaction_rows(transaction_rows);
@@ -205,14 +212,16 @@ fn sdk_scan_store_fixture() -> eyre::Result<StoreFixture> {
     )?)
 }
 
-fn sdk_scan_compact_block(block: &FixtureBlock) -> CompactBlockArtifact {
+fn lightwalletd_scan_compact_block(block: &FixtureBlock) -> CompactBlockArtifact {
     CompactBlockArtifact::new(
         BlockId::new(block.height, block.hash),
         block.parent_hash,
         block.block_time_seconds,
         vec![CompactTransaction {
             index: 0,
-            transaction_id: TransactionId::from_bytes(sdk_scan_txid_bytes(block.height.value())),
+            transaction_id: TransactionId::from_bytes(lightwalletd_scan_txid_bytes(
+                block.height.value(),
+            )),
             data: CompactTransactionData {
                 sapling_outputs: vec![CompactSaplingOutput {
                     commitment: [0x11; 32],
@@ -231,7 +240,7 @@ fn sdk_scan_compact_block(block: &FixtureBlock) -> CompactBlockArtifact {
     .unwrap_or_else(|_| std::process::abort())
 }
 
-fn sdk_scan_txid_bytes(height_value: u32) -> [u8; 32] {
+fn lightwalletd_scan_txid_bytes(height_value: u32) -> [u8; 32] {
     let mut bytes = [0_u8; 32];
     for chunk in bytes.chunks_exact_mut(4) {
         chunk.copy_from_slice(&height_value.to_be_bytes());
@@ -239,7 +248,7 @@ fn sdk_scan_txid_bytes(height_value: u32) -> [u8; 32] {
     bytes
 }
 
-fn sdk_scan_transaction_payload(height_value: u32) -> Vec<u8> {
+fn lightwalletd_scan_transaction_payload(height_value: u32) -> Vec<u8> {
     format!("zinder-acceptance-tx-at-height-{height_value}").into_bytes()
 }
 
