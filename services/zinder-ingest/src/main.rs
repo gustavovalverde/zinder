@@ -6,7 +6,8 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use parking_lot::RwLock;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
+use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
@@ -15,11 +16,11 @@ use zinder_ingest::{
     CanonicalControlGrpcAdapter, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
     CanonicalRunOverrides, CanonicalWriterConfig, ConventionalFeeDistributionBackfillConfig,
     ConventionalFeeDistributionBackfillContext, DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
-    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, HistoricalWorkGate, IngestError, LiveMempoolOwner,
-    MaterializedViewReplayConfig, MaterializedViewTailer, MempoolIngestSettings, NodeSourceKind,
-    TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
-    canonical_control_channel, classify_phase, mempool_ready_channel,
-    open_primary_materialized_view_store, run_canonical_writer_with_control,
+    DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, HistoricalWorkGate, IngestControlNodeComposition,
+    IngestError, LiveMempoolOwner, MaterializedViewReplayConfig, MaterializedViewTailer,
+    MempoolIngestSettings, NodeSourceKind, TransactionComponentBackfillConfig,
+    TransactionComponentBackfillContext, canonical_control_channel, classify_phase,
+    mempool_ready_channel, open_primary_materialized_view_store, run_canonical_writer_with_control,
     run_live_mempool_owner, run_mempool_retention, seed_backfill_owned_consumer_cursors,
     spawn_conventional_fee_distribution_backfill_task,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
@@ -288,18 +289,6 @@ async fn run_ingest(
     load_config_phase.complete();
     let readiness = Readiness::default();
     let start_api_phase = StartupPhase::StartApi.start();
-    let ops_handle = spawn_ops_endpoint_for(
-        RuntimeService::Ingest,
-        command_config.ops_listen_addr,
-        env!("CARGO_PKG_VERSION"),
-        encode_zinder_native_chain_name(command_config.runtime_config.node.network),
-        readiness.clone(),
-        Arc::from(zinder_proto::capabilities::always_on_capability_strings(
-            zinder_proto::capabilities::CapabilitySurface::Ingest,
-        )),
-    )
-    .await?;
-
     let connect_node_phase = StartupPhase::ConnectNode.start();
     let source = zebra_json_rpc_source_for_target(
         command_config.runtime_config.node_source,
@@ -313,6 +302,28 @@ async fn run_ingest(
         .await
         .map_err(IngestError::from)?;
     check_schema_phase.complete();
+    let ingest_control_listener = match command_config.ingest_control_listen_addr {
+        Some(listen_addr) => {
+            let node = IngestControlNodeComposition::new(
+                command_config.runtime_config.node.network,
+                Arc::new(source.clone()),
+            );
+            let listener = bind_ingest_control_listener(listen_addr).await?;
+            Some(IngestControlListenerComposition { listener, node })
+        }
+        None => None,
+    };
+    let advertised_capabilities =
+        ingest_control_advertised_capabilities(ingest_control_listener.as_ref());
+    let ops_handle = spawn_ops_endpoint_for(
+        RuntimeService::Ingest,
+        command_config.ops_listen_addr,
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(command_config.runtime_config.node.network),
+        readiness.clone(),
+        Arc::clone(&advertised_capabilities),
+    )
+    .await?;
 
     let recover_state_phase = StartupPhase::RecoverState.start();
     resolve_wallet_serving_modifiers(&mut command_config);
@@ -355,6 +366,7 @@ async fn run_ingest(
         &command_config,
         &source,
         &readiness,
+        ingest_control_listener,
         &worker_cancel,
         &mut writer_config,
     );
@@ -385,6 +397,31 @@ async fn run_ingest(
 
 type CanonicalControlServer = JoinHandle<Result<(), tonic::transport::Error>>;
 
+struct IngestControlListenerComposition {
+    listener: TcpListener,
+    node: IngestControlNodeComposition,
+}
+
+async fn bind_ingest_control_listener(
+    listen_addr: SocketAddr,
+) -> Result<TcpListener, IngestConfigError> {
+    TcpListener::bind(listen_addr)
+        .await
+        .map_err(|source| IngestConfigError::IngestControlBind {
+            listen_addr,
+            source,
+        })
+}
+
+fn ingest_control_advertised_capabilities(
+    composition: Option<&IngestControlListenerComposition>,
+) -> Arc<[&'static str]> {
+    composition.map_or_else(
+        || Arc::<[&'static str]>::from([]),
+        |composition| composition.node.advertised_capabilities(),
+    )
+}
+
 struct CanonicalControlTasks {
     server: Option<CanonicalControlServer>,
     commands: Option<mpsc::Receiver<CanonicalControlCommand>>,
@@ -393,14 +430,20 @@ struct CanonicalControlTasks {
     server_completed: bool,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one composition root wires the prebound control listener and its exact writer-owned tasks into a fail-closed lifecycle"
+)]
 fn spawn_canonical_control_tasks(
     command_config: &IngestCommandConfig,
     source: &ZebraJsonRpcSource,
     readiness: &Readiness,
+    listener_composition: Option<IngestControlListenerComposition>,
     cancel: &CancellationToken,
     writer_config: &mut CanonicalWriterConfig,
 ) -> CanonicalControlTasks {
-    if let Some(listen_addr) = command_config.ingest_control_listen_addr {
+    if let Some(IngestControlListenerComposition { listener, node }) = listener_composition {
         let (canonical_control_handle, canonical_control_commands) = canonical_control_channel();
         let mempool = command_config.runtime_config.mempool;
         let mempool_owner =
@@ -447,12 +490,10 @@ fn spawn_canonical_control_tasks(
                 .ingest_control_checkpoint_bearer_token
                 .clone(),
         );
-        let node_source: Arc<dyn NodeSource> = Arc::new(source.clone());
         let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
-            command_config.runtime_config.node.network,
             canonical_control_handle,
             mempool_owner,
-            node_source,
+            node,
             readiness.clone(),
         )
         .with_bearer_token(command_config.ingest_control_bearer_token.clone());
@@ -461,7 +502,10 @@ fn spawn_canonical_control_tasks(
             tonic::transport::Server::builder()
                 .add_service(canonical_adapter.into_server())
                 .add_service(ingest_adapter.into_server())
-                .serve_with_shutdown(listen_addr, server_cancel.cancelled_owned())
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    server_cancel.cancelled_owned(),
+                )
                 .await
         });
         CanonicalControlTasks {
@@ -1260,7 +1304,8 @@ mod tests {
 
     use super::{
         CanonicalControlTasks, NodeCapabilities, NodeCapability, ZebraJsonRpcSource,
-        coordinate_canonical_writer_lifecycle, require_ingest_node_capabilities,
+        bind_ingest_control_listener, coordinate_canonical_writer_lifecycle,
+        ingest_control_advertised_capabilities, require_ingest_node_capabilities,
         supervise_canonical_writer,
     };
 
@@ -1475,6 +1520,32 @@ mod tests {
 
         require_ingest_node_capabilities(capabilities)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_ingest_control_advertises_no_endpoint_capabilities() {
+        assert!(ingest_control_advertised_capabilities(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn occupied_ingest_control_port_fails_during_listener_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listen_addr = occupied.local_addr()?;
+
+        let error = bind_ingest_control_listener(listen_addr)
+            .await
+            .err()
+            .ok_or("occupied ingest-control listener must fail admission")?;
+
+        assert!(matches!(
+            error,
+            crate::config::IngestConfigError::IngestControlBind {
+                listen_addr: actual,
+                ..
+            } if actual == listen_addr
+        ));
         Ok(())
     }
 

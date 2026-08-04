@@ -2,7 +2,7 @@
 //!
 //! The single source of truth is the [`CAPABILITIES`] table in
 //! `zinder-proto`. Each row binds a capability string to its surface, the
-//! proto method it gates, and an advertise policy. The
+//! proto method it gates. The
 //! `capability-table-vs-descriptor` guard in `zinder-proto` cross-checks the
 //! table's proto-method bindings against the compiled `FileDescriptorSet`;
 //! this test guards the client-facing trait surface those wallet capabilities
@@ -30,20 +30,6 @@ fn every_capability_row_has_a_non_empty_string() {
             spec.surface
         );
     }
-}
-
-/// Regression guard for the ingest wire surface.
-///
-/// `ingest.writer.phase_v1` must stay always-on so federated clients can rely
-/// on the writer-phase vocabulary advertised by every Zinder deployment.
-/// ADR-0015.
-#[test]
-fn ingest_writer_phase_is_always_on() {
-    assert!(
-        always_on_capability_strings(CapabilitySurface::Ingest).contains(&INGEST_WRITER_PHASE_V1),
-        "{INGEST_WRITER_PHASE_V1} must stay always-on so every ingest deployment advertises it; \
-         the ingest wire surface depends on this invariant."
-    );
 }
 
 /// Compile-time existence check for the [`ChainIndex`] base reads that back

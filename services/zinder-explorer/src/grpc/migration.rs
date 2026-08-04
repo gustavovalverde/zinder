@@ -17,7 +17,8 @@ use std::collections::BTreeMap;
 use tonic::{Request, Response, Status};
 use zinder_core::BlockHeight;
 use zinder_materialized_views::{
-    IronwoodMigrationConsumer, MaterializedViewStore, Migration, MigrationPoolTotals,
+    IRONWOOD_MIGRATION_CONSUMER_NAME, IronwoodMigrationConsumer, MaterializedViewState,
+    MaterializedViewStore, MaterializedViewStoreReadSnapshot, Migration, MigrationPoolTotals,
 };
 use zinder_proto::capabilities::{
     EXPLORER_MIGRATION_COHORTS_V1, EXPLORER_MIGRATION_DENOMINATIONS_V1,
@@ -28,14 +29,14 @@ use zinder_proto::v1::explorer::{
     MigrationDenominationsRequest, MigrationDenominationsResponse, MigrationOverviewRequest,
     MigrationOverviewResponse,
 };
-use zinder_proto::v1::wallet::{
-    self, VisibleTipBlockRequest, wallet_query_client::WalletQueryClient,
-};
+use zinder_proto::v1::wallet::wallet_query_client::WalletQueryClient;
 use zinder_runtime::AuthenticatedChannel;
 
 use super::error::ExplorerError;
 use super::freshness::{
-    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
+    UpstreamObservationCache, WalletPinnedBlockSummarySnapshot, attach_upstream_observation,
+    build_explorer_freshness_from_snapshot, pin_wallet_to_block_summary_snapshot,
+    require_block_summary_range_coverage,
 };
 
 /// Hard cap on the block span one cohort or denomination request may cover.
@@ -52,6 +53,10 @@ const MAX_MIGRATION_BLOCK_SPAN: u32 = 4096;
 const MAX_MIGRATION_ROWS_PER_REQUEST: usize = 65_536;
 
 /// Executes one `ExplorerQuery.MigrationOverview` request.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the Wallet-pinned snapshot must span migration rows, exact totals, and response freshness"
+)]
 pub(crate) async fn query_migration_overview(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
@@ -64,31 +69,45 @@ pub(crate) async fn query_migration_overview(
     {
         return Err(ExplorerError::invalid_request("end_height must be >= start_height").into());
     }
-    let end_height = match inner.end_height {
-        Some(end) => Some(end),
-        None => read_latest_pool_totals(materialized_view_store)?.map(|totals| totals.block_height),
-    };
-    let (aggregate, delta) = match end_height {
-        Some(end_height) => {
-            let start_height = inner.start_height.unwrap_or(0);
-            let migrations = read_migrations(materialized_view_store, start_height, end_height)?;
-            let delta = read_range_pool_delta(materialized_view_store, start_height, end_height)?;
-            (aggregate_overview(&migrations), delta)
+    let (aggregate, delta, freshness) = {
+        let pinned =
+            pin_wallet_to_block_summary_snapshot(materialized_view_store, wallet_client).await?;
+        let state = pinned.block_summary_state();
+        let end_height = inner.end_height.unwrap_or_else(|| state.tip_height.value());
+        let coverage_start_height = state
+            .coverage
+            .ok_or_else(|| {
+                ExplorerError::not_materialized(
+                    "block-summary materialized-view coverage has not been verified",
+                )
+            })?
+            .complete_from_height
+            .value();
+        let start_height = inner.start_height.unwrap_or(coverage_start_height);
+        if end_height < start_height {
+            return Err(
+                ExplorerError::invalid_request("end_height must be >= start_height").into(),
+            );
         }
-        None => (OverviewAggregate::default(), PoolDelta::default()),
-    };
-
-    let chain_epoch = fetch_latest_chain_epoch(wallet_client, None).await?;
-    let freshness = attach_upstream_observation(
-        upstream_observation_cache,
-        build_explorer_freshness(
-            Some(materialized_view_store),
+        require_block_summary_range_coverage(state, start_height, end_height)?;
+        require_migration_snapshot_coherence(&pinned)?;
+        let snapshot = pinned.snapshot();
+        let migrations = read_migrations_snapshot(snapshot, start_height, end_height)?;
+        let delta = read_range_pool_delta_snapshot(
+            snapshot,
+            start_height,
+            end_height,
+            coverage_start_height,
+        )?;
+        let freshness = build_explorer_freshness_from_snapshot(
+            snapshot,
             EXPLORER_MIGRATION_OVERVIEW_V1,
-            Some(chain_epoch),
+            Some(pinned.wallet_chain_epoch().clone()),
             0,
-        )?,
-    )
-    .await;
+        )?;
+        (aggregate_overview(&migrations), delta, freshness)
+    };
+    let freshness = attach_upstream_observation(upstream_observation_cache, freshness).await;
     Ok(Response::new(MigrationOverviewResponse {
         freshness: Some(freshness),
         total_migrated_ironwood_zat: aggregate.total_migrated_ironwood_zat,
@@ -101,6 +120,10 @@ pub(crate) async fn query_migration_overview(
 }
 
 /// Executes one `ExplorerQuery.MigrationCohorts` request.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the Wallet-pinned snapshot must span cohort rows and response freshness"
+)]
 pub(crate) async fn query_migration_cohorts(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
@@ -109,24 +132,27 @@ pub(crate) async fn query_migration_cohorts(
 ) -> Result<Response<MigrationCohortsResponse>, Status> {
     let inner = request.into_inner();
     validate_span(inner.start_height, inner.end_height)?;
-    let migrations = read_migrations(
-        materialized_view_store,
-        inner.start_height,
-        inner.end_height,
-    )?;
-    let (cohorts, stats) = group_cohorts(&migrations);
-
-    let chain_epoch = fetch_latest_chain_epoch(wallet_client, inner.at_epoch_id).await?;
-    let freshness = attach_upstream_observation(
-        upstream_observation_cache,
-        build_explorer_freshness(
-            Some(materialized_view_store),
+    let (cohorts, stats, freshness) = {
+        let pinned =
+            pin_wallet_to_block_summary_snapshot(materialized_view_store, wallet_client).await?;
+        require_block_summary_range_coverage(
+            pinned.block_summary_state(),
+            inner.start_height,
+            inner.end_height,
+        )?;
+        require_migration_snapshot_coherence(&pinned)?;
+        let snapshot = pinned.snapshot();
+        let migrations = read_migrations_snapshot(snapshot, inner.start_height, inner.end_height)?;
+        let (cohorts, stats) = group_cohorts(&migrations);
+        let freshness = build_explorer_freshness_from_snapshot(
+            snapshot,
             EXPLORER_MIGRATION_COHORTS_V1,
-            Some(chain_epoch),
+            Some(pinned.wallet_chain_epoch().clone()),
             0,
-        )?,
-    )
-    .await;
+        )?;
+        (cohorts, stats, freshness)
+    };
+    let freshness = attach_upstream_observation(upstream_observation_cache, freshness).await;
     Ok(Response::new(MigrationCohortsResponse {
         freshness: Some(freshness),
         cohorts,
@@ -138,6 +164,10 @@ pub(crate) async fn query_migration_cohorts(
 }
 
 /// Executes one `ExplorerQuery.MigrationDenominations` request.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the Wallet-pinned snapshot must span denomination rows and response freshness"
+)]
 pub(crate) async fn query_migration_denominations(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
@@ -146,24 +176,27 @@ pub(crate) async fn query_migration_denominations(
 ) -> Result<Response<MigrationDenominationsResponse>, Status> {
     let inner = request.into_inner();
     validate_span(inner.start_height, inner.end_height)?;
-    let migrations = read_migrations(
-        materialized_view_store,
-        inner.start_height,
-        inner.end_height,
-    )?;
-    let (bins, total_tx) = bin_denominations(&migrations);
-
-    let chain_epoch = fetch_latest_chain_epoch(wallet_client, inner.at_epoch_id).await?;
-    let freshness = attach_upstream_observation(
-        upstream_observation_cache,
-        build_explorer_freshness(
-            Some(materialized_view_store),
+    let (bins, total_tx, freshness) = {
+        let pinned =
+            pin_wallet_to_block_summary_snapshot(materialized_view_store, wallet_client).await?;
+        require_block_summary_range_coverage(
+            pinned.block_summary_state(),
+            inner.start_height,
+            inner.end_height,
+        )?;
+        require_migration_snapshot_coherence(&pinned)?;
+        let snapshot = pinned.snapshot();
+        let migrations = read_migrations_snapshot(snapshot, inner.start_height, inner.end_height)?;
+        let (bins, total_tx) = bin_denominations(&migrations);
+        let freshness = build_explorer_freshness_from_snapshot(
+            snapshot,
             EXPLORER_MIGRATION_DENOMINATIONS_V1,
-            Some(chain_epoch),
+            Some(pinned.wallet_chain_epoch().clone()),
             0,
-        )?,
-    )
-    .await;
+        )?;
+        (bins, total_tx, freshness)
+    };
+    let freshness = attach_upstream_observation(upstream_observation_cache, freshness).await;
     Ok(Response::new(MigrationDenominationsResponse {
         freshness: Some(freshness),
         bins,
@@ -300,24 +333,57 @@ fn denomination_floor(amount_zat: u64) -> u64 {
         .unwrap_or(0)
 }
 
-fn read_range_pool_delta(
-    materialized_view_store: &MaterializedViewStore,
+fn read_range_pool_delta_snapshot(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     start_height: u32,
     end_height: u32,
+    coverage_start_height: u32,
 ) -> Result<PoolDelta, Status> {
-    let end_totals = read_pool_totals_at_or_before(materialized_view_store, end_height)?;
-    let baseline = match start_height.checked_sub(1) {
-        Some(previous) => read_pool_totals_at_or_before(materialized_view_store, previous)?,
-        None => None,
+    let end_totals = require_exact_pool_totals(
+        read_pool_totals_at_or_before_snapshot(snapshot, end_height)?,
+        end_height,
+        "end",
+    )?;
+    let baseline = if start_height <= coverage_start_height {
+        None
+    } else {
+        let previous = start_height.checked_sub(1).ok_or_else(|| {
+            ExplorerError::not_materialized("migration range baseline underflowed")
+        })?;
+        Some(require_exact_pool_totals(
+            read_pool_totals_at_or_before_snapshot(snapshot, previous)?,
+            previous,
+            "start-1 baseline",
+        )?)
     };
-    let end_orchard = end_totals.map_or(0, |totals| totals.cumulative_orchard_value_balance_zat);
-    let end_ironwood = end_totals.map_or(0, |totals| totals.cumulative_ironwood_value_balance_zat);
+    let end_orchard = end_totals.cumulative_orchard_value_balance_zat;
+    let end_ironwood = end_totals.cumulative_ironwood_value_balance_zat;
     let base_orchard = baseline.map_or(0, |totals| totals.cumulative_orchard_value_balance_zat);
     let base_ironwood = baseline.map_or(0, |totals| totals.cumulative_ironwood_value_balance_zat);
     Ok(PoolDelta {
         orchard_outflow_zat: saturating_positive_delta(end_orchard, base_orchard),
         ironwood_inflow_zat: saturating_negative_magnitude(end_ironwood, base_ironwood),
     })
+}
+
+fn require_exact_pool_totals(
+    totals: Option<MigrationPoolTotals>,
+    expected_height: u32,
+    role: &'static str,
+) -> Result<MigrationPoolTotals, Status> {
+    let totals = totals.ok_or_else(|| {
+        ExplorerError::not_materialized(format!(
+            "Ironwood Migration {role} pool-total record at height {expected_height} is unavailable",
+        ))
+    })?;
+    if totals.block_height != expected_height {
+        return Err(ExplorerError::not_materialized(format!(
+            "Ironwood Migration {role} pool-total record expected height {expected_height}, found {}",
+            totals.block_height,
+        ))
+        .into());
+    }
+    Ok(totals)
 }
 
 /// Magnitude of `end - base` when the range's net movement is positive
@@ -335,33 +401,41 @@ fn saturating_negative_magnitude(end: i64, base: i64) -> u64 {
         .unwrap_or(0)
 }
 
-fn read_migrations(
-    materialized_view_store: &MaterializedViewStore,
+fn read_migrations_snapshot(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     start_height: u32,
     end_height: u32,
 ) -> Result<Vec<Migration>, Status> {
-    IronwoodMigrationConsumer::read_migrations_in_range(
-        materialized_view_store,
+    let migrations = IronwoodMigrationConsumer::read_migrations_in_range_snapshot(
+        snapshot,
         BlockHeight::new(start_height),
         BlockHeight::new(end_height),
-        MAX_MIGRATION_ROWS_PER_REQUEST,
+        MAX_MIGRATION_ROWS_PER_REQUEST.saturating_add(1),
     )
-    .map_err(|error| ExplorerError::internal(error.to_string()).into())
+    .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    require_migration_row_limit(migrations)
 }
 
-fn read_latest_pool_totals(
-    materialized_view_store: &MaterializedViewStore,
-) -> Result<Option<MigrationPoolTotals>, Status> {
-    IronwoodMigrationConsumer::read_latest_pool_totals(materialized_view_store)
-        .map_err(|error| ExplorerError::internal(error.to_string()).into())
+/// Rejects a range that cannot be aggregated exactly within the response cap.
+///
+/// The store scan fetches one sentinel row beyond the cap so a truncating
+/// range iterator cannot turn an incomplete Overview, Cohorts, or
+/// Denominations aggregate into a successful response.
+fn require_migration_row_limit(migrations: Vec<Migration>) -> Result<Vec<Migration>, Status> {
+    if migrations.len() > MAX_MIGRATION_ROWS_PER_REQUEST {
+        return Err(Status::resource_exhausted(format!(
+            "requested migration range exceeds the exact per-request cap of {MAX_MIGRATION_ROWS_PER_REQUEST} rows",
+        )));
+    }
+    Ok(migrations)
 }
 
-fn read_pool_totals_at_or_before(
-    materialized_view_store: &MaterializedViewStore,
+fn read_pool_totals_at_or_before_snapshot(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     height: u32,
 ) -> Result<Option<MigrationPoolTotals>, Status> {
-    IronwoodMigrationConsumer::read_pool_totals_at_or_before(
-        materialized_view_store,
+    IronwoodMigrationConsumer::read_pool_totals_at_or_before_snapshot(
+        snapshot,
         BlockHeight::new(height),
     )
     .map_err(|error| ExplorerError::internal(error.to_string()).into())
@@ -381,19 +455,51 @@ fn validate_span(start_height: u32, end_height: u32) -> Result<(), Status> {
     Ok(())
 }
 
-async fn fetch_latest_chain_epoch(
-    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-    at_epoch_id: Option<u64>,
-) -> Result<wallet::ChainEpoch, Status> {
-    wallet_client
-        .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id }))
-        .await?
-        .into_inner()
-        .chain_view
-        .and_then(|chain_view| chain_view.chain_epoch)
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "one borrowed snapshot must span both migration state and checkpoint validation"
+)]
+fn require_migration_snapshot_coherence(
+    pinned: &WalletPinnedBlockSummarySnapshot<'_>,
+) -> Result<(), Status> {
+    let snapshot = pinned.snapshot();
+    let migration_state = snapshot
+        .consumer_state(IRONWOOD_MIGRATION_CONSUMER_NAME)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
         .ok_or_else(|| {
-            ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing").into()
-        })
+            ExplorerError::not_materialized(
+                "Ironwood Migration materialized-view state is unavailable",
+            )
+        })?;
+    require_matching_migration_state(migration_state, pinned.block_summary_state())?;
+    let migration_checkpoint = snapshot
+        .chain_event_checkpoint(IRONWOOD_MIGRATION_CONSUMER_NAME)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
+        .ok_or_else(|| {
+            ExplorerError::not_materialized(
+                "Ironwood Migration chain-event checkpoint is unavailable",
+            )
+        })?;
+    if migration_checkpoint != pinned.block_summary_checkpoint() {
+        return Err(ExplorerError::not_materialized(
+            "Ironwood Migration checkpoint does not match the Block Summary snapshot",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn require_matching_migration_state(
+    migration_state: MaterializedViewState,
+    block_summary_state: MaterializedViewState,
+) -> Result<(), Status> {
+    if migration_state != block_summary_state {
+        return Err(ExplorerError::not_materialized(
+            "Ironwood Migration state does not match the Block Summary snapshot",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -404,7 +510,20 @@ mod tests {
     )]
 
     use super::*;
-    use zinder_core::TransactionId;
+    use prost::Message as _;
+    use tempfile::tempdir;
+    use zinder_core::{
+        BlockHash, ChainEpochId, TransactionId,
+        wire::{encode_height_key_ascending, encode_rpc_block_hash_hex},
+    };
+    use zinder_materialized_views::{
+        BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BLOCK_SUMMARY_SCHEMA,
+        BlockSummaryConsumer, IRONWOOD_MIGRATION_POOL_TOTALS_COLUMN_FAMILY,
+        IRONWOOD_MIGRATION_SCHEMA, IRONWOOD_MIGRATIONS_COLUMN_FAMILY, MaterializedViewStoreOptions,
+    };
+    use zinder_proto::v1::explorer::{BlockSummary, BlockSummaryRecord};
+    use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
+    use zinder_store::{CanonicalEventCursor, RocksDbResourceBudget};
 
     fn migration(
         block_height: u32,
@@ -524,6 +643,48 @@ mod tests {
     }
 
     #[test]
+    fn pool_delta_refuses_a_missing_exact_end_total() -> Result<(), &'static str> {
+        let error = require_exact_pool_totals(None, 42, "end")
+            .err()
+            .ok_or("missing end total must fail")?;
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn pool_delta_refuses_an_earlier_total_as_a_start_baseline() -> Result<(), &'static str> {
+        let totals = MigrationPoolTotals {
+            block_height: 40,
+            cumulative_orchard_value_balance_zat: 0,
+            cumulative_ironwood_value_balance_zat: 0,
+            block_orchard_value_balance_zat: 0,
+            block_ironwood_value_balance_zat: 0,
+        };
+        let error = require_exact_pool_totals(Some(totals), 41, "start-1 baseline")
+            .err()
+            .ok_or("earlier baseline total must fail")?;
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_row_cap_rejects_a_sentinel_row_instead_of_truncating() -> Result<(), &'static str>
+    {
+        let rows = std::iter::repeat_n(
+            migration(100, 0, 1, 1, true),
+            MAX_MIGRATION_ROWS_PER_REQUEST + 1,
+        )
+        .collect();
+        let error = require_migration_row_limit(rows)
+            .err()
+            .ok_or("a sentinel migration row must reject the range")?;
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        Ok(())
+    }
+
+    #[test]
     fn bin_denominations_counts_only_conformant_rows() {
         let migrations = vec![
             migration(100, 0, 1, 500, true),
@@ -538,5 +699,189 @@ mod tests {
         assert_eq!(bins[0].count, 2);
         assert_eq!(bins[1].denomination_zat, 1_000);
         assert_eq!(bins[1].count, 1);
+    }
+
+    fn migration_key(height: u32, tx_index_in_block: u32) -> [u8; 8] {
+        let mut key = [0u8; 8];
+        key[..4].copy_from_slice(&encode_height_key_ascending(BlockHeight::new(height)));
+        key[4..].copy_from_slice(&tx_index_in_block.to_be_bytes());
+        key
+    }
+
+    fn migration_payload(record: Migration) -> [u8; 81] {
+        let mut payload = [0u8; 81];
+        payload[..32].copy_from_slice(&record.transaction_id.as_bytes());
+        payload[32..40].copy_from_slice(&record.orchard_value_balance_zat.to_be_bytes());
+        payload[40..48].copy_from_slice(&record.ironwood_value_balance_zat.to_be_bytes());
+        payload[48..80].copy_from_slice(&record.orchard_anchor);
+        payload[80] = u8::from(record.conformant);
+        payload
+    }
+
+    fn pool_totals_payload(
+        cumulative_orchard_value_balance_zat: i64,
+        cumulative_ironwood_value_balance_zat: i64,
+        block_orchard_value_balance_zat: i64,
+        block_ironwood_value_balance_zat: i64,
+    ) -> [u8; 32] {
+        let mut payload = [0u8; 32];
+        payload[..8].copy_from_slice(&cumulative_orchard_value_balance_zat.to_be_bytes());
+        payload[8..16].copy_from_slice(&cumulative_ironwood_value_balance_zat.to_be_bytes());
+        payload[16..24].copy_from_slice(&block_orchard_value_balance_zat.to_be_bytes());
+        payload[24..].copy_from_slice(&block_ironwood_value_balance_zat.to_be_bytes());
+        payload
+    }
+
+    fn snapshot_state(revision: u64, hash_seed: u8) -> MaterializedViewState {
+        MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(revision),
+            tip_height: BlockHeight::new(100),
+            tip_hash: BlockHash::from_bytes([hash_seed; 32]),
+            revision,
+            coverage: None,
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        clippy::too_many_lines,
+        reason = "the E1 snapshot intentionally spans the E2 replacement and all three migration response-shape assertions"
+    )]
+    fn migration_snapshot_retains_e1_overview_cohorts_denominations_and_freshness_after_e2_write()
+    -> eyre::Result<()> {
+        let directory = tempdir()?;
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let chain = zinder_testkit::ChainFixture::new(activations.network()).extend_blocks(2);
+        let mut canonical_fixture =
+            zinder_testkit::WalletServingStoreFixture::from_chain_after_live_append(
+                &chain,
+                &activations,
+            )?;
+        let identity = canonical_fixture.canonical_construction_identity()?;
+        let (canonical_reader, _) = canonical_fixture.take_readers()?;
+        let e1_checkpoint =
+            zinder_materialized_views::MaterializedViewChainEventCheckpoint::from_retained_event(
+                canonical_reader.retained_event_at_cursor(CanonicalEventCursor::at(1)?)?,
+            );
+        let e2_checkpoint =
+            zinder_materialized_views::MaterializedViewChainEventCheckpoint::from_retained_event(
+                canonical_reader.retained_event_at_cursor(CanonicalEventCursor::at(2)?)?,
+            );
+        let store = MaterializedViewStore::open(
+            directory.path(),
+            identity,
+            MaterializedViewStoreOptions {
+                sync_writes: false,
+                consumers: &[IRONWOOD_MIGRATION_SCHEMA, BLOCK_SUMMARY_SCHEMA],
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            },
+        )?;
+        let e1_state = snapshot_state(1, 0x11);
+        let e1_migration = migration(100, 0, 1, 1_000, true);
+        let e1_status = MaterializedViewStatus {
+            health: MaterializedViewHealth::Live as i32,
+            indexed_height: 100,
+            lag_blocks: 0,
+            observed_at_millis: 1_000,
+        };
+        store.put_consumer(
+            IRONWOOD_MIGRATIONS_COLUMN_FAMILY,
+            &migration_key(100, 0),
+            &migration_payload(e1_migration),
+        )?;
+        store.put_consumer(
+            IRONWOOD_MIGRATION_POOL_TOTALS_COLUMN_FAMILY,
+            &encode_height_key_ascending(BlockHeight::new(100)),
+            &pool_totals_payload(1_000, -1_000, 1_000, -1_000),
+        )?;
+        store.put_consumer(
+            BLOCK_SUMMARY_COLUMN_FAMILY,
+            &BlockSummaryConsumer::key_for_height(e1_state.tip_height),
+            &BlockSummaryRecord {
+                summary: Some(BlockSummary {
+                    block_height: 100,
+                    block_hash: encode_rpc_block_hash_hex(e1_state.tip_hash),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )?;
+        store.put_consumer_state(IRONWOOD_MIGRATION_CONSUMER_NAME, e1_state)?;
+        store.put_consumer_state(BLOCK_SUMMARY_CONSUMER_NAME, e1_state)?;
+        store.put_chain_event_checkpoint(IRONWOOD_MIGRATION_CONSUMER_NAME, e1_checkpoint)?;
+        store.put_chain_event_checkpoint(BLOCK_SUMMARY_CONSUMER_NAME, e1_checkpoint)?;
+        store.put_materialized_view_status(&e1_status.encode_to_vec())?;
+
+        let e1_snapshot = store.read_snapshot()?;
+
+        let e2_migration = migration(100, 1, 2, 9_000, true);
+        store.put_consumer(
+            IRONWOOD_MIGRATIONS_COLUMN_FAMILY,
+            &migration_key(100, 1),
+            &migration_payload(e2_migration),
+        )?;
+        store.put_consumer(
+            IRONWOOD_MIGRATION_POOL_TOTALS_COLUMN_FAMILY,
+            &encode_height_key_ascending(BlockHeight::new(100)),
+            &pool_totals_payload(10_000, -10_000, 10_000, -10_000),
+        )?;
+        let e2_state = snapshot_state(2, 0x22);
+        store.put_consumer_state(IRONWOOD_MIGRATION_CONSUMER_NAME, e2_state)?;
+        store.put_consumer_state(BLOCK_SUMMARY_CONSUMER_NAME, e2_state)?;
+        store.put_chain_event_checkpoint(IRONWOOD_MIGRATION_CONSUMER_NAME, e2_checkpoint)?;
+        store.put_chain_event_checkpoint(BLOCK_SUMMARY_CONSUMER_NAME, e2_checkpoint)?;
+        store.put_materialized_view_status(
+            &MaterializedViewStatus {
+                health: MaterializedViewHealth::Live as i32,
+                indexed_height: 101,
+                lag_blocks: 0,
+                observed_at_millis: 1_001,
+            }
+            .encode_to_vec(),
+        )?;
+
+        let migrations = read_migrations_snapshot(&e1_snapshot, 100, 100)?;
+        let overview = aggregate_overview(&migrations);
+        let delta = read_range_pool_delta_snapshot(&e1_snapshot, 100, 100, 100)?;
+        let (cohorts, cohort_stats) = group_cohorts(&migrations);
+        let (denominations, total_tx) = bin_denominations(&migrations);
+        let freshness = build_explorer_freshness_from_snapshot(
+            &e1_snapshot,
+            EXPLORER_MIGRATION_OVERVIEW_V1,
+            None,
+            0,
+        )?;
+
+        assert_eq!(overview.total_migrated_ironwood_zat, 1_000);
+        assert_eq!(overview.migration_count, 1);
+        assert_eq!(delta.orchard_outflow_zat, 1_000);
+        assert_eq!(delta.ironwood_inflow_zat, 1_000);
+        assert_eq!(cohorts.len(), 1);
+        assert_eq!(cohorts[0].orchard_anchor, vec![1; 32]);
+        assert_eq!(cohort_stats.cohorts, 1);
+        assert_eq!(denominations.len(), 1);
+        assert_eq!(denominations[0].denomination_zat, 1_000);
+        assert_eq!(denominations[0].count, 1);
+        assert_eq!(total_tx, 1);
+        for consumer in [
+            IRONWOOD_MIGRATION_CONSUMER_NAME,
+            BLOCK_SUMMARY_CONSUMER_NAME,
+        ] {
+            assert_eq!(e1_snapshot.consumer_state(consumer)?, Some(e1_state));
+            assert_eq!(
+                e1_snapshot.chain_event_checkpoint(consumer)?,
+                Some(e1_checkpoint)
+            );
+        }
+        assert_eq!(
+            freshness
+                .chain_view
+                .and_then(|chain_view| chain_view.materialized_views)
+                .map(|status| status.observed_at_millis),
+            Some(e1_status.observed_at_millis)
+        );
+        Ok(())
     }
 }

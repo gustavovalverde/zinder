@@ -5,7 +5,7 @@
 //! [Explorer plane §Block view shape](../../../../../docs/architecture/explorer-plane.md#block-view-shape).
 //!
 //! Capability strings advertised when the view is wired and the cursor has
-//! caught up: [`EXPLORER_BLOCK_SUMMARY_V1`] and [`EXPLORER_BLOCK_DETAIL_V1`].
+//! caught up: [`EXPLORER_BLOCK_SUMMARY_V2`] and [`EXPLORER_BLOCK_DETAIL_V1`].
 
 use prost::Message as _;
 use zinder_core::wire::{
@@ -17,13 +17,14 @@ use zinder_core::{
     TransactionFactsArtifact, TransactionPublicFacts, TransparentOutputFact,
 };
 use zinder_proto::capabilities::{
-    EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V1,
+    EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_SUMMARY_V2,
 };
 use zinder_proto::v1::explorer::{BlockSummary, BlockSummaryRecord};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
-    MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockProjection,
+    MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
+    MaterializedViewConsumerSchema, stage_block_keyed_consumer_state,
 };
 
 /// Column-family name the `BlockSummary` materialized view owns.
@@ -39,7 +40,7 @@ pub const BLOCK_SUMMARY_CONSUMER_NAME: MaterializedViewConsumerName =
 
 /// Capability strings the consumer's read surface lights up once caught up.
 pub const BLOCK_SUMMARY_CAPABILITIES: &[&str] = &[
-    EXPLORER_BLOCK_SUMMARY_V1,
+    EXPLORER_BLOCK_SUMMARY_V2,
     EXPLORER_BLOCK_DETAIL_V1,
     EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1,
 ];
@@ -103,6 +104,14 @@ impl BlockKeyedConsumer for BlockSummaryConsumer {
             .consumer_column_family(BLOCK_SUMMARY_COLUMN_FAMILY)?;
         ctx.batch.delete_cf(&cf, Self::key_for_height(height));
         Ok(())
+    }
+
+    fn stage_block_projection_state(
+        &mut self,
+        checkpoint: MaterializedViewBlockProjection<'_>,
+        ctx: &mut MaterializedViewConsumerCtx<'_>,
+    ) -> Result<(), MaterializedViewConsumerError> {
+        stage_block_keyed_consumer_state(BLOCK_SUMMARY_CONSUMER_NAME, checkpoint, ctx)
     }
 }
 

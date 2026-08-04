@@ -18,8 +18,8 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
-    CanonicalWriterConfig, LiveMempoolOwner, canonical_control_channel,
-    run_canonical_writer_with_control,
+    CanonicalWriterConfig, IngestControlNodeComposition, LiveMempoolOwner,
+    canonical_control_channel, run_canonical_writer_with_control,
 };
 use zinder_proto::v1::ingest::{WriterStatusRequest, ingest_control_client::IngestControlClient};
 use zinder_runtime::Readiness;
@@ -81,11 +81,11 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
+    let node = IngestControlNodeComposition::new(Network::ZcashRegtest, Arc::new(source.clone()));
     let adapter = CanonicalIngestControlGrpcAdapter::new(
-        Network::ZcashRegtest,
         canonical.clone(),
         LiveMempoolOwner::default(),
-        Arc::new(source.clone()),
+        node,
         readiness,
     );
     let server_cancel = cancel.clone();

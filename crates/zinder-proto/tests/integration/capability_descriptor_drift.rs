@@ -21,8 +21,7 @@ use prost::Message;
 use prost_types::FileDescriptorSet;
 use zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET;
 use zinder_proto::capabilities::{
-    CAPABILITIES, CapabilitySurface, EXPLORER_TRANSACTION_HISTORY_V1,
-    EXPLORER_TRANSACTION_HISTORY_V2,
+    CAPABILITIES, CapabilitySurface, EXPLORER_TRANSACTION_HISTORY_V2,
 };
 
 /// Fully qualified methods the descriptor serves but no capability of their
@@ -31,8 +30,7 @@ const UNCAPABILITIED_METHODS: &[&str] = &[];
 
 /// RPCs whose additive protocol revision is intentionally advertised beside
 /// its predecessor on the same method.
-const VERSIONED_CAPABILITY_METHODS: &[&str] =
-    &["zinder.v1.explorer.ExplorerQuery.TransactionHistory"];
+const VERSIONED_CAPABILITY_METHODS: &[&str] = &[];
 
 /// Proto service names that back each capability surface.
 const SURFACE_SERVICES: &[(CapabilitySurface, &str)] = &[
@@ -91,7 +89,7 @@ fn every_served_method_maps_to_exactly_one_capability() -> Result<()> {
 }
 
 #[test]
-fn transaction_history_capability_versions_share_one_rpc() {
+fn transaction_history_uses_only_the_read_fenced_v2_capability() {
     let history_capabilities: BTreeSet<&str> = CAPABILITIES
         .iter()
         .filter(|spec| spec.method == Some("zinder.v1.explorer.ExplorerQuery.TransactionHistory"))
@@ -100,10 +98,7 @@ fn transaction_history_capability_versions_share_one_rpc() {
 
     assert_eq!(
         history_capabilities,
-        BTreeSet::from([
-            EXPLORER_TRANSACTION_HISTORY_V1,
-            EXPLORER_TRANSACTION_HISTORY_V2,
-        ])
+        BTreeSet::from([EXPLORER_TRANSACTION_HISTORY_V2])
     );
 }
 

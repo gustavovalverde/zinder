@@ -4,7 +4,9 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Du
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
-use tokio::task::JoinHandle;
+use parking_lot::Mutex;
+use tokio::{net::TcpListener, task::JoinHandle};
+use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
     ExplorerQueryEndpointComposition, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
@@ -37,6 +39,67 @@ const WALLET_QUERY_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// probe.
 const DEFAULT_UPSTREAM_OBSERVATION_POLL_INTERVAL: Duration =
     Duration::from_millis(zinder_source::DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS);
+
+#[derive(Clone, Copy)]
+enum WalletEndpointReadiness {
+    Healthy,
+    Unavailable,
+    ContractMismatch,
+}
+
+struct ExplorerReadinessInputs {
+    wallet_endpoint: WalletEndpointReadiness,
+    shutdown_requested: bool,
+}
+
+#[derive(Clone)]
+struct ExplorerRuntimeReadiness {
+    public: Readiness,
+    inputs: Arc<Mutex<ExplorerReadinessInputs>>,
+}
+
+impl ExplorerRuntimeReadiness {
+    fn new(public: Readiness) -> Self {
+        Self {
+            public,
+            inputs: Arc::new(Mutex::new(ExplorerReadinessInputs {
+                wallet_endpoint: WalletEndpointReadiness::Healthy,
+                shutdown_requested: false,
+            })),
+        }
+    }
+
+    fn publish_ready(&self) {
+        self.update(|_| {});
+    }
+
+    fn record_wallet_health(&self, wallet_endpoint: WalletEndpointReadiness) {
+        self.update(|inputs| inputs.wallet_endpoint = wallet_endpoint);
+    }
+
+    fn record_shutdown(&self) {
+        self.update(|inputs| inputs.shutdown_requested = true);
+    }
+
+    fn update(&self, change: impl FnOnce(&mut ExplorerReadinessInputs)) {
+        let mut inputs = self.inputs.lock();
+        change(&mut inputs);
+        let state = if inputs.shutdown_requested {
+            ReadinessState::not_ready(ReadinessCause::ShuttingDown)
+        } else {
+            match inputs.wallet_endpoint {
+                WalletEndpointReadiness::Healthy => ReadinessState::ready(None),
+                WalletEndpointReadiness::Unavailable => {
+                    ReadinessState::not_ready(ReadinessCause::StorageUnavailable)
+                }
+                WalletEndpointReadiness::ContractMismatch => {
+                    ReadinessState::not_ready(ReadinessCause::SchemaMismatch)
+                }
+            }
+        };
+        self.public.set(state);
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "zinder-explorer")]
@@ -136,6 +199,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     };
     let readiness = Readiness::default();
     readiness.set(ReadinessState::starting());
+    let runtime_readiness = ExplorerRuntimeReadiness::new(readiness.clone());
     let start_api_phase = StartupPhase::StartApi.start();
 
     let materialized_view_store = match open_materialized_view_store(&explorer_config) {
@@ -151,13 +215,36 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
 
     let grpc_adapter =
-        build_grpc_adapter(&explorer_config, materialized_view_store.clone()).await?;
-    materialized_view_store.try_catch_up()?;
+        match build_grpc_adapter(&explorer_config, materialized_view_store.clone()).await {
+            Ok(grpc_adapter) => grpc_adapter,
+            Err(error) => {
+                start_api_phase.fail(&error);
+                return Err(error);
+            }
+        };
+    if let Err(error) = materialized_view_store.try_catch_up() {
+        let wrapped = ExplorerConfigError::Store(error);
+        start_api_phase.fail(&wrapped);
+        return Err(wrapped);
+    }
     let upstream_observation_handle =
-        spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, cancel.clone())?;
+        match spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, cancel.clone()) {
+            Ok(handle) => handle,
+            Err(error) => {
+                start_api_phase.fail(&error);
+                return Err(error);
+            }
+        };
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
+    let grpc_listener = match bind_explorer_listener(explorer_config.listen_addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            start_api_phase.fail(&error);
+            return Err(error);
+        }
+    };
 
-    let ops_handle = spawn_ops_endpoint_for(
+    let ops_handle = match spawn_ops_endpoint_for(
         RuntimeService::Explorer,
         explorer_config.ops_listen_addr,
         env!("CARGO_PKG_VERSION"),
@@ -165,20 +252,28 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         readiness.clone(),
         Arc::from(advertised_capabilities),
     )
-    .await?;
+    .await
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            let wrapped = ExplorerConfigError::OpsServer(error);
+            start_api_phase.fail(&wrapped);
+            return Err(wrapped);
+        }
+    };
     describe_request_metrics();
 
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    readiness.set(ReadinessState::ready(None));
+    runtime_readiness.publish_ready();
     let materialized_view_catchup_handle = Some(spawn_materialized_view_catchup_task(
         materialized_view_store,
-        readiness.clone(),
+        runtime_readiness.clone(),
         cancel.clone(),
     ));
     let wallet_query_health_handle = Some(spawn_wallet_query_health_probe(
         grpc_adapter.clone(),
-        readiness.clone(),
+        runtime_readiness.clone(),
         cancel.clone(),
     ));
 
@@ -187,7 +282,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         event = "explorer_started",
         network = encode_zinder_native_chain_name(explorer_config.network),
         listen_addr = %explorer_config.listen_addr,
-        storage_path = %explorer_config.storage.path.display(),
+        storage_path = %explorer_config.storage.canonical_root_path.display(),
         "explorer query gRPC server started"
     );
 
@@ -197,11 +292,12 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
             grpc_adapter.into_server(),
             traffic_readiness,
         ))
-        .serve_with_shutdown(
-            explorer_config.listen_addr,
+        .serve_with_incoming_shutdown(
+            TcpListenerStream::new(grpc_listener),
             cancel.clone().cancelled_owned(),
         )
         .await;
+    runtime_readiness.record_shutdown();
     cancel.cancel();
 
     tracing::info!(
@@ -232,6 +328,17 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         }
         Ok(()) => background_shutdown_result,
     }
+}
+
+async fn bind_explorer_listener(
+    listen_addr: SocketAddr,
+) -> Result<TcpListener, ExplorerConfigError> {
+    TcpListener::bind(listen_addr)
+        .await
+        .map_err(|source| ExplorerConfigError::GrpcBind {
+            listen_addr,
+            source,
+        })
 }
 
 fn report_materialized_view_workload(
@@ -330,10 +437,10 @@ fn open_materialized_view_store(
     explorer_config: &ExplorerConfig,
 ) -> Result<MaterializedViewStore, ExplorerConfigError> {
     let materialized_view_path =
-        MaterializedViewStore::path_for_canonical(&explorer_config.storage.path);
+        MaterializedViewStore::path_for_canonical(&explorer_config.storage.canonical_root_path);
     let secondary_path = explorer_config
         .storage
-        .secondary_path
+        .secondary_root_path
         .join("materialized-views");
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let materialized_view_preset =
@@ -358,7 +465,7 @@ fn open_materialized_view_store(
         materialized_view_preset,
         MaterializedViewStoreOptions {
             sync_writes: false,
-            rocksdb_resource_budget: explorer_config.storage.materialized_view_rocksdb_budget,
+            rocksdb_resource_budget: explorer_config.storage.rocksdb_budget,
             ..MaterializedViewStoreOptions::default()
         },
     ) {
@@ -376,7 +483,7 @@ fn open_materialized_view_store(
 
 fn spawn_materialized_view_catchup_task(
     store: MaterializedViewStore,
-    readiness: Readiness,
+    readiness: ExplorerRuntimeReadiness,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<Result<(), MaterializedViewStoreError>> {
     tokio::spawn(async move {
@@ -385,7 +492,7 @@ fn spawn_materialized_view_catchup_task(
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(error) = store.try_catch_up() {
-                        return Err(close_readiness_after_materialized_view_catchup_failure(
+                        return Err(stop_after_materialized_view_catchup_failure(
                             &readiness,
                             &cancel,
                             error,
@@ -398,27 +505,25 @@ fn spawn_materialized_view_catchup_task(
     })
 }
 
-fn close_readiness_after_materialized_view_catchup_failure(
-    readiness: &Readiness,
+fn stop_after_materialized_view_catchup_failure(
+    readiness: &ExplorerRuntimeReadiness,
     cancel: &CancellationToken,
     error: MaterializedViewStoreError,
 ) -> MaterializedViewStoreError {
-    readiness.set(ReadinessState::not_ready(
-        ReadinessCause::StorageUnavailable,
-    ));
+    readiness.record_shutdown();
     cancel.cancel();
     tracing::error!(
         target: "zinder::explorer",
         event = "materialized_view_secondary_catchup_failed",
         error = %error,
-        "materialized-view store secondary catchup failed; Explorer readiness closed"
+        "materialized-view store secondary catchup failed; Explorer is shutting down"
     );
     error
 }
 
 fn spawn_wallet_query_health_probe(
     grpc_adapter: ExplorerQueryGrpcAdapter,
-    readiness: Readiness,
+    readiness: ExplorerRuntimeReadiness,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -431,9 +536,9 @@ fn spawn_wallet_query_health_probe(
                         return;
                     }
                     match outcome {
-                        Ok(()) => readiness.set(ReadinessState::ready(None)),
+                        Ok(()) => readiness.record_wallet_health(WalletEndpointReadiness::Healthy),
                         Err(error) if error.is_contract_mismatch() => {
-                            readiness.set(ReadinessState::not_ready(ReadinessCause::SchemaMismatch));
+                            readiness.record_wallet_health(WalletEndpointReadiness::ContractMismatch);
                             tracing::warn!(
                                 target: "zinder::explorer",
                                 event = "wallet_query_contract_changed",
@@ -442,7 +547,7 @@ fn spawn_wallet_query_health_probe(
                             );
                         }
                         Err(error) => {
-                            readiness.set(ReadinessState::not_ready(ReadinessCause::StorageUnavailable));
+                            readiness.record_wallet_health(WalletEndpointReadiness::Unavailable);
                             tracing::warn!(
                                 target: "zinder::explorer",
                                 event = "wallet_query_health_failed",
@@ -469,8 +574,7 @@ async fn build_grpc_adapter(
         server_info,
         materialized_view_store,
         explorer_config.wallet_query_endpoint.clone(),
-    )
-    .with_prevout_resolution_online(true);
+    );
     if let Some(token) = explorer_config.wallet_query_bearer_token.clone() {
         composition = composition.with_wallet_query_bearer_token(token);
     }
@@ -514,26 +618,62 @@ mod tests {
     use tonic::service::Interceptor as _;
 
     #[test]
-    fn catchup_failure_closes_readiness_and_cancels_before_returning() {
-        let readiness = Readiness::new(ReadinessState::ready(None));
+    fn catchup_failure_enters_shutdown_and_cancels_before_returning() {
+        let public_readiness = Readiness::new(ReadinessState::ready(None));
+        let readiness = ExplorerRuntimeReadiness::new(public_readiness.clone());
         let cancel = CancellationToken::new();
         let error = MaterializedViewStoreError::InvalidOptions {
             reason: "injected terminal catch-up failure",
         };
 
-        let returned =
-            close_readiness_after_materialized_view_catchup_failure(&readiness, &cancel, error);
+        let returned = stop_after_materialized_view_catchup_failure(&readiness, &cancel, error);
 
-        let report = readiness.report();
+        let report = public_readiness.report();
         assert!(!report.is_ready);
-        assert!(matches!(report.cause, ReadinessCause::StorageUnavailable));
+        assert!(matches!(report.cause, ReadinessCause::ShuttingDown));
         assert!(cancel.is_cancelled());
         assert!(matches!(
             returned,
             MaterializedViewStoreError::InvalidOptions { .. }
         ));
 
-        let mut traffic_gate = TrafficReadinessInterceptor::new(readiness);
+        let mut traffic_gate = TrafficReadinessInterceptor::new(public_readiness);
         assert!(traffic_gate.call(tonic::Request::new(())).is_err());
+    }
+
+    #[test]
+    fn wallet_recovery_cannot_reopen_shutdown() {
+        let public_readiness = Readiness::new(ReadinessState::ready(None));
+        let readiness = ExplorerRuntimeReadiness::new(public_readiness.clone());
+
+        readiness.record_wallet_health(WalletEndpointReadiness::Unavailable);
+        assert!(!public_readiness.report().is_ready);
+        readiness.record_shutdown();
+        readiness.record_wallet_health(WalletEndpointReadiness::Healthy);
+        assert!(matches!(
+            public_readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
+    }
+
+    #[tokio::test]
+    async fn occupied_explorer_port_fails_before_listener_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let occupied = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_addr = occupied.local_addr()?;
+
+        let error = bind_explorer_listener(listen_addr)
+            .await
+            .err()
+            .ok_or("occupied ExplorerQuery listener must fail admission")?;
+
+        assert!(matches!(
+            error,
+            ExplorerConfigError::GrpcBind {
+                listen_addr: actual,
+                ..
+            } if actual == listen_addr
+        ));
+        Ok(())
     }
 }

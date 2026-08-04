@@ -8,6 +8,7 @@
 
 use std::{
     net::SocketAddr,
+    num::NonZeroU32,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -30,13 +31,14 @@ use zinder_core::{
 };
 use zinder_explorer::ExplorerServerInfoSettings;
 use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, MaterializedViewStore,
-    MaterializedViewStoreOptions, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
+    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer,
+    MaterializedViewChainEventCheckpoint, MaterializedViewCoverage, MaterializedViewState,
+    MaterializedViewStore, MaterializedViewStoreOptions, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
     TransparentAddressDeltasConsumer,
 };
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
-    EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_TRANSACTIONS_V2, EXPLORER_OVERVIEW_SNAPSHOT_V1,
+    EXPLORER_BLOCK_SUMMARY_V2, EXPLORER_BLOCK_TRANSACTIONS_V2, EXPLORER_OVERVIEW_SNAPSHOT_V1,
     EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
 };
 use zinder_proto::v1::explorer::{
@@ -56,7 +58,7 @@ use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
 };
-use zinder_store::{ChainStoreOptions, SecondaryChainStore};
+use zinder_store::{CanonicalEventHistoryRequest, ChainStoreOptions, SecondaryChainStore};
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, IngestControlFixture, StoreFixture,
     WalletServingStoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
@@ -241,7 +243,7 @@ async fn explorer_query_serves_block_summary_from_secondary_materialized_view_st
         .common
         .as_ref()
         .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
-    assert_advertises_capability(&common.capabilities, EXPLORER_BLOCK_SUMMARY_V1);
+    assert_advertises_capability(&common.capabilities, EXPLORER_BLOCK_SUMMARY_V2);
     assert_advertises_capability(&common.capabilities, EXPLORER_TRANSACTION_FEES_V1);
 
     let chain_view = server_info
@@ -271,7 +273,6 @@ async fn explorer_query_serves_block_summary_from_secondary_materialized_view_st
         .block_summaries_in_range(BlockSummariesInRangeRequest {
             start_height: 1,
             end_height: 1,
-            at_epoch_id: None,
         })
         .await?
         .into_inner();
@@ -287,6 +288,7 @@ async fn explorer_query_serves_block_summary_from_secondary_materialized_view_st
 }
 
 #[tokio::test]
+#[ignore = "P6a.2 does not allocate the block-production capability; P6c removes this surface"]
 #[allow(
     clippy::too_many_lines,
     reason = "scenario seeds a coinbase-bearing fixture, spawns wallet and explorer servers, and asserts every block-production and coinbase field in one request; splitting it obscures the end-to-end flow"
@@ -404,6 +406,7 @@ async fn explorer_query_serves_block_production_series_with_explicit_coverage() 
 }
 
 #[tokio::test]
+#[ignore = "P6a.2 does not allocate the block-activity capability; P6c removes this surface"]
 async fn explorer_query_aggregates_block_activity_with_explicit_coverage() -> Result<()> {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let (_store_fixture, construction_identity, wallet_addr, wallet_handle) =
@@ -1079,6 +1082,7 @@ fn assert_block_transactions_response(
 /// block's height and timestamp; the bundle's single
 /// `freshness.capability_version` is the overview capability string.
 #[tokio::test]
+#[ignore = "P6a.2 does not allocate the overview capability; P6c removes this surface"]
 async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_store() -> Result<()>
 {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
@@ -1162,6 +1166,7 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_s
 /// adapter's background probe at a short cadence, and asserts the resulting
 /// `OverviewSnapshot` carries the same fields the stub returned.
 #[tokio::test]
+#[ignore = "P6a.2 does not allocate the overview capability; P6c removes this surface"]
 async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires() -> Result<()> {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let (_store_fixture, construction_identity, wallet_addr, wallet_handle) =
@@ -1178,7 +1183,6 @@ async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires
         seeded_materialized_view_store.secondary_store,
         format!("http://{wallet_addr}"),
     )
-    .with_prevout_resolution_online(true)
     .compose()
     .await?;
     let probe_cancel = CancellationToken::new();
@@ -1336,6 +1340,43 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
         },
     )?;
     seed_block_summary(&primary_store, chain_fixture, transaction_ids)?;
+    let activations = sample_regtest_upgrade_activations();
+    let mut checkpoint_fixture =
+        WalletServingStoreFixture::from_chain(chain_fixture, &activations)?;
+    if checkpoint_fixture.canonical_construction_identity()? != construction_identity {
+        return Err(eyre!(
+            "seeded materialized view and admitted Wallet must share construction identity"
+        ));
+    }
+    let (canonical_reader, wallet_reader) = checkpoint_fixture.take_readers()?;
+    drop(wallet_reader);
+    let chain_epoch = canonical_reader.chain_epoch()?;
+    let retained_events = canonical_reader
+        .canonical_event_history(CanonicalEventHistoryRequest::new(None, NonZeroU32::MIN))?;
+    let [retained_event] = retained_events.as_slice() else {
+        return Err(eyre!(
+            "seeded canonical fixture must retain exactly one event, got {}",
+            retained_events.len()
+        ));
+    };
+    primary_store.put_consumer_state(
+        BLOCK_SUMMARY_CONSUMER_NAME,
+        MaterializedViewState {
+            chain_epoch_id: chain_epoch.id,
+            tip_height: chain_epoch.visible_tip_height,
+            tip_hash: chain_epoch.visible_tip_hash,
+            revision: 1,
+            coverage: Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(1),
+                complete_through_height: chain_epoch.visible_tip_height,
+                complete_through_hash: chain_epoch.visible_tip_hash,
+            }),
+        },
+    )?;
+    primary_store.put_chain_event_checkpoint(
+        BLOCK_SUMMARY_CONSUMER_NAME,
+        MaterializedViewChainEventCheckpoint::from_retained_event(*retained_event),
+    )?;
 
     let secondary_store = MaterializedViewStore::open_secondary(
         &primary_path,
@@ -1405,7 +1446,6 @@ async fn spawn_explorer_query_server(
         seeded_materialized_view_store.secondary_store.clone(),
         format!("http://{wallet_addr}"),
     )
-    .with_prevout_resolution_online(true)
     .compose()
     .await?;
     let handle = tokio::spawn(async move {
@@ -1716,6 +1756,7 @@ async fn spawn_deltas_explorer(
 /// Per-event rows arrive ascending by height with correct signs and indices,
 /// the advertised capability is present, and the net equals the delta sum.
 #[tokio::test]
+#[ignore = "P6a.2 does not allocate transparent-address deltas; P6c removes this surface"]
 async fn explorer_query_serves_transparent_address_deltas_ascending() -> Result<()> {
     let deltas = seeded_deltas();
     let (mut client, explorer_handle, wallet_handle) = spawn_deltas_explorer(&deltas).await?;
@@ -1760,6 +1801,7 @@ async fn explorer_query_serves_transparent_address_deltas_ascending() -> Result<
 /// The height range filters the series, an out-of-range window returns no rows
 /// and no cursor, and the page cursor resumes strictly after the prior page.
 #[tokio::test]
+#[ignore = "P6a.2 does not allocate transparent-address deltas; P6c removes this surface"]
 async fn explorer_query_pages_transparent_address_deltas() -> Result<()> {
     let deltas = seeded_deltas();
     let (mut client, explorer_handle, wallet_handle) = spawn_deltas_explorer(&deltas).await?;

@@ -3553,6 +3553,10 @@ mod tests {
 
     use eyre::Result;
     use tempfile::tempdir;
+    use zinder_core::{
+        ArtifactSchemaVersion, BlockHeightRange, ChainTipMetadata, UnixTimestampMillis,
+    };
+    use zinder_store::{ChainEpochCommitted, ChainRangeReverted};
 
     use super::*;
 
@@ -3565,6 +3569,243 @@ mod tests {
             1,
             &[TEST_CONSUMER_CF],
         );
+
+    fn block_keyed_test_epoch(id: u64, tip_height: u32, tip_hash: BlockHash) -> ChainEpoch {
+        ChainEpoch {
+            id: ChainEpochId::new(id),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(tip_height),
+            visible_tip_hash: tip_hash,
+            settled_tip_height: BlockHeight::new(0),
+            settled_tip_hash: Network::ZcashRegtest.genesis_hash(),
+            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(id),
+        }
+    }
+
+    fn block_keyed_test_checkpoint(
+        event_sequence: u64,
+        tip_height: u32,
+        tip_hash: BlockHash,
+    ) -> Result<MaterializedViewChainEventCheckpoint> {
+        let mut encoded = [0_u8; 95];
+        encoded[0] = 1;
+        encoded[1..9].copy_from_slice(&event_sequence.to_be_bytes());
+        encoded[9..17].copy_from_slice(&event_sequence.to_be_bytes());
+        encoded[17..21].copy_from_slice(&tip_height.to_be_bytes());
+        encoded[21..53].copy_from_slice(&tip_hash.as_bytes());
+        encoded[53..55].copy_from_slice(&1_u16.to_be_bytes());
+        encoded[55..63].copy_from_slice(&u64::from(tip_height).to_be_bytes());
+        encoded[63..95].fill(u8::try_from(event_sequence).unwrap_or(u8::MAX));
+        let resulting_fence = CanonicalEventFence::decode_persisted(&encoded)?;
+        Ok(MaterializedViewChainEventCheckpoint {
+            cursor: CanonicalEventCursor::at(event_sequence)?,
+            resulting_fence,
+        })
+    }
+
+    struct BlockKeyedTestState<'a> {
+        chain_epoch: ChainEpoch,
+        chain_event: &'a ChainEvent,
+        tip_height: BlockHeight,
+        tip_hash: BlockHash,
+        checkpoint: Option<MaterializedViewChainEventCheckpoint>,
+    }
+
+    fn stage_block_keyed_test_state(
+        store: &MaterializedViewStore,
+        state: &BlockKeyedTestState<'_>,
+    ) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        let mut ctx = MaterializedViewConsumerCtx {
+            store,
+            batch: &mut batch,
+        };
+        crate::consumer::stage_block_keyed_consumer_state(
+            BLOCK_SUMMARY_CONSUMER_NAME,
+            MaterializedViewBlockProjection {
+                chain_epoch: state.chain_epoch,
+                chain_event: state.chain_event,
+                tip_height: Some(state.tip_height),
+                tip_hash: Some(state.tip_hash),
+            },
+            &mut ctx,
+        )
+        .map_err(|error| eyre::eyre!(error.to_string()))?;
+        if let Some(checkpoint) = state.checkpoint {
+            store.stage_chain_event_checkpoint(
+                ctx.batch,
+                BLOCK_SUMMARY_CONSUMER_NAME,
+                checkpoint,
+            )?;
+        }
+        store.write_consumer_batch(BLOCK_SUMMARY_CONSUMER_NAME, &batch)?;
+        Ok(())
+    }
+
+    fn assert_incomplete_block_keyed_replay_page(
+        store: &MaterializedViewStore,
+    ) -> Result<ChainEpoch> {
+        let first_hash = BlockHash::from_bytes([0x10; 32]);
+        let first_epoch = block_keyed_test_epoch(1, 11, BlockHash::from_bytes([0x11; 32]));
+        let first_page = ChainEvent::ChainCommitted {
+            committed: ChainEpochCommitted {
+                chain_epoch: first_epoch,
+                block_range: BlockHeightRange::inclusive(
+                    BlockHeight::new(10),
+                    BlockHeight::new(10),
+                ),
+            },
+        };
+        stage_block_keyed_test_state(
+            store,
+            &BlockKeyedTestState {
+                chain_epoch: first_epoch,
+                chain_event: &first_page,
+                tip_height: BlockHeight::new(10),
+                tip_hash: first_hash,
+                checkpoint: None,
+            },
+        )?;
+        let intermediate = store
+            .consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("first replay page must persist state"))?;
+        assert_eq!(intermediate.revision, 1);
+        assert_eq!(intermediate.tip_height, BlockHeight::new(10));
+        assert_eq!(
+            intermediate.coverage,
+            Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(10),
+                complete_through_height: BlockHeight::new(10),
+                complete_through_hash: first_hash,
+            })
+        );
+        assert!(
+            store
+                .chain_event_checkpoint(BLOCK_SUMMARY_CONSUMER_NAME)?
+                .is_none(),
+            "an intermediate replay page must not advance admission"
+        );
+        Ok(first_epoch)
+    }
+
+    fn assert_converged_block_keyed_replay(
+        store: &MaterializedViewStore,
+        first_epoch: ChainEpoch,
+    ) -> Result<()> {
+        let final_hash = BlockHash::from_bytes([0x11; 32]);
+        let final_page = ChainEvent::ChainCommitted {
+            committed: ChainEpochCommitted {
+                chain_epoch: first_epoch,
+                block_range: BlockHeightRange::inclusive(
+                    BlockHeight::new(11),
+                    BlockHeight::new(11),
+                ),
+            },
+        };
+        let first_checkpoint = block_keyed_test_checkpoint(1, 11, final_hash)?;
+        stage_block_keyed_test_state(
+            store,
+            &BlockKeyedTestState {
+                chain_epoch: first_epoch,
+                chain_event: &final_page,
+                tip_height: BlockHeight::new(11),
+                tip_hash: final_hash,
+                checkpoint: Some(first_checkpoint),
+            },
+        )?;
+        let converged = store
+            .consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("final replay page must persist state"))?;
+        assert_eq!(converged.revision, 2);
+        assert_eq!(converged.tip_height, BlockHeight::new(11));
+        assert_eq!(
+            converged.coverage,
+            Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(10),
+                complete_through_height: BlockHeight::new(11),
+                complete_through_hash: final_hash,
+            })
+        );
+        assert_eq!(
+            store.chain_event_checkpoint(BLOCK_SUMMARY_CONSUMER_NAME)?,
+            Some(first_checkpoint)
+        );
+        Ok(())
+    }
+
+    fn assert_block_keyed_append_and_reorg(store: &MaterializedViewStore) -> Result<()> {
+        let committed_hash = BlockHash::from_bytes([0x12; 32]);
+        let committed_epoch = block_keyed_test_epoch(2, 12, committed_hash);
+        let committed_event = ChainEvent::ChainCommitted {
+            committed: ChainEpochCommitted {
+                chain_epoch: committed_epoch,
+                block_range: BlockHeightRange::inclusive(
+                    BlockHeight::new(12),
+                    BlockHeight::new(12),
+                ),
+            },
+        };
+        stage_block_keyed_test_state(
+            store,
+            &BlockKeyedTestState {
+                chain_epoch: committed_epoch,
+                chain_event: &committed_event,
+                tip_height: BlockHeight::new(12),
+                tip_hash: committed_hash,
+                checkpoint: Some(block_keyed_test_checkpoint(2, 12, committed_hash)?),
+            },
+        )?;
+        let committed = store
+            .consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("contiguous commit must persist state"))?;
+        assert_eq!(committed.revision, 3);
+
+        let replacement_hash = BlockHash::from_bytes([0xf2; 32]);
+        let replacement_epoch = block_keyed_test_epoch(3, 12, replacement_hash);
+        let reorg_event = ChainEvent::ChainReorged {
+            reverted: ChainRangeReverted {
+                chain_epoch: committed_epoch,
+                block_range: BlockHeightRange::inclusive(
+                    BlockHeight::new(12),
+                    BlockHeight::new(12),
+                ),
+            },
+            committed: ChainEpochCommitted {
+                chain_epoch: replacement_epoch,
+                block_range: BlockHeightRange::inclusive(
+                    BlockHeight::new(12),
+                    BlockHeight::new(12),
+                ),
+            },
+        };
+        stage_block_keyed_test_state(
+            store,
+            &BlockKeyedTestState {
+                chain_epoch: replacement_epoch,
+                chain_event: &reorg_event,
+                tip_height: BlockHeight::new(12),
+                tip_hash: replacement_hash,
+                checkpoint: Some(block_keyed_test_checkpoint(3, 12, replacement_hash)?),
+            },
+        )?;
+        let replaced = store
+            .consumer_state(BLOCK_SUMMARY_CONSUMER_NAME)?
+            .ok_or_else(|| eyre::eyre!("reorg replacement must persist state"))?;
+        assert_eq!(replaced.revision, 4);
+        assert_eq!(replaced.chain_epoch_id, ChainEpochId::new(3));
+        assert_eq!(replaced.tip_hash, replacement_hash);
+        assert_eq!(
+            replaced.coverage,
+            Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(10),
+                complete_through_height: BlockHeight::new(12),
+                complete_through_hash: replacement_hash,
+            })
+        );
+        Ok(())
+    }
 
     #[test]
     fn secondary_catchup_retries_only_missing_sst_file_races() {
@@ -3678,6 +3919,27 @@ mod tests {
             store.chain_event_checkpoint(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?,
             Some(checkpoint)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn block_keyed_state_stays_unadmitted_between_pages_then_converges_and_tracks_reorgs()
+    -> Result<()> {
+        let tempdir = tempdir()?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            MaterializedViewStoreOptions {
+                consumers: &[BLOCK_SUMMARY_SCHEMA],
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?;
+
+        // A newly added consumer starts at its first authenticated replay
+        // page, converges atomically, then advances through append and reorg.
+        let first_epoch = assert_incomplete_block_keyed_replay_page(&store)?;
+        assert_converged_block_keyed_replay(&store, first_epoch)?;
+        assert_block_keyed_append_and_reorg(&store)?;
         Ok(())
     }
 

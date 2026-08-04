@@ -8,6 +8,7 @@ mod commitment_root_search;
 mod conventional_fee_distribution;
 mod displaced_block;
 mod endpoint_admission;
+mod endpoint_capabilities;
 mod error;
 mod fee_summary;
 mod freshness;

@@ -13,9 +13,9 @@ use zinder_core::wire::{
     decode_height_key_descending, decode_in_block_position, decode_rpc_block_hash_hex,
     decode_rpc_transaction_id_hex, encode_internal_transaction_id, encode_rpc_block_hash_hex,
 };
-use zinder_core::{
-    BlockHash, BlockHeight, ChainEpochId, PrivacyShape, TransactionId, TransactionLocation,
-};
+#[cfg(test)]
+use zinder_core::{BlockHash, ChainEpochId};
+use zinder_core::{BlockHeight, PrivacyShape, TransactionId, TransactionLocation};
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_HISTORY_V2;
 use zinder_proto::v1::explorer::{
     ShieldedProtocol, TransactionFeesRecord, TransactionHistoryCountScope,
@@ -53,10 +53,12 @@ pub(crate) enum TransactionHistoryMaterializedViewReadiness {
 }
 
 impl TransactionHistoryMaterializedViewReadiness {
+    #[cfg(test)]
     pub(crate) const fn is_available(self) -> bool {
         matches!(self, Self::Available(_))
     }
 
+    #[cfg(test)]
     pub(crate) fn is_complete_at(
         self,
         canonical_position: Option<(ChainEpochId, BlockHeight, BlockHash)>,

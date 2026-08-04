@@ -58,21 +58,20 @@ convention. Specifically:
    `net_value_zat = 0` to mean "we only saw one side of the
    transaction".
 
-5. Capabilities are gated at the adapter's `advertised_capabilities()`
-   on a per-named-flag basis. The flags are set by the binary at
-   startup based on:
+5. The composition root allocates capabilities once, after admitting the
+   required Wallet endpoint and exact local materialized-view consumer
+   identities. `advertised_capabilities()` exposes that immutable set to
+   `ServerInfo` and the ops endpoint, while every handler checks the same set
+   before request data can reach storage or an upstream dependency. Runtime
+   lag and outages affect readiness or the admitted operation's typed result;
+   they do not mutate the advertised contract.
 
-   - probing the upstream's `ServerInfo`
-     (`wallet.read.transparent_outputs_by_outpoint_v1` flips on when the wallet
-     advertises it);
-   - whether the materialized-view store has been wired
-     (`materialized_view_store_online` covers `BlockSummary`, `BlockDetail`,
-     `MempoolEventCounts`, `RecentTransactions`, and
-     `TransparentAddressActivity`).
-
-   `advertised_capabilities()` is the single source of truth: the gRPC
-   `ServerInfo` and the ops endpoint's `/healthz` both read from it. A flag flipped in
-   one place therefore reaches every consumer.
+   An optional field capability is allocated only when the method and every
+   field carrier it reads are present in the admitted composition. Structural
+   absence leaves the capability unadvertised and the field unread. The
+   current `RecentTransactions.paid_fee_zat` allocation, for example, requires
+   the visible-tip primitive plus the block-summary, recent-transaction, and
+   transaction-fee consumers.
 
 ## Examples shipped under this convention
 
@@ -80,16 +79,22 @@ convention. Specifically:
 | ----- | ---------- | ---------------------- |
 | `TransactionDetailResponse.paid_fee_zat` | `explorer.transaction.fees_v1` | `prevout_resolution_status` |
 | `TransactionDetailResponse.transparent_inputs[].value_zat` | `explorer.transaction.fees_v1` | (status on the parent) |
-| `MempoolActivityEntry.paid_fee_zat` | `explorer.transaction.fees_v1` (when mempool prevouts are online) | (none; fall back to ZIP-317 floor) |
-| `BlockSummary.paid_fees_collected_zat` | `explorer.transaction.fees_v1` (advertised when the consumer is wired and prevouts are online) | (none; the row carries `fees_collected_zat` as the ZIP-317 floor always) |
-| `TransparentAddressActivityRecord.net_value_zat` | `explorer.transparent_address.activity_v1` | `prevout_resolution_status` on the record |
+| `MempoolActivityEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; fall back to ZIP-317 floor) |
+| `BlockSummary.paid_fees_collected_zat` | `explorer.transaction.fees_v1` | (none; the row carries `fees_collected_zat` as the ZIP-317 floor always) |
+| `TransparentAddressActivityRecord.net_value_zat` | `explorer.transparent_address.activity_v2` | `prevout_resolution_status` on the record |
 | `RecentTransactionEntry.zip317_conventional_fee_zat` | `explorer.transaction.recent_v1` | (none; `is_coinbase = true` explains absence) |
 | `RecentTransactionEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not provable from retained facts") |
-| `TransactionHistoryEntry.zip317_conventional_fee_zat` | `explorer.transaction.history_v1` | (none; `is_coinbase = true` explains absence) |
+| `TransactionHistoryEntry.zip317_conventional_fee_zat` | `explorer.transaction.history_v2` | (none; `is_coinbase = true` explains absence) |
 | `TransactionHistoryEntry.intrinsic_value_balances` | `explorer.transaction.intrinsic_value_balances_v1` | (none; absence remains unknown and never means all-zero balances) |
 | `TransactionDetailResponse.intrinsic_value_balances` | `explorer.transaction.intrinsic_value_balances_v1` | (none; absence remains unknown and never means all-zero balances) |
 | `TransactionHistoryEntry.paid_fee_zat` | `explorer.transaction.fees_v1` | (none; absence means "not provable from retained facts") |
 | `MinedTransaction.raw_transaction_bytes` | `wallet.read.transaction_bytes_v1` | (none; absence means "transaction blob not retained") |
+
+The table records wire-level carrier associations, not the current runtime
+allocation. The current Explorer binary allocates
+`explorer.transaction.fees_v1` only with `RecentTransactions` and its exact
+transaction-fee consumer; the other carrier methods remain structurally
+unadvertised.
 
 `MinedTransaction.raw_transaction_bytes` is the wallet-surface example.
 The field is `optional bytes`, gated on the `RequiresTransactionBlobs`

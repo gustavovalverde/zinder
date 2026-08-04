@@ -7,8 +7,8 @@ pub mod capabilities;
 pub mod error_policy;
 pub mod wire;
 pub use capabilities::{
-    AdvertisePolicy, CAPABILITIES, Capability, CapabilityDescriptor, CapabilitySpec,
-    CapabilitySurface, ExplorerReadiness, always_on_capability_strings, capabilities_for_surface,
+    CAPABILITIES, Capability, CapabilityDescriptor, CapabilitySpec, CapabilitySurface,
+    capabilities_for_surface,
 };
 pub use error_policy::{
     BoundaryError, ReasonPolicy, RetryDisposition, ZINDER_ERROR_DOMAIN, reason_policy,
