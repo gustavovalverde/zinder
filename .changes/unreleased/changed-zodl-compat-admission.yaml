@@ -1,0 +1,6 @@
+kind: changed
+body: Lightwalletd-compatible deployments now advertise transparent-address support only when their serving data can answer those requests. Startup rejects configurations that lack a transparent wallet projection or retained transaction bytes.
+time: 2026-08-02T12:00:00Z
+custom:
+  Bump: minor
+  PR: "71"

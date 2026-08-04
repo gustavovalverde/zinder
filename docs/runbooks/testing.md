@@ -156,8 +156,9 @@ cargo nextest run --profile=ci-parity
 Expected outcome: every `parity::` module exits zero and the report is archived
 with the release evidence. This profile is organized by consumer:
 
-- `parity/zodl.rs` covers the lightwalletd-compatible shapes Zodl and the
-  Android SDK hit today.
+- `parity/lightwalletd_adapter_shapes.rs` covers isolated lightwalletd adapter
+  shapes. Current ZODL proof comes from the bound ten-RPC contract and the real
+  Android application certification run.
 - `parity/zallet.rs` covers a Zallet-shaped retained chain-view contract,
   including the cloneable, `'static` owned snapshot surface. It is not a claim
   that a downstream Zallet integration has been certified.
@@ -875,18 +876,20 @@ gate on whether you actually changed trust-sensitive code.
 
 ### One-shot deterministic test
 
-Already covered by `services/zinder-compat-lightwalletd/tests/integration/wallet_sdk_scan.rs`
+Already covered by
+`services/zinder-compat-lightwalletd/tests/integration/lightwalletd_scan_contract.rs`
 in the default validation gate. It:
 
 1. Stands up `LightwalletdGrpcAdapter` over a populated `PrimaryChainStore`.
-2. Connects through the generated `CompactTxStreamerClient` (the same
-   transport `librustzcash` consumers use).
+2. Connects through the generated `CompactTxStreamerClient` to exercise the
+   protocol transport directly.
 3. Calls `GetBlockRange`, decodes every compact block, asserts `vtx`/`txid`
    alignment with stored transaction artifacts.
 4. Asserts no key material appears in any client→server payload.
 
-This test is the deterministic version of the wallet-SDK contract; running it
-under `cargo nextest run --profile=ci` is part of every commit.
+This is a deterministic generic lightwalletd scan contract, not current SDK or
+application certification. Running it under `cargo nextest run --profile=ci`
+is part of every commit.
 
 ### End-to-end with a real lightwalletd-compatible client
 
@@ -946,14 +949,15 @@ For production Android-wallet claims
 - `GetAddressUtxosStream` is backed by stored transparent output artifacts.
   Synthetic empty responses, upstream-node fallbacks, and compact-block scans do
   not satisfy the wallet-serving contract.
-- Pending-transaction UX requires both mempool surfaces: `GetMempoolTx` returns
-  the compact transaction while pending, and `GetMempoolStream` emits the raw
-  transaction before closing on the mining tip change.
+- Pending-transaction UX requires `SendTransaction` and `GetMempoolStream`
+  through the selected endpoint, followed by `GetTransaction` after mining.
+  `GetMempoolTx` remains broader lightwalletd compatibility and is not part of
+  the current Android SDK inventory.
 - Send tests record writer-tip lag at submission time. A success when the writer
   is outside the wallet expiry window is not production evidence.
 
-Reference comparison points: `zec.rocks` for public lightwalletd behavior,
-the existing `wallet_sdk_scan.rs` for the in-process baseline.
+Reference comparison points: `zec.rocks` for public lightwalletd behavior and
+`lightwalletd_scan_contract.rs` for the in-process protocol baseline.
 
 ## Public native `WalletQuery` contract
 
@@ -1107,10 +1111,11 @@ update the referenced architecture or reference page.
 | --- | --- | --- | --- | --- | --- |
 | Full wallet-serving testnet bulk catchup | Medium | Against a synced testnet Zebra, start the checked-in ingest, projector, native query, and compatibility topology with fresh canonical and wallet stores. | Canonical construction reaches READY, the projector publishes the same authenticated fence, both readers open exact canonical/wallet secondary pairs, every `/readyz` endpoint is ready, native `WalletQuery/ServerInfo` reports the admitted tip, and `GetLightdInfo` reports the same non-zero height with `taddrSupport: true`. | Logs and `/readyz` JSON for all four runtimes; `WalletQuery/ServerInfo` and `GetLightdInfo` output; canonical floor/tip; wallet source event sequence and digest. | [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims), [Chain ingestion §Operation Shape](../architecture/chain-ingestion.md#operation-shape) |
 | Lightwalletd-compatible wallet bootstrap and restore | Medium | Point a real lightwalletd-compatible wallet or SDK at the testnet compat endpoint. Exercise create-new-wallet first, then restore/import or resync against the same serving store. | Create-new-wallet and restored/resync wallets reach the chain tip when requested tree-state and subtree-root heights are at or above the store floor. Below-floor requests fail only as the documented strict `NOT_FOUND` unsupported-floor case; unknown tree-state or subtree-root gaps are blockers. | Wallet logs, endpoint config diff, wallet-visible height, store floor, requested tree-state/subtree-root heights, `GetAddressUtxosStream` sample. | [External integration: lightwalletd-compatible wallets](#external-integration-lightwalletd-compatible-wallets), [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims) |
-| Send plus mempool end-to-end | Medium | With the unified `zinder-ingest` loop and the mempool surface running, open the mempool stream, then submit a self-send from a real wallet through `zinder-compat-lightwalletd`. | `SendTransaction` returns the expected success mapping. `GetMempoolStream` emits `RawTransaction`, stays open while the tx is pending, and closes on mining. `GetMempoolTx` returns the compact tx while pending and empties after mining. Wallet scan-back observes the mined tx, and writer-tip lag stays inside the wallet expiry window. | Wallet logs, compat logs, mempool stream excerpt, `GetMempoolTx` before/after output, txid, mined height, `/readyz` lag sample at submit time. | [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims), [Wallet data plane §Mempool Snapshot and Subscription](../architecture/wallet-data-plane.md#mempool-snapshot-and-subscription) |
+| Current Zodl send plus mempool | Medium | With the unified `zinder-ingest` loop and mempool surface running, submit a self-send from the exact current app through its selected trusted-TLS compatibility endpoint. | `SendTransaction` returns the expected success mapping. The app's `GetMempoolStream` emits the exact submitted `RawTransaction` before mining, the bytes match the node transaction, wallet scan-back observes confirmation, and restart preserves the result. Traffic attribution shows no bundled-endpoint fallback. | App and compatibility logs, txid-correlated stream digest, matching node transaction digest, mined height, selected endpoint, no-fallback trace, and post-restart app state. | [Trusted TLS and ZODL compatibility admission](zodl-trusted-tls-certification.md), [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims) |
+| Broader lightwalletd mempool methods | Medium | Exercise every additional mempool RPC named by the compatibility claim, independently of the current Zodl method inventory. | `GetMempoolTx` returns the compact transaction while pending and empties after mining; stream lifecycle behavior matches the pinned lightwalletd contract. | Protocol-client transcript, transaction ID, compact transaction digest, mined height, and before/after responses. | [Wallet data plane §Mempool Snapshot and Subscription](../architecture/wallet-data-plane.md#mempool-snapshot-and-subscription) |
 | Mainnet bounded live sweep | Low when local mainnet is synced | Run the mainnet-only `ci-live` tests against the local operator-hosted Zebra before attempting longer sessions. Prefer targeted filters first, then the full live profile if the node is healthy. | Mainnet-only tests pass on `ZINDER_NETWORK=zcash-mainnet`; non-mainnet tests either pass or skip for the documented reason. No test mutates mainnet state. | Nextest output, Zebra tip height, tested block range, node auth source used. | [T3: Live mainnet](#t3-live-mainnet-operator-hosted-zebra) |
 | Lightwalletd compatibility parity | Medium | Run the same lightwalletd-compatible probes or wallet flow against Zinder and a reference lightwalletd endpoint. Include `GetBlockRange`, transaction lookup, transparent history, UTXO, mempool, and send shapes that the support claim names. | Zinder returns compatible response and error shapes where the lightwalletd contract applies. Any intentional difference is documented against the native contract or compatibility adapter. Hot-path timings stay inside the published budgets. | Per-method request/response summaries, error codes, timing samples, endpoint versions. | [T3: Parity against a reference lightwalletd](#t3-parity-against-a-reference-lightwalletd), [Wallet data plane §Performance and Pagination](../architecture/wallet-data-plane.md#performance-and-pagination) |
-| Public deployment shape | Medium for internal CA, high for public cert | Put TLS in front of `zinder-compat-lightwalletd` with Caddy, nginx, or traefik, forwarding h2c to the local compat process. Use a private CA only for internal pilots; use a publicly trusted cert for public claims. | A real lightwalletd-compatible wallet validation succeeds through TLS, `GetLightdInfo` works through the proxy, public traffic cannot reach plaintext gRPC, `IngestControl`, or ops endpoints, proxy rate limiting is present for public exposure, and `--print-config` plus logs redact secrets. | Proxy config, cert source, endpoint validation logs, `grpcurl` result through TLS, bind-address audit, redacted `--print-config` output. | [Integration surfaces §Lightwalletd Compatibility](../reference/integration-surfaces.md#lightwalletd-compatibility), [Service operations §Deployment guidance](../architecture/service-operations.md#deployment-guidance) |
+| Public deployment shape | Medium for internal CA, high for public cert | Put TLS in front of `zinder-compat-lightwalletd` with Caddy, nginx, or traefik, forwarding h2c to the local compat process. Use a private CA only for internal pilots; use a publicly trusted cert for public claims. | A real lightwalletd-compatible wallet validation succeeds through TLS, `GetLightdInfo` works through the proxy, public traffic cannot reach plaintext gRPC, `IngestControl`, or ops endpoints, proxy rate limiting is present for public exposure, and `--print-config` plus logs redact secrets. | Proxy config, cert source, endpoint validation logs, `grpcurl` result through TLS, bind-address audit, redacted `--print-config` output. | [Trusted TLS and ZODL compatibility admission](zodl-trusted-tls-certification.md), [Integration surfaces §Lightwalletd Compatibility](../reference/integration-surfaces.md#lightwalletd-compatibility) |
 | Observability and mempool lifecycle semantics | Low | Run `scripts/observability-smoke.sh run` against regtest or a bounded public-network smoke. After it completes, manually query the documented `zinder_mempool_*` series because the smoke report does not yet assert the lifecycle and retention series. Inspect `/readyz`, Prometheus, and Grafana after mempool traffic and one retention pass. | Healthy traffic has no blocking readiness cause; exactly one mempool lifecycle state is active; retained count, floor sequence and age are present; examined-event and examined-encoded-byte histograms reflect bounded retention steps; retention duration uses only the documented closed step outcomes. Withdrawing the mempool hydration gate makes ingest non-ready until a newly certified snapshot at the exact canonical tip and a fresh canonical observation restore it. | `.tmp/observability/reports/latest-readiness.json`, latest readiness Markdown, manual Prometheus query output, Grafana screenshot or panel JSON, service logs. | [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness), [Observability smoke](../../observability/README.md) |
 | Coherent backup, restore, and rolling restart | High until the coherent bundle exists | Produce one authenticated canonical/wallet checkpoint bundle, stop the stack, restore both stores into fresh paths, then start ingest, projector, native query, and compatibility in ownership order. Restart compatibility, query, projector, and ingest separately while the source advances. | The restored stores carry one matching canonical event fence and wallet digest; all owners fail closed on mismatches; both readers publish only an admitted wallet-serving pair; the 10,000-block tail reaches ready within 15 minutes; later restarts preserve continuous following. An ad hoc copy of independently timed RocksDB directories is not evidence. | Bundle manifest and digests, restore duration, tail range, source and restored fences, restart logs, all four `/readyz` responses, native `WalletQuery/ServerInfo` after every restart, compatibility `GetLightdInfo` after every restart, and second-owner failure output. | [ADR-0035 §Recovery boundary](../adrs/0035-canonical-storage-topologies.md#recovery-boundary), [Service operations §Recovery](../architecture/service-operations.md#recovery) |
 | Long soak | High | Run ingest, projector, native query, and compatibility for several hours or longer while scraping every runtime and exercising native and compatibility wallet reads, mempool streams, and transaction submission. | No unexplained readiness flaps; canonical, projection, and wallet-serving lag stay bounded; cursor-retention and RocksDB alerts stay quiet; memory growth is explainable; and restart/shutdown is clean. | Metrics scrape and readiness samples for all four runtimes, native `WalletQuery/ServerInfo` samples, compatibility `GetLightdInfo` samples, process logs, memory/RSS samples, and final restart result. | [Service operations §Validation Tiers](../architecture/service-operations.md#validation-tiers), [Wallet data plane §Performance and Pagination](../architecture/wallet-data-plane.md#performance-and-pagination) |

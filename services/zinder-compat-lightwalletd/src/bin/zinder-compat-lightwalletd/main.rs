@@ -223,6 +223,10 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         network_upgrade_activations.clone(),
     )?;
     let native_endpoint_capabilities = wallet_query.native_endpoint_capabilities().clone();
+    let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(
+        wallet_query,
+        network_upgrade_activations.clone(),
+    )?;
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -264,9 +268,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         lightwalletd_config.ingest_control_bearer_token.clone(),
         cancel.clone(),
     );
-    let grpc_adapter = LightwalletdGrpcAdapter::new(wallet_query, network_upgrade_activations)
-        .with_serving_pair_slot(serving_pair_slot)
-        .with_transparent_address_support()
+    let grpc_adapter = grpc_adapter
         .with_mempool_surface(mempool_surface)
         .with_tip_change_watcher(tip_change_watcher);
 

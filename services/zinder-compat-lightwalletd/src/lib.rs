@@ -9,7 +9,7 @@ mod mempool;
 
 pub use grpc::{
     DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS, DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS,
-    LightwalletdCompatibilityOptions, LightwalletdGrpcAdapter,
+    LightwalletdAdmissionError, LightwalletdGrpcAdapter, LightwalletdResponseLimits,
 };
 pub use mempool::{
     IngestControlMempoolSurface, MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface,

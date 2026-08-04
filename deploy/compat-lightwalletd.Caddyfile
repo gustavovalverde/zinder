@@ -1,0 +1,25 @@
+# Caddy v2 template for the public lightwalletd compatibility endpoint.
+#
+# Set every variable in the Caddy service environment before adapting this
+# file. The certificate must contain a SAN for ZINDER_COMPAT_PUBLIC_FQDN.
+# Caddy never obtains or renews a certificate from this template.
+{
+	auto_https off
+}
+
+https://{$ZINDER_COMPAT_PUBLIC_FQDN}:443 {
+	tls {$ZINDER_COMPAT_TLS_CERT_FILE} {$ZINDER_COMPAT_TLS_KEY_FILE} {
+		alpn h2
+	}
+
+	route {
+		# Use the ordinary HTTP ops listener for every new gRPC RPC. A 2xx
+		# /readyz response admits the request; a non-2xx response reaches the
+		# client and the h2c gRPC upstream is not called.
+		forward_auth 127.0.0.1:{$ZINDER_COMPAT_OPS_HOST_PORT} {
+			uri /readyz
+		}
+
+		reverse_proxy h2c://127.0.0.1:{$ZINDER_COMPAT_HOST_PORT}
+	}
+}

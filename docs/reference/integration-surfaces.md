@@ -26,7 +26,7 @@ network.
 | Consumer | Contract | Current claim |
 | --- | --- | --- |
 | [Zallet](https://github.com/zcash/zallet) | Native `WalletQuery` through the backend-neutral `Chain` and snapshot-scoped `ChainView` traits | The current source-built default Zinder backend is Regtest-certified for server metadata, network-upgrade activations, visible tip, block selectors and headers, full blocks, tree state, Sapling, Orchard, and Ironwood subtree roots, transaction lookup, transparent-address UTXOs and ascending history, chain events, mempool snapshot and events, and broadcast. Official Zallet packaging remains tracked in [Zallet #696](https://github.com/zcash/zallet/issues/696). |
-| [ZODL](https://github.com/zodl-inc/zodl-android) | Zcash Android SDK `LightWalletEndpoint` over `CompactTxStreamer` | The protocol shape maps to `zinder-compat-lightwalletd`, but current ZODL and SDK certification over an Android-trusted TLS route is still required before Zinder claims support. |
+| [ZODL](https://github.com/zodl-inc/zodl-android) | Zcash Android SDK `LightWalletEndpoint` over `CompactTxStreamer` | The current source-built ZODL and SDK pair has passed fresh-wallet, restore, transparent-history, send, mempool, mining, continuous-follow, and restart flows through the candidate's Android-trusted Testnet TLS route. This local certification does not claim a public operator deployment or reorg behavior. |
 
 ## Lightwalletd compatibility
 
@@ -48,6 +48,10 @@ server address. It is not an operator-level binary or configuration replacement.
 Zinder has its own ingest, storage, query, readiness, and deployment model.
 
 Public deployments terminate TLS, authentication, rate limiting, and quota controls before traffic reaches Zinder. The compatibility process speaks plaintext h2c by default and should be bound behind the operator's proxy boundary.
+For the isolated `transactions` retention route, trusted TLS, compatibility
+`/readyz` admission, external plaintext-unreachability, and ZODL endpoint
+attribution are owned by the [Trusted TLS and ZODL compatibility admission
+runbook](../runbooks/zodl-trusted-tls-certification.md).
 
 ## Native Rust clients
 

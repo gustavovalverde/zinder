@@ -139,9 +139,9 @@ impl TransactionBroadcaster for ParityNodeSource {
 }
 
 mod explorers;
+mod lightwalletd_adapter_shapes;
 mod lightwalletd_operators;
 mod zallet;
-mod zodl;
 
 fn parity_chain_fixture(block_count: u32) -> ChainFixture {
     ChainFixture::new(Network::ZcashRegtest)
@@ -209,15 +209,15 @@ fn build_transparent_address_adapter(
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
     let query = WalletServingQuery::from_serving_pair_slot(
-        serving_pair_slot.clone(),
+        serving_pair_slot,
         MockTransactionBroadcaster::broadcast_disabled(),
         Arc::clone(&fixture.activations),
     );
-    Ok(
-        LightwalletdGrpcAdapter::new(query, Arc::clone(&fixture.activations))
-            .with_serving_pair_slot(serving_pair_slot)
-            .with_transparent_address_support(),
+    LightwalletdGrpcAdapter::from_admitted_compatibility_query(
+        query,
+        Arc::clone(&fixture.activations),
     )
+    .map_err(Into::into)
 }
 
 fn address_history_filter(address: String) -> lightwalletd::TransparentAddressBlockFilter {
