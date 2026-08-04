@@ -105,6 +105,13 @@ pressure and byte ticker metrics demonstrate a maintenance backlog.
 profiles retain the field at `2` in the uniform budget type but neither apply it
 nor export it as an effective limit.
 
+Secondary stores set RocksDB's `max_file_opening_threads` to `1`. Periodic
+secondary catch-up reloads table handlers for each column family; RocksDB's
+default of `16` creates and joins a temporary thread group on every reload.
+Serial table-handler loading keeps steady-state thread creation independent of
+catch-up cadence and column-family count. This is a locked reader posture, not
+an operator-tunable resource setting.
+
 ### Locked RocksDB Invariants
 
 These options are storage-layer contracts and are not operator-configurable:
