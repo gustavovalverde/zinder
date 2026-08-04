@@ -24,6 +24,7 @@ type PrefixScanVisitor<'visitor> =
 
 const DIRECT_IO_COMPACTION_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
 const ROCKSDB_DEFAULT_COLUMN_FAMILY: &str = "default";
+const SECONDARY_MAX_FILE_OPENING_THREADS: i32 = 1;
 
 /// Filesystem I/O mode resolved while opening a `RocksDB` instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +97,13 @@ impl RocksDbOpenPosture {
         match self {
             Self::Primary => Some(resource_budget.max_background_jobs),
             Self::Secondary => None,
+        }
+    }
+
+    const fn effective_max_file_opening_threads(self) -> Option<i32> {
+        match self {
+            Self::Primary => None,
+            Self::Secondary => Some(SECONDARY_MAX_FILE_OPENING_THREADS),
         }
     }
 }
@@ -305,6 +313,13 @@ where
         .effective_max_background_jobs(open_attempt.rocksdb_resource_budget)
     {
         db_options.set_max_background_jobs(max_background_jobs);
+    }
+    if let Some(max_file_opening_threads) = open_attempt
+        .role
+        .open_posture()
+        .effective_max_file_opening_threads()
+    {
+        db_options.set_max_file_opening_threads(max_file_opening_threads);
     }
     db_options.set_write_buffer_manager(open_attempt.write_buffer_manager);
     if io_mode == RocksDbIoMode::Direct {
@@ -1169,8 +1184,10 @@ fn build_primary_db_options(
 /// Secondaries replay the writer's WAL but do not generate one, so the WAL
 /// ceiling and atomic-flush flag are not applied here. `OpenAsSecondary` also
 /// disables automatic flushes and compactions, so the primary-only background
-/// job limit is not applied. The block-cache and open-file caps still bound the
-/// secondary's open-time RAM peak as the store grows.
+/// job limit is not applied. Secondary catch-up serializes table-handler loads
+/// because `RocksDB` otherwise creates and joins a fresh thread group for every
+/// column family on every catch-up. The block-cache and open-file caps still
+/// bound the secondary's open-time RAM peak as the store grows.
 #[must_use]
 fn build_secondary_db_options(
     rocksdb_resource_budget: RocksDbResourceBudget,
@@ -2189,6 +2206,39 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn secondary_open_serializes_table_handler_loading() {
+        let primary_open = RocksDbOpenRole::Primary {
+            path: Path::new("primary"),
+        };
+        let existing_primary_open = RocksDbOpenRole::ExistingPrimary {
+            path: Path::new("primary"),
+        };
+        let secondary_open = RocksDbOpenRole::Secondary {
+            primary_path: Path::new("primary"),
+            secondary_path: Path::new("secondary"),
+        };
+
+        assert_eq!(
+            primary_open
+                .open_posture()
+                .effective_max_file_opening_threads(),
+            None
+        );
+        assert_eq!(
+            existing_primary_open
+                .open_posture()
+                .effective_max_file_opening_threads(),
+            None
+        );
+        assert_eq!(
+            secondary_open
+                .open_posture()
+                .effective_max_file_opening_threads(),
+            Some(1)
+        );
     }
 
     #[test]
