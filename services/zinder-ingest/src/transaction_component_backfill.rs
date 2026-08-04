@@ -8,8 +8,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, BlockHeightRange, NetworkUpgradeActivations};
 use zinder_materialized_views::{
-    BlockCommitContext, MaterializedViewStore, TransactionComponentBackfillCoverage,
-    TransactionComponentSummaryConsumer,
+    BlockCommitContext, MaterializedViewChainEventCheckpoint, MaterializedViewStore,
+    TransactionComponentBackfillCoverage, TransactionComponentSummaryConsumer,
 };
 use zinder_store::RocksDbCanonicalSecondary;
 
@@ -31,13 +31,18 @@ const BACKFILL_BATCH_BLOCKS: NonZeroU32 = nonzero_u32(256);
 /// The tail boundary is initialized separately before this call. Batches are
 /// cursor-neutral, resumable after a crash, and remain owned by normal reorg
 /// events once ingest starts.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bounded startup seed keeps its canonical source, destination, range, limit, and inherited checkpoint explicit"
+)]
 pub(crate) fn seed_transaction_component_visible_tail(
     canonical: &RocksDbCanonicalSecondary,
     activations: &NetworkUpgradeActivations,
     materialized_view_store: &MaterializedViewStore,
     through_height: BlockHeight,
     batch_blocks: NonZeroU32,
-) -> Result<(), IngestError> {
+    checkpoint: Option<MaterializedViewChainEventCheckpoint>,
+) -> Result<bool, IngestError> {
     loop {
         let tail = TransactionComponentSummaryConsumer::tail_coverage(materialized_view_store)?
             .ok_or_else(|| {
@@ -55,7 +60,7 @@ pub(crate) fn seed_transaction_component_visible_tail(
                 )
             })?;
         if next_height > through_height {
-            return Ok(());
+            return Ok(false);
         }
         let batch_end = BlockHeight::new(
             next_height
@@ -69,9 +74,17 @@ pub(crate) fn seed_transaction_component_visible_tail(
             BlockHeightRange::inclusive(next_height, batch_end),
         )?;
         let _write_guard = materialized_view_write_guard();
+        let final_page = batch_end == through_height;
         TransactionComponentSummaryConsumer::new()
-            .write_tail_seed_batch(materialized_view_store, &contexts)
+            .write_tail_seed_batch_with_checkpoint(
+                materialized_view_store,
+                &contexts,
+                final_page.then_some(checkpoint).flatten(),
+            )
             .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
+        if final_page {
+            return Ok(checkpoint.is_some());
+        }
     }
 }
 
@@ -382,7 +395,7 @@ pub(crate) fn read_canonical_context_batch(
     activations: &NetworkUpgradeActivations,
     range: BlockHeightRange,
 ) -> Result<Vec<BlockCommitContext>, IngestError> {
-    let contexts = CanonicalBlockContextReader::new(canonical, activations)
+    let contexts = CanonicalBlockContextReader::new(canonical, activations)?
         .read_ordered_block_commit_contexts(range)?;
     if contexts.len() != range.into_iter().len() {
         return Err(IngestError::MaterializedViewDispatch(format!(

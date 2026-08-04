@@ -1277,11 +1277,22 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         name: "ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT",
         toml_path: "explorer.wallet_query_endpoint",
         used_by: &["zinder-explorer"],
+        requirement: Requirement::Required,
+        sensitive: false,
+        description: "Native WalletQuery gRPC endpoint admitted before Explorer binds. Its \
+                      network, contract revision, capabilities, and canonical construction \
+                      binding are frozen and exact-compared with the explorer materialized-view \
+                      store; empty or unset configuration fails startup.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_EXPLORER__WALLET_QUERY_BEARER_TOKEN_PATH",
+        toml_path: "explorer.wallet_query_bearer_token_path",
+        used_by: &["zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "WalletQuery gRPC endpoint backing the explorer's wallet-composed reads \
-                      (transaction detail, block views, search, mempool activity). Empty/unset \
-                      disables the explorer capabilities that compose canonical wallet reads.",
+        description: "Path to the bearer token Explorer presents to its admitted WalletQuery \
+                      dependency. Required when that private endpoint enforces bearer \
+                      authentication; token contents remain file-only and redacted.",
     },
 ];
 

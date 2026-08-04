@@ -97,7 +97,7 @@ async fn full_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Resu
         (),
         ingest_control,
         activations,
-    );
+    )?;
 
     let start = Instant::now();
     let mut stream = wallet_query

@@ -11,6 +11,9 @@ use zinder_materialized_views::{
     MaterializedViewStore, MaterializedViewStoreOptions, TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY,
     TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, encode_transparent_spend_row_value,
 };
+use zinder_store::CanonicalStoreConstructionIdentity;
+
+use crate::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
 /// Failure returned while preparing a materialized-view fixture.
 #[derive(Debug, Error)]
@@ -19,6 +22,26 @@ pub enum MaterializedViewFixtureError {
     /// Materialized-view store could not be opened or written.
     #[error(transparent)]
     Store(#[from] zinder_materialized_views::MaterializedViewStoreError),
+}
+
+/// Builds one published Regtest canonical construction and returns its identity.
+///
+/// Tests that exercise materialized-view storage in isolation use this helper
+/// instead of inventing construction bytes that no canonical publication ever
+/// admitted.
+///
+/// # Errors
+///
+/// Returns an error when the production canonical or wallet fixture cannot be
+/// built and admitted.
+pub fn published_regtest_canonical_construction_identity()
+-> eyre::Result<CanonicalStoreConstructionIdentity> {
+    let activations = sample_regtest_upgrade_activations();
+    let fixture = WalletServingStoreFixture::from_chain(
+        &ChainFixture::new(activations.network()).extend_blocks(1),
+        &activations,
+    )?;
+    fixture.canonical_construction_identity()
 }
 
 /// Opens the materialized-view primary paired with `canonical_path` for tests.
@@ -32,9 +55,11 @@ pub enum MaterializedViewFixtureError {
 /// Returns [`MaterializedViewFixtureError`] when the materialized-view store cannot be opened.
 pub fn open_test_materialized_view_store_for_canonical(
     canonical_path: &Path,
+    construction_identity: CanonicalStoreConstructionIdentity,
 ) -> Result<MaterializedViewStore, MaterializedViewFixtureError> {
     Ok(MaterializedViewStore::open(
         MaterializedViewStore::path_for_canonical(canonical_path),
+        construction_identity,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),

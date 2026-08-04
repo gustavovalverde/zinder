@@ -1,8 +1,10 @@
 use rust_rocksdb::{DB, WriteBatch, WriteOptions};
+use thiserror::Error;
 use zinder_core::{
-    BlockHeight, BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
-    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
-    ChainEpochId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint, NetworkUpgradeActivations,
+    BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
+    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestBuilder,
+    CanonicalBlockFactsSequenceDigestVersion, ChainEpochId, CommitmentTreeAccumulator,
+    CommitmentTreeCheckpoint, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootArtifact,
     TransactionLocation, UnixTimestampMillis,
 };
@@ -77,6 +79,9 @@ pub struct CanonicalEventFence {
     sequence_digest: CanonicalBlockFactsSequenceDigest,
 }
 
+const CANONICAL_EVENT_FENCE_RECORD_VERSION: u8 = 1;
+const CANONICAL_EVENT_FENCE_RECORD_BYTES: usize = 1 + 8 + 8 + 4 + 32 + 2 + 8 + 32;
+
 impl CanonicalEventFence {
     pub(super) const fn from_persisted_event(
         chain_epoch_id: ChainEpochId,
@@ -119,6 +124,139 @@ impl CanonicalEventFence {
     pub const fn sequence_digest(self) -> CanonicalBlockFactsSequenceDigest {
         self.sequence_digest
     }
+
+    /// Encodes the exact authenticated fence as one stable persisted record.
+    #[must_use]
+    pub fn encode_persisted(self) -> [u8; CANONICAL_EVENT_FENCE_RECORD_BYTES] {
+        let mut encoded = [0; CANONICAL_EVENT_FENCE_RECORD_BYTES];
+        encoded[0] = CANONICAL_EVENT_FENCE_RECORD_VERSION;
+        encoded[1..9].copy_from_slice(&self.chain_epoch_id.value().to_be_bytes());
+        encoded[9..17].copy_from_slice(&self.chain_event_sequence.to_be_bytes());
+        encoded[17..21].copy_from_slice(&self.visible_tip.height.value().to_be_bytes());
+        encoded[21..53].copy_from_slice(&self.visible_tip.hash.as_bytes());
+        encoded[53..55].copy_from_slice(&self.sequence_digest.version().value().to_be_bytes());
+        encoded[55..63].copy_from_slice(&self.sequence_digest.block_count().to_be_bytes());
+        encoded[63..95].copy_from_slice(&self.sequence_digest.as_bytes());
+        encoded
+    }
+
+    /// Decodes one strict persisted canonical-event-fence claim.
+    ///
+    /// Callers must still compare the decoded value with the authoritative
+    /// retained canonical event before admitting derived rows.
+    pub fn decode_persisted(encoded: &[u8]) -> Result<Self, CanonicalEventFenceDecodeError> {
+        if encoded.len() != CANONICAL_EVENT_FENCE_RECORD_BYTES {
+            return Err(CanonicalEventFenceDecodeError::WrongRecordLength {
+                expected: CANONICAL_EVENT_FENCE_RECORD_BYTES,
+                observed: encoded.len(),
+            });
+        }
+        if encoded[0] != CANONICAL_EVENT_FENCE_RECORD_VERSION {
+            return Err(CanonicalEventFenceDecodeError::UnsupportedRecordVersion {
+                observed: encoded[0],
+            });
+        }
+        let chain_epoch_id = ChainEpochId::new(u64::from_be_bytes([
+            encoded[1], encoded[2], encoded[3], encoded[4], encoded[5], encoded[6], encoded[7],
+            encoded[8],
+        ]));
+        let chain_event_sequence = u64::from_be_bytes([
+            encoded[9],
+            encoded[10],
+            encoded[11],
+            encoded[12],
+            encoded[13],
+            encoded[14],
+            encoded[15],
+            encoded[16],
+        ]);
+        if chain_event_sequence == 0 {
+            return Err(CanonicalEventFenceDecodeError::ZeroEventSequence);
+        }
+        if chain_epoch_id.value() != chain_event_sequence {
+            return Err(CanonicalEventFenceDecodeError::EpochEventSequenceMismatch {
+                chain_epoch_id: chain_epoch_id.value(),
+                event_sequence: chain_event_sequence,
+            });
+        }
+        let visible_tip_height = BlockHeight::new(u32::from_be_bytes([
+            encoded[17],
+            encoded[18],
+            encoded[19],
+            encoded[20],
+        ]));
+        let mut visible_tip_hash = [0; 32];
+        visible_tip_hash.copy_from_slice(&encoded[21..53]);
+        let sequence_digest_version_value = u16::from_be_bytes([encoded[53], encoded[54]]);
+        let sequence_digest_version =
+            CanonicalBlockFactsSequenceDigestVersion::try_from(sequence_digest_version_value)
+                .map_err(
+                    |_| CanonicalEventFenceDecodeError::UnsupportedSequenceDigestVersion {
+                        observed: sequence_digest_version_value,
+                    },
+                )?;
+        let sequence_digest_block_count = u64::from_be_bytes([
+            encoded[55],
+            encoded[56],
+            encoded[57],
+            encoded[58],
+            encoded[59],
+            encoded[60],
+            encoded[61],
+            encoded[62],
+        ]);
+        let mut sequence_digest_bytes = [0; 32];
+        sequence_digest_bytes.copy_from_slice(&encoded[63..95]);
+        Ok(Self {
+            chain_epoch_id,
+            chain_event_sequence,
+            visible_tip: BlockId::new(visible_tip_height, BlockHash::from_bytes(visible_tip_hash)),
+            sequence_digest: CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                sequence_digest_version,
+                sequence_digest_block_count,
+                sequence_digest_bytes,
+            ),
+        })
+    }
+}
+
+/// Structural failure decoding a persisted canonical event fence.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum CanonicalEventFenceDecodeError {
+    /// The record is not the one exact supported width.
+    #[error("canonical event fence record requires {expected} bytes; observed {observed}")]
+    WrongRecordLength {
+        /// Exact supported record width.
+        expected: usize,
+        /// Persisted record width.
+        observed: usize,
+    },
+    /// The record version is unsupported.
+    #[error("unsupported canonical event fence record version {observed}")]
+    UnsupportedRecordVersion {
+        /// Persisted record version.
+        observed: u8,
+    },
+    /// Canonical event sequence zero is never a retained event.
+    #[error("canonical event fence event sequence must be nonzero")]
+    ZeroEventSequence,
+    /// Current retained events use the event sequence as their epoch identity.
+    #[error(
+        "canonical event fence epoch {chain_epoch_id} differs from event sequence {event_sequence}"
+    )]
+    EpochEventSequenceMismatch {
+        /// Persisted epoch identity.
+        chain_epoch_id: u64,
+        /// Persisted event sequence.
+        event_sequence: u64,
+    },
+    /// The ordered canonical-facts digest algorithm is unsupported.
+    #[error("unsupported canonical event fence sequence digest version {observed}")]
+    UnsupportedSequenceDigestVersion {
+        /// Persisted digest version.
+        observed: u16,
+    },
 }
 
 /// Authenticated state required to prepare the next live canonical append.
@@ -942,6 +1080,38 @@ mod tests {
     };
 
     use super::*;
+
+    fn persisted_fence() -> Result<CanonicalEventFence, CanonicalEventFenceDecodeError> {
+        let mut encoded = [0_u8; CANONICAL_EVENT_FENCE_RECORD_BYTES];
+        encoded[0] = CANONICAL_EVENT_FENCE_RECORD_VERSION;
+        encoded[1..9].copy_from_slice(&5_u64.to_be_bytes());
+        encoded[9..17].copy_from_slice(&5_u64.to_be_bytes());
+        encoded[17..21].copy_from_slice(&42_u32.to_be_bytes());
+        encoded[21..53].copy_from_slice(&[0xAB; 32]);
+        encoded[53..55].copy_from_slice(&1_u16.to_be_bytes());
+        encoded[55..63].copy_from_slice(&42_u64.to_be_bytes());
+        CanonicalEventFence::decode_persisted(&encoded)
+    }
+
+    #[test]
+    fn persisted_event_fence_codec_round_trips_and_rejects_epoch_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = persisted_fence()?;
+        let encoded = fence.encode_persisted();
+
+        assert_eq!(CanonicalEventFence::decode_persisted(&encoded)?, fence);
+
+        let mut mismatched_epoch = encoded;
+        mismatched_epoch[1..9].copy_from_slice(&4_u64.to_be_bytes());
+        assert!(matches!(
+            CanonicalEventFence::decode_persisted(&mismatched_epoch),
+            Err(CanonicalEventFenceDecodeError::EpochEventSequenceMismatch {
+                chain_epoch_id: 4,
+                event_sequence: 5,
+            })
+        ));
+        Ok(())
+    }
 
     #[test]
     fn live_subtree_rows_cover_every_newly_completed_index_exactly()

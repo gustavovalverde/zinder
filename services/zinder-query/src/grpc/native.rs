@@ -21,7 +21,9 @@ use zinder_core::{
 use zinder_materialized_views::MaterializedViewPreset;
 use zinder_proto::v1::{ops, wallet};
 use zinder_proto::wire::{
-    compact_block_message, encode_transparent_utxo_set_commitment, mempool_entry_message,
+    CanonicalConstructionManifestBindingFields, compact_block_message,
+    encode_canonical_construction_manifest_binding, encode_transparent_utxo_set_commitment,
+    mempool_entry_message,
 };
 use zinder_source::transparent_address_matches_network;
 
@@ -34,9 +36,9 @@ use crate::{
 };
 pub(crate) use zinder_store::chain_view_message as build_chain_view_message;
 use zinder_store::{
-    ChainEventEncodeError, ChainEventStreamFamily, StreamCursorTokenV1,
-    chain_event_envelope_message, outpoint_message, transparent_output_entry_message,
-    transparent_spend_message,
+    CanonicalConstructionManifestBinding, ChainEventEncodeError, ChainEventStreamFamily,
+    StreamCursorTokenV1, chain_event_envelope_message, outpoint_message,
+    transparent_output_entry_message, transparent_spend_message,
 };
 
 /// Encodes the configured node's advertised network-upgrade schedule.
@@ -127,6 +129,7 @@ pub fn build_wallet_server_info(
     metadata: WalletEndpointMetadata,
     capabilities: &NativeWalletEndpointCapabilities,
     upstream: Option<&UpstreamNodeCapabilities>,
+    canonical_construction_manifest_binding: Option<CanonicalConstructionManifestBinding>,
 ) -> wallet::WalletServerInfo {
     let materialized_view_preset = metadata.materialized_view_preset;
     let common = ops::ServerInfo {
@@ -152,6 +155,16 @@ pub fn build_wallet_server_info(
         schema_version: metadata.schema_version,
         reorg_window_blocks: metadata.reorg_window_blocks,
         node: Some(build_node_capabilities_descriptor(upstream)),
+        canonical_construction_manifest_binding: canonical_construction_manifest_binding.map(
+            |binding| {
+                encode_canonical_construction_manifest_binding(
+                    CanonicalConstructionManifestBindingFields::new(
+                        binding.version,
+                        binding.sha256,
+                    ),
+                )
+            },
+        ),
     }
 }
 
@@ -949,7 +962,7 @@ mod server_info_tests {
         ])?);
         upstream.version = Some("2.4.0".to_owned());
 
-        let descriptor = build_wallet_server_info(metadata, &capabilities, Some(&upstream));
+        let descriptor = build_wallet_server_info(metadata, &capabilities, Some(&upstream), None);
         let Some(node) = descriptor.node else {
             unreachable!("node field must always be set")
         };
@@ -993,7 +1006,7 @@ mod server_info_tests {
             NodeCapabilities::default(),
             &admitted_ingest_control,
         );
-        let common = build_wallet_server_info(metadata, &capabilities, None)
+        let common = build_wallet_server_info(metadata, &capabilities, None, None)
             .common
             .unwrap_or_default();
 
@@ -1027,7 +1040,7 @@ mod server_info_tests {
             NodeCapabilities::default(),
             &admitted_ingest_control,
         );
-        let descriptor = build_wallet_server_info(metadata, &capabilities, None);
+        let descriptor = build_wallet_server_info(metadata, &capabilities, None, None);
         let Some(node) = descriptor.node else {
             unreachable!("node field must always be set")
         };

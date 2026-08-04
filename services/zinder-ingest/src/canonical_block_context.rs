@@ -14,14 +14,14 @@ use std::{
 use zinder_core::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
     CanonicalBlockFacts, CanonicalTransactionFacts, CommitmentTreeAccumulator,
-    CompactBlockArtifact, NetworkUpgradeActivations, TransactionFactsArtifact, TransactionId,
-    TransactionIntrinsicValueBalances, TransactionLocation, TransparentAddressScriptHash,
-    TransparentOutPoint, TransparentOutputFact, TransparentSpendFact,
-    ValidatedCanonicalBlockReplay,
+    CompactBlockArtifact, NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprintVersion,
+    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalances,
+    TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint, TransparentOutputFact,
+    TransparentSpendFact, ValidatedCanonicalBlockReplay,
 };
 use zinder_materialized_views::{
-    BlockCommitContext, BlockCommitInput, TransactionIntrinsicValueBalanceFacts,
-    TransparentSpendFacts,
+    BlockCommitContext, BlockCommitInput, MaterializedViewStore,
+    TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts,
 };
 use zinder_store::RocksDbCanonicalSecondary;
 
@@ -29,6 +29,66 @@ use crate::{CanonicalBlockConstructionError, IngestError};
 
 /// First height a canonical store retains when its history is complete.
 const GENESIS_COMPLETE_FIRST_HEIGHT: BlockHeight = BlockHeight::new(1);
+
+/// Validates that canonical storage and its activation table share one identity.
+pub(crate) fn validate_canonical_activations_identity(
+    canonical: &RocksDbCanonicalSecondary,
+    activations: &NetworkUpgradeActivations,
+) -> Result<(), IngestError> {
+    if canonical.network() != activations.network() {
+        return Err(IngestError::CanonicalActivationsNetworkMismatch {
+            canonical: canonical.network(),
+            activations: activations.network(),
+        });
+    }
+    let canonical_fingerprint = canonical.network_upgrade_activations_fingerprint();
+    let activations_fingerprint =
+        activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::CURRENT);
+    if canonical_fingerprint != activations_fingerprint {
+        return Err(IngestError::CanonicalActivationsFingerprintMismatch {
+            canonical: canonical_fingerprint,
+            activations: activations_fingerprint,
+        });
+    }
+    Ok(())
+}
+
+/// Validates that materialized-view storage belongs to its canonical source.
+pub(crate) fn validate_materialized_view_canonical_identity(
+    canonical: &RocksDbCanonicalSecondary,
+    materialized_view_store: &MaterializedViewStore,
+) -> Result<(), IngestError> {
+    let canonical_identity = canonical.construction_identity();
+    let materialized_view_identity = materialized_view_store.construction_identity();
+    if canonical_identity.network() != materialized_view_identity.network() {
+        return Err(IngestError::MaterializedViewCanonicalNetworkMismatch {
+            canonical: canonical_identity.network(),
+            materialized_view: materialized_view_identity.network(),
+        });
+    }
+    if canonical_identity.network_upgrade_activations_fingerprint()
+        != materialized_view_identity.network_upgrade_activations_fingerprint()
+    {
+        return Err(
+            IngestError::MaterializedViewCanonicalActivationsFingerprintMismatch {
+                canonical: canonical_identity.network_upgrade_activations_fingerprint(),
+                materialized_view: materialized_view_identity
+                    .network_upgrade_activations_fingerprint(),
+            },
+        );
+    }
+    if canonical_identity.construction_manifest_binding()
+        != materialized_view_identity.construction_manifest_binding()
+    {
+        return Err(
+            IngestError::MaterializedViewCanonicalConstructionBindingMismatch {
+                canonical: canonical_identity.construction_manifest_binding(),
+                materialized_view: materialized_view_identity.construction_manifest_binding(),
+            },
+        );
+    }
+    Ok(())
+}
 
 /// Refuses materialized-view work on a store without complete history.
 ///
@@ -60,16 +120,16 @@ pub struct CanonicalBlockContextReader<'canonical> {
 
 impl<'canonical> CanonicalBlockContextReader<'canonical> {
     /// Binds one hydrator to an admitted canonical secondary.
-    #[must_use]
-    pub const fn new(
+    pub fn new(
         secondary: &'canonical RocksDbCanonicalSecondary,
         activations: &'canonical NetworkUpgradeActivations,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, IngestError> {
+        validate_canonical_activations_identity(secondary, activations)?;
+        Ok(Self {
             secondary,
             activations,
             roots: FinalRootsCursor { accumulator: None },
-        }
+        })
     }
 
     /// Hydrates one connected height range into dispatch-ready contexts.

@@ -721,6 +721,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            crate::store::test_construction_identity(zinder_core::Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
                 consumers: &[TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),

@@ -347,7 +347,9 @@ fn read_transaction_history_snapshot(
     materialized_view_store: &MaterializedViewStore,
     request: &TransactionHistorySnapshotRequest,
 ) -> Result<TransactionHistorySnapshotRead, Status> {
-    let snapshot = materialized_view_store.read_snapshot();
+    let snapshot = materialized_view_store
+        .read_snapshot()
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let materialized_view_state = snapshot
         .consumer_state(TRANSACTION_HISTORY_CONSUMER_NAME)
         .map_err(|error| ExplorerError::internal(error.to_string()))?
@@ -1246,6 +1248,7 @@ mod tests {
         MaterializedViewCoverage, MaterializedViewPreset, MaterializedViewStoreOptions,
     };
     use zinder_store::RocksDbResourceBudget;
+    use zinder_testkit::published_regtest_canonical_construction_identity;
 
     use super::*;
 
@@ -1262,6 +1265,7 @@ mod tests {
         let wallet_path = tempdir()?;
         let wallet_store = MaterializedViewStore::open_with_materialized_view_preset(
             wallet_path.path(),
+            published_regtest_canonical_construction_identity()?,
             MaterializedViewPreset::Wallet,
             test_options(),
         )?;
@@ -1274,6 +1278,7 @@ mod tests {
         let explorer_path = tempdir()?;
         let explorer_store = MaterializedViewStore::open_with_materialized_view_preset(
             explorer_path.path(),
+            published_regtest_canonical_construction_identity()?,
             MaterializedViewPreset::Explorer,
             test_options(),
         )?;

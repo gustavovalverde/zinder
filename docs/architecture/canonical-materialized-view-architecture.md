@@ -161,8 +161,10 @@ consumer rows, cursors, coverage, and schema metadata together so a consumer can
 be rebuilt independently.
 
 The deployed `zinder-explorer` runtime reads materialized views through a
-process-owned secondary and federates wallet-owned facts through `WalletQuery`;
-it does not open the canonical store. Library compositions may additionally
+process-owned secondary and federates wallet-owned facts through an admitted
+`WalletQuery` endpoint; both inputs are mandatory and must name the same
+canonical construction before the service binds. It does not open the
+canonical store. Library compositions may additionally
 provide a canonical secondary for capabilities that explicitly require
 retained canonical artifacts. The explorer schema must not duplicate wallet
 ownership. The optional Compose overlay provides the materialized-view plus

@@ -29,7 +29,7 @@ use zinder_core::wire::{
 use zinder_core::{BlockHeight, TransparentOutPoint, TransparentSpendEntry, TransparentSpendFact};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockCheckpoint,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockProjection,
     MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
     MaterializedViewConsumerSchema, advance_verified_materialized_view_coverage,
 };
@@ -232,9 +232,9 @@ impl BlockKeyedConsumer for TransparentOutpointSpendConsumer {
         Ok(())
     }
 
-    fn stage_chain_event_checkpoint(
+    fn stage_block_projection_state(
         &mut self,
-        checkpoint: MaterializedViewBlockCheckpoint<'_>,
+        checkpoint: MaterializedViewBlockProjection<'_>,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
         let tip_height = checkpoint
@@ -399,7 +399,7 @@ mod tests {
         BlockCommitContext, BlockCommitInput, TransparentSpendFacts,
     };
     use crate::consumer::{
-        BlockKeyedConsumer, MaterializedViewBlockCheckpoint, MaterializedViewConsumerCtx,
+        BlockKeyedConsumer, MaterializedViewBlockProjection, MaterializedViewConsumerCtx,
     };
     use crate::store::{MaterializedViewStore, MaterializedViewStoreOptions};
 
@@ -527,6 +527,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            crate::store::test_construction_identity(zinder_core::Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
                 consumers: &[TRANSPARENT_OUTPOINT_SPEND_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -569,8 +570,8 @@ mod tests {
             store: &store,
             batch: &mut batch,
         };
-        TransparentOutpointSpendConsumer::new().stage_chain_event_checkpoint(
-            MaterializedViewBlockCheckpoint {
+        TransparentOutpointSpendConsumer::new().stage_block_projection_state(
+            MaterializedViewBlockProjection {
                 chain_epoch: epoch,
                 chain_event: &event,
                 tip_height: Some(tip),

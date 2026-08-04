@@ -769,6 +769,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            zinder_testkit::published_regtest_canonical_construction_identity()?,
             MaterializedViewStoreOptions {
                 consumers: &[TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),

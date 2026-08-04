@@ -5,9 +5,9 @@ use zinder_core::{
 };
 use zinder_store::RocksDbResourceBudget;
 use zinder_wallet_projection::{
-    WalletCanonicalSourceIdentity, WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest,
-    WalletProjectionBuildOwner, WalletProjectionRetainedEventAnchor,
-    WalletProjectionSourcePosition,
+    WalletCanonicalConstructionBinding, WalletCanonicalSourceIdentity, WalletProjectionBuildLease,
+    WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
+    WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{RocksDbWalletBuildStore, RocksDbWalletError};
 
@@ -18,6 +18,7 @@ fn active_build_lease_refuses_a_competing_owner() -> Result<(), Box<dyn std::err
     let build = RocksDbWalletBuildStore::create_fresh(
         temporary.path().join("wallet"),
         Network::ZcashRegtest,
+        WalletCanonicalConstructionBinding::new(1, [0x91; 32]),
         source,
         0,
         RocksDbResourceBudget::for_local_tests(),
@@ -47,6 +48,7 @@ fn expired_lease_takeover_persists_and_rejects_stale_capabilities()
     let build = RocksDbWalletBuildStore::create_fresh(
         &path,
         Network::ZcashRegtest,
+        WalletCanonicalConstructionBinding::new(1, [0x91; 32]),
         source,
         0,
         RocksDbResourceBudget::for_local_tests(),
@@ -112,6 +114,7 @@ fn build_lease_rejects_a_stale_canonical_or_retained_event_anchor()
     let build = RocksDbWalletBuildStore::create_fresh(
         temporary.path().join("wallet"),
         Network::ZcashRegtest,
+        WalletCanonicalConstructionBinding::new(1, [0x91; 32]),
         source,
         0,
         RocksDbResourceBudget::for_local_tests(),
@@ -154,6 +157,7 @@ fn discard_unpublished_refuses_a_live_owner_then_removes_an_expired_build()
     let build = RocksDbWalletBuildStore::create_fresh(
         &path,
         Network::ZcashRegtest,
+        WalletCanonicalConstructionBinding::new(1, [0x91; 32]),
         source,
         0,
         RocksDbResourceBudget::for_local_tests(),

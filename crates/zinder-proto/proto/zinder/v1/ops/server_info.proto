@@ -10,6 +10,19 @@ syntax = "proto3";
 
 package zinder.v1.ops;
 
+// Structural claim naming the immutable canonical construction sidecar.
+//
+// Decoding this message proves only that its fields are well-formed. A
+// consumer admits it only by exact comparison with the value returned by its
+// already-admitted canonical reader.
+message CanonicalConstructionManifestBinding {
+  // Exact sidecar format version committed by canonical READY evidence.
+  uint32 format_version = 1;
+
+  // Domain-separated SHA-256 over the exact immutable sidecar bytes.
+  bytes sha256 = 2;
+}
+
 // Cross-service identity and capability descriptor.
 //
 // Every Zinder gRPC service that wants to advertise its identity and

@@ -212,7 +212,7 @@ fn build_transparent_address_adapter(
         serving_pair_slot,
         MockTransactionBroadcaster::broadcast_disabled(),
         Arc::clone(&fixture.activations),
-    );
+    )?;
     LightwalletdGrpcAdapter::from_admitted_compatibility_query(
         query,
         Arc::clone(&fixture.activations),

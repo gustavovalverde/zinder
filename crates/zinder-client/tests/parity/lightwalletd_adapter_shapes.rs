@@ -44,7 +44,7 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
         serving_pair_slot,
         MockTransactionBroadcaster::broadcast_disabled(),
         Arc::clone(&activations),
-    );
+    )?;
     let adapter = LightwalletdGrpcAdapter::new(query, activations);
 
     let visible_tip_block = adapter

@@ -32,6 +32,9 @@ use zinder_proto::v1::ingest::{
     ReleaseCanonicalProjectionBuildLeaseResponse, RenewCanonicalProjectionBuildLeaseRequest,
     canonical_control_server::{CanonicalControl, CanonicalControlServer},
 };
+use zinder_proto::wire::{
+    CanonicalConstructionManifestBindingFields, encode_canonical_construction_manifest_binding,
+};
 use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind,
@@ -1080,10 +1083,21 @@ fn writer_status_response(
     let retention_floor = store
         .canonical_event_retention_floor()
         .map_err(|error| map_store_error(&error))?;
+    let construction_binding = store
+        .construction_identity()
+        .construction_manifest_binding();
     Ok(CanonicalWriterStatusResponse {
         network_name: encode_zinder_native_chain_name(store.network()).to_owned(),
         fence: Some(writer_fence_message(store)),
         oldest_retained_event_sequence: retention_floor,
+        canonical_construction_manifest_binding: Some(
+            encode_canonical_construction_manifest_binding(
+                CanonicalConstructionManifestBindingFields::new(
+                    construction_binding.version,
+                    construction_binding.sha256,
+                ),
+            ),
+        ),
     })
 }
 
@@ -1513,6 +1527,7 @@ pub(crate) mod test_support {
         ReleaseCanonicalProjectionBuildLeaseRequest, RenewCanonicalProjectionBuildLeaseRequest,
         canonical_control_client::CanonicalControlClient,
     };
+    use zinder_proto::wire::decode_canonical_construction_manifest_binding;
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
         CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, MempoolEvent,
@@ -1590,6 +1605,9 @@ pub(crate) mod test_support {
         fs::create_dir(checkpoint_staging_root.join("bundle-b2"))?;
         let delayed_target = checkpoint_staging_root.join("bundle-b2/canonical.rocksdb");
         let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let expected_construction_binding = store
+            .construction_identity()
+            .construction_manifest_binding();
         let (handle, mut commands) = canonical_control_channel();
         let status_handle = handle.clone();
         let command_task = tokio::spawn(async move {
@@ -1632,9 +1650,7 @@ pub(crate) mod test_support {
             .writer_status(authenticated(CanonicalWriterStatusRequest {}))
             .await?
             .into_inner();
-        assert_eq!(status.network_name, "zcash-testnet");
-        assert_eq!(status.oldest_retained_event_sequence, 1);
-        assert_eq!(status.fence.map(|fence| fence.event_sequence), Some(1));
+        assert_fixture_writer_status(&status, expected_construction_binding)?;
 
         let page = client
             .event_page(authenticated(CanonicalEventPageRequest {
@@ -1666,6 +1682,33 @@ pub(crate) mod test_support {
         cancel.cancel();
         server_task.await?;
         command_task.abort();
+        Ok(())
+    }
+
+    fn assert_fixture_writer_status(
+        status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+        expected_construction_binding: zinder_store::CanonicalConstructionManifestBinding,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(status.network_name, "zcash-testnet");
+        assert_eq!(status.oldest_retained_event_sequence, 1);
+        assert_eq!(
+            status.fence.as_ref().map(|fence| fence.event_sequence),
+            Some(1)
+        );
+        let construction_binding = status
+            .canonical_construction_manifest_binding
+            .as_ref()
+            .ok_or("fixture writer status omitted construction binding")?;
+        let construction_binding =
+            decode_canonical_construction_manifest_binding(construction_binding)?;
+        assert_eq!(
+            construction_binding.format_version(),
+            expected_construction_binding.version
+        );
+        assert_eq!(
+            construction_binding.sha256(),
+            expected_construction_binding.sha256
+        );
         Ok(())
     }
 

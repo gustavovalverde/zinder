@@ -54,7 +54,9 @@ pub(crate) async fn query_paid_fee_distribution(
     for _ in 0..MAX_EPOCH_STABILIZATION_ATTEMPTS {
         let (chain_epoch, visible_tip_height) = fetch_current_chain_epoch(wallet_client).await?;
         let (distribution, coverage, freshness) = {
-            let snapshot = materialized_view_store.read_snapshot();
+            let snapshot = materialized_view_store
+                .read_snapshot()
+                .map_err(|error| ExplorerError::internal(error.to_string()))?;
             let distribution = PaidFeeDistributionConsumer::distribution_in_time_range_snapshot(
                 &snapshot,
                 request.start_time_unix_seconds,

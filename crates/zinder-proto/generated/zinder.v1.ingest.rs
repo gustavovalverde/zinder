@@ -83,6 +83,12 @@ pub struct CanonicalWriterStatusResponse {
     pub fence: ::core::option::Option<CanonicalWriterFence>,
     #[prost(uint64, tag = "3")]
     pub oldest_retained_event_sequence: u64,
+    /// Immutable canonical-construction claim. Readers must exact-compare this
+    /// with their admitted canonical secondary before publishing derived state.
+    #[prost(message, optional, tag = "4")]
+    pub canonical_construction_manifest_binding: ::core::option::Option<
+        super::ops::CanonicalConstructionManifestBinding,
+    >,
 }
 /// Inclusive block-height range carried by one canonical transition.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

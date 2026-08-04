@@ -2,6 +2,7 @@
 
 use std::{collections::BTreeSet, path::Path};
 
+use super::construction_identity;
 use eyre::Result;
 use tempfile::TempDir;
 use zinder_materialized_views::{
@@ -66,7 +67,14 @@ fn open(
     path: &Path,
     consumers: &'static [MaterializedViewConsumerSchema],
 ) -> Result<MaterializedViewStore> {
-    Ok(MaterializedViewStore::open(path, options(consumers))?)
+    Ok(open_with_options(path, options(consumers))?)
+}
+
+fn open_with_options(
+    path: &Path,
+    options: MaterializedViewStoreOptions,
+) -> std::result::Result<MaterializedViewStore, MaterializedViewStoreError> {
+    MaterializedViewStore::open(path, construction_identity()?, options)
 }
 
 fn column_family_set(path: &Path) -> BTreeSet<String> {
@@ -83,12 +91,10 @@ fn higher_declared_consumer_schema_rejects_lower_manifest_without_mutation() -> 
         let store = open(tempdir.path(), BOTH_V1)?;
         store.put_consumer(CONSUMER_A_CF, b"key-a", b"value-a")?;
         store.put_consumer(CONSUMER_B_CF, b"key-b", b"value-b")?;
-        store.put_chain_event_cursor(CONSUMER_A, b"cursor-a")?;
-        store.put_chain_event_cursor(CONSUMER_B, b"cursor-b")?;
     }
 
     let column_families_before = column_family_set(tempdir.path());
-    let outcome = MaterializedViewStore::open(tempdir.path(), options(A_V2_B_V1));
+    let outcome = open_with_options(tempdir.path(), options(A_V2_B_V1));
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ConsumerSchemaMismatch {
@@ -105,28 +111,19 @@ fn higher_declared_consumer_schema_rejects_lower_manifest_without_mutation() -> 
         Some(b"value-a".to_vec())
     );
     assert_eq!(
-        store.get_chain_event_cursor(CONSUMER_A)?,
-        Some(b"cursor-a".to_vec())
-    );
-    assert_eq!(
         store.get_consumer(CONSUMER_B_CF, b"key-b")?,
         Some(b"value-b".to_vec())
-    );
-    assert_eq!(
-        store.get_chain_event_cursor(CONSUMER_B)?,
-        Some(b"cursor-b".to_vec())
     );
     Ok(())
 }
 
 #[test]
-fn reordering_the_same_column_family_set_preserves_rows_and_cursor() -> Result<()> {
+fn reordering_the_same_column_family_set_preserves_rows() -> Result<()> {
     let tempdir = TempDir::new()?;
     {
         let store = open(tempdir.path(), ONLY_A_TWO_CFS_V1)?;
         store.put_consumer(CONSUMER_A_CF, b"key-a", b"value-a")?;
         store.put_consumer(CONSUMER_B_CF, b"key-b", b"value-b")?;
-        store.put_chain_event_cursor(CONSUMER_A, b"cursor-a")?;
     }
 
     let store = open(tempdir.path(), ONLY_A_TWO_CFS_REORDERED_V1)?;
@@ -138,10 +135,6 @@ fn reordering_the_same_column_family_set_preserves_rows_and_cursor() -> Result<(
         store.get_consumer(CONSUMER_B_CF, b"key-b")?,
         Some(b"value-b".to_vec())
     );
-    assert_eq!(
-        store.get_chain_event_cursor(CONSUMER_A)?,
-        Some(b"cursor-a".to_vec())
-    );
     Ok(())
 }
 
@@ -151,10 +144,9 @@ fn lower_declared_consumer_schema_rejects_higher_manifest_without_mutation() -> 
     {
         let store = open(tempdir.path(), ONLY_A_V2)?;
         store.put_consumer(CONSUMER_A_CF, b"key-a", b"value-a")?;
-        store.put_chain_event_cursor(CONSUMER_A, b"cursor-a")?;
     }
 
-    let outcome = MaterializedViewStore::open(tempdir.path(), options(ONLY_A_V1));
+    let outcome = open_with_options(tempdir.path(), options(ONLY_A_V1));
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ConsumerSchemaMismatch {
@@ -169,10 +161,6 @@ fn lower_declared_consumer_schema_rejects_higher_manifest_without_mutation() -> 
         store.get_consumer(CONSUMER_A_CF, b"key-a")?,
         Some(b"value-a".to_vec())
     );
-    assert_eq!(
-        store.get_chain_event_cursor(CONSUMER_A)?,
-        Some(b"cursor-a".to_vec())
-    );
     Ok(())
 }
 
@@ -183,11 +171,10 @@ fn changed_consumer_column_family_set_rejects_without_mutation() -> Result<()> {
         let store = open(tempdir.path(), ONLY_A_TWO_CFS_V1)?;
         store.put_consumer(CONSUMER_A_CF, b"key-a", b"value-a")?;
         store.put_consumer(CONSUMER_B_CF, b"key-b", b"value-b")?;
-        store.put_chain_event_cursor(CONSUMER_A, b"cursor-a")?;
     }
 
     let column_families_before = column_family_set(tempdir.path());
-    let outcome = MaterializedViewStore::open(tempdir.path(), options(ONLY_A_V1));
+    let outcome = open_with_options(tempdir.path(), options(ONLY_A_V1));
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ConsumerSchemaMismatch {
@@ -207,10 +194,6 @@ fn changed_consumer_column_family_set_rejects_without_mutation() -> Result<()> {
         store.get_consumer(CONSUMER_B_CF, b"key-b")?,
         Some(b"value-b".to_vec())
     );
-    assert_eq!(
-        store.get_chain_event_cursor(CONSUMER_A)?,
-        Some(b"cursor-a".to_vec())
-    );
     Ok(())
 }
 
@@ -220,11 +203,10 @@ fn adding_a_consumer_to_an_existing_manifest_rejects_without_mutation() -> Resul
     {
         let store = open(tempdir.path(), ONLY_A_V1)?;
         store.put_consumer(CONSUMER_A_CF, b"key-a", b"value-a")?;
-        store.put_chain_event_cursor(CONSUMER_A, b"cursor-a")?;
     }
 
     let column_families_before = column_family_set(tempdir.path());
-    let outcome = MaterializedViewStore::open(tempdir.path(), options(A_AND_EMPTY_B_V1));
+    let outcome = open_with_options(tempdir.path(), options(A_AND_EMPTY_B_V1));
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ConsumerSchemaMismatch {
@@ -239,10 +221,6 @@ fn adding_a_consumer_to_an_existing_manifest_rejects_without_mutation() -> Resul
     assert_eq!(
         store.get_consumer(CONSUMER_A_CF, b"key-a")?,
         Some(b"value-a".to_vec())
-    );
-    assert_eq!(
-        store.get_chain_event_cursor(CONSUMER_A)?,
-        Some(b"cursor-a".to_vec())
     );
     Ok(())
 }
@@ -259,7 +237,7 @@ fn physical_column_family_drift_rejects_before_primary_open_mutates_the_store() 
     }
 
     let missing_before = column_family_set(tempdir.path());
-    let outcome = MaterializedViewStore::open(tempdir.path(), options(ONLY_A_V1));
+    let outcome = open_with_options(tempdir.path(), options(ONLY_A_V1));
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ColumnFamilyIdentityMismatch { .. })
@@ -276,7 +254,7 @@ fn physical_column_family_drift_rejects_before_primary_open_mutates_the_store() 
     }
 
     let orphan_before = column_family_set(orphan.path());
-    let outcome = MaterializedViewStore::open(orphan.path(), options(ONLY_A_V1));
+    let outcome = open_with_options(orphan.path(), options(ONLY_A_V1));
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ColumnFamilyIdentityMismatch { .. })
@@ -292,10 +270,9 @@ fn unknown_manifest_consumer_fails_closed_without_clearing_rows() -> Result<()> 
         let store = open(tempdir.path(), BOTH_V1)?;
         store.put_consumer(CONSUMER_A_CF, b"key-a", b"value-a")?;
         store.put_consumer(CONSUMER_B_CF, b"key-b", b"value-b")?;
-        store.put_chain_event_cursor(CONSUMER_B, b"cursor-b")?;
     }
 
-    let outcome = MaterializedViewStore::open(tempdir.path(), options(ONLY_A_V1));
+    let outcome = open_with_options(tempdir.path(), options(ONLY_A_V1));
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ConsumerNotDeclared {
@@ -308,10 +285,6 @@ fn unknown_manifest_consumer_fails_closed_without_clearing_rows() -> Result<()> 
     assert_eq!(
         store.get_consumer(CONSUMER_B_CF, b"key-b")?,
         Some(b"value-b".to_vec())
-    );
-    assert_eq!(
-        store.get_chain_event_cursor(CONSUMER_B)?,
-        Some(b"cursor-b".to_vec())
     );
     assert_eq!(
         store.get_consumer(CONSUMER_A_CF, b"key-a")?,
@@ -346,7 +319,7 @@ fn fresh_store_records_every_declared_consumer_version() -> Result<()> {
 #[test]
 fn declaring_one_column_family_from_two_consumers_is_rejected() -> Result<()> {
     let tempdir = TempDir::new()?;
-    let outcome = MaterializedViewStore::open(tempdir.path(), options(DUPLICATE_CF));
+    let outcome = open_with_options(tempdir.path(), options(DUPLICATE_CF));
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ConsumerColumnFamilyConflict { name }) if name == CONSUMER_A_CF
@@ -357,7 +330,7 @@ fn declaring_one_column_family_from_two_consumers_is_rejected() -> Result<()> {
 #[test]
 fn declaring_a_reserved_store_table_column_family_is_rejected() -> Result<()> {
     let tempdir = TempDir::new()?;
-    let outcome = MaterializedViewStore::open(tempdir.path(), options(RESERVED_CF));
+    let outcome = open_with_options(tempdir.path(), options(RESERVED_CF));
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ConsumerColumnFamilyConflict { name })
@@ -374,7 +347,7 @@ fn transferring_a_column_family_to_a_new_consumer_fails_closed() -> Result<()> {
         store.put_consumer(CONSUMER_A_CF, b"key-a", b"value-a")?;
     }
 
-    let outcome = MaterializedViewStore::open(tempdir.path(), options(ONLY_C_ON_A_CF));
+    let outcome = open_with_options(tempdir.path(), options(ONLY_C_ON_A_CF));
     assert!(matches!(
         outcome,
         Err(MaterializedViewStoreError::ConsumerNotDeclared {

@@ -30,8 +30,8 @@ use zinder_store::{
     RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
-    WALLET_PROJECTION_STORE_IDENTITY, WalletCanonicalSourceIdentity,
-    WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence,
+    WALLET_PROJECTION_STORE_IDENTITY, WalletCanonicalConstructionBinding,
+    WalletCanonicalSourceIdentity, WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence,
 };
 use zinder_wallet_rocksdb::{
     RocksDbWalletFollowingStore, WALLET_ROCKSDB_SCHEMA_VERSION, WalletOwnerCheckpointEvidence,
@@ -375,7 +375,7 @@ impl StateBundleManifest {
         )?;
         require_manifest_value(
             self.format_version == STATE_BUNDLE_FORMAT_VERSION,
-            "format version must be exactly 1",
+            format!("format version must be exactly {STATE_BUNDLE_FORMAT_VERSION}"),
         )?;
         require_manifest_value(
             self.topology == STATE_BUNDLE_TOPOLOGY,
@@ -395,6 +395,16 @@ impl StateBundleManifest {
         self.fence.validate()?;
         self.canonical_checkpoint.validate(network, &self.fence)?;
         self.wallet_checkpoint.validate(network, &self.fence)?;
+        require_manifest_value(
+            self.wallet_checkpoint
+                .canonical_construction_manifest_version
+                == self.canonical_checkpoint.construction_manifest_version
+                && self
+                    .wallet_checkpoint
+                    .canonical_construction_manifest_sha256
+                    == self.canonical_checkpoint.construction_manifest_sha256,
+            "canonical and wallet checkpoint construction bindings differ",
+        )?;
         Ok(())
     }
 }
@@ -440,6 +450,7 @@ pub fn complete_state_bundle_capture(
     let canonical = &canonical_checkpoint.admission;
     let live_wallet = WalletAdmission::from_ready(
         wallet.network(),
+        wallet.canonical_construction_binding(),
         wallet.ready_evidence(),
         WALLET_PROJECTION_STORE_IDENTITY,
         WALLET_ROCKSDB_SCHEMA_VERSION,
@@ -919,14 +930,20 @@ struct WalletAdmission {
     store_identity: String,
     schema_version: u16,
     network: Network,
+    canonical_construction_binding: WalletCanonicalConstructionBinding,
     source: WalletCanonicalSourceIdentity,
     ready: WalletProjectionReadyEvidence,
     checkpoint_database_identity_sha256: Option<String>,
 }
 
 impl WalletAdmission {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "wallet checkpoint admission keeps each independently cold-read identity explicit"
+    )]
     fn from_ready(
         network: Network,
+        canonical_construction_binding: WalletCanonicalConstructionBinding,
         ready: &WalletProjectionReadyEvidence,
         store_identity: &[u8],
         schema_version: u16,
@@ -938,7 +955,7 @@ impl WalletAdmission {
         )?;
         require_manifest_value(
             schema_version == WALLET_ROCKSDB_SCHEMA_VERSION,
-            "wallet checkpoint schema must be exactly 1",
+            format!("wallet checkpoint schema must be exactly {WALLET_ROCKSDB_SCHEMA_VERSION}"),
         )?;
         if let Some(database_identity) = checkpoint_database_identity {
             require_manifest_value(
@@ -952,6 +969,7 @@ impl WalletAdmission {
             })?,
             schema_version,
             network,
+            canonical_construction_binding,
             source: WalletCanonicalSourceIdentity::from_ready_evidence(ready),
             ready: ready.clone(),
             checkpoint_database_identity_sha256: checkpoint_database_identity.map(sha256_hex),
@@ -962,6 +980,7 @@ impl WalletAdmission {
         self.store_identity == other.store_identity
             && self.schema_version == other.schema_version
             && self.network == other.network
+            && self.canonical_construction_binding == other.canonical_construction_binding
             && self.source == other.source
             && self.ready == other.ready
     }
@@ -973,6 +992,7 @@ impl TryFrom<&WalletOwnerCheckpointEvidence> for WalletAdmission {
     fn try_from(evidence: &WalletOwnerCheckpointEvidence) -> Result<Self, Self::Error> {
         Self::from_ready(
             evidence.network,
+            evidence.canonical_construction_binding,
             &evidence.ready_evidence,
             evidence.store_identity,
             evidence.schema_version,
@@ -1364,6 +1384,8 @@ struct WalletCheckpointManifest {
     schema_version: u16,
     cold_admitted: bool,
     database_identity_sha256: String,
+    canonical_construction_manifest_version: u16,
+    canonical_construction_manifest_sha256: String,
     chain_epoch_id: u64,
     chain_event_sequence: u64,
     event_cursor: String,
@@ -1396,6 +1418,12 @@ impl WalletCheckpointManifest {
             schema_version: wallet.schema_version,
             cold_admitted: true,
             database_identity_sha256,
+            canonical_construction_manifest_version: wallet
+                .canonical_construction_binding
+                .format_version(),
+            canonical_construction_manifest_sha256: hex::encode(
+                wallet.canonical_construction_binding.sha256(),
+            ),
             chain_epoch_id: ready.source_position.chain_epoch_id.value(),
             chain_event_sequence: ready.source_position.event_sequence,
             event_cursor: hex::encode(ready.source_position.event_cursor.as_bytes()),
@@ -1433,7 +1461,7 @@ impl WalletCheckpointManifest {
         )?;
         require_manifest_value(
             self.schema_version == WALLET_ROCKSDB_SCHEMA_VERSION,
-            "wallet checkpoint schema must be exactly 1",
+            format!("wallet checkpoint schema must be exactly {WALLET_ROCKSDB_SCHEMA_VERSION}"),
         )?;
         require_manifest_value(
             self.cold_admitted,
@@ -1442,6 +1470,15 @@ impl WalletCheckpointManifest {
         validate_lower_hex_32(
             &self.database_identity_sha256,
             "wallet checkpoint database identity SHA-256",
+        )?;
+        require_manifest_value(
+            self.canonical_construction_manifest_version
+                == CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
+            "wallet canonical construction-manifest version is unsupported",
+        )?;
+        validate_lower_hex_32(
+            &self.canonical_construction_manifest_sha256,
+            "wallet canonical construction-manifest SHA-256",
         )?;
         require_manifest_value(
             self.chain_epoch_id == fence.chain_epoch_id,
@@ -1524,6 +1561,13 @@ fn validate_exact_fence(
     require_manifest_value(
         canonical.network == wallet.network,
         "canonical and wallet checkpoint networks differ",
+    )?;
+    require_manifest_value(
+        canonical.construction_manifest_version
+            == wallet.canonical_construction_binding.format_version()
+            && canonical.construction_manifest_sha256
+                == wallet.canonical_construction_binding.sha256(),
+        "canonical and wallet checkpoint construction bindings differ",
     )?;
     let source_position = wallet.source.source_position();
     require_manifest_value(
@@ -2093,7 +2137,7 @@ mod tests {
             CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
                 .checked_add(1)
                 .ok_or("construction manifest test version overflow")?;
-        let mutations: [(&str, Value); 17] = [
+        let mutations: [(&str, Value); 19] = [
             ("/identity", Value::String("state_bundle".to_owned())),
             ("/format_version", Value::from(1)),
             ("/topology", Value::String("mixed-runtime".to_owned())),
@@ -2128,7 +2172,15 @@ mod tests {
                 "/canonical_checkpoint/build_plan/history_predecessor/block_id/hash",
                 Value::String(hex::encode([0x99; 32])),
             ),
-            ("/wallet_checkpoint/schema_version", Value::from(2)),
+            ("/wallet_checkpoint/schema_version", Value::from(1)),
+            (
+                "/wallet_checkpoint/canonical_construction_manifest_version",
+                Value::from(2),
+            ),
+            (
+                "/wallet_checkpoint/canonical_construction_manifest_sha256",
+                Value::String(hex::encode([0x98; 32])),
+            ),
             (
                 "/wallet_checkpoint/database_identity_sha256",
                 Value::String("not-a-sha256".to_owned()),
@@ -2182,6 +2234,7 @@ mod tests {
             store_identity: WALLET_PROJECTION_STORE_IDENTITY,
             schema_version: WALLET_ROCKSDB_SCHEMA_VERSION,
             network: sample.network,
+            canonical_construction_binding: sample.canonical_construction_binding,
             ready_evidence: sample.ready,
         };
         let wallet = WalletAdmission::try_from(&evidence)?;
@@ -2429,6 +2482,22 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn wallet_checkpoint_is_refused_when_its_construction_binding_differs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let canonical = sample_canonical_admission(7);
+        let mut wallet = sample_wallet_admission(7)?;
+        wallet.canonical_construction_binding = WalletCanonicalConstructionBinding::new(
+            CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
+            [0xbc; 32],
+        );
+        assert!(matches!(
+            validate_exact_fence(&canonical, &wallet),
+            Err(StateBundleError::ManifestContract { .. })
+        ));
+        Ok(())
+    }
+
     fn sample_canonical_admission(sequence: u64) -> CanonicalAdmission {
         let visible_tip = block(sequence);
         let settled_tip = block(sequence.saturating_sub(1));
@@ -2579,6 +2648,10 @@ mod tests {
             store_identity: "wallet".to_owned(),
             schema_version: WALLET_ROCKSDB_SCHEMA_VERSION,
             network: Network::ZcashRegtest,
+            canonical_construction_binding: WalletCanonicalConstructionBinding::new(
+                CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
+                [0xbb; 32],
+            ),
             source,
             ready,
             checkpoint_database_identity_sha256: Some(sha256_hex(&[0x99; 16])),

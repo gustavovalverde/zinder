@@ -18,7 +18,9 @@ use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
     MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
 };
-use crate::{MaterializedViewStore, MaterializedViewStoreError};
+use crate::{
+    MaterializedViewChainEventCheckpoint, MaterializedViewStore, MaterializedViewStoreError,
+};
 
 /// Per-block ZIP-317 conventional-fee contributions ordered by block time.
 pub const CONVENTIONAL_FEE_DISTRIBUTION_COLUMN_FAMILY: &str = "conventional_fee_distribution";
@@ -489,6 +491,16 @@ impl ConventionalFeeDistributionConsumer {
         store: &MaterializedViewStore,
         blocks: &[BlockCommitContext],
     ) -> Result<(), MaterializedViewConsumerError> {
+        self.write_tail_seed_batch_with_checkpoint(store, blocks, None)
+    }
+
+    /// Atomically seeds the final visible-tail page and its inherited checkpoint.
+    pub fn write_tail_seed_batch_with_checkpoint(
+        &mut self,
+        store: &MaterializedViewStore,
+        blocks: &[BlockCommitContext],
+        checkpoint: Option<MaterializedViewChainEventCheckpoint>,
+    ) -> Result<(), MaterializedViewConsumerError> {
         validate_tail_seed_batch(store, blocks)?;
         let mut batch = WriteBatch::default();
         let mut ctx = MaterializedViewConsumerCtx {
@@ -500,6 +512,13 @@ impl ConventionalFeeDistributionConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
+        if let Some(checkpoint) = checkpoint {
+            store.stage_chain_event_checkpoint(
+                ctx.batch,
+                CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
+                checkpoint,
+            )?;
+        }
         store.write_consumer_batch(CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
@@ -1545,6 +1564,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            crate::store::test_construction_identity(zinder_core::Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
                 consumers: &[CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -1832,6 +1852,42 @@ mod tests {
                 }],
                 unavailable_transaction_count: 0,
             }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn final_tail_seed_page_commits_its_inherited_checkpoint() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = ConventionalFeeDistributionConsumer::new();
+        let checkpoint = crate::store::test_chain_event_checkpoint()?;
+        ConventionalFeeDistributionConsumer::initialize_tail_boundary(
+            &store,
+            BlockHeight::new(10),
+        )?;
+
+        consumer.write_tail_seed_batch_with_checkpoint(
+            &store,
+            &[block(
+                10,
+                1,
+                1_700_000_000,
+                &[(TransactionComponentCounts::EMPTY, Vec::new())],
+            )],
+            Some(checkpoint),
+        )?;
+
+        assert_eq!(
+            ConventionalFeeDistributionConsumer::tail_coverage(&store)?,
+            Some(ConventionalFeeDistributionTailCoverage {
+                boundary_height: BlockHeight::new(10),
+                complete_through_height: Some(BlockHeight::new(10)),
+                complete_through_time_unix_seconds: Some(1_700_000_000),
+            })
+        );
+        assert_eq!(
+            store.chain_event_checkpoint(CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME)?,
+            Some(checkpoint)
         );
         Ok(())
     }

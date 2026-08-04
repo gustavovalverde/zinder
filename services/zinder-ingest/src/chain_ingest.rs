@@ -18,20 +18,20 @@ use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
     BlockHeightRange, BlockTransactionIndexArtifact, CanonicalBlockReplayEnvelope,
     CanonicalTransactionFacts, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CommitmentTreeAccumulatorError, CompactBlockArtifact, Network, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootIndex, TransactionBlobArtifact, TransactionFactsArtifact,
-    TransactionId, TransactionIntrinsicValueBalancesArtifact, TransactionLocation,
-    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact,
-    UnixTimestampMillis,
+    CommitmentTreeAccumulatorError, CompactBlockArtifact, Network,
+    NetworkUpgradeActivationsFingerprint, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex,
+    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentSpendFact, TreeStateArtifact, UnixTimestampMillis,
 };
 use zinder_source::{
     NodeCapability, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError, SourceFailureClass, SourceSubtreeRoots, SourceTreeState,
 };
 use zinder_store::{
-    CanonicalStoreError, ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEvent,
-    ChainStoreOptions, PrimaryChainStore, ReorgWindowChange, RocksDbResourceBudget, StoreError,
-    StoreReadCaller,
+    CanonicalConstructionManifestBinding, CanonicalStoreError, ChainEpochArtifacts,
+    ChainEpochCommitOutcome, ChainEvent, ChainStoreOptions, PrimaryChainStore, ReorgWindowChange,
+    RocksDbResourceBudget, StoreError, StoreReadCaller,
 };
 
 use crate::{
@@ -162,6 +162,85 @@ pub enum IngestError {
     MaterializedViewHistoryIncomplete {
         /// First height the canonical store retains.
         first_available_height: BlockHeight,
+    },
+
+    /// Canonical storage and the activation table belong to different networks.
+    #[error(
+        "canonical network {canonical:?} differs from network-upgrade activations network {activations:?}"
+    )]
+    CanonicalActivationsNetworkMismatch {
+        /// Immutable network authenticated by canonical storage.
+        canonical: Network,
+        /// Network carried by the activation table.
+        activations: Network,
+    },
+
+    /// Canonical storage and the activation table carry different activation identities.
+    #[error(
+        "canonical network-upgrade activations fingerprint {canonical:?} differs from supplied fingerprint {activations:?}"
+    )]
+    CanonicalActivationsFingerprintMismatch {
+        /// Immutable activation identity authenticated by canonical storage.
+        canonical: NetworkUpgradeActivationsFingerprint,
+        /// Activation identity derived from the supplied table.
+        activations: NetworkUpgradeActivationsFingerprint,
+    },
+
+    /// Materialized-view storage and canonical storage belong to different networks.
+    #[error(
+        "materialized-view network {materialized_view:?} differs from canonical network {canonical:?}"
+    )]
+    MaterializedViewCanonicalNetworkMismatch {
+        /// Immutable network authenticated by canonical storage.
+        canonical: Network,
+        /// Immutable network authenticated by materialized-view storage.
+        materialized_view: Network,
+    },
+
+    /// Materialized-view rows were decoded under a different activation table.
+    #[error(
+        "materialized-view activation fingerprint {materialized_view:?} differs from canonical fingerprint {canonical:?}"
+    )]
+    MaterializedViewCanonicalActivationsFingerprintMismatch {
+        /// Immutable activation identity authenticated by canonical storage.
+        canonical: NetworkUpgradeActivationsFingerprint,
+        /// Activation identity claimed by materialized-view storage.
+        materialized_view: NetworkUpgradeActivationsFingerprint,
+    },
+
+    /// Materialized-view rows came from a different canonical construction.
+    #[error(
+        "materialized-view construction binding {materialized_view:?} differs from canonical binding {canonical:?}"
+    )]
+    MaterializedViewCanonicalConstructionBindingMismatch {
+        /// Immutable construction binding authenticated by canonical storage.
+        canonical: CanonicalConstructionManifestBinding,
+        /// Construction binding claimed by materialized-view storage.
+        materialized_view: CanonicalConstructionManifestBinding,
+    },
+
+    /// A persisted materialized-view checkpoint no longer has retained proof.
+    #[error(
+        "materialized-view checkpoint for `{consumer}` at event sequence {event_sequence} is older than retained canonical sequence {oldest_retained_sequence}; rebuild the materialized-view store from a fresh path"
+    )]
+    MaterializedViewCheckpointExpired {
+        /// Stable materialized-view consumer identity.
+        consumer: &'static str,
+        /// Persisted checkpoint sequence.
+        event_sequence: u64,
+        /// Earliest canonical event whose exact fence remains authenticated.
+        oldest_retained_sequence: u64,
+    },
+
+    /// A persisted checkpoint collides with a different retained event fence.
+    #[error(
+        "materialized-view checkpoint for `{consumer}` disagrees with canonical event sequence {event_sequence}; rebuild the materialized-view store from a fresh path"
+    )]
+    MaterializedViewCheckpointFenceMismatch {
+        /// Stable materialized-view consumer identity.
+        consumer: &'static str,
+        /// Colliding event sequence.
+        event_sequence: u64,
     },
 
     /// A non-coinbase transparent input references an unresolvable previous output.
@@ -1682,6 +1761,10 @@ pub(crate) const fn outcome_status<T, E>(outcome: &Result<T, E>) -> &'static str
     if outcome.is_ok() { "ok" } else { "error" }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive stable error-class mapping is clearest as one closed match"
+)]
 pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
     match error {
         None => "none",
@@ -1737,6 +1820,27 @@ pub(crate) fn ingest_error_class(error: Option<&IngestError>) -> &'static str {
         }
         Some(IngestError::MaterializedViewHistoryIncomplete { .. }) => {
             "materialized_view_history_incomplete"
+        }
+        Some(IngestError::CanonicalActivationsNetworkMismatch { .. }) => {
+            "canonical_activations_network_mismatch"
+        }
+        Some(IngestError::CanonicalActivationsFingerprintMismatch { .. }) => {
+            "canonical_activations_fingerprint_mismatch"
+        }
+        Some(IngestError::MaterializedViewCanonicalNetworkMismatch { .. }) => {
+            "materialized_view_canonical_network_mismatch"
+        }
+        Some(IngestError::MaterializedViewCanonicalActivationsFingerprintMismatch { .. }) => {
+            "materialized_view_canonical_activations_fingerprint_mismatch"
+        }
+        Some(IngestError::MaterializedViewCanonicalConstructionBindingMismatch { .. }) => {
+            "materialized_view_canonical_construction_binding_mismatch"
+        }
+        Some(IngestError::MaterializedViewCheckpointExpired { .. }) => {
+            "materialized_view_checkpoint_expired"
+        }
+        Some(IngestError::MaterializedViewCheckpointFenceMismatch { .. }) => {
+            "materialized_view_checkpoint_fence_mismatch"
         }
         Some(IngestError::TransparentPrevoutUnresolved { .. }) => "transparent_prevout_unresolved",
         Some(IngestError::CommitmentTreeCheckpointMissing { .. }) => {

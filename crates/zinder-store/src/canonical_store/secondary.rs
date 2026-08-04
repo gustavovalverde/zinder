@@ -19,7 +19,10 @@ use super::{
     CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
     block_replay::{CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at},
     construction_manifest::validate_ready_construction_manifest,
-    event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
+    event_lifecycle::{
+        canonical_event_history_from_db, canonical_event_retention_floor_from_db,
+        read_retained_event_from_db,
+    },
     live_commit::event_fence_from_ready,
     mempool_lifecycle::validate_mempool_lifecycle_admission,
     publication::{validate_ready_publication, validate_ready_sequence_checkpoint},
@@ -220,6 +223,24 @@ impl RocksDbCanonicalSecondary {
                 "canonical READY publication changed without advancing its event sequence",
             ));
         }
+        validate_ready_construction_manifest(
+            &self.primary_path,
+            &ready_evidence,
+            opened_control.workload,
+            &opened_control.build_plan,
+        )?;
+        let before_identity = self.construction_identity();
+        let after_identity = super::CanonicalStoreConstructionIdentity::from_admitted(
+            &opened_control.build_plan,
+            &ready_evidence,
+        );
+        if after_identity != before_identity {
+            return Err(CanonicalStoreError::SecondaryConstructionIdentityChanged {
+                path: self.primary_path.clone(),
+                before: Box::new(before_identity),
+                after: Box::new(after_identity),
+            });
+        }
         validate_ready_sequence_checkpoint(
             &self.bounded_open.db,
             &self.build_plan,
@@ -268,6 +289,15 @@ impl RocksDbCanonicalSecondary {
     #[must_use]
     pub const fn build_plan(&self) -> &super::CanonicalStoreBuildPlan {
         &self.build_plan
+    }
+
+    /// Returns the exact construction identity admitted for this secondary.
+    #[must_use]
+    pub const fn construction_identity(&self) -> super::CanonicalStoreConstructionIdentity {
+        super::CanonicalStoreConstructionIdentity::from_admitted(
+            &self.build_plan,
+            &self.ready_evidence,
+        )
     }
 
     /// Returns the currently admitted READY evidence.
@@ -332,6 +362,31 @@ impl RocksDbCanonicalSecondary {
             self.ready_evidence.visible_event_sequence,
             request,
         )
+    }
+
+    /// Authenticates the exact retained event named by `cursor`.
+    ///
+    /// A pruned cursor returns the same typed expiry used by paged history;
+    /// callers must rebuild derived state rather than infer a fence from the
+    /// colliding sequence number.
+    pub fn retained_event_at_cursor(
+        &self,
+        cursor: super::CanonicalEventCursor,
+    ) -> Result<CanonicalRetainedEvent, CanonicalStoreError> {
+        let event_sequence = cursor.event_sequence();
+        let oldest_retained_sequence = self.canonical_event_retention_floor()?;
+        if event_sequence < oldest_retained_sequence {
+            return Err(CanonicalStoreError::CanonicalEventCursorExpired {
+                event_sequence,
+                oldest_retained_sequence,
+            });
+        }
+        if event_sequence > self.ready_evidence.visible_event_sequence {
+            return Err(CanonicalStoreError::CanonicalEventCursorMalformed {
+                reason: "cursor sequence is ahead of canonical history",
+            });
+        }
+        read_retained_event_from_db(&self.bounded_open.db, event_sequence)
     }
 
     /// Returns this secondary's admitted inclusive retained-event floor.

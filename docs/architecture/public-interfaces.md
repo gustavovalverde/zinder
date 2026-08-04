@@ -332,7 +332,8 @@ stay synchronized with it.
 | `ZINDER_RETENTION__MEMPOOL_EVENT_RETENTION_MAX_ENCODED_BYTES_PER_STEP` | zinder-ingest | Optional | `retention.mempool_event_retention_max_encoded_bytes_per_step` | Target maximum encoded event bytes examined by one bounded mempool-retention step. The first row may exceed the target to guarantee progress. Must be greater than zero. Defaults to 16000000. |
 | `ZINDER_EXPLORER__BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.bearer_token_path` | Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0006). |
 | `ZINDER_EXPLORER__LISTEN_ADDR` | zinder-explorer | Optional | `explorer.listen_addr` | Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068. |
-| `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Optional | `explorer.wallet_query_endpoint` | WalletQuery gRPC endpoint backing the explorer's wallet-composed reads (transaction detail, block views, search, mempool activity). Empty/unset disables the explorer capabilities that compose canonical wallet reads. |
+| `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT` | zinder-explorer | Required | `explorer.wallet_query_endpoint` | Native WalletQuery gRPC endpoint admitted before Explorer binds. Its network, contract revision, capabilities, and canonical construction binding are frozen and exact-compared with the explorer materialized-view store; empty or unset configuration fails startup. |
+| `ZINDER_EXPLORER__WALLET_QUERY_BEARER_TOKEN_PATH` | zinder-explorer | Optional | `explorer.wallet_query_bearer_token_path` | Path to the bearer token Explorer presents to its admitted WalletQuery dependency. Required when that private endpoint enforces bearer authentication; token contents remain file-only and redacted. |
 <!-- env-var-table:public-interfaces:end -->
 
 ## Capabilities

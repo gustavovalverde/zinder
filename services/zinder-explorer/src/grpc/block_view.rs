@@ -248,7 +248,9 @@ fn read_block_production_time_page(
         .current_chain_epoch_reader()
         .map_err(|error| status_from_store_error(&error))?;
     let chain_epoch = reader.chain_epoch();
-    let snapshot = materialized_view_store.read_snapshot();
+    let snapshot = materialized_view_store
+        .read_snapshot()
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let current_materialized_view_state = snapshot
         .consumer_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)
         .map_err(|error| ExplorerError::internal(error.to_string()))?

@@ -21,8 +21,9 @@ use zinder_ingest::{
     load_fresh_canonical, spawn_materialized_view_tailer_task,
 };
 use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, MaterializedViewStore,
-    MaterializedViewStoreOptions, REORG_INCIDENTS_CONSUMER_NAME, decode_stored_record,
+    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, MaterializedViewChainEventCheckpoint,
+    MaterializedViewStore, MaterializedViewStoreOptions, REORG_INCIDENTS_CONSUMER_NAME,
+    decode_stored_record,
 };
 use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
 use zinder_runtime::{IngestPhase, Readiness};
@@ -52,7 +53,7 @@ const REORG_WINDOW_BLOCKS: u32 = 2;
 async fn a_fresh_view_store_rebuilds_the_rows_event_replay_would_have_written()
 -> Result<(), Box<dyn Error>> {
     let mut harness = CanonicalHarness::baseline().await?;
-    let (_incremental_directory, incremental) = view_store()?;
+    let (_incremental_directory, incremental) = view_store(harness.construction_identity())?;
     harness.tailer(&incremental).catch_up()?;
     assert_eq!(
         block_summary_hashes(&incremental, BASELINE_TIP_HEIGHT)?,
@@ -62,7 +63,7 @@ async fn a_fresh_view_store_rebuilds_the_rows_event_replay_would_have_written()
     harness.follow_to_tip().await?;
     harness.tailer(&incremental).catch_up()?;
 
-    let (_rebuilt_directory, rebuilt) = view_store()?;
+    let (_rebuilt_directory, rebuilt) = view_store(harness.construction_identity())?;
     harness.tailer(&rebuilt).catch_up()?;
 
     assert_eq!(
@@ -85,7 +86,7 @@ async fn a_reorg_transition_reverts_and_reapplies_the_replaced_height() -> Resul
 {
     let mut harness = CanonicalHarness::baseline().await?;
     harness.follow_to_tip().await?;
-    let (_directory, view) = view_store()?;
+    let (_directory, view) = view_store(harness.construction_identity())?;
     harness.tailer(&view).catch_up()?;
     let replaced = harness.canonical_hashes(CHAIN_TIP_HEIGHT);
 
@@ -99,7 +100,7 @@ async fn a_reorg_transition_reverts_and_reapplies_the_replaced_height() -> Resul
         reapplied
     );
     assert!(
-        view.get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
+        view.chain_event_checkpoint(REORG_INCIDENTS_CONSUMER_NAME)?
             .is_some(),
         "the reorg incident log must advance through the replacement transition"
     );
@@ -107,49 +108,30 @@ async fn a_reorg_transition_reverts_and_reapplies_the_replaced_height() -> Resul
 }
 
 #[tokio::test]
-async fn an_expired_cursor_recovers_onto_the_rows_a_clean_rebuild_produces()
+async fn a_pruned_checkpoint_without_an_authenticated_prefix_refuses_replay()
 -> Result<(), Box<dyn Error>> {
     let mut harness = CanonicalHarness::baseline().await?;
-    let (_recovered_directory, recovered) = view_store()?;
+    let (_recovered_directory, recovered) = view_store(harness.construction_identity())?;
     harness.tailer(&recovered).catch_up()?;
+    let rows_before_pruning = block_summary_hashes(&recovered, BASELINE_TIP_HEIGHT)?;
 
     harness.follow_to_tip().await?;
     harness.prune_events_to_fence()?;
-    harness.tailer(&recovered).catch_up()?;
-
-    let (_rebuilt_directory, rebuilt) = view_store()?;
-    harness.tailer(&rebuilt).catch_up()?;
-
-    assert_eq!(
-        block_summary_hashes(&recovered, CHAIN_TIP_HEIGHT)?,
-        harness.canonical_hashes(CHAIN_TIP_HEIGHT)
-    );
-    assert_eq!(
-        block_summary_hashes(&recovered, CHAIN_TIP_HEIGHT)?,
-        block_summary_hashes(&rebuilt, CHAIN_TIP_HEIGHT)?
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn an_undecodable_persisted_cursor_names_the_view_store_for_rebuild()
--> Result<(), Box<dyn Error>> {
-    let harness = CanonicalHarness::baseline().await?;
-    let (directory, view) = view_store()?;
-    for consumer_name in MaterializedViewStore::bundled_chain_event_consumer_names() {
-        view.put_chain_event_cursor(*consumer_name, &[0xA5; 64])?;
-    }
-
     let error = harness
-        .tailer(&view)
+        .tailer(&recovered)
         .catch_up()
         .err()
-        .ok_or("an undecodable cursor must refuse replay")?;
+        .ok_or("a pruned checkpoint without a retained-event witness must refuse replay")?;
 
-    let IngestError::MaterializedViewCursorUnreadable { path, .. } = error else {
-        return Err(format!("expected an undecodable-cursor refusal, got {error:?}").into());
-    };
-    assert_eq!(path, directory.path());
+    assert!(matches!(
+        error,
+        IngestError::MaterializedViewCheckpointExpired { .. }
+    ));
+    assert_eq!(
+        block_summary_hashes(&recovered, BASELINE_TIP_HEIGHT)?,
+        rows_before_pruning,
+        "the tailer must fail before replaying or rebuilding rows from an unauthenticated prefix"
+    );
     Ok(())
 }
 
@@ -158,7 +140,7 @@ async fn the_tailer_publishes_a_live_status_and_opens_the_historical_work_gate()
 -> Result<(), Box<dyn Error>> {
     let mut harness = CanonicalHarness::baseline().await?;
     harness.follow_to_tip().await?;
-    let (_directory, view) = view_store()?;
+    let (_directory, view) = view_store(harness.construction_identity())?;
     let readiness = Readiness::default();
     readiness.set_phase(IngestPhase::FollowingTip);
     let gate = zinder_ingest::HistoricalWorkGate::new(readiness);
@@ -187,10 +169,13 @@ async fn the_tailer_publishes_a_live_status_and_opens_the_historical_work_gate()
     Ok(())
 }
 
-fn view_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
+fn view_store(
+    construction_identity: zinder_store::CanonicalStoreConstructionIdentity,
+) -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
     let directory = TempDir::new()?;
     let store = MaterializedViewStore::open(
         directory.path(),
+        construction_identity,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
@@ -221,14 +206,14 @@ fn block_summary_hashes(
     Ok(hashes)
 }
 
-type ChainEventCursors = BTreeMap<&'static str, Option<Vec<u8>>>;
+type ChainEventCursors = BTreeMap<&'static str, Option<MaterializedViewChainEventCheckpoint>>;
 
 fn chain_event_cursors(view: &MaterializedViewStore) -> Result<ChainEventCursors, Box<dyn Error>> {
     let mut cursors = BTreeMap::new();
     for consumer_name in view.chain_event_consumer_names() {
         cursors.insert(
             consumer_name.as_str(),
-            view.get_chain_event_cursor(consumer_name)?,
+            view.chain_event_checkpoint(consumer_name)?,
         );
     }
     Ok(cursors)
@@ -306,6 +291,10 @@ impl CanonicalHarness {
             chain_event_retention_window: Some(Duration::from_hours(168)),
             cursor_at_risk_warning: Duration::from_hours(24),
         }
+    }
+
+    fn construction_identity(&self) -> zinder_store::CanonicalStoreConstructionIdentity {
+        self.canonical.read().construction_identity()
     }
 
     async fn follow_to_tip(&mut self) -> Result<(), Box<dyn Error>> {

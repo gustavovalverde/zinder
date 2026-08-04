@@ -19,7 +19,9 @@ use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
     MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
 };
-use crate::{MaterializedViewStore, MaterializedViewStoreError};
+use crate::{
+    MaterializedViewChainEventCheckpoint, MaterializedViewStore, MaterializedViewStoreError,
+};
 
 /// Per-block contributions ordered by signed block time, then height.
 pub const TRANSACTION_COMPONENT_SUMMARY_COLUMN_FAMILY: &str = "transaction_component_summary";
@@ -667,6 +669,16 @@ impl TransactionComponentSummaryConsumer {
         store: &MaterializedViewStore,
         blocks: &[BlockCommitContext],
     ) -> Result<(), MaterializedViewConsumerError> {
+        self.write_tail_seed_batch_with_checkpoint(store, blocks, None)
+    }
+
+    /// Atomically seeds the final visible-tail page and its inherited checkpoint.
+    pub fn write_tail_seed_batch_with_checkpoint(
+        &mut self,
+        store: &MaterializedViewStore,
+        blocks: &[BlockCommitContext],
+        checkpoint: Option<MaterializedViewChainEventCheckpoint>,
+    ) -> Result<(), MaterializedViewConsumerError> {
         validate_tail_seed_batch(store, blocks)?;
         let mut batch = WriteBatch::default();
         let mut ctx = MaterializedViewConsumerCtx {
@@ -678,6 +690,13 @@ impl TransactionComponentSummaryConsumer {
             self.apply_block(block, &mut ctx)?;
         }
         self.finish_batch(&mut ctx)?;
+        if let Some(checkpoint) = checkpoint {
+            store.stage_chain_event_checkpoint(
+                ctx.batch,
+                TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
+                checkpoint,
+            )?;
+        }
         store.write_consumer_batch(TRANSACTION_COMPONENT_SUMMARY_SCHEMA.name, ctx.batch)?;
         Ok(())
     }
@@ -1941,6 +1960,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            crate::store::test_construction_identity(zinder_core::Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
                 consumers: &[TRANSACTION_COMPONENT_SUMMARY_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -2360,7 +2380,9 @@ mod tests {
             &store,
             BlockHeight::new(102),
         )?;
-        store.put_chain_event_cursor(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, b"seeded")?;
+        let checkpoint = crate::store::test_chain_event_checkpoint()?;
+        store
+            .put_chain_event_checkpoint(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, checkpoint)?;
         write_blocks(
             &store,
             &mut consumer,
@@ -2396,8 +2418,8 @@ mod tests {
             ))
         );
         assert_eq!(
-            store.get_chain_event_cursor(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME)?,
-            Some(b"seeded".to_vec())
+            store.chain_event_checkpoint(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME)?,
+            Some(checkpoint)
         );
         let summary =
             TransactionComponentSummaryConsumer::summary_in_time_range(&store, 0, SECONDS_PER_DAY)?;
@@ -2426,11 +2448,11 @@ mod tests {
             &store,
             BlockHeight::new(101),
         )?;
-        store.put_chain_event_cursor(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, b"existing")?;
-
-        consumer.write_tail_seed_batch(
+        let checkpoint = crate::store::test_chain_event_checkpoint()?;
+        consumer.write_tail_seed_batch_with_checkpoint(
             &store,
             &[block(101, 2, 20, &[counts]), block(102, 3, 30, &[counts])],
+            Some(checkpoint),
         )?;
         assert_eq!(
             TransactionComponentSummaryConsumer::tail_coverage(&store)?,
@@ -2441,8 +2463,8 @@ mod tests {
             })
         );
         assert_eq!(
-            store.get_chain_event_cursor(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME)?,
-            Some(b"existing".to_vec())
+            store.chain_event_checkpoint(TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME)?,
+            Some(checkpoint)
         );
 
         replace_blocks(

@@ -1162,6 +1162,35 @@ fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
     Ok(())
 }
 
+#[test]
+fn current_shape_canonical_construction_binding_round_trips_through_writer_and_wallet_metadata()
+-> eyre::Result<()> {
+    let binding = ops::CanonicalConstructionManifestBinding {
+        format_version: 4,
+        sha256: vec![0x5a; 32],
+    };
+    let writer_status = ingest::CanonicalWriterStatusResponse {
+        network_name: "zcash-regtest".to_owned(),
+        fence: None,
+        oldest_retained_event_sequence: 42,
+        canonical_construction_manifest_binding: Some(binding.clone()),
+    };
+    let wallet_info = wallet::WalletServerInfo {
+        canonical_construction_manifest_binding: Some(binding.clone()),
+        ..wallet::WalletServerInfo::default()
+    };
+
+    assert_eq!(
+        round_trip(&writer_status)?.canonical_construction_manifest_binding,
+        Some(binding.clone())
+    );
+    assert_eq!(
+        round_trip(&wallet_info)?.canonical_construction_manifest_binding,
+        Some(binding)
+    );
+    Ok(())
+}
+
 fn round_trip<MessageType>(message: &MessageType) -> Result<MessageType, prost::DecodeError>
 where
     MessageType: Message + Default,

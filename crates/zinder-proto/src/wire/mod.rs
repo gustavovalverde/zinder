@@ -11,11 +11,16 @@
 //! twin: it owns the translations whose return type is one of the
 //! generated `zinder_proto::v1::*` enums.
 
+mod canonical_construction_manifest_binding;
 mod privacy_shape;
 mod transparent_delta_kind;
 mod utxo_set_commitment;
 mod wallet;
 
+pub use canonical_construction_manifest_binding::{
+    CanonicalConstructionManifestBindingDecodeError, CanonicalConstructionManifestBindingFields,
+    decode_canonical_construction_manifest_binding, encode_canonical_construction_manifest_binding,
+};
 pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};
 pub use transparent_delta_kind::{
     TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE,
@@ -29,6 +34,7 @@ pub use wallet::{
     WalletWireDecodeError, chain_epoch_from_message, chain_epoch_message,
     compact_block_from_message, compact_block_message, compact_transaction_data_from_message,
     compact_transaction_data_message, decode_compact_block, encode_compact_block,
-    mempool_entry_from_message, mempool_entry_message, outpoint_message,
-    transparent_mempool_output_from_message, transparent_mempool_spend_from_message,
+    mempool_entry_from_message, mempool_entry_message, network_upgrade_activations_from_message,
+    outpoint_message, transparent_mempool_output_from_message,
+    transparent_mempool_spend_from_message,
 };

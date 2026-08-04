@@ -13,8 +13,9 @@ use zinder_core::{
 use zinder_store::{RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget, open_bounded_rocksdb};
 use zinder_wallet_projection::{
     WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
-    WalletCanonicalSourceIdentity, WalletProjectionBuildState, WalletProjectionReadyEvidence,
-    WalletReorgUndo, WalletSpentOutput, WalletUnspentOutput, WalletUtxoSetSummary,
+    WalletCanonicalConstructionBinding, WalletCanonicalSourceIdentity, WalletProjectionBuildState,
+    WalletProjectionReadyEvidence, WalletReorgUndo, WalletSpentOutput, WalletUnspentOutput,
+    WalletUtxoSetSummary,
 };
 
 use crate::{
@@ -168,6 +169,12 @@ impl RocksDbWalletSecondary {
     #[must_use]
     pub const fn network(&self) -> Network {
         self.store.network()
+    }
+
+    /// Returns the canonical construction binding persisted by the projection.
+    #[must_use]
+    pub const fn canonical_construction_binding(&self) -> WalletCanonicalConstructionBinding {
+        self.store.canonical_construction_binding()
     }
 
     /// Returns one current output by exact outpoint.

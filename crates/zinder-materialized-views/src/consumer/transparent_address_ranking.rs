@@ -495,10 +495,10 @@ impl TransparentAddressRankingConsumer {
     }
 
     /// Atomically activates a built generation at one chain-event boundary.
-    pub fn activate_snapshot_generation_at_cursor(
+    pub fn activate_snapshot_generation_at_checkpoint(
         store: &MaterializedViewStore,
         generation: u64,
-        cursor_bytes: &[u8],
+        checkpoint: crate::MaterializedViewChainEventCheckpoint,
     ) -> Result<TransparentAddressRankingMetadata, TransparentAddressRankingConsumerError> {
         let Some(mut metadata) = Self::build_metadata(store)? else {
             let active = Self::active_metadata(store)?
@@ -506,10 +506,10 @@ impl TransparentAddressRankingConsumer {
                 .ok_or(
                     TransparentAddressRankingConsumerError::SnapshotBuildMissing { generation },
                 )?;
-            let persisted_cursor =
-                store.get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?;
-            if persisted_cursor.as_deref() != Some(cursor_bytes) {
-                return Err(TransparentAddressRankingConsumerError::ActiveCursorMismatch);
+            let persisted_checkpoint =
+                store.chain_event_checkpoint(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?;
+            if persisted_checkpoint != Some(checkpoint) {
+                return Err(TransparentAddressRankingConsumerError::ActiveCheckpointMismatch);
             }
             return Ok(active);
         };
@@ -541,10 +541,10 @@ impl TransparentAddressRankingConsumer {
         batch.put_cf(&metadata_cf, ACTIVE_METADATA_KEY, encode_metadata(metadata));
         batch.delete_cf(&metadata_cf, BUILD_METADATA_KEY);
         batch.delete_cf(&metadata_cf, BUILD_MANIFEST_KEY);
-        store.stage_chain_event_cursor(
+        store.stage_chain_event_checkpoint(
             &mut batch,
             TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
-            cursor_bytes,
+            checkpoint,
         )?;
         store.write_consumer_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
         Ok(metadata)
@@ -1983,9 +1983,11 @@ pub enum TransparentAddressRankingConsumerError {
     /// Cursor-neutral tail application failed.
     #[error("transparent-address ranking snapshot tail failed: {0}")]
     SnapshotTail(String),
-    /// An already active generation does not own the requested event cursor.
-    #[error("transparent-address ranking active generation cursor does not match startup boundary")]
-    ActiveCursorMismatch,
+    /// An already active generation does not own the requested event checkpoint.
+    #[error(
+        "transparent-address ranking active generation checkpoint does not match startup boundary"
+    )]
+    ActiveCheckpointMismatch,
     /// One snapshot batch repeated an address hash.
     #[error("transparent-address ranking snapshot batch contains a duplicate address")]
     DuplicateSnapshotAddress,
@@ -2161,6 +2163,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            crate::store::test_construction_identity(zinder_core::Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
                 consumers: &[TRANSPARENT_ADDRESS_RANKING_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -2173,17 +2176,16 @@ mod tests {
     fn activate(
         store: &MaterializedViewStore,
         generation: u64,
-    ) -> Result<
-        super::TransparentAddressRankingMetadata,
-        super::TransparentAddressRankingConsumerError,
-    > {
+    ) -> TestResult<super::TransparentAddressRankingMetadata> {
         if TransparentAddressRankingConsumer::build_metadata(store)?.is_some() {
             TransparentAddressRankingConsumer::finalize_snapshot_base(store, generation)?;
         }
-        TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(
-            store,
-            generation,
-            &[9, 8, 7],
+        Ok(
+            TransparentAddressRankingConsumer::activate_snapshot_generation_at_checkpoint(
+                store,
+                generation,
+                crate::store::test_chain_event_checkpoint()?,
+            )?,
         )
     }
 
@@ -2574,13 +2576,13 @@ mod tests {
         TransparentAddressRankingConsumer::write_snapshot_tail_block(&store, 8, &block)?;
         assert!(
             store
-                .get_chain_event_cursor(super::TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
+                .chain_event_checkpoint(super::TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
                 .is_none()
         );
-        TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(
+        TransparentAddressRankingConsumer::activate_snapshot_generation_at_checkpoint(
             &store,
             8,
-            &[4, 5, 6],
+            crate::store::test_chain_event_checkpoint()?,
         )?;
         let mut consumer = TransparentAddressRankingConsumer::new();
         apply_and_commit(&store, &mut consumer, &block)?;

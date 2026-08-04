@@ -26,12 +26,13 @@ The decisions that govern this plane:
 ## Boundary
 
 `zinder-explorer` is an optional runtime over the shared query and storage
-libraries. It:
+libraries. Its service is optional in a deployment, but its Wallet and
+materialized-view inputs are mandatory once the service is selected. It:
 
-- **Consumes** the explorer materialized-view store through a process-owned RocksDB secondary when available, plus `WalletQuery` over gRPC for federated read paths.
+- **Consumes** one explorer materialized-view store through a process-owned RocksDB secondary plus one admitted `WalletQuery` endpoint over gRPC. Their exact canonical construction identities must match before any listener binds.
 - **Owns** no primary RocksDB. `storage.path` identifies the canonical root whose `materialized-views` subdirectory ingest owns, while `storage.secondary_path/materialized-views` holds the explorer's secondary metadata. The deployed binary does not open the canonical store.
 - **Produces** the `ExplorerQuery` gRPC service.
-- **Does not** open any primary store, custody wallet secrets, or serve wallet balance RPCs. It may parse transaction bytes through `zinder-source` and attach an optional cached upstream-health observation to freshness; neither is an authoritative chain-fact read.
+- **Does not** open any primary store, custody wallet secrets, or serve wallet balance RPCs. It may parse transaction bytes through `zinder-source` and attach an optional cached upstream-health observation to freshness; the Node endpoint never supplies activation authority, capability admission, or fallback chain facts.
 
 The boundary rules:
 
@@ -410,14 +411,14 @@ secondary_path = "/var/lib/zinder/explorer-secondary"
 [explorer]
 listen_addr = "127.0.0.1:9068"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
-wallet_query_endpoint = "https://zinder.example:9102"   # optional zinder-query gRPC endpoint
+wallet_query_endpoint = "https://zinder.example:9102"   # required admitted zinder-query gRPC endpoint
 
 [explorer.freshness]
 max_lag_blocks = 16              # response carries UNAVAILABLE_STALE beyond this
 warn_lag_blocks = 4              # readiness cause flips at this threshold
 ```
 
-When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The explorer's `wallet_query_endpoint` config points to an optional `zinder-query` endpoint for its wallet-composed reads (transaction detail, block views, search, mempool activity, and value pools).
+When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The required `wallet_query_endpoint` is admitted before bind: Explorer freezes its network, minimum contract revision, capabilities, and canonical construction binding, then exact-compares that binding with the materialized-view store. If Wallet advertises network-upgrade activations, Explorer fetches and fingerprint-validates that table on the admitted channel; absent activation capability leaves activation-dependent allocation to the capability phase and never falls back to Node discovery.
 
 Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-specific fields, plus the shared `ZINDER_OPS__*` prefix for the universal operational endpoint:
 
@@ -438,7 +439,7 @@ The explorer plane fails independently from canonical state.
   explorer state. The current release endpoint omits
   `WalletQuery.TransparentAddressBalance`; Explorer cannot depend on that
   primitive without a coherent canonical-and-mempool snapshot.
-- An explorer materialized view becoming inconsistent does not corrupt canonical state. Operators drop the materialized-view store and rebuild from retained canonical events. When the materialized-view store is absent, `zinder-explorer` starts with materialized-view-backed capabilities omitted.
+- An explorer materialized view becoming inconsistent does not corrupt canonical state. Explorer closes readiness and exits on terminal secondary catch-up failure. Operators select a fresh materialized-view path and rebuild it from retained canonical events; a missing, malformed, or lineage-mismatched store prevents the service from binding.
 - Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
 
 ## Cursor expiry contract

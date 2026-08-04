@@ -1,5 +1,8 @@
 //! Materialized-view preset storage contracts.
 
+use std::path::Path;
+
+use super::construction_identity;
 use eyre::Result;
 use tempfile::TempDir;
 use zinder_materialized_views::{
@@ -23,17 +26,36 @@ fn options() -> MaterializedViewStoreOptions {
     }
 }
 
+fn open_preset(
+    path: &Path,
+    preset: MaterializedViewPreset,
+) -> std::result::Result<MaterializedViewStore, MaterializedViewStoreError> {
+    MaterializedViewStore::open_with_materialized_view_preset(
+        path,
+        construction_identity()?,
+        preset,
+        options(),
+    )
+}
+
+fn open_with_options(
+    path: &Path,
+    options: MaterializedViewStoreOptions,
+) -> Result<MaterializedViewStore> {
+    Ok(MaterializedViewStore::open(
+        path,
+        construction_identity()?,
+        options,
+    )?)
+}
+
 #[test]
 fn wallet_preset_persists_only_wallet_materialized_view_schemas() -> Result<()> {
     let primary = TempDir::new()?;
     let secondary = TempDir::new()?;
 
     {
-        let store = MaterializedViewStore::open_with_materialized_view_preset(
-            primary.path(),
-            MaterializedViewPreset::Wallet,
-            options(),
-        )?;
+        let store = open_preset(primary.path(), MaterializedViewPreset::Wallet)?;
         store.consumer_column_family(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY)?;
         store.consumer_column_family(TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY)?;
         assert!(matches!(
@@ -57,16 +79,8 @@ fn persisted_workload_detection_distinguishes_wallet_explorer_and_missing_paths(
     let wallet = TempDir::new()?;
     let explorer = TempDir::new()?;
     let missing = TempDir::new()?;
-    MaterializedViewStore::open_with_materialized_view_preset(
-        wallet.path(),
-        MaterializedViewPreset::Wallet,
-        options(),
-    )?;
-    MaterializedViewStore::open_with_materialized_view_preset(
-        explorer.path(),
-        MaterializedViewPreset::Explorer,
-        options(),
-    )?;
+    open_preset(wallet.path(), MaterializedViewPreset::Wallet)?;
+    open_preset(explorer.path(), MaterializedViewPreset::Explorer)?;
 
     assert_eq!(
         MaterializedViewStore::detect_materialized_view_preset_at_path(wallet.path())?,
@@ -87,20 +101,12 @@ fn persisted_workload_detection_distinguishes_wallet_explorer_and_missing_paths(
 fn changing_a_persisted_materialized_view_preset_fails_before_manifest_mutation() -> Result<()> {
     let primary = TempDir::new()?;
     {
-        MaterializedViewStore::open_with_materialized_view_preset(
-            primary.path(),
-            MaterializedViewPreset::Wallet,
-            options(),
-        )?;
+        open_preset(primary.path(), MaterializedViewPreset::Wallet)?;
     }
     let column_families_before =
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
 
-    let outcome = MaterializedViewStore::open_with_materialized_view_preset(
-        primary.path(),
-        MaterializedViewPreset::Explorer,
-        options(),
-    );
+    let outcome = open_preset(primary.path(), MaterializedViewPreset::Explorer);
     assert!(matches!(
         outcome,
         Err(
@@ -113,11 +119,7 @@ fn changing_a_persisted_materialized_view_preset_fails_before_manifest_mutation(
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
     assert_eq!(column_families_after, column_families_before);
 
-    let store = MaterializedViewStore::open_with_materialized_view_preset(
-        primary.path(),
-        MaterializedViewPreset::Wallet,
-        options(),
-    )?;
+    let store = open_preset(primary.path(), MaterializedViewPreset::Wallet)?;
     assert!(matches!(
         store.consumer_column_family(BLOCK_SUMMARY_COLUMN_FAMILY),
         Err(MaterializedViewStoreError::ConsumerColumnFamilyMissing { name })
@@ -130,20 +132,12 @@ fn changing_a_persisted_materialized_view_preset_fails_before_manifest_mutation(
 fn reducing_explorer_to_wallet_fails_before_column_family_mutation() -> Result<()> {
     let primary = TempDir::new()?;
     {
-        MaterializedViewStore::open_with_materialized_view_preset(
-            primary.path(),
-            MaterializedViewPreset::Explorer,
-            options(),
-        )?;
+        open_preset(primary.path(), MaterializedViewPreset::Explorer)?;
     }
     let column_families_before =
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
 
-    let outcome = MaterializedViewStore::open_with_materialized_view_preset(
-        primary.path(),
-        MaterializedViewPreset::Wallet,
-        options(),
-    );
+    let outcome = open_preset(primary.path(), MaterializedViewPreset::Wallet);
     assert!(matches!(
         outcome,
         Err(
@@ -162,7 +156,7 @@ fn reducing_explorer_to_wallet_fails_before_column_family_mutation() -> Result<(
 fn explorer_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()> {
     let primary = TempDir::new()?;
     {
-        let store = MaterializedViewStore::open(
+        let store = open_with_options(
             primary.path(),
             MaterializedViewStoreOptions {
                 consumers: &[FOREIGN_SCHEMA],
@@ -170,7 +164,6 @@ fn explorer_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()
             },
         )?;
         store.put_consumer(FOREIGN_COLUMN_FAMILY, b"key", b"value")?;
-        store.put_chain_event_cursor(FOREIGN_CONSUMER_NAME, b"cursor")?;
     }
     let column_families_before =
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
@@ -187,7 +180,7 @@ fn explorer_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()
         rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), primary.path())?;
     assert_eq!(column_families_after, column_families_before);
 
-    let store = MaterializedViewStore::open(
+    let store = open_with_options(
         primary.path(),
         MaterializedViewStoreOptions {
             consumers: &[FOREIGN_SCHEMA],
@@ -197,10 +190,6 @@ fn explorer_preflight_rejects_a_foreign_consumer_without_mutation() -> Result<()
     assert_eq!(
         store.get_consumer(FOREIGN_COLUMN_FAMILY, b"key")?,
         Some(b"value".to_vec())
-    );
-    assert_eq!(
-        store.get_chain_event_cursor(FOREIGN_CONSUMER_NAME)?,
-        Some(b"cursor".to_vec())
     );
     Ok(())
 }

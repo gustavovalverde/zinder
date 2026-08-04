@@ -467,8 +467,11 @@ ZINDER_TEST_LIVE=1 \
 Currently-mainnet-only tests are:
 `fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
 `tip_id_advances_above_one_million`,
-`bulk_catchup_last_1000_blocks_from_checkpoint`, plus the transparent-address
-balance read-only confirmations under `services/zinder-explorer/tests/live/`.
+and `bulk_catchup_last_1000_blocks_from_checkpoint`. Explorer production proof
+uses the Gate F current-Zexplorer process workflow because the service now
+requires an admitted exact-pair Wallet endpoint and matching materialized-view
+construction before bind; the retired generic-Wallet federation fixtures could
+not exercise that contract.
 
 ## T3: Parity against a reference lightwalletd
 

@@ -102,6 +102,10 @@ hold the shared side of the catch-up barrier for the snapshot lifetime, so a
 catch-up cannot advance the underlying sequence halfway through a multi-read
 response.
 
+A terminal secondary catch-up failure fences every later direct and snapshot
+read before releasing the exclusive catch-up barrier. The process must open a
+fresh secondary before it can serve materialized-view rows again.
+
 ## Replay and coverage
 
 The host feeds retained `ChainEventEnvelope` values in order, hydrates the
@@ -140,6 +144,16 @@ in [ADR-0028](../adrs/0028-materialized-view-schema-versioning.md).
 Persisted keys use codecs from `zinder-core::wire`. Heights, positions,
 timestamps, address script hashes, and outpoints are not encoded ad hoc inside
 consumers.
+
+Fresh format-10 stores persist the canonical construction identity alongside
+the exact consumer manifest in the initialization batch. Each selected block
+or event-only chain consumer owns a typed checkpoint containing its canonical
+event cursor and the event's exact resulting `CanonicalEventFence`; rows and
+that checkpoint advance in the same final batch. Ingest authenticates every
+persisted checkpoint against the admitted canonical secondary before replay.
+A missing retained event requires equivalent authenticated prefix evidence;
+sequence-only recovery is rejected. Construction or checkpoint mismatch
+requires a fresh store and certified rebuild rather than an in-place repair.
 
 Each block-keyed consumer must be able to delete exactly the rows produced by a
 reverted block. Height-prefixed layouts use bounded range deletes. Layouts
