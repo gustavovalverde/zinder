@@ -1,0 +1,6 @@
+kind: changed
+body: Explorer now rejects wallet and materialized-view stores that were built from different canonical constructions, even when their network and visible chain state match. Existing wallet projections and materialized-view stores must be rebuilt on fresh paths before use with this release.
+time: 2026-08-10T16:04:26Z
+custom:
+  Bump: minor
+  PR: "74"
