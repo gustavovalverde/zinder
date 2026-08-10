@@ -5828,6 +5828,7 @@ dependencies = [
  "config",
  "eyre",
  "hex",
+ "parking_lot",
  "prost",
  "serde",
  "serde_json",
@@ -5853,6 +5854,8 @@ dependencies = [
  "zinder-source",
  "zinder-store",
  "zinder-testkit",
+ "zinder-wallet-projection",
+ "zinder-wallet-rocksdb",
 ]
 
 [[package]]

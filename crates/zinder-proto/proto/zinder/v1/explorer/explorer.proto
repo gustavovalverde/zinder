@@ -457,8 +457,8 @@ message BlockSummariesInRangeRequest {
   // Last block height to return (inclusive).
   uint32 end_height = 2;
 
-  // Optional chain-epoch id pin for snapshot consistency with concurrent reads.
-  optional uint64 at_epoch_id = 3;
+  reserved 3;
+  reserved "at_epoch_id";
 }
 
 // `ExplorerQuery.BlockSummariesInRange` response.
@@ -1078,10 +1078,9 @@ message TransactionVersionCount {
 
 // `ExplorerQuery.MempoolSummary` request.
 //
-// Optionally pins the read to a specific chain epoch so the response
-// stays consistent with concurrent reads.
 message MempoolSummaryRequest {
-  optional uint64 at_epoch_id = 1;
+  reserved 1;
+  reserved "at_epoch_id";
 }
 
 // `ExplorerQuery.MempoolSummary` response.
@@ -1187,9 +1186,9 @@ message MempoolActivityEntry {
   uint64 zip317_conventional_fee_zat = 6;
 
   // Actual paid fee, in zatoshis. Populated when the explorer advertises
-  // `EXPLORER_TRANSACTION_FEES_V1` and the wallet plane's mempool prevout
-  // index resolved every transparent input for this entry. Absent
-  // otherwise; consumers fall back to `zip317_conventional_fee_zat`.
+  // `EXPLORER_TRANSACTION_FEES_V1` and the retained transaction-fee
+  // materialized view contains a row for this entry. Absent otherwise;
+  // consumers fall back to `zip317_conventional_fee_zat`.
   optional uint64 paid_fee_zat = 7;
 
   // ZIP-317 logical-action count for this entry. The fee floor formula's
@@ -1540,8 +1539,8 @@ message MigrationCohortsRequest {
   // the `MAX_BLOCK_SUMMARIES_PER_REQUEST`-style caps elsewhere on this surface.
   uint32 end_height = 2;
 
-  // Optional chain-epoch id pin for snapshot consistency with concurrent reads.
-  optional uint64 at_epoch_id = 3;
+  reserved 3;
+  reserved "at_epoch_id";
 }
 
 // One anchor-sharing migration cohort.
@@ -1601,8 +1600,8 @@ message MigrationDenominationsRequest {
   // the `MAX_BLOCK_SUMMARIES_PER_REQUEST`-style caps elsewhere on this surface.
   uint32 end_height = 2;
 
-  // Optional chain-epoch id pin for snapshot consistency with concurrent reads.
-  optional uint64 at_epoch_id = 3;
+  reserved 3;
+  reserved "at_epoch_id";
 }
 
 // One power-of-ten denomination bucket.
@@ -1878,7 +1877,7 @@ service ExplorerQuery {
 
   // Returns one `BlockSummary` per canonical block in the requested
   // height range, ordered by ascending height. Capability:
-  // `explorer.block.summary_v1`.
+  // `explorer.block.summary_v2`.
   rpc BlockSummariesInRange(BlockSummariesInRangeRequest)
       returns (BlockSummariesInRangeResponse);
 
@@ -1937,7 +1936,7 @@ service ExplorerQuery {
   // Aggregates the current mempool snapshot into a single explorer-shaped
   // response: total counts, byte size, privacy-shape distribution,
   // version distribution, and freshness extremes. Capability:
-  // `explorer.mempool.summary_v1`.
+  // `explorer.mempool.summary_v2`.
   rpc MempoolSummary(MempoolSummaryRequest) returns (MempoolSummaryResponse);
 
   // Returns aggregate facts and one page from the same observed mempool
@@ -2068,7 +2067,7 @@ service ExplorerQuery {
       returns (stream RecentTransactionsChunk);
 
   // Returns one filtered, newest-first page of canonical transaction history.
-  // Capability: `explorer.transaction.history_v1`.
+  // Capability: `explorer.transaction.history_v2`.
   rpc TransactionHistory(TransactionHistoryRequest)
       returns (TransactionHistoryResponse);
 

@@ -24,8 +24,8 @@ use tonic::transport::Server;
 use zinder_core::{BlockHeight, Network};
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalIngestControlGrpcAdapter,
-    CanonicalPipelineLimits, CanonicalWriterConfig, LiveMempoolOwner, canonical_control_channel,
-    run_canonical_writer_with_control,
+    CanonicalPipelineLimits, CanonicalWriterConfig, IngestControlNodeComposition, LiveMempoolOwner,
+    canonical_control_channel, run_canonical_writer_with_control,
 };
 use zinder_proto::v1::{
     ingest::ingest_control_client::IngestControlClient,
@@ -119,11 +119,11 @@ async fn canonical_writer_publishes_visible_reorg_for_invalidated_zebra_suffix()
     let address = listener.local_addr()?;
     let server_cancel = cancel.clone();
     let node_source: Arc<dyn NodeSource> = Arc::new(source.clone());
+    let node = IngestControlNodeComposition::new(env.network(), node_source);
     let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
-        env.network(),
         canonical,
         LiveMempoolOwner::default(),
-        node_source,
+        node,
         readiness,
     );
     let server = tokio::spawn(async move {

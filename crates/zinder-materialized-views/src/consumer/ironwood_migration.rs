@@ -46,11 +46,12 @@ use zinder_core::wire::{HEIGHT_KEY_LEN, encode_height_key_ascending};
 use zinder_core::{BlockHeight, TransactionFactsArtifact, TransactionId};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
-    MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockProjection,
+    MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
+    MaterializedViewConsumerSchema, stage_block_keyed_consumer_state,
 };
 use crate::error::{MaterializedViewStoreColumnFamily, MaterializedViewStoreError};
-use crate::store::MaterializedViewStore;
+use crate::store::{MaterializedViewStore, MaterializedViewStoreReadSnapshot};
 
 /// Column family holding one cumulative running-total record per block.
 ///
@@ -228,6 +229,29 @@ impl IronwoodMigrationConsumer {
         }
     }
 
+    /// Returns cumulative pool totals from one immutable read snapshot at
+    /// `height`, or the nearest earlier materialized height.
+    ///
+    /// This is the snapshot-pinned counterpart of
+    /// [`Self::read_pool_totals_at_or_before`]. Callers reading migration rows
+    /// and pool totals together must use it to avoid combining different
+    /// materialized-view revisions.
+    pub fn read_pool_totals_at_or_before_snapshot(
+        snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+        height: BlockHeight,
+    ) -> Result<Option<MigrationPoolTotals>, MaterializedViewStoreError> {
+        if let Some(payload) = snapshot.get_consumer(
+            IRONWOOD_MIGRATION_POOL_TOTALS_COLUMN_FAMILY,
+            &encode_height_key_ascending(height),
+        )? {
+            return Ok(Some(decode_pool_totals_value(height.value(), &payload)?));
+        }
+        match Self::read_latest_pool_totals_snapshot(snapshot)? {
+            Some(latest) if latest.block_height < height.value() => Ok(Some(latest)),
+            _ => Ok(None),
+        }
+    }
+
     /// Returns the cumulative pool totals at the highest materialized block, or
     /// `None` when no block has been materialized yet.
     pub fn read_latest_pool_totals(
@@ -235,6 +259,20 @@ impl IronwoodMigrationConsumer {
     ) -> Result<Option<MigrationPoolTotals>, MaterializedViewStoreError> {
         let Some((key, payload)) =
             store.last_consumer_entry(IRONWOOD_MIGRATION_POOL_TOTALS_COLUMN_FAMILY)?
+        else {
+            return Ok(None);
+        };
+        let height = decode_height_key(&key)?;
+        Ok(Some(decode_pool_totals_value(height, &payload)?))
+    }
+
+    /// Returns the latest cumulative pool totals visible in one immutable read
+    /// snapshot, or `None` when no totals row has been materialized.
+    pub fn read_latest_pool_totals_snapshot(
+        snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+    ) -> Result<Option<MigrationPoolTotals>, MaterializedViewStoreError> {
+        let Some((key, payload)) =
+            snapshot.last_consumer_entry(IRONWOOD_MIGRATION_POOL_TOTALS_COLUMN_FAMILY)?
         else {
             return Ok(None);
         };
@@ -256,6 +294,33 @@ impl IronwoodMigrationConsumer {
         let start_key = migration_key(start_height, 0);
         let end_key = migration_key(end_height, u32::MAX);
         let entries = store.range_iterate_consumer(
+            IRONWOOD_MIGRATIONS_COLUMN_FAMILY,
+            &start_key,
+            &end_key,
+            limit,
+        )?;
+        let mut migrations = Vec::with_capacity(entries.len());
+        for (key, payload) in entries {
+            migrations.push(decode_migration(&key, &payload)?);
+        }
+        Ok(migrations)
+    }
+
+    /// Returns migration rows in `[start_height, end_height]` from one
+    /// immutable read snapshot, in ascending `(height, transaction index)`
+    /// order and capped at `limit` rows.
+    pub fn read_migrations_in_range_snapshot(
+        snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+        start_height: BlockHeight,
+        end_height: BlockHeight,
+        limit: usize,
+    ) -> Result<Vec<Migration>, MaterializedViewStoreError> {
+        if limit == 0 || end_height.value() < start_height.value() {
+            return Ok(Vec::new());
+        }
+        let start_key = migration_key(start_height, 0);
+        let end_key = migration_key(end_height, u32::MAX);
+        let entries = snapshot.range_iterate_consumer(
             IRONWOOD_MIGRATIONS_COLUMN_FAMILY,
             &start_key,
             &end_key,
@@ -386,6 +451,14 @@ impl BlockKeyedConsumer for IronwoodMigrationConsumer {
             migration_range_end(height).as_slice(),
         );
         Ok(())
+    }
+
+    fn stage_block_projection_state(
+        &mut self,
+        checkpoint: MaterializedViewBlockProjection<'_>,
+        ctx: &mut MaterializedViewConsumerCtx<'_>,
+    ) -> Result<(), MaterializedViewConsumerError> {
+        stage_block_keyed_consumer_state(IRONWOOD_MIGRATION_CONSUMER_NAME, checkpoint, ctx)
     }
 }
 

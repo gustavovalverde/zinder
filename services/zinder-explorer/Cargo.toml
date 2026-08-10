@@ -14,6 +14,7 @@ publish.workspace = true
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
+parking_lot.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
@@ -55,3 +56,5 @@ tracing.workspace = true
 zinder-ingest.workspace = true
 zinder-query.workspace = true
 zinder-testkit.workspace = true
+zinder-wallet-projection.workspace = true
+zinder-wallet-rocksdb.workspace = true

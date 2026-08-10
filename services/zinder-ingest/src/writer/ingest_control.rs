@@ -18,7 +18,15 @@ use zinder_core::{
     wire::{decode_rpc_transaction_id_hex, encode_zinder_native_chain_name},
 };
 use zinder_proto::{
-    capabilities::{CapabilitySurface, capabilities_for_surface},
+    capabilities::{
+        INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1, INGEST_CONTROL_MEMPOOL_EVENTS_V2,
+        INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3, INGEST_CONTROL_MEMPOOL_TRANSACTION_V2,
+        INGEST_CONTROL_SERVER_INFO_V1, INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
+        INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
+        INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
+        INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1, INGEST_CONTROL_WRITER_STATUS_V1,
+        INGEST_WRITER_PHASE_V1,
+    },
     v1::{
         ingest::{
             MempoolTransactionRequest, ServerInfoRequest, ServerInfoResponse, WriterPhase,
@@ -55,34 +63,94 @@ const MAX_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES: u32 = 1_024;
 const CANONICAL_EVENT_PAGE_SIZE: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
 const EVENT_STREAM_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Capabilities implemented by every admitted `IngestControl` composition.
+///
+/// This list is deliberately endpoint-owned rather than registry-derived: a
+/// vocabulary-only protocol addition must not become a production claim until
+/// the concrete composition explicitly adopts it.
+const INGEST_CONTROL_REQUIRED_CAPABILITIES: [&str; 10] = [
+    INGEST_CONTROL_SERVER_INFO_V1,
+    INGEST_CONTROL_WRITER_STATUS_V1,
+    INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1,
+    INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
+    INGEST_CONTROL_MEMPOOL_TRANSACTION_V2,
+    INGEST_CONTROL_MEMPOOL_EVENTS_V2,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
+    INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
+    INGEST_WRITER_PHASE_V1,
+];
+
+/// One node source and the immutable `IngestControl` contract derived from it.
+///
+/// Production constructs this composition only after node capability
+/// admission. Capability identifiers are frozen from the owned source at
+/// construction, so callers cannot pair one source with another source's
+/// evidence. The same allocation supplies both the operational endpoint and
+/// native `ServerInfo`.
+#[derive(Clone)]
+pub struct IngestControlNodeComposition {
+    network: Network,
+    node_source: Arc<dyn NodeSource>,
+    advertised_identifiers: Arc<[&'static str]>,
+}
+
+impl IngestControlNodeComposition {
+    /// Owns an admitted source and freezes the endpoint contract it supports.
+    ///
+    pub fn new(network: Network, node_source: Arc<dyn NodeSource>) -> Self {
+        let admitted_node_capabilities = node_source.capabilities();
+        let chain_value_pools_supported =
+            admitted_node_capabilities.supports(NodeCapability::ChainValuePools);
+        let mut advertised_identifiers = INGEST_CONTROL_REQUIRED_CAPABILITIES.to_vec();
+        if chain_value_pools_supported {
+            advertised_identifiers.push(INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1);
+        }
+        Self {
+            network,
+            node_source,
+            advertised_identifiers: advertised_identifiers.into(),
+        }
+    }
+
+    /// Shares the exact immutable capability identifiers used by every
+    /// endpoint exposed by this runtime.
+    #[must_use]
+    pub fn advertised_capabilities(&self) -> Arc<[&'static str]> {
+        Arc::clone(&self.advertised_identifiers)
+    }
+
+    fn supports_chain_value_pools(&self) -> bool {
+        self.advertised_identifiers
+            .contains(&INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1)
+    }
+}
+
 /// Version-1 adapter for query and compatibility clients that consume the
 /// ingest writer's control plane.
 #[derive(Clone)]
 pub struct CanonicalIngestControlGrpcAdapter {
-    network: Network,
     canonical: CanonicalControlHandle,
     mempool: LiveMempoolOwner,
-    node_source: Arc<dyn NodeSource>,
+    node: IngestControlNodeComposition,
     bearer_token: Option<BearerToken>,
     readiness: Readiness,
 }
 
 impl CanonicalIngestControlGrpcAdapter {
     /// Binds one canonical writer command channel, one live mempool owner,
-    /// and the source handle already owned by the ingest runtime.
+    /// and the admitted node composition already owned by the ingest runtime.
     #[must_use]
     pub fn new(
-        network: Network,
         canonical: CanonicalControlHandle,
         mempool: LiveMempoolOwner,
-        node_source: Arc<dyn NodeSource>,
+        node: IngestControlNodeComposition,
         readiness: Readiness,
     ) -> Self {
         Self {
-            network,
             canonical,
             mempool,
-            node_source,
+            node,
             bearer_token: None,
             readiness,
         }
@@ -107,15 +175,9 @@ impl CanonicalIngestControlGrpcAdapter {
         InterceptedService::new(server, interceptor)
     }
 
-    fn advertised_capabilities(&self) -> Vec<String> {
-        let chain_value_pools_supported = self
-            .node_source
-            .capabilities()
-            .supports(NodeCapability::ChainValuePools);
-        capabilities_for_surface(CapabilitySurface::Ingest)
-            .filter(|spec| spec.policy.ingest_satisfied(chain_value_pools_supported))
-            .map(|spec| spec.string.to_owned())
-            .collect()
+    #[cfg(test)]
+    fn advertised_capabilities(&self) -> Arc<[&'static str]> {
+        self.node.advertised_capabilities()
     }
 
     async fn current_chain_epoch(&self) -> Result<CanonicalWriterSnapshot, Status> {
@@ -134,11 +196,16 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
     ) -> Result<Response<ServerInfoResponse>, Status> {
         Ok(Response::new(ServerInfoResponse {
             server_info: Some(ops::ServerInfo {
-                network: encode_zinder_native_chain_name(self.network).to_owned(),
+                network: encode_zinder_native_chain_name(self.node.network).to_owned(),
                 service_name: env!("CARGO_PKG_NAME").to_owned(),
                 service_version: env!("CARGO_PKG_VERSION").to_owned(),
                 build_git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
-                capabilities: self.advertised_capabilities(),
+                capabilities: self
+                    .node
+                    .advertised_identifiers
+                    .iter()
+                    .map(|capability| (*capability).to_owned())
+                    .collect(),
                 contract_revision: zinder_proto::CONTRACT_REVISION,
                 materialized_view_preset: String::new(),
                 materialized_view_identities: Vec::new(),
@@ -152,7 +219,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
     ) -> Result<Response<WriterStatusResponse>, Status> {
         let snapshot = self.current_chain_epoch().await?;
         Ok(Response::new(writer_status_response(
-            self.network,
+            self.node.network,
             snapshot.chain_epoch,
             &self.readiness.report(),
         )))
@@ -348,17 +415,14 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         _request: Request<wallet::ChainValuePoolsAtTipRequest>,
     ) -> Result<Response<wallet::ChainValuePoolsAtTipResponse>, Status> {
-        if !self
-            .node_source
-            .capabilities()
-            .supports(NodeCapability::ChainValuePools)
-        {
+        if !self.node.supports_chain_value_pools() {
             return Err(Status::unimplemented(
                 "upstream node does not advertise chain_value_pools",
             ));
         }
         let snapshot = self.current_chain_epoch().await?;
         let value_pools = self
+            .node
             .node_source
             .fetch_chain_value_pools_at_tip()
             .await
@@ -649,10 +713,13 @@ mod tests {
         ChainEpochId, ChainTipMetadata, ChainValuePool, ChainValuePools, CompactTransactionData,
         CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolObservation,
         RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, TransactionId,
-        UnixTimestampMillis, wire::encode_rpc_transaction_id_hex,
+        UnixTimestampMillis,
+        wire::{encode_rpc_transaction_id_hex, encode_zinder_native_chain_name},
     };
     use zinder_proto::{
-        capabilities::INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1,
+        capabilities::{
+            INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1, INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1,
+        },
         v1::{
             ingest::{
                 CanonicalWriterStatusRequest, MempoolTransactionRequest, ServerInfoRequest,
@@ -670,8 +737,7 @@ mod tests {
     };
     use zinder_runtime::{BearerToken, IngestPhase, Readiness, ReadinessState};
     use zinder_source::{
-        NodeAuth, NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError,
-        SourceSubtreeRoots, ZebraJsonRpcSource,
+        NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceSubtreeRoots,
     };
     use zinder_store::{
         CanonicalEventCursor, CanonicalEventKind, EventStreamStartPosition, MempoolEvent,
@@ -686,7 +752,10 @@ mod tests {
         },
     };
 
-    use super::{CanonicalIngestControlGrpcAdapter, canonical_event_message};
+    use super::{
+        CanonicalIngestControlGrpcAdapter, INGEST_CONTROL_REQUIRED_CAPABILITIES,
+        IngestControlNodeComposition, canonical_event_message,
+    };
 
     #[test]
     fn tip_reorg_wire_event_names_the_exact_previous_epoch()
@@ -1051,26 +1120,46 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = shared_control_fixture().await?;
         let expected_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        let admitted_node = NodeCapabilities::new([NodeCapability::ChainValuePools])?;
         let source = StaticValuePoolSource {
-            capabilities: NodeCapabilities::new([NodeCapability::ChainValuePools])?,
+            capabilities: admitted_node,
             value_pools: ChainValuePools::new(
                 BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x42; 32])),
                 vec![ChainValuePool::new("transparent", true, Some(1_000))],
             ),
         };
+        let node_source: Arc<dyn NodeSource> = Arc::new(source);
+        let node_composition =
+            IngestControlNodeComposition::new(zinder_core::Network::ZcashTestnet, node_source);
+        let operational_capabilities = node_composition.advertised_capabilities();
         let adapter = CanonicalIngestControlGrpcAdapter::new(
-            zinder_core::Network::ZcashTestnet,
             fixture.canonical.clone(),
             fixture.mempool.clone(),
-            Arc::new(source),
+            node_composition,
             Readiness::default(),
         );
+        let advertised_capabilities = adapter.advertised_capabilities();
+        assert!(Arc::ptr_eq(
+            &operational_capabilities,
+            &adapter.advertised_capabilities(),
+        ));
 
         let server_info = IngestControl::server_info(&adapter, Request::new(ServerInfoRequest {}))
             .await?
             .into_inner()
             .server_info
             .ok_or("ingest server info was absent")?;
+        assert_eq!(
+            server_info.network,
+            encode_zinder_native_chain_name(zinder_core::Network::ZcashTestnet)
+        );
+        assert_eq!(
+            server_info.capabilities,
+            advertised_capabilities
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect::<Vec<_>>(),
+        );
         assert!(server_info.capabilities.iter().any(|capability| {
             capability == zinder_proto::capabilities::INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1
         }));
@@ -1100,6 +1189,47 @@ mod tests {
         fixture.shutdown().await
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adapter_omits_and_rejects_value_pools_without_admitted_node_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = shared_control_fixture().await?;
+        let node_source: Arc<dyn NodeSource> = Arc::new(StaticValuePoolSource {
+            capabilities: NodeCapabilities::new([])?,
+            value_pools: ChainValuePools::new(
+                BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x42; 32])),
+                Vec::new(),
+            ),
+        });
+        let node_composition =
+            IngestControlNodeComposition::new(zinder_core::Network::ZcashTestnet, node_source);
+        assert_eq!(
+            node_composition.advertised_capabilities().as_ref(),
+            INGEST_CONTROL_REQUIRED_CAPABILITIES,
+            "registry vocabulary must not broaden the endpoint-owned required contract"
+        );
+        assert!(
+            !node_composition
+                .advertised_capabilities()
+                .contains(&INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1)
+        );
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            fixture.canonical.clone(),
+            fixture.mempool.clone(),
+            node_composition,
+            Readiness::default(),
+        );
+        let status = IngestControl::chain_value_pools_at_tip(
+            &adapter,
+            Request::new(zinder_proto::v1::wallet::ChainValuePoolsAtTipRequest {}),
+        )
+        .await
+        .err()
+        .ok_or("value-pool method unexpectedly served without its admitted capability")?;
+        assert_eq!(status.code(), Code::Unimplemented);
+
+        fixture.shutdown().await
+    }
+
     /// Writer status derives its epoch from the canonical owner and its phase
     /// and upstream gap from readiness, without opening a second store.
     #[tokio::test(flavor = "multi_thread")]
@@ -1113,17 +1243,19 @@ mod tests {
             ReadinessState::syncing(Some(2), Some(visible_height), Some(upstream_height))
                 .with_phase(IngestPhase::BulkCatchup),
         );
-        let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
-            zinder_core::Network::ZcashTestnet,
-            "http://127.0.0.1:1",
-            NodeAuth::None,
-            Duration::from_secs(1),
-        )?);
+        let source: Arc<dyn NodeSource> = Arc::new(StaticValuePoolSource {
+            capabilities: NodeCapabilities::default(),
+            value_pools: ChainValuePools::new(
+                BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x42; 32])),
+                Vec::new(),
+            ),
+        });
+        let node_composition =
+            IngestControlNodeComposition::new(zinder_core::Network::ZcashTestnet, source);
         let adapter = CanonicalIngestControlGrpcAdapter::new(
-            zinder_core::Network::ZcashTestnet,
             fixture.canonical.clone(),
             fixture.mempool.clone(),
-            source,
+            node_composition,
             readiness,
         );
 
@@ -1237,12 +1369,13 @@ mod tests {
         let _certification = owner.try_complete_hydration(&canonical, source_tip).await?;
 
         let bearer_token = BearerToken::from_str("fixture-control-token")?;
-        let node_source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
-            zinder_core::Network::ZcashTestnet,
-            "http://127.0.0.1:1",
-            NodeAuth::None,
-            Duration::from_secs(1),
-        )?);
+        let node_source: Arc<dyn NodeSource> = Arc::new(StaticValuePoolSource {
+            capabilities: NodeCapabilities::default(),
+            value_pools: ChainValuePools::new(
+                BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x42; 32])),
+                Vec::new(),
+            ),
+        });
         let readiness = Readiness::new(ReadinessState::ready(Some(1)));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let listen_addr = listener.local_addr()?;
@@ -1254,11 +1387,12 @@ mod tests {
             RocksDbResourceBudget::for_local_tests(),
         )
         .with_bearer_token(Some(bearer_token.clone()));
+        let node_composition =
+            IngestControlNodeComposition::new(zinder_core::Network::ZcashTestnet, node_source);
         let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
-            zinder_core::Network::ZcashTestnet,
             canonical.clone(),
             owner.clone(),
-            node_source,
+            node_composition,
             readiness,
         )
         .with_bearer_token(Some(bearer_token));

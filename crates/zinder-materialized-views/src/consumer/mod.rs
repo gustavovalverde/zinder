@@ -50,7 +50,7 @@ pub use commitment_root_search::{
     CommitmentRootSearchConsumerError,
 };
 
-use crate::store::{MaterializedViewCoverage, MaterializedViewStore};
+use crate::store::{MaterializedViewCoverage, MaterializedViewState, MaterializedViewStore};
 
 /// Stable name of a materialized-view consumer used to scope cursor and metadata rows.
 ///
@@ -218,6 +218,77 @@ pub(crate) fn advance_verified_materialized_view_coverage(
         }
         _ => Some(coverage),
     }
+}
+
+/// Stages the common epoch, revision, and verified-coverage metadata for one
+/// block-keyed consumer in the same batch as its rows.
+///
+/// A consumer opts into this helper explicitly from its
+/// [`BlockKeyedConsumer::stage_block_projection_state`] implementation. The
+/// helper neither selects consumers nor interprets their rows; it only keeps
+/// their durable read fence atomic with the already-owned write batch.
+pub(crate) fn stage_block_keyed_consumer_state(
+    consumer: MaterializedViewConsumerName,
+    checkpoint: MaterializedViewBlockProjection<'_>,
+    ctx: &mut MaterializedViewConsumerCtx<'_>,
+) -> Result<(), MaterializedViewConsumerError> {
+    let tip_height = checkpoint.tip_height.ok_or_else(|| {
+        Box::new(MaterializedViewConsumerStateError::IncompleteCheckpoint {
+            consumer: consumer.as_str(),
+        }) as MaterializedViewConsumerError
+    })?;
+    let tip_hash = checkpoint.tip_hash.ok_or_else(|| {
+        Box::new(MaterializedViewConsumerStateError::IncompleteCheckpoint {
+            consumer: consumer.as_str(),
+        }) as MaterializedViewConsumerError
+    })?;
+    let current = ctx.store.consumer_state(consumer)?;
+    if let Some(state) = current
+        && matches!(checkpoint.chain_event, ChainEvent::ChainCommitted { .. })
+        && tip_height < state.tip_height
+    {
+        return Ok(());
+    }
+    let revision = current
+        .map_or(Some(1), |state| state.revision.checked_add(1))
+        .ok_or_else(|| {
+            Box::new(MaterializedViewConsumerStateError::RevisionOverflow {
+                consumer: consumer.as_str(),
+            }) as MaterializedViewConsumerError
+        })?;
+    let initial_complete_from = match checkpoint.chain_event {
+        ChainEvent::ChainCommitted { committed } | ChainEvent::ChainReorged { committed, .. } => {
+            Some(committed.block_range.start)
+        }
+        _ => None,
+    };
+    let coverage = advance_verified_materialized_view_coverage(
+        current.and_then(|state| state.coverage),
+        checkpoint,
+        tip_height,
+        tip_hash,
+        initial_complete_from,
+    );
+    ctx.store.stage_consumer_state(
+        ctx.batch,
+        consumer,
+        MaterializedViewState {
+            chain_epoch_id: checkpoint.chain_epoch.id,
+            tip_height,
+            tip_hash,
+            revision,
+            coverage,
+        },
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+enum MaterializedViewConsumerStateError {
+    #[error("{consumer} received an incomplete materialized-view checkpoint")]
+    IncompleteCheckpoint { consumer: &'static str },
+    #[error("{consumer} materialized-view revision overflowed")]
+    RevisionOverflow { consumer: &'static str },
 }
 
 /// Typed wrapper for a `ChainCommitted` chain event delivered to a consumer.

@@ -23,7 +23,7 @@ use zinder_core::{
 };
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_DETAIL_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
-    EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1, EXPLORER_BLOCK_SUMMARY_V1,
+    EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1, EXPLORER_BLOCK_SUMMARY_V2,
     EXPLORER_BLOCK_TRANSACTIONS_V2,
 };
 use zinder_proto::v1::explorer::{
@@ -43,7 +43,8 @@ use zinder_runtime::AuthenticatedChannel;
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
-    build_explorer_freshness_from_snapshot,
+    build_explorer_freshness_from_snapshot, pin_wallet_to_block_summary_snapshot,
+    require_block_summary_range_coverage,
 };
 use super::require_matching_chain_epoch;
 use super::transaction_detail::encode_public_facts;
@@ -97,6 +98,10 @@ struct MaterializedProductionTimePage {
     read_fence: BlockProductionTimeRangeReadFence,
 }
 
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the Wallet-pinned snapshot must span every summary read and the response freshness fence"
+)]
 pub(crate) async fn query_block_summaries_in_range(
     materialized_view_store: &MaterializedViewStore,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
@@ -108,23 +113,29 @@ pub(crate) async fn query_block_summaries_in_range(
     let end_height = inner.end_height;
     validate_block_view_range(start_height, end_height)?;
 
-    let (chain_epoch, canonical_tip) = read_canonical_tip(wallet_client).await?;
-    let mut summaries =
-        read_materialized_block_summaries(materialized_view_store, start_height, end_height)?;
-    for summary in &mut summaries {
-        annotate_request_time_fields(summary, canonical_tip);
-    }
-
-    let freshness = attach_upstream_observation(
-        upstream_observation_cache,
-        build_explorer_freshness(
-            Some(materialized_view_store),
-            EXPLORER_BLOCK_SUMMARY_V1,
-            Some(chain_epoch),
+    let (summaries, freshness) = {
+        let pinned_snapshot =
+            pin_wallet_to_block_summary_snapshot(materialized_view_store, wallet_client).await?;
+        let state = pinned_snapshot.block_summary_state();
+        require_block_summary_range_coverage(state, start_height, end_height)?;
+        let mut summaries = read_materialized_block_summaries_snapshot(
+            pinned_snapshot.snapshot(),
+            start_height,
+            end_height,
+            state,
+        )?;
+        for summary in &mut summaries {
+            annotate_request_time_fields(summary, state.tip_height.value());
+        }
+        let freshness = build_explorer_freshness_from_snapshot(
+            pinned_snapshot.snapshot(),
+            EXPLORER_BLOCK_SUMMARY_V2,
+            Some(pinned_snapshot.wallet_chain_epoch().clone()),
             0,
-        )?,
-    )
-    .await;
+        )?;
+        (summaries, freshness)
+    };
+    let freshness = attach_upstream_observation(upstream_observation_cache, freshness).await;
 
     Ok(Response::new(BlockSummariesInRangeResponse {
         freshness: Some(freshness),
@@ -686,17 +697,52 @@ fn validate_block_view_range(start_height: u32, end_height: u32) -> Result<u32, 
     Ok(u32::try_from(span).unwrap_or(MAX_BLOCK_SUMMARIES_PER_REQUEST))
 }
 
-fn read_materialized_block_summaries(
-    materialized_view_store: &MaterializedViewStore,
+fn read_materialized_block_summaries_snapshot(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     start_height: u32,
     end_height: u32,
+    state: MaterializedViewState,
 ) -> Result<Vec<BlockSummary>, Status> {
-    read_materialized_block_records(materialized_view_store, start_height, end_height)?
+    let heights = (start_height..=end_height).collect::<Vec<_>>();
+    let keys = heights
+        .iter()
+        .map(|height| encode_height_key_ascending(BlockHeight::new(*height)))
+        .collect::<Vec<_>>();
+    snapshot
+        .multi_get_consumer(BLOCK_SUMMARY_COLUMN_FAMILY, &keys)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?
         .into_iter()
-        .map(|record| {
-            record
+        .zip(heights)
+        .map(|(payload, expected_height)| {
+            let payload = payload.ok_or_else(|| {
+                ExplorerError::not_materialized(format!(
+                    "BlockSummary is not materialized for height {expected_height}"
+                ))
+            })?;
+            let record = BlockSummaryRecord::decode(payload.as_slice()).map_err(|error| {
+                ExplorerError::internal(format!("BlockSummaryRecord decode failed: {error}"))
+            })?;
+            let summary = record
                 .summary
-                .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing").into())
+                .ok_or_else(|| ExplorerError::internal("BlockSummaryRecord.summary missing"))
+                .map_err(Status::from)?;
+            if summary.block_height != expected_height {
+                return Err(ExplorerError::internal(format!(
+                    "BlockSummaryRecord at height {expected_height} carries height {}",
+                    summary.block_height
+                ))
+                .into());
+            }
+            if expected_height == state.tip_height.value()
+                && summary.block_hash
+                    != zinder_core::wire::encode_rpc_block_hash_hex(state.tip_hash)
+            {
+                return Err(ExplorerError::unsatisfied_precondition(
+                    "block-summary tip row does not match its materialized-view state",
+                )
+                .into());
+            }
+            Ok(summary)
         })
         .collect()
 }

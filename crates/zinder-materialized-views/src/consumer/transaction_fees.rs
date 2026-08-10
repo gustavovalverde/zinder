@@ -44,9 +44,11 @@ use zinder_proto::v1::explorer::{
 use zinder_store::{ChainEpochReader, StoreError};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
-    MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockProjection,
+    MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
+    MaterializedViewConsumerSchema, stage_block_keyed_consumer_state,
 };
+use crate::store::MaterializedViewStoreReadSnapshot;
 
 /// Column family holding per-transaction fee records keyed by 32-byte txid.
 pub const TRANSACTION_FEES_COLUMN_FAMILY: &str = "transaction_fees";
@@ -128,6 +130,40 @@ impl TransactionFeesConsumer {
             .map(|(transaction_id, _privacy_shape)| encode_internal_transaction_id(*transaction_id))
             .collect();
         let values = store.multi_get_consumer(TRANSACTION_FEES_COLUMN_FAMILY, &keys)?;
+        let mut out = HashMap::with_capacity(values.len());
+        for ((transaction_id, privacy_shape), maybe_bytes) in
+            transactions.iter().copied().zip(values)
+        {
+            if let Some(bytes) = maybe_bytes
+                && let Ok(record) = TransactionFeesRecord::decode(bytes.as_slice())
+            {
+                out.insert(
+                    transaction_id,
+                    record_with_provable_paid_fee(record, privacy_shape),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch-reads servable fee records from one immutable materialized-view
+    /// snapshot. Recent Transactions uses this companion to ensure its row
+    /// page and fee hydration cannot cross a materialized-view commit.
+    pub fn read_fees_records_many_snapshot(
+        snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+        transactions: &[(TransactionId, PrivacyShape)],
+    ) -> Result<
+        HashMap<TransactionId, TransactionFeesRecord>,
+        crate::error::MaterializedViewStoreError,
+    > {
+        if transactions.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let keys: Vec<[u8; TXID_LEN]> = transactions
+            .iter()
+            .map(|(transaction_id, _privacy_shape)| encode_internal_transaction_id(*transaction_id))
+            .collect();
+        let values = snapshot.multi_get_consumer(TRANSACTION_FEES_COLUMN_FAMILY, &keys)?;
         let mut out = HashMap::with_capacity(values.len());
         for ((transaction_id, privacy_shape), maybe_bytes) in
             transactions.iter().copied().zip(values)
@@ -391,6 +427,14 @@ impl BlockKeyedConsumer for TransactionFeesConsumer {
         }
         ctx.batch.delete_cf(&index_cf, index_key);
         Ok(())
+    }
+
+    fn stage_block_projection_state(
+        &mut self,
+        checkpoint: MaterializedViewBlockProjection<'_>,
+        ctx: &mut MaterializedViewConsumerCtx<'_>,
+    ) -> Result<(), MaterializedViewConsumerError> {
+        stage_block_keyed_consumer_state(TRANSACTION_FEES_CONSUMER_NAME, checkpoint, ctx)
     }
 }
 

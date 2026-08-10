@@ -82,7 +82,7 @@ pub use writer::follow::{
     follow_canonical_tip, follow_canonical_tip_with_control,
 };
 pub use writer::ingest_control::{
-    CanonicalIngestControlGrpcAdapter,
+    CanonicalIngestControlGrpcAdapter, IngestControlNodeComposition,
     MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE as CANONICAL_WRITER_MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE,
 };
 pub use writer::{

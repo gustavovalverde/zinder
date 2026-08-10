@@ -36,7 +36,9 @@ materialized-view inputs are mandatory once the service is selected. It:
 
 The boundary rules:
 
-- A `zinder-explorer` crash does not stop ingest or wallet sync. The wallet plane keeps serving every `WalletQuery` primitive, including `WalletQuery.TransparentAddressBalance`.
+- A `zinder-explorer` crash does not stop ingest or wallet sync. The wallet plane
+  keeps serving its independently admitted `WalletQuery` surface; the current
+  endpoint omits `WalletQuery.TransparentAddressBalance`.
 - Library compositions may provide a canonical secondary for capabilities whose policies explicitly require retained canonical facts. The checked-in Compose overlay uses the current materialized-view plus wallet composition and omits those capabilities.
 - The explorer plane never extends canonical artifact schemas. When a view needs an authoritative chain fact the canonical surface does not carry, the source boundary extends first, the canonical artifact or event gains the field, then the explorer subscribes.
 - Server-side shielded address scanning, persisted viewing keys, and memo decryption are out of scope by product invariant.
@@ -342,33 +344,29 @@ The totals count every unspent transparent output, including non-standard and pr
 
 ## Capability namespace
 
-The explorer plane uses the `explorer.*` capability prefix. The full namespace structure:
+The explorer plane uses the `explorer.*` capability prefix. The current binary
+allocates exactly this retained surface after admitting its concrete Wallet and
+materialized-view inputs:
 
-| Capability | Owner method | Always-on? |
-| ---------- | ------------ | ---------- |
-| `explorer.server_info_v1` | `ExplorerQuery.ServerInfo` | Yes |
-| `explorer.transaction.detail_v4` | `ExplorerQuery.TransactionDetail` | When the wallet endpoint and explorer materialized-view store are configured |
-| `explorer.block.summary_v1` | `ExplorerQuery.BlockSummariesInRange` + `BlockDetail` summary part | When the block-summary consumer is built and caught up |
-| `explorer.block.production_series_v2` | `ExplorerQuery.BlockProductionSeries` | When the block-summary consumer and canonical secondary store are available |
-| `explorer.block.production_time_range_v1` | `ExplorerQuery.BlockProductionInTimeRange` | When the time index has contiguous height-domain coverage through its materialized-view tip |
-| `explorer.block.detail_v1` | `ExplorerQuery.BlockDetail` per-tx rows | When the block-detail consumer is built and caught up |
-| `explorer.block.activity_distribution_v1` | `ExplorerQuery.BlockActivityDistribution` | When the block-summary consumer and wallet endpoint are available |
-| `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint is configured |
-| `explorer.transparent_address.activity_v2` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint plus explorer activity and ranking consumers are available, and the ranking has an active complete generation |
-| `explorer.transparent_address.deltas_v1` | `ExplorerQuery.TransparentAddressDeltas` | When the wallet endpoint is configured |
-| `explorer.transparent_address.ranking_v1` | `ExplorerQuery.TransparentAddressRanking` | When the ranking consumer has an active generation and the wallet endpoint is configured |
-| `explorer.mempool.summary_v1` | `ExplorerQuery.MempoolSummary` | When the wallet endpoint is configured |
-| `explorer.mempool.snapshot_v1` | `ExplorerQuery.MempoolSnapshot` | When the wallet endpoint is configured |
-| `explorer.mempool.activity_v1` | `ExplorerQuery.MempoolActivity` | When the wallet endpoint is configured |
-| `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | When the wallet endpoint is configured |
-| `explorer.fee.conventional_distribution_v1` | `ExplorerQuery.ConventionalFeeDistribution` | When the conventional-fee materialized view has contiguous coverage and the wallet endpoint is configured |
-| `explorer.fee.paid_distribution_v1` | `ExplorerQuery.PaidFeeDistribution` | When the paid-fee materialized view has coverage and the wallet endpoint is configured |
-| `explorer.value_pool.summary_v1` | `ExplorerQuery.ValuePoolSummary` | When the wallet endpoint is configured and `WalletQuery.ChainValuePoolsAtTip` is available |
-| `explorer.transaction.component_summary_v2` | `ExplorerQuery.TransactionComponentSummary` | When the transaction-component consumer and wallet endpoint are available |
-| `explorer.utxo_set.summary_v1` | `ExplorerQuery.UtxoSetSummary` | When the wallet endpoint is configured |
-| `explorer.search_v1` | `ExplorerQuery.Search` | When the wallet endpoint is configured |
+| Capability | Owner | Required composition evidence |
+| ---------- | ----- | ----------------------------- |
+| `explorer.server_info_v1` | `ExplorerQuery.ServerInfo` | Successful endpoint composition |
+| `explorer.block.summary_v2` | `ExplorerQuery.BlockSummariesInRange` | Wallet visible tip and block-summary consumer |
+| `explorer.chain.reorg_history_v1` | `ExplorerQuery.ChainReorgHistory` | Reorg-incidents consumer |
+| `explorer.transaction.recent_v1` | `ExplorerQuery.RecentTransactions` | Wallet visible tip plus block-summary and recent-transaction consumers |
+| `explorer.transaction.fees_v1` | `RecentTransactionEntry.paid_fee_zat` | Recent-transaction evidence plus transaction-fee consumer |
+| `explorer.mempool.event_counts_v1` | `ExplorerQuery.MempoolEventCounts` | Mempool-event-counts consumer |
+| `explorer.fee.summary_v1` | `ExplorerQuery.FeeSummary` | Wallet visible tip and block-summary consumer |
+| `explorer.network_upgrade.status_v1` | `ExplorerQuery.NetworkUpgradeStatus` | Wallet visible tip and fingerprint-validated activation table |
+| `explorer.migration.overview_v1` | `ExplorerQuery.MigrationOverview` | Wallet visible tip plus block-summary and Ironwood-migration consumers |
+| `explorer.migration.cohorts_v1` | `ExplorerQuery.MigrationCohorts` | Wallet visible tip plus block-summary and Ironwood-migration consumers |
+| `explorer.migration.denominations_v1` | `ExplorerQuery.MigrationDenominations` | Wallet visible tip plus block-summary and Ironwood-migration consumers |
 
-The naming follows `explorer.<noun>.<capability>_v{N}`. The noun is a domain category; the capability is the operation. New methods add new capability strings; wire-shape changes ship as `_vN` increments.
+The protocol registry retains 33 additional Explorer identifiers during this
+transition, but this composition allocates none of them. Their handlers reject
+the request before storage or dependency I/O. The naming follows
+`explorer.<noun>.<capability>_v{N}`; wire-shape changes ship as `_vN`
+increments.
 
 Every `explorer.*` capability is served by the explorer plane itself; clients reach these methods on `ExplorerQuery`, never through `WalletQuery`. Materialized-view consumers surfaced through the wallet client follow the federation rule in [ADR-0009](../adrs/0009-explorer-plane-as-product-surface.md): the capability lives in the consumer's product namespace, and the wallet plane advertises it only while the consumer's proxy is ready.
 
@@ -408,14 +406,23 @@ listen_addr = "127.0.0.1:9069"   # shared section; "" disables the endpoint
 path = "/var/lib/zinder/store"
 secondary_path = "/var/lib/zinder/explorer-secondary"
 
+[storage.materialized_views.rocksdb]
+block_cache_bytes = 67108864
+max_open_files = 64
+write_buffer_bytes = 4194304
+max_write_buffer_count = 2
+memtable_budget_bytes = 16777216
+statistics_level = "tickers"
+
 [explorer]
 listen_addr = "127.0.0.1:9068"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
 wallet_query_endpoint = "https://zinder.example:9102"   # required admitted zinder-query gRPC endpoint
+wallet_query_bearer_token_path = "/run/secrets/zinder-query-token"
 
-[explorer.freshness]
-max_lag_blocks = 16              # response carries UNAVAILABLE_STALE beyond this
-warn_lag_blocks = 4              # readiness cause flips at this threshold
+# Optional, observation-only source for ExplorerFreshness.upstream_tip.
+[node]
+json_rpc_addr = "http://127.0.0.1:8232"
 ```
 
 When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The required `wallet_query_endpoint` is admitted before bind: Explorer freezes its network, minimum contract revision, capabilities, and canonical construction binding, then exact-compares that binding with the materialized-view store. If Wallet advertises network-upgrade activations, Explorer fetches and fingerprint-validates that table on the admitted channel; absent activation capability leaves activation-dependent allocation to the capability phase and never falls back to Node discovery.
@@ -425,8 +432,15 @@ Environment-variable mapping uses the `ZINDER_EXPLORER__*` prefix for explorer-s
 - `ZINDER_EXPLORER__LISTEN_ADDR`
 - `ZINDER_EXPLORER__BEARER_TOKEN_PATH`
 - `ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT`
+- `ZINDER_EXPLORER__WALLET_QUERY_BEARER_TOKEN_PATH`
 - `ZINDER_STORAGE__PATH`
 - `ZINDER_STORAGE__SECONDARY_PATH`
+- `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES`
+- `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES`
+- `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__WRITE_BUFFER_BYTES`
+- `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WRITE_BUFFER_COUNT`
+- `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES`
+- `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__STATISTICS_LEVEL`
 - `ZINDER_OPS__LISTEN_ADDR` (shared with every Zinder binary; default `127.0.0.1:9069` for the explorer)
 
 ## Failure isolation
@@ -440,7 +454,9 @@ The explorer plane fails independently from canonical state.
   `WalletQuery.TransparentAddressBalance`; Explorer cannot depend on that
   primitive without a coherent canonical-and-mempool snapshot.
 - An explorer materialized view becoming inconsistent does not corrupt canonical state. Explorer closes readiness and exits on terminal secondary catch-up failure. Operators select a fresh materialized-view path and rebuild it from retained canonical events; a missing, malformed, or lineage-mismatched store prevents the service from binding.
-- Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
+- Explorer readiness causes flow through the Explorer `/readyz` endpoint. The
+  immutable capability allocation remains unchanged, and Explorer failures
+  never propagate to the wallet plane's readiness.
 
 ## Cursor expiry contract
 
@@ -505,13 +521,14 @@ post-catch-up state. The response returns the exact read fence and coverage.
 Opaque cursors bind both the filter and fence, and a supplied stale fence fails
 with `FAILED_PRECONDITION`.
 
-Capability advertisement follows live materialized-view state. Capability v1
-is available when the materialized view and its `WalletQuery` dependency are
-online. Capability v2 is advertised only when contiguous coverage starts at
-height 1 and reaches the current materialized-view tip with the same hash.
-Exact totals are omitted unless that condition holds; when returned, their
-scope is `FULL_HISTORY`. Adapters that walk multiple pages or cache totals must
-carry the fence through every request and include it in cache identity.
+Capability allocation is frozen at construction from admitted Wallet evidence
+and exact local consumer identities. Live materialized-view state does not add
+or remove identifiers. An allocated handler still validates its request-time
+snapshot, coverage, and read fence and fails precisely when those conditions
+are not met. Exact totals are omitted unless full-history coverage is proven;
+when returned, their scope is `FULL_HISTORY`. Adapters that walk multiple pages
+or cache totals must carry the fence through every request and include it in
+cache identity.
 
 ## Cross-references
 

@@ -192,6 +192,13 @@ pub(crate) enum IngestConfigError {
     #[error(transparent)]
     OpsServer(#[from] OpsServerError),
 
+    #[error("failed to bind IngestControl listener at {listen_addr}: {source}")]
+    IngestControlBind {
+        listen_addr: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error(transparent)]
     Ingest(#[from] IngestError),
 

@@ -17,7 +17,7 @@ use zinder_core::{
     NetworkUpgradeActivations, TransactionPublicFacts as CoreFacts,
     TransactionVersion as CoreTransactionVersion,
 };
-use zinder_proto::capabilities::{EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V1};
+use zinder_proto::capabilities::{EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V2};
 use zinder_proto::v1::explorer::{
     MempoolActivityEntry, MempoolActivityRequest, MempoolActivityResponse, MempoolSnapshotRequest,
     MempoolSnapshotResponse, MempoolSnapshotSummary, MempoolSummaryRequest, MempoolSummaryResponse,
@@ -172,7 +172,7 @@ pub(crate) async fn query_mempool_summary(
         upstream_observation_cache,
         build_explorer_freshness(
             materialized_view_store,
-            EXPLORER_MEMPOOL_SUMMARY_V1,
+            EXPLORER_MEMPOOL_SUMMARY_V2,
             Some(chain_epoch),
             snapshot.snapshot_age_millis,
         )?,

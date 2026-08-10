@@ -3,10 +3,8 @@
 //! Reader shapes mirror the storage boundaries documented in
 //! [ADR-0003](../../../../docs/adrs/0003-canonical-storage-access-boundary.md):
 //!
-//! - [`SecondaryStorageSection`] for readers that open both canonical and
-//!   materialized-view stores (`zinder-query`, `zinder-explorer`).
-//! - [`CanonicalSecondaryStorageSection`] for readers that open only the
-//!   canonical store (`zinder-query`).
+//! - [`CanonicalSecondaryStorageSection`] for readers that open the canonical
+//!   store (`zinder-query` and `zinder-compat-lightwalletd`).
 
 use std::{path::PathBuf, time::Duration};
 
@@ -110,30 +108,6 @@ pub struct StorageRoleSection {
     pub rocksdb: RocksDbResourceBudgetSection,
 }
 
-/// Raw `[storage]` section consumed by reader binaries.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SecondaryStorageSection {
-    /// Filesystem path of the canonical primary instance the reader opens
-    /// as a `RocksDB` secondary.
-    pub path: Option<PathBuf>,
-    /// Reader-local secondary metadata path; must be unique per reader
-    /// process per ADR-0003.
-    pub secondary_path: Option<PathBuf>,
-    /// Catchup tick cadence in milliseconds.
-    pub secondary_catchup_interval_ms: Option<u64>,
-    /// Maximum startup catchup duration in milliseconds before the reader
-    /// proceeds with the opened secondary and lets readiness report lag.
-    pub initial_catchup_timeout_ms: Option<u64>,
-    /// Replica-lag threshold in chain epochs. Crossing this threshold
-    /// flips readiness to [`crate::ReadinessCause::ReplicaLagging`].
-    pub secondary_replica_lag_threshold_chain_epochs: Option<u64>,
-    /// Canonical store role budget.
-    pub canonical: StorageRoleSection,
-    /// Materialized-view store role budget.
-    pub materialized_views: StorageRoleSection,
-}
-
 /// Raw `[storage]` section consumed by reader binaries that only open the
 /// canonical store as a `RocksDB` secondary.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -162,25 +136,6 @@ pub struct CanonicalSecondaryStorageSection {
     pub serving_pair_staleness_ceiling_ms: Option<u64>,
     /// Canonical store role budget.
     pub canonical: StorageRoleSection,
-}
-
-/// Resolved secondary storage location with catchup cadence.
-#[derive(Clone, Debug)]
-pub struct ResolvedSecondaryStorage {
-    /// Canonical primary path the reader opens as secondary.
-    pub path: PathBuf,
-    /// Reader-local secondary metadata path.
-    pub secondary_path: PathBuf,
-    /// Catchup tick cadence.
-    pub secondary_catchup_interval: Duration,
-    /// Maximum startup catchup duration before serving with the opened secondary.
-    pub initial_catchup_timeout: Duration,
-    /// Replica-lag threshold in chain epochs.
-    pub secondary_replica_lag_threshold_chain_epochs: u64,
-    /// Bounded `RocksDB` resource budget for the canonical store.
-    pub canonical_rocksdb_budget: RocksDbResourceBudget,
-    /// Bounded `RocksDB` resource budget for the materialized-view store.
-    pub materialized_view_rocksdb_budget: RocksDbResourceBudget,
 }
 
 /// Resolved canonical-secondary storage location with catchup cadence.
@@ -290,52 +245,6 @@ pub fn resolve_wallet_projection_reader_rocksdb_budget(
         RocksDbResourceBudget::wallet_projection_reader_defaults(),
         "wallet.rocksdb",
     )
-}
-
-/// Validates and resolves a [`SecondaryStorageSection`], applying
-/// per-field defaults for `secondary_catchup_interval_ms` and
-/// `secondary_replica_lag_threshold_chain_epochs`.
-pub fn resolve_secondary_storage(
-    section: SecondaryStorageSection,
-) -> Result<ResolvedSecondaryStorage, ConfigError> {
-    let path = section
-        .path
-        .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
-    let secondary_path = section
-        .secondary_path
-        .ok_or_else(|| ConfigError::missing_field("storage.secondary_path"))?;
-    let catchup_ms = section
-        .secondary_catchup_interval_ms
-        .unwrap_or(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS);
-    if catchup_ms == 0 {
-        return Err(ConfigError::invalid(
-            "storage.secondary_catchup_interval_ms must be greater than zero",
-        ));
-    }
-    let initial_catchup_timeout_ms = section
-        .initial_catchup_timeout_ms
-        .unwrap_or(DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS);
-    if initial_catchup_timeout_ms == 0 {
-        return Err(ConfigError::invalid(
-            "storage.initial_catchup_timeout_ms must be greater than zero",
-        ));
-    }
-    let secondary_replica_lag_threshold_chain_epochs = section
-        .secondary_replica_lag_threshold_chain_epochs
-        .unwrap_or(DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS);
-    let canonical_rocksdb_budget =
-        resolve_canonical_reader_rocksdb_budget(section.canonical.rocksdb)?;
-    let materialized_view_rocksdb_budget =
-        resolve_materialized_view_reader_rocksdb_budget(section.materialized_views.rocksdb)?;
-    Ok(ResolvedSecondaryStorage {
-        path,
-        secondary_path,
-        secondary_catchup_interval: Duration::from_millis(catchup_ms),
-        initial_catchup_timeout: Duration::from_millis(initial_catchup_timeout_ms),
-        secondary_replica_lag_threshold_chain_epochs,
-        canonical_rocksdb_budget,
-        materialized_view_rocksdb_budget,
-    })
 }
 
 /// Validates and resolves a [`CanonicalSecondaryStorageSection`].
@@ -453,47 +362,6 @@ impl StorageRoleToml {
     }
 }
 
-/// Redacted TOML projection of the reader-side `[storage]` section.
-#[derive(Debug, Serialize)]
-pub struct SecondaryStorageToml {
-    /// Canonical primary path.
-    pub path: String,
-    /// Reader-local secondary metadata path.
-    pub secondary_path: String,
-    /// Catchup tick cadence in milliseconds.
-    pub secondary_catchup_interval_ms: u64,
-    /// Initial catchup timeout in milliseconds.
-    pub initial_catchup_timeout_ms: u64,
-    /// Replica-lag threshold in chain epochs.
-    pub secondary_replica_lag_threshold_chain_epochs: u64,
-    /// Canonical store role projection.
-    pub canonical: StorageRoleToml,
-    /// Materialized-view store role projection.
-    pub materialized_views: StorageRoleToml,
-}
-
-impl SecondaryStorageToml {
-    /// Builds a [`SecondaryStorageToml`] from a resolved reader storage
-    /// configuration.
-    #[must_use]
-    pub fn from_resolved(resolved: &ResolvedSecondaryStorage) -> Self {
-        Self {
-            path: resolved.path.display().to_string(),
-            secondary_path: resolved.secondary_path.display().to_string(),
-            secondary_catchup_interval_ms: duration_as_millis_u64(
-                resolved.secondary_catchup_interval,
-            ),
-            initial_catchup_timeout_ms: duration_as_millis_u64(resolved.initial_catchup_timeout),
-            secondary_replica_lag_threshold_chain_epochs: resolved
-                .secondary_replica_lag_threshold_chain_epochs,
-            canonical: StorageRoleToml::from_resolved(resolved.canonical_rocksdb_budget),
-            materialized_views: StorageRoleToml::from_resolved(
-                resolved.materialized_view_rocksdb_budget,
-            ),
-        }
-    }
-}
-
 /// Redacted TOML projection of a canonical-secondary `[storage]` section.
 #[derive(Debug, Serialize)]
 pub struct CanonicalSecondaryStorageToml {
@@ -541,65 +409,6 @@ impl CanonicalSecondaryStorageToml {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn secondary_storage_requires_both_paths() {
-        let only_primary = SecondaryStorageSection {
-            path: Some(PathBuf::from("/tmp/store")),
-            ..SecondaryStorageSection::default()
-        };
-        assert!(matches!(
-            resolve_secondary_storage(only_primary),
-            Err(ConfigError::MissingField {
-                field: "storage.secondary_path"
-            })
-        ));
-
-        let only_secondary = SecondaryStorageSection {
-            secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
-            ..SecondaryStorageSection::default()
-        };
-        assert!(matches!(
-            resolve_secondary_storage(only_secondary),
-            Err(ConfigError::MissingField {
-                field: "storage.path"
-            })
-        ));
-    }
-
-    #[test]
-    fn secondary_storage_applies_defaults() -> Result<(), ConfigError> {
-        let resolved = resolve_secondary_storage(SecondaryStorageSection {
-            path: Some(PathBuf::from("/tmp/store")),
-            secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
-            ..SecondaryStorageSection::default()
-        })?;
-        assert_eq!(
-            resolved.secondary_catchup_interval,
-            Duration::from_millis(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS)
-        );
-        assert_eq!(
-            resolved.initial_catchup_timeout,
-            Duration::from_millis(DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS)
-        );
-        assert_eq!(
-            resolved.secondary_replica_lag_threshold_chain_epochs,
-            DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS
-        );
-        assert_eq!(
-            resolved.canonical_rocksdb_budget.block_cache_bytes,
-            crate::canonical_reader_block_cache_bytes()
-        );
-        assert_eq!(
-            resolved.canonical_rocksdb_budget.max_open_files,
-            crate::canonical_reader_max_open_files()
-        );
-        assert_eq!(
-            resolved.materialized_view_rocksdb_budget,
-            RocksDbResourceBudget::materialized_view_reader_defaults()
-        );
-        Ok(())
-    }
 
     #[test]
     fn canonical_secondary_storage_applies_canonical_budget_only() -> Result<(), ConfigError> {
@@ -666,28 +475,6 @@ mod tests {
             Duration::from_secs(30)
         );
         Ok(())
-    }
-
-    #[test]
-    fn secondary_storage_rejects_zero_catchup_interval() {
-        let outcome = resolve_secondary_storage(SecondaryStorageSection {
-            path: Some(PathBuf::from("/tmp/store")),
-            secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
-            secondary_catchup_interval_ms: Some(0),
-            ..SecondaryStorageSection::default()
-        });
-        assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
-    }
-
-    #[test]
-    fn secondary_storage_rejects_zero_initial_catchup_timeout() {
-        let outcome = resolve_secondary_storage(SecondaryStorageSection {
-            path: Some(PathBuf::from("/tmp/store")),
-            secondary_path: Some(PathBuf::from("/tmp/store-secondary")),
-            initial_catchup_timeout_ms: Some(0),
-            ..SecondaryStorageSection::default()
-        });
-        assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
     }
 
     #[test]

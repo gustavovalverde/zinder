@@ -108,8 +108,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Required,
         sensitive: false,
         description: "Upstream Zebra JSON-RPC URL the service connects to. Optional for \
-                      `zinder-explorer`: without it the upstream-observation probe stays \
-                      off and `ExplorerFreshness.chain_view.upstream_tip` is always unset.",
+                      `zinder-explorer`: without it the upstream-observation probe stays off and \
+                      `ExplorerFreshness.chain_view.upstream_tip` is always unset. Explorer \
+                      capability allocation never depends on this observation source.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__INDEXER_GRPC_ADDR",
@@ -132,7 +133,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Upstream-node auth shape: `basic`, `cookie`, or unset for no auth.",
+        description: "Upstream-node auth shape: `none`, `basic`, or `cookie`. An omitted method is \
+                      also resolved as no auth.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__AUTH__USERNAME",
@@ -228,7 +230,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
-            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -242,13 +243,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "URL of the upstream's HTTP `/ready` endpoint. When set, ingest and the \
-                      wallet-serving readers poll it as the primary upstream-sync signal; when \
-                      unset, they fall back \
-                      to `getblockchaininfo.verificationprogress`/`estimatedheight`. See \
+                      wallet-serving readers poll it as the primary upstream-sync signal; \
+                      Explorer records it only as an upstream freshness observation. When \
+                      unset, they fall back to \
+                      `getblockchaininfo.verificationprogress`/`estimatedheight`. See \
                       [ADR-0015](../adrs/0015-phase-driven-ingest.md).",
     },
     EnvVarDoc {
@@ -266,7 +269,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Must be greater than zero. Query and compatibility use it to refresh \
                       serving readiness; `zinder-explorer` reuses the same cadence for \
                       its upstream-observation probe (the one that populates \
-                      `ExplorerFreshness.chain_view.upstream_tip`).",
+                      `ExplorerFreshness.chain_view.upstream_tip`) and requires \
+                      `node.health.addr` when this setting is present.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR",
@@ -275,12 +279,14 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Lower bound on `getblockchaininfo.verificationprogress` below which the \
-                      fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in \
-                      `(0.0, 1.0)`.",
+                      fallback path reports the node as not ready. Explorer records that outcome \
+                      only as freshness. Defaults to 0.999. Must be in `(0.0, 1.0)`; Explorer \
+                      requires `node.health.addr` when this setting is present.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS",
@@ -289,11 +295,14 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Block gap between `estimatedheight` and the local tip above which the \
-                      fallback path reports `upstream_not_ready`. Defaults to 10.",
+                      fallback path reports the node as not ready. Explorer records that outcome \
+                      only as freshness. Defaults to 10; Explorer requires `node.health.addr` \
+                      when this setting is present.",
     },
     EnvVarDoc {
         name: "ZINDER_OPS__LISTEN_ADDR",
@@ -438,8 +447,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Required,
         sensitive: false,
-        description: "Canonical RocksDB store path. Writers open it as primary; readers open it \
-                      as a secondary.",
+        description: "Canonical storage root. Ingest opens the canonical RocksDB primary; query \
+                      and compatibility open it as a secondary. Explorer derives the nested \
+                      materialized-view primary path and does not open the canonical store.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__SECONDARY_PATH",
@@ -452,17 +462,14 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Required,
         sensitive: false,
-        description: "Process-unique RocksDB secondary metadata directory. Never share this path \
-                      across reader processes.",
+        description: "Process-unique RocksDB secondary metadata root. Explorer uses only its \
+                      nested materialized-view secondary path. Never share this root across \
+                      reader processes.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS",
         toml_path: "storage.initial_catchup_timeout_ms",
-        used_by: &[
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
+        used_by: &["zinder-query", "zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Maximum startup RocksDB secondary catchup duration before a reader starts \
@@ -625,7 +632,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
-            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -640,7 +646,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
-            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -655,7 +660,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
-            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -670,7 +674,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
-            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -685,7 +688,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
-            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -700,7 +702,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
-            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -715,7 +716,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
-            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -730,7 +730,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
-            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -803,11 +802,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WAL_BYTES",
         toml_path: "storage.materialized_views.rocksdb.max_wal_bytes",
-        used_by: &["zinder-ingest", "zinder-explorer"],
+        used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Materialized-view store RocksDB live WAL ceiling in bytes. Defaults to \
-                      268435456 for writers and 16777216 for readers.",
+        description: "Materialized-view primary-writer RocksDB live WAL ceiling in bytes. \
+                      Defaults to 268435456.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES",
@@ -835,6 +834,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Materialized-view store per-column-family mutable plus immutable RocksDB write \
                       buffer count. Defaults to 4 for writers and 2 for readers.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS",
+        toml_path: "storage.materialized_views.rocksdb.max_background_jobs",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Materialized-view primary-writer background flush and compaction job cap. \
+                      Defaults to 2.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES",
@@ -1367,21 +1375,32 @@ mod tests {
     }
 
     #[test]
-    fn background_job_variables_mark_secondary_inapplicability() {
+    fn background_job_variables_match_each_service_posture() -> Result<(), &'static str> {
         let background_job_variables = ENVIRONMENT_VARIABLES
             .iter()
             .filter(|env_var| env_var.name.ends_with("__ROCKSDB__MAX_BACKGROUND_JOBS"))
             .collect::<Vec<_>>();
 
-        assert_eq!(background_job_variables.len(), 2);
+        assert_eq!(background_job_variables.len(), 3);
         for env_var in background_job_variables {
             assert!(env_var.description.contains("primary-writer"));
-            assert!(
-                env_var
-                    .description
-                    .contains("not applied to secondary opens")
-            );
+            if env_var.name != "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS" {
+                assert!(
+                    env_var
+                        .description
+                        .contains("not applied to secondary opens")
+                );
+            }
         }
+
+        let materialized_view_jobs = ENVIRONMENT_VARIABLES
+            .iter()
+            .find(|env_var| {
+                env_var.name == "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS"
+            })
+            .ok_or("materialized-view background-job config must be documented")?;
+        assert_eq!(materialized_view_jobs.used_by, ["zinder-ingest"]);
+        Ok(())
     }
 
     #[test]

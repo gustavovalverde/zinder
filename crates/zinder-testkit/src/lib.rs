@@ -78,4 +78,6 @@ pub use transparent_signer::{
     TransparentSignerError, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
     regtest_local_network,
 };
-pub use wallet_serving_store_fixture::WalletServingStoreFixture;
+pub use wallet_serving_store_fixture::{
+    WalletServingStoreFixture, canonical_build_block_for_wallet_serving_fixture,
+};

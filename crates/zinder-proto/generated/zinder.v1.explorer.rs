@@ -424,9 +424,6 @@ pub struct BlockSummariesInRangeRequest {
     /// Last block height to return (inclusive).
     #[prost(uint32, tag = "2")]
     pub end_height: u32,
-    /// Optional chain-epoch id pin for snapshot consistency with concurrent reads.
-    #[prost(uint64, optional, tag = "3")]
-    pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// `ExplorerQuery.BlockSummariesInRange` response.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1100,14 +1097,8 @@ pub struct TransactionVersionCount {
     pub count: u32,
 }
 /// `ExplorerQuery.MempoolSummary` request.
-///
-/// Optionally pins the read to a specific chain epoch so the response
-/// stays consistent with concurrent reads.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct MempoolSummaryRequest {
-    #[prost(uint64, optional, tag = "1")]
-    pub at_epoch_id: ::core::option::Option<u64>,
-}
+pub struct MempoolSummaryRequest {}
 /// `ExplorerQuery.MempoolSummary` response.
 ///
 /// Aggregates the current mempool snapshot into a single page-friendly
@@ -1227,9 +1218,9 @@ pub struct MempoolActivityEntry {
     #[prost(uint64, tag = "6")]
     pub zip317_conventional_fee_zat: u64,
     /// Actual paid fee, in zatoshis. Populated when the explorer advertises
-    /// `EXPLORER_TRANSACTION_FEES_V1` and the wallet plane's mempool prevout
-    /// index resolved every transparent input for this entry. Absent
-    /// otherwise; consumers fall back to `zip317_conventional_fee_zat`.
+    /// `EXPLORER_TRANSACTION_FEES_V1` and the retained transaction-fee
+    /// materialized view contains a row for this entry. Absent otherwise;
+    /// consumers fall back to `zip317_conventional_fee_zat`.
     #[prost(uint64, optional, tag = "7")]
     pub paid_fee_zat: ::core::option::Option<u64>,
     /// ZIP-317 logical-action count for this entry. The fee floor formula's
@@ -1615,9 +1606,6 @@ pub struct MigrationCohortsRequest {
     /// the `MAX_BLOCK_SUMMARIES_PER_REQUEST`-style caps elsewhere on this surface.
     #[prost(uint32, tag = "2")]
     pub end_height: u32,
-    /// Optional chain-epoch id pin for snapshot consistency with concurrent reads.
-    #[prost(uint64, optional, tag = "3")]
-    pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// One anchor-sharing migration cohort.
 ///
@@ -1678,9 +1666,6 @@ pub struct MigrationDenominationsRequest {
     /// the `MAX_BLOCK_SUMMARIES_PER_REQUEST`-style caps elsewhere on this surface.
     #[prost(uint32, tag = "2")]
     pub end_height: u32,
-    /// Optional chain-epoch id pin for snapshot consistency with concurrent reads.
-    #[prost(uint64, optional, tag = "3")]
-    pub at_epoch_id: ::core::option::Option<u64>,
 }
 /// One power-of-ten denomination bucket.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -3933,7 +3918,7 @@ pub mod explorer_query_client {
         }
         /// Returns one `BlockSummary` per canonical block in the requested
         /// height range, ordered by ascending height. Capability:
-        /// `explorer.block.summary_v1`.
+        /// `explorer.block.summary_v2`.
         pub async fn block_summaries_in_range(
             &mut self,
             request: impl tonic::IntoRequest<super::BlockSummariesInRangeRequest>,
@@ -4244,7 +4229,7 @@ pub mod explorer_query_client {
         /// Aggregates the current mempool snapshot into a single explorer-shaped
         /// response: total counts, byte size, privacy-shape distribution,
         /// version distribution, and freshness extremes. Capability:
-        /// `explorer.mempool.summary_v1`.
+        /// `explorer.mempool.summary_v2`.
         pub async fn mempool_summary(
             &mut self,
             request: impl tonic::IntoRequest<super::MempoolSummaryRequest>,
@@ -4949,7 +4934,7 @@ pub mod explorer_query_client {
             self.inner.server_streaming(req, path, codec).await
         }
         /// Returns one filtered, newest-first page of canonical transaction history.
-        /// Capability: `explorer.transaction.history_v1`.
+        /// Capability: `explorer.transaction.history_v2`.
         pub async fn transaction_history(
             &mut self,
             request: impl tonic::IntoRequest<super::TransactionHistoryRequest>,
@@ -5147,7 +5132,7 @@ pub mod explorer_query_server {
         >;
         /// Returns one `BlockSummary` per canonical block in the requested
         /// height range, ordered by ascending height. Capability:
-        /// `explorer.block.summary_v1`.
+        /// `explorer.block.summary_v2`.
         async fn block_summaries_in_range(
             &self,
             request: tonic::Request<super::BlockSummariesInRangeRequest>,
@@ -5246,7 +5231,7 @@ pub mod explorer_query_server {
         /// Aggregates the current mempool snapshot into a single explorer-shaped
         /// response: total counts, byte size, privacy-shape distribution,
         /// version distribution, and freshness extremes. Capability:
-        /// `explorer.mempool.summary_v1`.
+        /// `explorer.mempool.summary_v2`.
         async fn mempool_summary(
             &self,
             request: tonic::Request<super::MempoolSummaryRequest>,
@@ -5478,7 +5463,7 @@ pub mod explorer_query_server {
             tonic::Status,
         >;
         /// Returns one filtered, newest-first page of canonical transaction history.
-        /// Capability: `explorer.transaction.history_v1`.
+        /// Capability: `explorer.transaction.history_v2`.
         async fn transaction_history(
             &self,
             request: tonic::Request<super::TransactionHistoryRequest>,

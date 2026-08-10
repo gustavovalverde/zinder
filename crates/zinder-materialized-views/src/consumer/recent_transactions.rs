@@ -22,8 +22,9 @@ use zinder_proto::v1::explorer::{
 use zinder_proto::wire::encode_privacy_shape;
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
-    MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockProjection,
+    MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
+    MaterializedViewConsumerSchema, stage_block_keyed_consumer_state,
 };
 
 /// Column-family name the consumer owns.
@@ -158,6 +159,14 @@ impl BlockKeyedConsumer for RecentTransactionsConsumer {
         ctx.batch
             .delete_range_cf(&cf, start_key.as_slice(), end_key.as_slice());
         Ok(())
+    }
+
+    fn stage_block_projection_state(
+        &mut self,
+        checkpoint: MaterializedViewBlockProjection<'_>,
+        ctx: &mut MaterializedViewConsumerCtx<'_>,
+    ) -> Result<(), MaterializedViewConsumerError> {
+        stage_block_keyed_consumer_state(RECENT_TRANSACTIONS_CONSUMER_NAME, checkpoint, ctx)
     }
 }
 

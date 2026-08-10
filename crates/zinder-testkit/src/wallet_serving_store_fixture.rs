@@ -1,11 +1,13 @@
 //! Production-store fixtures for the immutable wallet-serving boundary.
 
+use std::path::PathBuf;
+
 use eyre::{Context as _, ensure, eyre};
 use tempfile::TempDir;
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockReplayEnvelope, ChainTipMetadata, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontiers, NetworkUpgradeActivations, UnixTimestampMillis,
-    decode_canonical_block_replay,
+    CommitmentTreeFrontier, CommitmentTreeFrontiers, NetworkUpgradeActivations, ShieldedProtocol,
+    UnixTimestampMillis, decode_canonical_block_replay,
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend, CanonicalReorgPolicy,
@@ -29,7 +31,7 @@ const TEST_REORG_DEPTH: u32 = 100;
 pub struct WalletServingStoreFixture {
     canonical_reader: Option<RocksDbCanonicalSecondary>,
     wallet_reader: Option<RocksDbWalletSecondary>,
-    _temporary_directory: TempDir,
+    temporary_directory: TempDir,
 }
 
 impl WalletServingStoreFixture {
@@ -45,6 +47,18 @@ impl WalletServingStoreFixture {
             .as_ref()
             .map(RocksDbCanonicalSecondary::construction_identity)
             .ok_or_else(|| eyre!("wallet-serving canonical reader was already taken"))
+    }
+
+    /// Returns the fixture-owned canonical primary path for real-process tests.
+    #[must_use]
+    pub fn canonical_primary_path(&self) -> PathBuf {
+        self.temporary_directory.path().join("canonical-primary")
+    }
+
+    /// Returns the fixture-owned wallet primary path for real-process tests.
+    #[must_use]
+    pub fn wallet_primary_path(&self) -> PathBuf {
+        self.temporary_directory.path().join("wallet-primary")
     }
 
     /// Builds READY primaries from `chain_fixture` and opens immutable secondaries.
@@ -91,7 +105,8 @@ impl WalletServingStoreFixture {
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        let canonical_blocks = canonical_build_blocks(&canonical_chain_fixture)?;
+        let canonical_blocks =
+            canonical_build_blocks(&canonical_chain_fixture, network_upgrade_activations)?;
         builder.bulk_load_blocks(
             canonical_blocks
                 .into_iter()
@@ -101,7 +116,7 @@ impl WalletServingStoreFixture {
         let tip_checkpoint = CommitmentTreeCheckpoint::new(
             tip,
             tip_block.block_time_seconds,
-            CommitmentTreeFrontiers::default(),
+            empty_active_frontiers(tip.height, network_upgrade_activations),
         );
         builder.confirm_source_tip_checkpoint(&tip_checkpoint)?;
         let validated = builder.prepare_cold_certified_publication()?;
@@ -141,7 +156,7 @@ impl WalletServingStoreFixture {
         Ok(Self {
             canonical_reader: Some(canonical_reader),
             wallet_reader: Some(wallet_reader),
-            _temporary_directory: temporary_directory,
+            temporary_directory,
         })
     }
 
@@ -199,7 +214,7 @@ impl WalletServingStoreFixture {
             RocksDbResourceBudget::for_local_tests(),
         )?;
         builder.bulk_load_blocks(
-            canonical_build_blocks(&baseline_chain)?
+            canonical_build_blocks(&baseline_chain, network_upgrade_activations)?
                 .into_iter()
                 .map(Ok::<_, std::convert::Infallible>),
         )?;
@@ -207,7 +222,7 @@ impl WalletServingStoreFixture {
         let baseline_checkpoint = CommitmentTreeCheckpoint::new(
             baseline_tip_id,
             baseline_tip.block_time_seconds,
-            CommitmentTreeFrontiers::default(),
+            empty_active_frontiers(baseline_tip_id.height, network_upgrade_activations),
         );
         builder.confirm_source_tip_checkpoint(&baseline_checkpoint)?;
         let validated = builder.prepare_cold_certified_publication()?;
@@ -220,7 +235,7 @@ impl WalletServingStoreFixture {
         let canonical_primary = validated.publish_baseline(publication)?;
         let expected_fence = canonical_primary.event_fence();
         let full_chain = chain_fixture.clone().with_canonical_genesis_parent();
-        let live_block = canonical_build_blocks(&full_chain)?
+        let live_block = canonical_build_blocks(&full_chain, network_upgrade_activations)?
             .pop()
             .ok_or_else(|| eyre!("wallet-serving fixture requires a live block"))?;
         let (canonical_primary, _) = canonical_primary.commit_live_append(
@@ -266,7 +281,7 @@ impl WalletServingStoreFixture {
         Ok(Self {
             canonical_reader: Some(canonical_reader),
             wallet_reader: Some(wallet_reader),
-            _temporary_directory: temporary_directory,
+            temporary_directory,
         })
     }
 
@@ -290,7 +305,65 @@ impl WalletServingStoreFixture {
     }
 }
 
-fn canonical_build_blocks(chain_fixture: &ChainFixture) -> eyre::Result<Vec<CanonicalBuildBlock>> {
+/// Converts one fixture block into the production canonical live-mutation input.
+///
+/// The conversion preserves the fixture's raw-blob retention, canonical replay
+/// rows, compact artifact, and tip checkpoint rules. It is intended for tests
+/// that extend or replace a READY [`WalletServingStoreFixture`] through the
+/// production live-commit APIs after its initial fixture construction.
+///
+/// # Errors
+///
+/// Returns an error when `block_height` is absent from the fixture or the
+/// fixture cannot be converted into a production canonical build block.
+pub fn canonical_build_block_for_wallet_serving_fixture(
+    chain_fixture: &ChainFixture,
+    block_height: BlockHeight,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> eyre::Result<CanonicalBuildBlock> {
+    let canonical_chain_fixture = chain_fixture.clone().with_canonical_genesis_parent();
+    let block_index = canonical_chain_fixture
+        .blocks()
+        .iter()
+        .position(|block| block.height == block_height)
+        .ok_or_else(|| {
+            eyre!(
+                "wallet-serving fixture omitted block at height {}",
+                block_height.value()
+            )
+        })?;
+    canonical_build_blocks(&canonical_chain_fixture, network_upgrade_activations)?
+        .into_iter()
+        .nth(block_index)
+        .ok_or_else(|| {
+            eyre!(
+                "wallet-serving canonical conversion omitted block at height {}",
+                block_height.value()
+            )
+        })
+}
+
+fn empty_active_frontiers(
+    height: BlockHeight,
+    activations: &NetworkUpgradeActivations,
+) -> CommitmentTreeFrontiers {
+    let frontier = |protocol: ShieldedProtocol| {
+        activations
+            .activation_height_by_name(protocol.activation_upgrade_name())
+            .is_some_and(|activation_height| activation_height.value() <= height.value())
+            .then(|| CommitmentTreeFrontier::empty(protocol))
+    };
+    CommitmentTreeFrontiers::from_validated_parts(
+        frontier(ShieldedProtocol::Sapling),
+        frontier(ShieldedProtocol::Orchard),
+        frontier(ShieldedProtocol::Ironwood),
+    )
+}
+
+fn canonical_build_blocks(
+    chain_fixture: &ChainFixture,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+) -> eyre::Result<Vec<CanonicalBuildBlock>> {
     let transaction_rows = chain_fixture.canonical_transaction_rows();
     let replay_envelopes = chain_fixture.block_replay_envelopes();
     let compact_blocks = chain_fixture.compact_block_artifacts();
@@ -301,6 +374,7 @@ fn canonical_build_blocks(chain_fixture: &ChainFixture) -> eyre::Result<Vec<Cano
         transaction_rows: &transaction_rows,
         tip_height,
         raw_blob_retention: chain_fixture.raw_blob_retention(),
+        network_upgrade_activations,
     };
     let mut build_blocks = Vec::with_capacity(chain_fixture.block_count());
 
@@ -325,6 +399,7 @@ struct CanonicalBlockBuildInputs<'a> {
     transaction_rows: &'a [FixtureTransactionRows],
     tip_height: BlockHeight,
     raw_blob_retention: RawBlobRetention,
+    network_upgrade_activations: &'a NetworkUpgradeActivations,
 }
 
 fn canonical_build_block(
@@ -385,7 +460,10 @@ fn canonical_build_block(
         CommitmentTreeCheckpoint::new(
             BlockId::new(fixture_block.height, fixture_block.hash),
             fixture_block.block_time_seconds,
-            CommitmentTreeFrontiers::default(),
+            empty_active_frontiers(
+                fixture_block.height,
+                build_inputs.network_upgrade_activations,
+            ),
         )
     });
 

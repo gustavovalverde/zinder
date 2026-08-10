@@ -19,13 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_core::{Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name};
-use zinder_proto::capabilities::{
-    CapabilitySurface, EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
-    EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1, EXPLORER_PAID_FEE_DISTRIBUTION_V1,
-    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2, EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
-    ExplorerReadiness, capabilities_for_surface,
-};
+use zinder_proto::capabilities;
 use zinder_proto::v1::{
     explorer::{
         BlockActivityDistributionRequest, BlockActivityDistributionResponse, BlockDetailRequest,
@@ -74,8 +68,6 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
     "zinder_explorer_request_total",
 );
 
-/// First canonical artifact schema that contains transaction-intrinsic balances.
-const MINIMUM_INTRINSIC_VALUE_BALANCE_HISTORY_SCHEMA_VERSION: u16 = 15;
 use super::block_activity::query_block_activity_distribution;
 use super::block_view::{
     query_block_detail, query_block_production_in_time_range, query_block_production_series,
@@ -86,11 +78,13 @@ use super::commitment_root_search::query_commitment_root_search;
 use super::conventional_fee_distribution::query_conventional_fee_distribution;
 use super::displaced_block::{query_displaced_block_detail, query_displaced_block_history};
 use super::endpoint_admission::{AdmittedWalletQueryEndpoint, ExplorerEndpointAdmissionError};
+use super::endpoint_capabilities::ExplorerEndpointCapabilities;
 use super::error::ExplorerError;
 use super::fee_summary::query_fee_summary;
 use super::freshness::{
-    UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
-    read_materialized_view_status, spawn_upstream_observation_probe_task,
+    UpstreamObservationCache, attach_upstream_observation,
+    build_server_info_freshness_from_snapshot, read_materialized_view_status_snapshot,
+    spawn_upstream_observation_probe_task,
 };
 use super::mempool::{query_mempool_activity, query_mempool_snapshot, query_mempool_summary};
 use super::mempool_event_counts::query_mempool_event_counts;
@@ -153,7 +147,6 @@ pub struct ExplorerQueryEndpointComposition {
     wallet_query_bearer_token: Option<BearerToken>,
     bearer_token: Option<BearerToken>,
     canonical_store: Option<SecondaryChainStore>,
-    prevout_resolution_online: bool,
 }
 
 impl ExplorerQueryEndpointComposition {
@@ -171,7 +164,6 @@ impl ExplorerQueryEndpointComposition {
             wallet_query_bearer_token: None,
             bearer_token: None,
             canonical_store: None,
-            prevout_resolution_online: false,
         }
     }
 
@@ -196,13 +188,6 @@ impl ExplorerQueryEndpointComposition {
         self
     }
 
-    /// Declares that the local materialized-view workload resolves prevouts.
-    #[must_use]
-    pub const fn with_prevout_resolution_online(mut self, online: bool) -> Self {
-        self.prevout_resolution_online = online;
-        self
-    }
-
     /// Admits the mandatory Wallet and materialized-view construction identity.
     pub async fn compose(self) -> Result<ExplorerQueryGrpcAdapter, ExplorerEndpointAdmissionError> {
         let wallet_endpoint = AdmittedWalletQueryEndpoint::admit(
@@ -222,6 +207,11 @@ impl ExplorerQueryEndpointComposition {
         let transaction_history_materialized_view_reader = Arc::new(
             TransactionHistoryMaterializedViewReader::new(self.materialized_view_store.clone()),
         );
+        let endpoint_capabilities = ExplorerEndpointCapabilities::from_admitted_composition(
+            &wallet_endpoint,
+            &self.materialized_view_store,
+            network_upgrade_activations.as_ref(),
+        );
 
         Ok(ExplorerQueryGrpcAdapter {
             settings: self.settings,
@@ -232,7 +222,7 @@ impl ExplorerQueryEndpointComposition {
             materialized_view_preset,
             transaction_history_materialized_view_reader,
             network_upgrade_activations,
-            prevout_resolution_online: self.prevout_resolution_online,
+            endpoint_capabilities,
             upstream_observation_cache: UpstreamObservationCache::empty(),
         })
     }
@@ -254,11 +244,28 @@ pub struct ExplorerQueryGrpcAdapter {
     transaction_history_materialized_view_reader:
         Arc<dyn TransactionHistoryMaterializedViewReadApi>,
     network_upgrade_activations: Option<NetworkUpgradeActivations>,
-    prevout_resolution_online: bool,
+    endpoint_capabilities: ExplorerEndpointCapabilities,
     upstream_observation_cache: UpstreamObservationCache,
 }
 
 impl ExplorerQueryGrpcAdapter {
+    /// Rejects an RPC before its request body can reach a local store or an
+    /// admitted upstream dependency.
+    fn require_capability(
+        &self,
+        identifier: &'static str,
+        method: &'static str,
+    ) -> Result<(), Status> {
+        if self.endpoint_capabilities.contains(identifier) {
+            Ok(())
+        } else {
+            Err(ExplorerError::unsupported(format!(
+                "{method} is not admitted by this Explorer endpoint composition"
+            ))
+            .into())
+        }
+    }
+
     /// Rechecks the frozen Wallet endpoint evidence without rediscovery.
     pub async fn check_wallet_endpoint_health(
         &self,
@@ -305,137 +312,16 @@ impl ExplorerQueryGrpcAdapter {
         InterceptedService::new(server, interceptor)
     }
 
-    fn advertised_capability_readiness(&self) -> ExplorerReadiness {
-        let wallet_query_online = true;
-        let transaction_history_readiness = self
-            .transaction_history_materialized_view_reader
-            .readiness()
-            .ok();
-        let canonical_transaction_history_position =
-            self.canonical_store.as_ref().and_then(|store| {
-                store.try_catch_up().ok()?;
-                let chain_epoch = store.current_chain_epoch().ok().flatten()?;
-                Some((
-                    chain_epoch.id,
-                    chain_epoch.visible_tip_height,
-                    chain_epoch.visible_tip_hash,
-                ))
-            });
-
-        ExplorerReadiness {
-            wallet_query_online,
-            canonical_store_online: self.canonical_store.is_some(),
-            materialized_view_store_online: self.materialized_view_preset
-                == MaterializedViewPreset::Explorer,
-            prevout_resolution_online: self.prevout_resolution_online && wallet_query_online,
-            transaction_history_available: transaction_history_readiness
-                .is_some_and(TransactionHistoryMaterializedViewReadiness::is_available),
-            transaction_history_complete: transaction_history_readiness.is_some_and(|readiness| {
-                readiness.is_complete_at(canonical_transaction_history_position)
-            }),
-        }
-    }
-
-    /// Returns the capability strings the adapter currently advertises.
+    /// Returns this admitted composition's immutable capability allocation.
     ///
-    /// Single source of truth for capability gating: `ServerInfo`, the ops
-    /// endpoint `/healthz`, and any future advertisement surface all read
-    /// from this method so a flag flip in one place reaches every consumer.
-    /// Per ADR-0018, each capability lights up only when the upstream
-    /// state it depends on is satisfied; the adapter never advertises a
-    /// capability whose handler would return `Unavailable`.
+    /// `ServerInfo`, the ops endpoint, and every handler guard read the same
+    /// frozen set. Runtime lag and dependency failures affect readiness or the
+    /// admitted operation's typed result; they never mutate the advertised
+    /// contract.
     #[must_use]
     pub fn advertised_capabilities(&self) -> Vec<&'static str> {
-        let readiness = self.advertised_capability_readiness();
-        let ranking_active =
-            zinder_materialized_views::TransparentAddressRankingConsumer::active_metadata(
-                &self.materialized_view_store,
-            )
-            .ok()
-            .flatten()
-            .is_some();
-        let conventional_fee_distribution_covered =
-            zinder_materialized_views::ConventionalFeeDistributionConsumer::coverage(
-                &self.materialized_view_store,
-            )
-            .ok()
-            .flatten()
-            .is_some();
-        let paid_fee_distribution_covered =
-            zinder_materialized_views::PaidFeeDistributionConsumer::coverage(
-                &self.materialized_view_store,
-            )
-            .ok()
-            .flatten()
-            .is_some();
-        let block_production_time_covered =
-            block_production_time_materialized_view_available(Some(&self.materialized_view_store));
-        let transaction_intrinsic_value_balances_available =
-            self.canonical_store.as_ref().is_some_and(|store| {
-                store.try_catch_up().is_ok()
-                    && store.current_chain_epoch().is_ok_and(|chain_epoch| {
-                        chain_epoch.is_some_and(intrinsic_value_balance_schema_supported)
-                    })
-            });
-        capabilities_for_surface(CapabilitySurface::Explorer)
-            .filter(|spec| spec.policy.explorer_satisfied(readiness))
-            .filter(|spec| {
-                !matches!(
-                    spec.string,
-                    EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2
-                        | EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1
-                ) || ranking_active
-            })
-            .filter(|spec| {
-                spec.string != EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1
-                    || conventional_fee_distribution_covered
-            })
-            .filter(|spec| {
-                spec.string != EXPLORER_PAID_FEE_DISTRIBUTION_V1
-                    || (paid_fee_distribution_covered && readiness.canonical_store_online)
-            })
-            .filter(|spec| {
-                spec.string != EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1
-                    || block_production_time_covered
-            })
-            .filter(|spec| {
-                spec.string != EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1
-                    || transaction_intrinsic_value_balances_available
-            })
-            .map(|spec| spec.string)
-            .collect()
+        self.endpoint_capabilities.iter().collect()
     }
-}
-
-fn block_production_time_materialized_view_available(
-    materialized_view_store: Option<&MaterializedViewStore>,
-) -> bool {
-    let Some(store) = materialized_view_store else {
-        return false;
-    };
-    let Ok(snapshot) = store.read_snapshot() else {
-        return false;
-    };
-    let coverage =
-        zinder_materialized_views::BlockProductionTimeConsumer::coverage_snapshot(&snapshot)
-            .ok()
-            .flatten();
-    let materialized_view_state = snapshot
-        .consumer_state(zinder_materialized_views::BLOCK_PRODUCTION_TIME_CONSUMER_NAME)
-        .ok()
-        .flatten();
-    drop(snapshot);
-    coverage
-        .zip(materialized_view_state)
-        .is_some_and(|(coverage, materialized_view_state)| {
-            coverage.complete_from_height.value() <= 1
-                && coverage.complete_through_height >= materialized_view_state.tip_height
-        })
-}
-
-fn intrinsic_value_balance_schema_supported(chain_epoch: zinder_core::ChainEpoch) -> bool {
-    chain_epoch.artifact_schema_version.value()
-        >= MINIMUM_INTRINSIC_VALUE_BALANCE_HISTORY_SCHEMA_VERSION
 }
 
 /// Pair of operation labels used by every `ExplorerQuery` handler.
@@ -448,35 +334,43 @@ fn intrinsic_value_balance_schema_supported(chain_epoch: zinder_core::ChainEpoch
 struct OperationNames {
     method: &'static str,
     metric: &'static str,
+    capability: &'static str,
 }
 
 #[tonic::async_trait]
 impl ExplorerQuery for ExplorerQueryGrpcAdapter {
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "ServerInfo deliberately holds one RocksDB snapshot through freshness and materialized-view status reads"
+    )]
     async fn server_info(
         &self,
         _request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
         // ServerInfo carries the standard ExplorerFreshness envelope per
         // ADR-0011 so consumers can read `chain_view.upstream_tip` from the
-        // bootstrap call, before any materialized-view-backed capability is up.
-        // During `bulk_catchup` this is the only explorer response that
-        // is guaranteed to succeed; sync-progress UIs depend on it for
+        // bootstrap call, before materialized-view rows are available. During
+        // `bulk_catchup` this is the only explorer response guaranteed to
+        // succeed; the immutable allocation does not change as rows catch up,
+        // and sync-progress UIs depend on this response for
         // an honest denominator. `chain_epoch` is left unset here because
         // ServerInfo resolves no canonical follower tip and so makes no
         // snapshot-consistency claim; the materialized-view indexed tip and the
         // upstream observation carry the rest of the freshness signal.
-        let freshness = attach_upstream_observation(
-            &self.upstream_observation_cache,
-            build_explorer_freshness(
-                Some(&self.materialized_view_store),
-                EXPLORER_SERVER_INFO_V1,
-                None,
-                0,
-            )?,
-        )
-        .await;
-        let materialized_view_status =
-            read_materialized_view_status(Some(&self.materialized_view_store))?;
+        let (freshness, materialized_view_status) = {
+            let snapshot = self
+                .materialized_view_store
+                .read_snapshot()
+                .map_err(|error| ExplorerError::internal(error.to_string()))?;
+            let freshness = build_server_info_freshness_from_snapshot(
+                &self.materialized_view_store,
+                &snapshot,
+            )?;
+            let materialized_view_status = read_materialized_view_status_snapshot(&snapshot)?;
+            (freshness, materialized_view_status)
+        };
+        let freshness =
+            attach_upstream_observation(&self.upstream_observation_cache, freshness).await;
         Ok(Response::new(ServerInfoResponse {
             freshness: Some(freshness),
             info: Some(ExplorerServerInfo {
@@ -512,9 +406,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "TransactionDetail",
             metric: "transaction_detail",
+            capability: capabilities::EXPLORER_TRANSACTION_DETAIL_V4,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let network_upgrade_activations =
                 self.require_admitted_network_upgrade_activations(OP.method)?;
             let mut client = self.wallet_client();
@@ -543,9 +439,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "BlockSummariesInRange",
             metric: "block_summaries_in_range",
+            capability: capabilities::EXPLORER_BLOCK_SUMMARY_V2,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_block_summaries_in_range(
@@ -568,9 +466,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "BlockProductionSeries",
             metric: "block_production_series",
+            capability: capabilities::EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
             query_block_production_series(
@@ -593,9 +493,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "BlockProductionInTimeRange",
             metric: "block_production_in_time_range",
+            capability: capabilities::EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
             query_block_production_in_time_range(
@@ -618,9 +520,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "BlockActivityDistribution",
             metric: "block_activity_distribution",
+            capability: capabilities::EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_block_activity_distribution(
@@ -643,9 +547,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "TransactionComponentSummary",
             metric: "transaction_component_summary",
+            capability: capabilities::EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_transaction_component_summary(
@@ -668,9 +574,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "TransparentAddressRanking",
             metric: "transparent_address_ranking",
+            capability: capabilities::EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_transparent_address_ranking(
@@ -693,9 +601,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "BlockDetail",
             metric: "block_detail",
+            capability: capabilities::EXPLORER_BLOCK_DETAIL_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_block_detail(
@@ -718,9 +628,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "BlockTransactions",
             metric: "block_transactions",
+            capability: capabilities::EXPLORER_BLOCK_TRANSACTIONS_V2,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
             let mut client = self.wallet_client();
@@ -745,9 +657,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "Search",
             metric: "search",
+            capability: capabilities::EXPLORER_SEARCH_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let mut client = self.wallet_client();
             query_search(
                 Some(&self.materialized_view_store),
@@ -770,9 +684,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "CommitmentRootSearch",
             metric: "commitment_root_search",
+            capability: capabilities::EXPLORER_COMMITMENT_ROOT_SEARCH_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let network_upgrade_activations =
                 self.require_admitted_network_upgrade_activations(OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
@@ -798,9 +714,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "MempoolSummary",
             metric: "mempool_summary",
+            capability: capabilities::EXPLORER_MEMPOOL_SUMMARY_V2,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let mut client = self.wallet_client();
             query_mempool_summary(
                 Some(&self.materialized_view_store),
@@ -823,9 +741,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "MempoolSnapshot",
             metric: "mempool_snapshot",
+            capability: capabilities::EXPLORER_MEMPOOL_SNAPSHOT_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let mut client = self.wallet_client();
             query_mempool_snapshot(
                 Some(&self.materialized_view_store),
@@ -848,9 +768,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "MempoolActivity",
             metric: "mempool_activity",
+            capability: capabilities::EXPLORER_MEMPOOL_ACTIVITY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let mut client = self.wallet_client();
             query_mempool_activity(
                 Some(&self.materialized_view_store),
@@ -873,9 +795,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "TransparentAddressActivity",
             metric: "transparent_address_activity",
+            capability: capabilities::EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = &self.materialized_view_store;
             let mut client = self.wallet_client();
             query_transparent_address_activity(
@@ -902,9 +826,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "TransparentAddressDeltas",
             metric: "transparent_address_deltas",
+            capability: capabilities::EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = &self.materialized_view_store;
             let mut client = self.wallet_client();
             query_transparent_address_deltas(
@@ -928,9 +854,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "FeeSummary",
             metric: "fee_summary",
+            capability: capabilities::EXPLORER_FEE_SUMMARY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_fee_summary(
@@ -953,9 +881,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "ConventionalFeeDistribution",
             metric: "conventional_fee_distribution",
+            capability: capabilities::EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_conventional_fee_distribution(
@@ -978,9 +908,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "PaidFeeDistribution",
             metric: "paid_fee_distribution",
+            capability: capabilities::EXPLORER_PAID_FEE_DISTRIBUTION_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
             let mut client = self.wallet_client();
@@ -1005,9 +937,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "ValuePoolSummary",
             metric: "value_pool_summary",
+            capability: capabilities::EXPLORER_VALUE_POOL_SUMMARY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let mut client = self.wallet_client();
             query_value_pool_summary(
                 Some(&self.materialized_view_store),
@@ -1029,9 +963,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "NetworkUpgradeStatus",
             metric: "network_upgrade_status",
+            capability: capabilities::EXPLORER_NETWORK_UPGRADE_STATUS_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let network_upgrade_activations =
                 self.network_upgrade_activations.as_ref().ok_or_else(|| {
                     ExplorerError::dependency_not_configured(
@@ -1040,7 +976,6 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                 })?;
             let mut client = self.wallet_client();
             query_network_upgrade_status(
-                Some(&self.materialized_view_store),
                 network_upgrade_activations,
                 &mut client,
                 &self.upstream_observation_cache,
@@ -1060,9 +995,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "ValuePoolFlowHistory",
             metric: "value_pool_flow_history",
+            capability: capabilities::EXPLORER_VALUE_POOL_FLOW_HISTORY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_value_pool_flow_history(
@@ -1085,9 +1022,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "ValuePoolFlowEventsInRange",
             metric: "value_pool_flow_events_in_range",
+            capability: capabilities::EXPLORER_VALUE_POOL_FLOW_EVENTS_IN_RANGE_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_value_pool_flow_events_in_range(
@@ -1110,9 +1049,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "ValuePoolFlowSummary",
             metric: "value_pool_flow_summary",
+            capability: capabilities::EXPLORER_VALUE_POOL_FLOW_SUMMARY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_value_pool_flow_summary(
@@ -1135,9 +1076,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "ValuePoolFlowAmountThresholdSummary",
             metric: "value_pool_flow_amount_threshold_summary",
+            capability: capabilities::EXPLORER_VALUE_POOL_FLOW_AMOUNT_THRESHOLD_SUMMARY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_value_pool_flow_amount_threshold_summary(
@@ -1160,9 +1103,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "ValuePoolFlowRoundedAmountSummary",
             metric: "value_pool_flow_rounded_amount_summary",
+            capability: capabilities::EXPLORER_VALUE_POOL_FLOW_ROUNDED_AMOUNT_SUMMARY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_value_pool_flow_rounded_amount_summary(
@@ -1185,9 +1130,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "ValuePoolBalanceHistory",
             metric: "value_pool_balance_history",
+            capability: capabilities::EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_value_pool_balance_history(
@@ -1210,9 +1157,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "UtxoSetSummary",
             metric: "utxo_set_summary",
+            capability: capabilities::EXPLORER_UTXO_SET_SUMMARY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let mut client = self.wallet_client();
             query_utxo_set_summary(
                 Some(&self.materialized_view_store),
@@ -1234,9 +1183,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "ChainReorgHistory",
             metric: "chain_reorg_history",
+            capability: capabilities::EXPLORER_CHAIN_REORG_HISTORY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = &self.materialized_view_store;
             query_chain_reorg_history(
                 materialized_view_store,
@@ -1257,9 +1208,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "DisplacedBlockHistory",
             metric: "displaced_block_history",
+            capability: capabilities::EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
             query_displaced_block_history(
                 canonical_store,
@@ -1280,9 +1233,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "DisplacedBlockDetail",
             metric: "displaced_block_detail",
+            capability: capabilities::EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let canonical_store = self.require_canonical_store(OP.method)?;
             query_displaced_block_detail(canonical_store, &self.upstream_observation_cache, request)
                 .await
@@ -1299,14 +1254,14 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "MempoolEventCounts",
             metric: "mempool_event_counts",
+            capability: capabilities::EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = &self.materialized_view_store;
-            let mut client = self.wallet_client();
             query_mempool_event_counts(
                 materialized_view_store,
-                &mut client,
                 &self.upstream_observation_cache,
                 request,
             )
@@ -1324,9 +1279,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "TransactionHistory",
             metric: "transaction_history",
+            capability: capabilities::EXPLORER_TRANSACTION_HISTORY_V2,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_reader =
                 self.require_transaction_history_materialized_view_reader();
             materialized_view_reader
@@ -1360,14 +1317,17 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "RecentTransactions",
             metric: "recent_transactions",
+            capability: capabilities::EXPLORER_TRANSACTION_RECENT_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_recent_transactions(
                 materialized_view_store,
-                self.canonical_store.as_ref(),
+                self.endpoint_capabilities
+                    .contains(capabilities::EXPLORER_TRANSACTION_FEES_V1),
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1386,9 +1346,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "OverviewSnapshot",
             metric: "overview_snapshot",
+            capability: capabilities::EXPLORER_OVERVIEW_SNAPSHOT_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_overview_snapshot(
@@ -1411,9 +1373,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "MigrationOverview",
             metric: "migration_overview",
+            capability: capabilities::EXPLORER_MIGRATION_OVERVIEW_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_migration_overview(
@@ -1436,9 +1400,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "MigrationCohorts",
             metric: "migration_cohorts",
+            capability: capabilities::EXPLORER_MIGRATION_COHORTS_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_migration_cohorts(
@@ -1461,9 +1427,11 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         const OP: OperationNames = OperationNames {
             method: "MigrationDenominations",
             metric: "migration_denominations",
+            capability: capabilities::EXPLORER_MIGRATION_DENOMINATIONS_V1,
         };
         let started = Instant::now();
         let outcome = async {
+            self.require_capability(OP.capability, OP.method)?;
             let materialized_view_store = self.require_materialized_view_store(OP.method)?;
             let mut client = self.wallet_client();
             query_migration_denominations(
@@ -1583,5 +1551,66 @@ fn status_error_class(status: &Status) -> &'static str {
         Code::DataLoss => "data_loss",
         Code::Unauthenticated => "unauthenticated",
         Code::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        missing_docs,
+        reason = "Unit test names describe the behavior under test."
+    )]
+
+    use super::*;
+    use prost::Message as _;
+    use tempfile::tempdir;
+    use zinder_materialized_views::MaterializedViewStoreOptions;
+    use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
+    use zinder_store::RocksDbResourceBudget;
+
+    fn status(indexed_height: u32, observed_at_millis: u64) -> MaterializedViewStatus {
+        MaterializedViewStatus {
+            health: MaterializedViewHealth::Live as i32,
+            indexed_height,
+            lag_blocks: 0,
+            observed_at_millis,
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the E1 snapshot must remain open while the primary advances to E2"
+    )]
+    fn server_info_snapshot_retains_e1_status_and_freshness_after_e2_write() -> eyre::Result<()> {
+        let directory = tempdir()?;
+        let store = MaterializedViewStore::open(
+            directory.path(),
+            zinder_testkit::published_regtest_canonical_construction_identity()?,
+            MaterializedViewStoreOptions {
+                sync_writes: false,
+                consumers: &[],
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            },
+        )?;
+        let e1_status = status(100, 1_000);
+        store.put_materialized_view_status(&e1_status.encode_to_vec())?;
+
+        let e1_snapshot = store.read_snapshot()?;
+
+        let e2_status = status(101, 1_001);
+        store.put_materialized_view_status(&e2_status.encode_to_vec())?;
+
+        let freshness = build_server_info_freshness_from_snapshot(&store, &e1_snapshot)?;
+        let server_info_status = read_materialized_view_status_snapshot(&e1_snapshot)?;
+        assert_eq!(server_info_status, Some(e1_status));
+        assert_eq!(
+            freshness
+                .chain_view
+                .and_then(|chain_view| chain_view.materialized_views)
+                .map(|snapshot_status| snapshot_status.observed_at_millis),
+            Some(e1_status.observed_at_millis)
+        );
+        Ok(())
     }
 }
