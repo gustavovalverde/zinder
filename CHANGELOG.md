@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.6.0] - 2026-08-10
+
+### Changed
+
+- Lightwalletd-compatible deployments now advertise transparent-address support only when their serving data can answer those requests. Startup rejects configurations that lack a transparent wallet projection or retained transaction bytes. ([#71](https://github.com/gustavovalverde/zinder/pull/71))
+- Document the production Testnet Zebra readiness calibration that keeps ordinary block gaps available while peer, sync, lag, and stale-tip failures remain fail-closed. ([#73](https://github.com/gustavovalverde/zinder/pull/73))
+
+### Fixed
+
+- Stale fixed-view mempool epochs now reach the typed view-expiration path so wallet consumers can reacquire the view without treating expected chain rotation as service unavailability. ([#69](https://github.com/gustavovalverde/zinder/pull/69))
+- Secondary query and projection processes no longer create thousands of short-lived storage threads per second while following the chain. ([#72](https://github.com/gustavovalverde/zinder/pull/72))
+
+
 ## [0.5.0] - 2026-07-29
 
 ### Added

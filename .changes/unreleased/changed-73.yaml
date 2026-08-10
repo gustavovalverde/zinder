@@ -1,6 +1,0 @@
-kind: changed
-body: Document the production Testnet Zebra readiness calibration that keeps ordinary block gaps available while peer, sync, lag, and stale-tip failures remain fail-closed.
-time: 2026-08-04T04:12:00Z
-custom:
-  Bump: patch
-  PR: "73"

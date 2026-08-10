@@ -1,6 +1,0 @@
-kind: fixed
-body: Stale fixed-view mempool epochs now reach the typed view-expiration path so wallet consumers can reacquire the view without treating expected chain rotation as service unavailability.
-time: 2026-08-02T11:18:24.463999044Z
-custom:
-    Bump: patch
-    PR: "69"
