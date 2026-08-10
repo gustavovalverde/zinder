@@ -1,6 +1,0 @@
-kind: fixed
-body: Secondary query and projection processes no longer create thousands of short-lived storage threads per second while following the chain.
-time: 2026-08-04T03:39:12.675543095Z
-custom:
-    Bump: patch
-    PR: "72"
