@@ -1,0 +1,6 @@
+kind: changed
+body: Explorer now advertises only operations that its admitted listeners, stores, and wallet dependency can serve coherently. Native Explorer clients must regenerate for the v2 block and mempool summary identifiers, removed legacy request fields, and reduced runtime configuration surface.
+time: 2026-08-10T16:06:10Z
+custom:
+  Bump: minor
+  PR: "75"
