@@ -206,6 +206,22 @@ is a `WalletQuery` surface answering from a chain that stopped advancing.
 Upstream outages and sync lag drain readiness the same way but clear on their
 own, so they are tolerated for an hour before the container terminates.
 
+For Testnet, configure Zebra with `ready_max_blocks_behind = 4` and
+`ready_max_tip_age = "5m"`. The four-block limit is the bounded correction for
+an observed `lag=3` transition during a canonically current 225-second block
+gap, leaving one estimator block of margin. It is not an arithmetic equivalent
+of the five-minute limit: Zebra derives estimated lag from the best tip's
+header timestamp, while tip age measures elapsed time since the local height
+increased.
+
+Before release, record the local time when each new `bestblockhash` is first
+observed, its `getblockheader` `time`, and every `/ready` transition through an
+ordinary gap. Reject the four-block calibration if the measured header-time
+offset makes estimated lag exceed it before the local five-minute tip-age
+boundary while `blocks == headers`; select a new bounded threshold and repeat
+the failure matrix. Keep peer, sync-status, tip-age, and lag checks enabled; do
+not make `/ready` unconditional on Testnet.
+
 Railway sends `SIGTERM` on redeploy and stop. The entrypoint forwards it to the
 query, projector, and ingest processes in that order and waits twenty seconds,
 inside Railway's thirty-second drain window. It exits zero once all three stop,
