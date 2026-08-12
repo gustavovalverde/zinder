@@ -3,6 +3,27 @@
 [CLAUDE.md](CLAUDE.md) contains the canonical repository instructions. Read and
 follow it before making changes; this file is a concise project reference.
 
+## GitHub Delivery and Project Management
+
+Open delivery work is tracked in the private [Zinder delivery Project 7](https://github.com/users/gustavovalverde/projects/7). Project metadata is part of the delivery contract, not a secondary documentation layer.
+
+- Use GitHub's native parent and sub-issue hierarchy for decomposition. Use native `blocked by` relationships for hard prerequisites; do not maintain `Parent`, `Blocks`, `Blocked by`, or hand-written issue maps in issue bodies. Project `Blocked by` mirrors the native direct dependencies for board visibility.
+- Every executable Zinder issue has one primary issue-kind label, exactly one `type:*` label, every relevant `area:*` label, one milestone, and Project 7 Status, Priority, and Track. Cross-repository PRs may omit a milestone when no Zinder exit gate applies, but they still require Project 7 Status, Priority, and Track.
+- `type:afk` means every acceptance criterion can be completed from repository, fixture, or isolated-test evidence. `type:hitl` means at least one criterion requires a named human decision, credential, external system, public-network effect, operator-owned environment, or official interaction. `type:epic` is reserved for grouping issues with native executable sub-issues; it is not an implementation type.
+- Use one workflow-state label where applicable: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, or `wontfix`. Apply `ready-for-agent` only to a sufficiently scoped autonomous issue; do not use it for epics, human-controlled qualification, or unresolved scope decisions.
+- Apply area labels from the Zinder taxonomy: `area:ingest`, `area:storage`, `area:wallet`, `area:compat`, `area:operations`, `area:release`, `area:postgres`, and `area:explorer`. Create a new area label only when an outcome cannot be represented by these existing ownership boundaries.
+- Issue bodies state the actor outcome, domain problem, delivery scope, acceptance criteria, execution boundary, durable references, and out-of-scope claims. They must not duplicate native hierarchy, native dependencies, or Project fields.
+
+Project 7 uses these delivery fields:
+
+- Priority: `P0 Now`, `P1 Next`, `P2 Later`, `P3 Backlog`, `Epic`.
+- Track: `Wallet adoption`, `Single-host production`, `Query scalability`, `PostgreSQL topology`, `Explorer`, `Release engineering`.
+- Milestones: M0 Consumer adoption, M1 v0.6.x reliability, M2 Operator-ready RocksDB, M3 Horizontal topology, and M4 Explorer. A milestone is an exit gate, not merely a topic label.
+
+Wallet compatibility evidence and production-topology qualification are separate claims. The supported candidate remains `rocksdb-single-host` until release-specific capacity, recovery, replacement, and operator evidence admit another topology. PostgreSQL tracer or benchmark work remains diagnostic and non-production until the measured single-host evidence and the explicit horizontal-admission decision close.
+
+Project 7's native workflows are enabled for item addition, sub-issue addition, issue closure, pull-request linkage, and pull-request merge. Preserve those workflows. After any issue, pull request, milestone, label, dependency, or Project mutation, verify the native hierarchy, direct dependencies, labels, milestone, Project Status/Priority/Track, and mirrored `Blocked by` value.
+
 ## Project Structure & Module Organization
 
 This is a Rust 2024 workspace.
