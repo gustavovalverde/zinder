@@ -5,7 +5,7 @@ follow it before making changes; this file is a concise project reference.
 
 ## GitHub Delivery and Project Management
 
-Open delivery work is tracked in the private [Zinder delivery Project 7](https://github.com/users/gustavovalverde/projects/7). Project metadata is part of the delivery contract, not a secondary documentation layer.
+Open delivery work is tracked in the public [Zinder delivery Project 7](https://github.com/users/gustavovalverde/projects/7). Project metadata is part of the delivery contract, not a secondary documentation layer.
 
 - Use GitHub's native parent and sub-issue hierarchy for decomposition. Use native `blocked by` relationships for hard prerequisites; do not maintain `Parent`, `Blocks`, `Blocked by`, or hand-written issue maps in issue bodies. Project `Blocked by` mirrors the native direct dependencies for board visibility.
 - Every executable Zinder issue has one primary issue-kind label, exactly one `type:*` label, every relevant `area:*` label, one milestone, and Project 7 Status, Priority, and Track. Cross-repository PRs may omit a milestone when no Zinder exit gate applies, but they still require Project 7 Status, Priority, and Track.
