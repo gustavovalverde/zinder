@@ -507,7 +507,9 @@ fn resolve_materialized_transparent_output_spends(
         .map(BlockHeight::new)
         .ok_or_else(|| ExplorerError::internal("MinedTransaction missing block location"))?;
     let spends = {
-        let snapshot = materialized_view_store.read_snapshot();
+        let snapshot = materialized_view_store
+            .read_snapshot()
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
         let state = snapshot
             .consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)
             .map_err(|error| ExplorerError::internal(error.to_string()))?

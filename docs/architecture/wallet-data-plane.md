@@ -659,6 +659,17 @@ but the current SDK does not call it. Claims for that method therefore require
 separate protocol or consumer evidence and must not be presented as current
 Zodl certification.
 
+## Wallet construction identity
+
+Wallet projection schema 2 persists the canonical construction-manifest
+binding in its control record before READY publication. Fresh construction,
+following, secondary admission, and the serving-pair composition carry that
+value unchanged. A query exact-compares it with the binding minted by its
+canonical reader before publishing any pair; matching network, height, epoch,
+or row digests cannot substitute for construction identity. Schema-1 wallet
+stores have no such proof and require a fresh projection rebuild rather than a
+migration or compatibility shim.
+
 ## Query Consistency
 
 Wallet sync APIs must read from one `ChainEpoch`. Primary in-process reads may also be backed by one RocksDB snapshot; secondary reads are snapshotless and rely on epoch-bound visibility retention per [ADR-0003](../adrs/0003-canonical-storage-access-boundary.md).

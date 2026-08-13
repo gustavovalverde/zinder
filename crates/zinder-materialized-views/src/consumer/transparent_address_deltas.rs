@@ -570,6 +570,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            crate::store::test_construction_identity(zinder_core::Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
                 consumers: &[TRANSPARENT_ADDRESS_DELTAS_SCHEMA],
                 ..MaterializedViewStoreOptions::default()

@@ -224,7 +224,7 @@ async fn commit_store_and_spawn_grpc() -> Result<String> {
         (),
         ingest_control,
         activations,
-    );
+    )?;
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     spawn_wallet_query_server(grpc_adapter, store_fixture).await
 }

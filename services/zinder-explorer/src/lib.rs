@@ -9,7 +9,10 @@
 
 mod grpc;
 
-pub use grpc::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};
+pub use grpc::{
+    ExplorerEndpointAdmissionError, ExplorerQueryEndpointComposition, ExplorerQueryGrpcAdapter,
+    ExplorerServerInfoSettings, ExplorerWalletQueryHealthError, describe_request_metrics,
+};
 pub use zinder_materialized_views::{
     BLOCK_SUMMARY_CAPABILITIES, BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME,
     BlockCommitContext, BlockKeyedConsumer, BlockSummaryConsumer, BlockSummaryConsumerError,
@@ -17,10 +20,10 @@ pub use zinder_materialized_views::{
     MATERIALIZED_VIEW_STORE_FORMAT_VERSION, MEMPOOL_EVENT_COUNTS_COLUMN_FAMILY,
     MEMPOOL_EVENT_COUNTS_CONSUMER_NAME, MEMPOOL_EVENT_COUNTS_RETENTION_SECONDS,
     MaterializedViewConsumer, MaterializedViewConsumerCtx, MaterializedViewConsumerError,
-    MaterializedViewConsumerName, MaterializedViewCursorEntry, MaterializedViewError,
-    MaterializedViewMempoolConsumer, MaterializedViewStore, MaterializedViewStoreColumnFamily,
-    MaterializedViewStoreError, MaterializedViewStoreOptions, MaterializedViewStoreTable,
-    MempoolConsumerEvent, MempoolConsumerEventVariant, MempoolEventCountsConsumer, RevertedRange,
+    MaterializedViewConsumerName, MaterializedViewError, MaterializedViewMempoolConsumer,
+    MaterializedViewStore, MaterializedViewStoreColumnFamily, MaterializedViewStoreError,
+    MaterializedViewStoreOptions, MaterializedViewStoreTable, MempoolConsumerEvent,
+    MempoolConsumerEventVariant, MempoolEventCountsConsumer, RevertedRange,
     TRANSACTION_FEES_COLUMN_FAMILIES, TRANSACTION_FEES_COLUMN_FAMILY,
     TRANSACTION_FEES_CONSUMER_NAME, TRANSACTION_FEES_INDEX_COLUMN_FAMILY,
     TRANSACTION_HISTORY_COLUMN_FAMILY, TRANSACTION_HISTORY_CONSUMER_NAME,

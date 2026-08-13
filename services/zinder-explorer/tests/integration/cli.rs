@@ -3,25 +3,10 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{
-    fs,
-    net::SocketAddr,
-    path::Path,
-    process::{Command, Stdio},
-    time::Duration,
-};
+use std::{fs, net::SocketAddr, path::Path, process::Command};
 
 use tempfile::tempdir;
-use tokio::process::Command as TokioCommand;
-use tonic::transport::{Channel, Endpoint};
 use zinder_core::Network;
-use zinder_proto::{
-    capabilities::{
-        EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_TRANSACTION_DETAIL_V4,
-        EXPLORER_TRANSACTION_FEES_V1,
-    },
-    v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient},
-};
 use zinder_testkit::StoreFixture;
 
 #[test]
@@ -45,6 +30,8 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
             path_str(&secondary_path)?,
             "--listen-addr",
             "127.0.0.1:9068",
+            "--wallet-query-endpoint",
+            "http://127.0.0.1:1",
             "--bearer-token-path",
             path_str(&token_path)?,
         ])
@@ -103,8 +90,8 @@ fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn runtime_starts_without_materialized_view_store_and_omits_materialized_view_capabilities()
+#[test]
+fn runtime_refuses_to_bind_without_an_admitted_materialized_view_and_wallet_pair()
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let tempdir = tempdir()?;
@@ -116,66 +103,14 @@ async fn runtime_starts_without_materialized_view_store_and_omits_materialized_v
         explorer_config_toml(store_fixture.tempdir_path(), &secondary_path, listen_addr)?,
     )?;
 
-    let mut child = zinder_explorer_tokio_command()
+    let output = zinder_explorer_command()
         .args(["--config", path_str(&config_path)?])
-        .spawn()?;
-
-    let channel = await_explorer_channel(listen_addr).await;
-    if channel.is_err() {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
-    let channel = channel?;
-    let mut client = ExplorerQueryClient::new(channel);
-    let server_info = tokio::time::timeout(
-        Duration::from_secs(5),
-        client.server_info(ServerInfoRequest {}),
-    )
-    .await;
-
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-
-    let explorer_info = server_info
-        .map_err(|_| eyre::eyre!("explorer ServerInfo request timed out"))??
-        .into_inner()
-        .info
-        .ok_or_else(|| eyre::eyre!("server info missing info envelope"))?;
-    let common = explorer_info
-        .common
-        .ok_or_else(|| eyre::eyre!("server info missing common envelope"))?;
-
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
     assert!(
-        !common
-            .capabilities
-            .iter()
-            .any(|capability| capability == EXPLORER_TRANSACTION_DETAIL_V4),
-        "{:?}",
-        common.capabilities
-    );
-    assert!(
-        !common
-            .capabilities
-            .iter()
-            .any(|capability| capability == EXPLORER_BLOCK_SUMMARY_V1),
-        "{:?}",
-        common.capabilities
-    );
-    assert!(
-        !common
-            .capabilities
-            .iter()
-            .any(|capability| capability == EXPLORER_OVERVIEW_SNAPSHOT_V1),
-        "{:?}",
-        common.capabilities
-    );
-    assert!(
-        !common
-            .capabilities
-            .iter()
-            .any(|capability| capability == EXPLORER_TRANSACTION_FEES_V1),
-        "{:?}",
-        common.capabilities
+        stderr.contains("materialized-view") || stderr.contains("wallet"),
+        "{stderr}"
     );
 
     Ok(())
@@ -184,13 +119,6 @@ async fn runtime_starts_without_materialized_view_store_and_omits_materialized_v
 fn zinder_explorer_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-explorer"));
     command.env_clear();
-    command
-}
-
-fn zinder_explorer_tokio_command() -> TokioCommand {
-    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_zinder-explorer"));
-    command.env_clear();
-    command.stdout(Stdio::null()).stderr(Stdio::null());
     command
 }
 
@@ -223,19 +151,6 @@ listen_addr = ""
 fn unused_loopback_addr() -> eyre::Result<SocketAddr> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?)
-}
-
-async fn await_explorer_channel(listen_addr: SocketAddr) -> eyre::Result<Channel> {
-    let endpoint = format!("http://{listen_addr}");
-    for _ in 0..100 {
-        match Endpoint::from_shared(endpoint.clone())?.connect().await {
-            Ok(channel) => return Ok(channel),
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-        }
-    }
-    Err(eyre::eyre!(
-        "explorer did not accept gRPC connections at {listen_addr}"
-    ))
 }
 
 fn path_str(path: &Path) -> eyre::Result<&str> {

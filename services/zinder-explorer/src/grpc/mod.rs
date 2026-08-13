@@ -7,6 +7,7 @@ mod chain_reorg_history;
 mod commitment_root_search;
 mod conventional_fee_distribution;
 mod displaced_block;
+mod endpoint_admission;
 mod error;
 mod fee_summary;
 mod freshness;
@@ -31,7 +32,11 @@ mod value_pool_balance_history;
 mod value_pool_flow;
 mod value_pool_summary;
 
-pub use adapter::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};
+pub use adapter::{
+    ExplorerQueryEndpointComposition, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,
+    describe_request_metrics,
+};
+pub use endpoint_admission::{ExplorerEndpointAdmissionError, ExplorerWalletQueryHealthError};
 
 fn require_matching_chain_epoch(
     expected: zinder_core::ChainEpoch,

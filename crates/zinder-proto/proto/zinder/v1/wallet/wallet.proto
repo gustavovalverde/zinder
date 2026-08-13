@@ -953,6 +953,11 @@ message WalletServerInfo {
 
   // Upstream node capabilities detected by zinder-source.
   NodeCapabilitiesDescriptor node = 8;
+
+  // Immutable canonical construction backing this admitted Wallet serving
+  // pair. Consumers must treat this as a structural claim and exact-compare
+  // it with their own canonical authority before using Wallet-backed rows.
+  zinder.v1.ops.CanonicalConstructionManifestBinding canonical_construction_manifest_binding = 9;
 }
 
 // Upstream node capability descriptor. Storage-only query deployments may

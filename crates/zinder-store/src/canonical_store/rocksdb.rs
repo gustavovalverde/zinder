@@ -436,6 +436,15 @@ impl RocksDbCanonicalStore {
         self.build_plan.reorg_policy()
     }
 
+    /// Returns the exact construction identity admitted for this primary.
+    #[must_use]
+    pub const fn construction_identity(&self) -> super::CanonicalStoreConstructionIdentity {
+        super::CanonicalStoreConstructionIdentity::from_admitted(
+            &self.build_plan,
+            &self.ready_evidence,
+        )
+    }
+
     /// Returns the durable boundary of intentionally retained history.
     #[must_use]
     pub const fn history_bounds(&self) -> CanonicalHistoryBounds {

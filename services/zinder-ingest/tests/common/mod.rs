@@ -67,9 +67,11 @@ pub(crate) struct WalletReadTestRange {
 /// only need to satisfy writer API wiring.
 pub(crate) fn test_materialized_view_store(
     storage_path: &Path,
+    construction_identity: zinder_store::CanonicalStoreConstructionIdentity,
 ) -> Result<zinder_materialized_views::MaterializedViewStore> {
     Ok(zinder_materialized_views::MaterializedViewStore::open(
         zinder_materialized_views::MaterializedViewStore::path_for_canonical(storage_path),
+        construction_identity,
         zinder_materialized_views::MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[],

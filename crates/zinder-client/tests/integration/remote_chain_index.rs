@@ -34,24 +34,38 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    AdmittedIngestControl, WalletEndpointMetadata, WalletQuery, WalletQueryApi,
-    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, CanonicalReader, WalletEndpointMetadata, WalletProjectionReader,
+    WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_testkit::{
-    ChainFixture, IngestControlFixture, MockTransactionBroadcaster, StoreFixture,
-    WalletServingStoreFixture, sample_regtest_upgrade_activations,
+    ChainFixture, IngestControlFixture, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
 };
 
 #[tokio::test]
 async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::Result<()> {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let store_fixture =
-        StoreFixture::with_chain_committed(&chain_fixture, zinder_client::ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        MockTransactionBroadcaster::broadcast_disabled(),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain_fixture, &activations)?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = WalletServingReadPair::new(
+        Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
+        Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+    )?;
+    let ingest_control_fixture = IngestControlFixture::spawn(chain_fixture.network()).await?;
+    let ingest_control = AdmittedIngestControl::connect(
+        ingest_control_fixture.endpoint(),
+        None,
+        chain_fixture.network(),
+    )
+    .await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(Arc::new(serving_pair)),
+        (),
+        ingest_control,
+        activations,
+    )?;
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let endpoint = spawn_wallet_query(grpc_adapter).await?;
     let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
@@ -122,7 +136,7 @@ async fn remote_chain_index_returns_typed_network_upgrade_activations() -> eyre:
         (),
         admitted_ingest_control,
         activations,
-    );
+    )?;
     let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
         wallet_query,
         WalletEndpointMetadata::default(),
@@ -201,7 +215,7 @@ async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resum
         (),
         admitted_ingest_control,
         activations,
-    );
+    )?;
     let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
         wallet_query,
         WalletEndpointMetadata::default(),

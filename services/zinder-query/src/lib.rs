@@ -35,8 +35,9 @@ use zinder_proto::capabilities::{
 use zinder_runtime::AuthenticatedChannel;
 use zinder_source::{SourceError, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
-    AddressOutputIndexPageRequest, ArtifactFamily, BlockHashLookup, ChainEpochReadApi,
-    ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
+    AddressOutputIndexPageRequest, ArtifactFamily, BlockHashLookup,
+    CanonicalConstructionManifestBinding, ChainEpochReadApi, ChainEventEnvelope,
+    ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
     DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EventStreamStartPosition, StoreError,
     StreamCursorTokenV1,
 };
@@ -86,6 +87,15 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Returns the immutable structural capability set derived when this query
     /// was composed and admitted.
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;
+
+    /// Returns the admitted canonical construction backing row-serving methods.
+    ///
+    /// Generic query adapters that cannot prove a canonical serving-pair
+    /// lineage return `None`; composition roots requiring row authority must
+    /// reject that absence before reading rows.
+    fn canonical_construction_manifest_binding(
+        &self,
+    ) -> Option<CanonicalConstructionManifestBinding>;
 
     /// Returns the diagnostic capability snapshot from the exact upstream
     /// source handle installed in this query, when one exists.
@@ -488,16 +498,6 @@ impl<ReadApi, Broadcaster> WalletQuery<ReadApi, Broadcaster> {
         }
     }
 
-    /// Attaches the materialized-view projections used by wallet queries.
-    #[must_use]
-    pub fn with_materialized_view_store(
-        mut self,
-        materialized_view_store: MaterializedViewStore,
-    ) -> Self {
-        self.materialized_view_store = Some(materialized_view_store);
-        self
-    }
-
     /// Attaches the upstream node used to fill tree states at heights without a
     /// stored checkpoint. Without it, `tree_state_at` serves only stored
     /// checkpoint heights and returns `ArtifactUnavailable` for the gaps.
@@ -532,6 +532,12 @@ where
 {
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
         &self.native_endpoint_capabilities
+    }
+
+    fn canonical_construction_manifest_binding(
+        &self,
+    ) -> Option<CanonicalConstructionManifestBinding> {
+        None
     }
 
     fn upstream_node_capabilities(&self) -> Option<&UpstreamNodeCapabilities> {
@@ -866,7 +872,7 @@ where
                         capability: WALLET_READ_TRANSPARENT_SPENDS_V1,
                     })?;
                 materialized_view_store.try_catch_up()?;
-                let snapshot = materialized_view_store.read_snapshot();
+                let snapshot = materialized_view_store.read_snapshot()?;
                 for materialized_spend in resolve_materialized_transparent_spends(
                     &snapshot,
                     &reader,
@@ -1106,14 +1112,12 @@ where
             let canonical_fence =
                 current_visible_chain_event_cursor_for_epoch(&read_api, chain_epoch)?;
             materialized_view_store.try_catch_up()?;
-            let snapshot = materialized_view_store.read_snapshot();
-            let materialized_fence = snapshot
-                .get_chain_event_cursor(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME)?;
-            if materialized_fence.as_deref()
-                != canonical_fence
-                    .as_ref()
-                    .map(zinder_store::StreamCursorTokenV1::as_bytes)
-            {
+            let snapshot = materialized_view_store.read_snapshot()?;
+            let materialized_checkpoint = snapshot
+                .chain_event_checkpoint(TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME)?;
+            if !materialized_checkpoint.is_some_and(|checkpoint| {
+                materialized_view_checkpoint_matches_chain_epoch(checkpoint, chain_epoch)
+            }) {
                 return Err(QueryError::MaterializedViewUnavailable {
                     capability: WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
                 });
@@ -1626,6 +1630,26 @@ fn current_visible_chain_event_cursor_for_epoch(
     Ok(fence)
 }
 
+/// Returns whether an authenticated materialized-view checkpoint names the
+/// exact canonical epoch whose response is being assembled.
+///
+/// Canonical live commits enforce that the epoch identifier and event sequence
+/// advance together. The query still compares both fields so a malformed or
+/// independently constructed checkpoint cannot pass on the visible tip alone.
+fn materialized_view_checkpoint_matches_chain_epoch(
+    checkpoint: zinder_materialized_views::MaterializedViewChainEventCheckpoint,
+    chain_epoch: ChainEpoch,
+) -> bool {
+    let resulting_fence = checkpoint.resulting_fence();
+    resulting_fence.chain_epoch_id() == chain_epoch.id
+        && resulting_fence.chain_event_sequence() == chain_epoch.id.value()
+        && resulting_fence.visible_tip()
+            == BlockId {
+                height: chain_epoch.visible_tip_height,
+                hash: chain_epoch.visible_tip_hash,
+            }
+}
+
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "Unknown materialized-view failures retain the query storage-error mapping."
@@ -1961,6 +1985,9 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
         Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
         Some(QueryError::EndpointCapabilityUnavailable { .. }) => "endpoint_capability_unavailable",
+        Some(QueryError::CanonicalActivationsFingerprintMismatch) => {
+            "canonical_activations_fingerprint_mismatch"
+        }
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
@@ -2464,6 +2491,10 @@ pub enum QueryError {
     #[error(transparent)]
     MaterializedViewStore(#[from] zinder_materialized_views::MaterializedViewStoreError),
 
+    /// Query activation evidence disagrees with the admitted canonical pair.
+    #[error("network-upgrade activation table does not match the admitted canonical construction")]
+    CanonicalActivationsFingerprintMismatch,
+
     /// Typed wallet-projection backend returned a storage failure.
     #[error("wallet projection read failed: {source}")]
     WalletProjectionRead {
@@ -2528,6 +2559,7 @@ impl zinder_proto::BoundaryError for QueryError {
                 ErrorReason::NodeCapabilityMissing
             }
             Self::Node(_) => ErrorReason::NodeUnavailable,
+            Self::CanonicalActivationsFingerprintMismatch => ErrorReason::SchemaMismatch,
             Self::MaterializedViewStore(_)
             | Self::Store(_)
             | Self::WalletProjectionRead { .. }

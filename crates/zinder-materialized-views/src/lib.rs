@@ -163,7 +163,7 @@ pub use consumer::value_pool_flow_history::{
 };
 pub use consumer::{
     BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, BlockValuePoolBalanceFacts,
-    ChainCommittedEvent, ChainReorgedEvent, CommittedRange, MaterializedViewBlockCheckpoint,
+    ChainCommittedEvent, ChainReorgedEvent, CommittedRange, MaterializedViewBlockProjection,
     MaterializedViewConsumer, MaterializedViewConsumerCtx, MaterializedViewConsumerError,
     MaterializedViewConsumerName, MaterializedViewConsumerSchema, MaterializedViewMempoolConsumer,
     MempoolConsumerEvent, MempoolConsumerEventVariant, RevertedRange,
@@ -181,7 +181,7 @@ pub use error::{
 pub use store::{
     ChainEventDispatchConsumers, ChainEventDispatchInputs, ConsumerEntry,
     MATERIALIZED_VIEW_STORE_FORMAT_VERSION, MATERIALIZED_VIEW_STORE_SUBDIR,
-    MaterializedViewCoverage, MaterializedViewCursorEntry, MaterializedViewPreset,
+    MaterializedViewChainEventCheckpoint, MaterializedViewCoverage, MaterializedViewPreset,
     MaterializedViewState, MaterializedViewStore, MaterializedViewStoreOptions,
     MaterializedViewStoreReadSnapshot, MaterializedViewStoreTable,
     MaterializedViewWriteMeasurement,

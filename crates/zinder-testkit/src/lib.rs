@@ -63,7 +63,7 @@ pub use json_rpc_test_server::{
 pub use log_capture::{CapturedEvent, LogCapture};
 pub use materialized_view_fixture::{
     MaterializedViewFixtureError, open_test_materialized_view_store_for_canonical,
-    seed_transparent_outpoint_spends,
+    published_regtest_canonical_construction_identity, seed_transparent_outpoint_spends,
 };
 pub use mock_mempool_source::{
     MockMempoolSource, MockMempoolSourceClosed, MockMempoolSourceControl,

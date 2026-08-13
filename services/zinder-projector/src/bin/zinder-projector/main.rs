@@ -12,15 +12,16 @@ use zinder_core::{
     BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFactsSequenceDigest, UnixTimestampMillis,
     wire::encode_zinder_native_chain_name,
 };
+use zinder_proto::wire::decode_canonical_construction_manifest_binding;
 use zinder_runtime::{
     OpsServer, Readiness, ReadinessState, cancel_on_terminating_signal,
     host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint,
 };
 use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
-    CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalReorgPolicy,
-    CanonicalRetainedEvent, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
-    RocksDbCanonicalSecondary,
+    CanonicalConstructionManifestBinding, CanonicalEventCursor, CanonicalEventFence,
+    CanonicalEventHistoryRequest, CanonicalReorgPolicy, CanonicalRetainedEvent,
+    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
@@ -270,11 +271,19 @@ async fn run_owned_projector(
             config.wallet_rocksdb_budget,
         ) {
             Ok(wallet) => {
+                let canonical_construction_binding = canonical
+                    .construction_identity()
+                    .construction_manifest_binding();
+                require_wallet_construction_binding(
+                    wallet.canonical_construction_binding(),
+                    canonical_construction_binding,
+                )?;
                 let wallet_source =
                     WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
                 match admit_resumed_following(
                     &mut canonical_control,
                     wallet_source,
+                    canonical_construction_binding,
                     config.lease_duration,
                 )
                 .await?
@@ -430,6 +439,9 @@ async fn run_owned_projector(
                         &canonical_lease,
                         expected_wallet_source,
                         network,
+                        canonical
+                            .construction_identity()
+                            .construction_manifest_binding(),
                     )
                     .inspect_err(|_| {
                         tracing::error!(
@@ -1258,9 +1270,11 @@ enum ResumedFollowingRetentionPlan {
 async fn admit_resumed_following(
     control: &mut CanonicalWriterControlClient,
     source: WalletCanonicalSourceIdentity,
+    construction_binding: CanonicalConstructionManifestBinding,
     lease_duration: Duration,
 ) -> Result<ResumedFollowingAdmission, ProjectorError> {
     let initial_status = control.writer_status().await?;
+    require_writer_construction_binding(&initial_status, construction_binding)?;
     match classify_resumed_following_retention(
         source,
         initial_status.oldest_retained_event_sequence,
@@ -1277,6 +1291,7 @@ async fn admit_resumed_following(
                     Err(error) => error,
                 };
             let refreshed_status = control.writer_status().await?;
+            require_writer_construction_binding(&refreshed_status, construction_binding)?;
             match classify_resumed_following_retention(
                 source,
                 refreshed_status.oldest_retained_event_sequence,
@@ -1451,9 +1466,13 @@ fn require_pre_promotion_follower_admission(
     lease: &CanonicalRetentionLease,
     expected: WalletCanonicalSourceIdentity,
     network: zinder_core::Network,
+    construction_binding: CanonicalConstructionManifestBinding,
 ) -> Result<(), zinder_wallet_rocksdb::RocksDbWalletError> {
     let expected_position = expected.source_position();
     let expected_cursor = expected_position.event_cursor.as_bytes();
+    if require_writer_construction_binding(&status, construction_binding).is_err() {
+        return Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled);
+    }
     let Some(fence) = status.fence else {
         return Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled);
     };
@@ -1476,7 +1495,13 @@ async fn converge_on_writer_fence(
         canonical.try_catch_up()?;
         let ready = canonical.ready_evidence();
         let status = control.writer_status().await?;
-        if writer_status_matches(status, &ready, canonical.network()) {
+        require_writer_construction_binding(
+            &status,
+            canonical
+                .construction_identity()
+                .construction_manifest_binding(),
+        )?;
+        if writer_status_matches(&status, &ready, canonical.network()) {
             return Ok(ready);
         }
         tokio::time::sleep(CANONICAL_FENCE_CONVERGENCE_DELAY).await;
@@ -1485,7 +1510,7 @@ async fn converge_on_writer_fence(
 }
 
 fn writer_status_matches(
-    status: zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
     ready: &CanonicalStoreReadyEvidence,
     network: zinder_core::Network,
 ) -> bool {
@@ -1493,11 +1518,11 @@ fn writer_status_matches(
 }
 
 fn writer_status_matches_source(
-    status: zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
     expected: WalletCanonicalSourceIdentity,
     network: zinder_core::Network,
 ) -> bool {
-    let Some(fence) = status.fence else {
+    let Some(fence) = status.fence.as_ref() else {
         return false;
     };
     let source_position = expected.source_position();
@@ -1508,6 +1533,32 @@ fn writer_status_matches_source(
         && fence.visible_tip_hash == source_position.tip.hash.as_bytes()
         && fence.visible_block_count == expected.source_sequence_digest().block_count()
         && fence.canonical_sequence_digest == expected.source_sequence_digest().as_bytes()
+}
+
+fn require_writer_construction_binding(
+    status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    expected: CanonicalConstructionManifestBinding,
+) -> Result<(), ProjectorError> {
+    let message = status
+        .canonical_construction_manifest_binding
+        .as_ref()
+        .ok_or(ProjectorError::CanonicalConstructionBindingMissing)?;
+    let observed = decode_canonical_construction_manifest_binding(message)
+        .map_err(|source| ProjectorError::CanonicalConstructionBindingMalformed { source })?;
+    if observed.format_version() != expected.version || observed.sha256() != expected.sha256 {
+        return Err(ProjectorError::CanonicalConstructionBindingMismatch);
+    }
+    Ok(())
+}
+
+fn require_wallet_construction_binding(
+    observed: zinder_wallet_projection::WalletCanonicalConstructionBinding,
+    expected: CanonicalConstructionManifestBinding,
+) -> Result<(), ProjectorError> {
+    if observed.format_version() != expected.version || observed.sha256() != expected.sha256 {
+        return Err(ProjectorError::CanonicalConstructionBindingMismatch);
+    }
+    Ok(())
 }
 
 fn canonical_source_identity(ready: &CanonicalStoreReadyEvidence) -> WalletCanonicalSourceIdentity {
@@ -1975,11 +2026,20 @@ mod tests {
         following_retention_lease_renewal_expiry, following_retention_lease_transition_expiry,
         lease_expiry, reconciliation_ranges, require_bounded_reconciliation_replay,
         require_built_wallet_source, require_pre_promotion_follower_admission,
-        require_retention_lease_anchor, settled_tip_for_transition, writer_status_matches_source,
+        require_retention_lease_anchor, require_wallet_construction_binding,
+        require_writer_construction_binding, settled_tip_for_transition,
+        writer_status_matches_source,
     };
-    use zinder_proto::v1::ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse};
+    use zinder_proto::{
+        v1::ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse},
+        wire::{
+            CanonicalConstructionManifestBindingFields,
+            encode_canonical_construction_manifest_binding,
+        },
+    };
     use zinder_store::{
-        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventHistoryRequest,
+        CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CanonicalBaselinePublication,
+        CanonicalBuildBlock, CanonicalConstructionManifestBinding, CanonicalEventHistoryRequest,
         CanonicalLiveAppend, CanonicalLiveReplacement, CanonicalReorgPolicy,
         CanonicalReplacementBlock, CanonicalStoreBuildPlan, CanonicalStoreWorkload,
         RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
@@ -2182,6 +2242,7 @@ mod tests {
                 &retention_lease(expected),
                 expected,
                 test_network(),
+                test_construction_binding(),
             )
             .is_ok()
         );
@@ -2203,6 +2264,7 @@ mod tests {
                 &retention_lease(expected),
                 expected,
                 test_network(),
+                test_construction_binding(),
             )
             .is_ok()
         );
@@ -2217,6 +2279,7 @@ mod tests {
                 &retention_lease(expected),
                 expected,
                 test_network(),
+                test_construction_binding(),
             ),
             Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled)
         ));
@@ -2232,6 +2295,72 @@ mod tests {
                 &retention_lease(source_identity(2, 2)),
                 expected,
                 test_network(),
+                test_construction_binding(),
+            ),
+            Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled)
+        ));
+    }
+
+    #[test]
+    fn writer_binding_validation_rejects_missing_malformed_and_different_claims() {
+        let source = source_identity(1, 1);
+        let expected = test_construction_binding();
+
+        let mut missing = writer_status(source);
+        missing.canonical_construction_manifest_binding = None;
+        assert!(matches!(
+            require_writer_construction_binding(&missing, expected),
+            Err(ProjectorError::CanonicalConstructionBindingMissing)
+        ));
+
+        let mut malformed = writer_status(source);
+        if let Some(binding) = malformed.canonical_construction_manifest_binding.as_mut() {
+            binding.sha256.truncate(31);
+        }
+        assert!(matches!(
+            require_writer_construction_binding(&malformed, expected),
+            Err(ProjectorError::CanonicalConstructionBindingMalformed { .. })
+        ));
+
+        let mut different = writer_status(source);
+        if let Some(binding) = different.canonical_construction_manifest_binding.as_mut() {
+            binding.sha256 = vec![0x7b; 32];
+        }
+        assert!(matches!(
+            require_writer_construction_binding(&different, expected),
+            Err(ProjectorError::CanonicalConstructionBindingMismatch)
+        ));
+    }
+
+    #[test]
+    fn resumed_wallet_rejects_a_different_canonical_construction() {
+        let expected = test_construction_binding();
+        let observed = zinder_wallet_projection::WalletCanonicalConstructionBinding::new(
+            expected.version,
+            [0x7b; 32],
+        );
+
+        assert!(matches!(
+            require_wallet_construction_binding(observed, expected),
+            Err(ProjectorError::CanonicalConstructionBindingMismatch)
+        ));
+    }
+
+    #[test]
+    fn pre_promotion_refuses_the_same_fence_with_another_construction_binding() {
+        let source = source_identity(1, 1);
+        let mut status = writer_status(source);
+        if let Some(binding) = status.canonical_construction_manifest_binding.as_mut() {
+            binding.sha256 = vec![0x7b; 32];
+        }
+
+        assert!(matches!(
+            require_pre_promotion_follower_admission(
+                status,
+                &retention_lease(source),
+                source,
+                test_network(),
+                test_construction_binding(),
             ),
             Err(zinder_wallet_rocksdb::RocksDbWalletError::ProjectionBuildCancelled)
         ));
@@ -2246,7 +2375,7 @@ mod tests {
         }
 
         assert!(!writer_status_matches_source(
-            status,
+            &status,
             expected,
             test_network(),
         ));
@@ -2519,6 +2648,21 @@ mod tests {
                 canonical_sequence_digest: identity.source_sequence_digest().as_bytes().to_vec(),
             }),
             oldest_retained_event_sequence: 1,
+            canonical_construction_manifest_binding: Some(
+                encode_canonical_construction_manifest_binding(
+                    CanonicalConstructionManifestBindingFields::new(
+                        test_construction_binding().version,
+                        test_construction_binding().sha256,
+                    ),
+                ),
+            ),
+        }
+    }
+
+    fn test_construction_binding() -> CanonicalConstructionManifestBinding {
+        CanonicalConstructionManifestBinding {
+            version: CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
+            sha256: [0x6a; 32],
         }
     }
 

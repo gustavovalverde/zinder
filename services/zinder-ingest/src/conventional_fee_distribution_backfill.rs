@@ -10,7 +10,7 @@ use zinder_core::{BlockHeight, BlockHeightRange, NetworkUpgradeActivations};
 use zinder_materialized_views::{
     BlockCommitContext, ConventionalFeeDistributionBackfillCoverage,
     ConventionalFeeDistributionConsumer, ConventionalFeeDistributionTailCoverage,
-    MaterializedViewStore,
+    MaterializedViewChainEventCheckpoint, MaterializedViewStore,
 };
 use zinder_store::RocksDbCanonicalSecondary;
 
@@ -27,13 +27,18 @@ const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const BACKFILL_CAUGHT_UP_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BACKFILL_BATCH_BLOCKS: NonZeroU32 = nonzero_u32(256);
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bounded startup seed keeps its canonical source, destination, range, limit, and inherited checkpoint explicit"
+)]
 pub(crate) fn seed_conventional_fee_distribution_visible_tail(
     canonical: &RocksDbCanonicalSecondary,
     activations: &NetworkUpgradeActivations,
     materialized_view_store: &MaterializedViewStore,
     through_height: BlockHeight,
     batch_blocks: NonZeroU32,
-) -> Result<(), IngestError> {
+    checkpoint: Option<MaterializedViewChainEventCheckpoint>,
+) -> Result<bool, IngestError> {
     loop {
         let tail = ConventionalFeeDistributionConsumer::tail_coverage(materialized_view_store)?
             .ok_or_else(|| {
@@ -51,7 +56,7 @@ pub(crate) fn seed_conventional_fee_distribution_visible_tail(
                 )
             })?;
         if next_height > through_height {
-            return Ok(());
+            return Ok(false);
         }
         let batch_end = BlockHeight::new(
             next_height
@@ -65,9 +70,17 @@ pub(crate) fn seed_conventional_fee_distribution_visible_tail(
             BlockHeightRange::inclusive(next_height, batch_end),
         )?;
         let _write_guard = materialized_view_write_guard();
+        let final_page = batch_end == through_height;
         ConventionalFeeDistributionConsumer::new()
-            .write_tail_seed_batch(materialized_view_store, &contexts)
+            .write_tail_seed_batch_with_checkpoint(
+                materialized_view_store,
+                &contexts,
+                final_page.then_some(checkpoint).flatten(),
+            )
             .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
+        if final_page {
+            return Ok(checkpoint.is_some());
+        }
     }
 }
 

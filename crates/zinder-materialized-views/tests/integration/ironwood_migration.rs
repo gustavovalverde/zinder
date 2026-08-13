@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use super::construction_identity;
 use eyre::{Result, eyre};
 use rust_rocksdb::WriteBatch;
 use tempfile::TempDir;
@@ -22,6 +23,7 @@ const TEST_CONSUMERS: &[MaterializedViewConsumerSchema] = &[IRONWOOD_MIGRATION_S
 fn open_store(path: &Path) -> Result<MaterializedViewStore> {
     Ok(MaterializedViewStore::open(
         path,
+        construction_identity()?,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: TEST_CONSUMERS,

@@ -280,7 +280,7 @@ async fn unretained_transactions_reject_compatibility_before_listener_binding() 
         WalletServingPairSlot::new(serving_pair),
         MockTransactionBroadcaster::broadcast_disabled(),
         activations.clone(),
-    );
+    )?;
     let reservation = TcpListener::bind("127.0.0.1:0").await?;
     let address = reservation.local_addr()?;
     drop(reservation);
@@ -573,7 +573,7 @@ fn build_wallet_serving_adapter_from_readers(
         serving_pair_slot,
         MockTransactionBroadcaster::broadcast_disabled(),
         activations.clone(),
-    );
+    )?;
     LightwalletdGrpcAdapter::from_admitted_compatibility_query(query, activations)
         .map_err(Into::into)
 }
@@ -641,6 +641,10 @@ struct MissingTransactionBlobCanonicalReader {
 }
 
 impl CanonicalReader for MissingTransactionBlobCanonicalReader {
+    fn construction_identity(&self) -> zinder_store::CanonicalStoreConstructionIdentity {
+        self.canonical_reader.construction_identity()
+    }
+
     fn raw_blob_retention(&self) -> RawBlobRetention {
         self.canonical_reader.raw_blob_retention()
     }

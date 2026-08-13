@@ -18,6 +18,40 @@ use crate::{
 const WALLET_PROJECTION_EVENT_CURSOR_VERSION: u8 = 1;
 const WALLET_PROJECTION_EVENT_CURSOR_LEN: usize = 1 + size_of::<u64>();
 
+/// Immutable canonical construction claim persisted by a wallet projection.
+///
+/// This value is structurally valid evidence, not an admission token. A wallet
+/// serving composition must compare it with the binding minted by its admitted
+/// canonical reader before publishing the projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WalletCanonicalConstructionBinding {
+    format_version: u16,
+    sha256: [u8; 32],
+}
+
+impl WalletCanonicalConstructionBinding {
+    /// Creates the portable wallet representation of one canonical binding.
+    #[must_use]
+    pub const fn new(format_version: u16, sha256: [u8; 32]) -> Self {
+        Self {
+            format_version,
+            sha256,
+        }
+    }
+
+    /// Returns the canonical construction-manifest format version.
+    #[must_use]
+    pub const fn format_version(self) -> u16 {
+        self.format_version
+    }
+
+    /// Returns the exact construction-manifest SHA-256 value.
+    #[must_use]
+    pub const fn sha256(self) -> [u8; 32] {
+        self.sha256
+    }
+}
+
 /// Exact portable encoding of the canonical retained-event cursor.
 ///
 /// The wallet contract does not depend on a canonical-store implementation,
@@ -461,6 +495,8 @@ pub enum WalletProjectionBuildState {
 pub struct WalletStoreControlRecord {
     /// Network whose canonical facts produced the projection.
     pub network: Network,
+    /// Canonical construction whose authenticated facts produced the projection.
+    pub canonical_construction_binding: WalletCanonicalConstructionBinding,
     /// Maximum rollback depth represented by `reorg_undo`.
     pub supported_reorg_depth: u32,
     /// Monotonic single-writer generation.
@@ -483,6 +519,13 @@ impl WalletStoreControlRecord {
         bytes.extend_from_slice(&WALLET_PROJECTION_SCHEMA_VERSION.to_be_bytes());
         bytes.extend_from_slice(&WALLET_PROJECTION_VALUE_ENCODING_VERSION.to_be_bytes());
         bytes.extend_from_slice(&self.network.id().to_be_bytes());
+        bytes.extend_from_slice(
+            &self
+                .canonical_construction_binding
+                .format_version()
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(&self.canonical_construction_binding.sha256());
         bytes.extend_from_slice(&REQUIRED_CANONICAL_STORE_SCHEMA_VERSION.to_be_bytes());
         bytes.extend_from_slice(&REQUIRED_CANONICAL_REPLAY_FORMAT_VERSION.to_be_bytes());
         bytes.extend_from_slice(&REQUIRED_CANONICAL_FACTS_DIGEST_VERSION.to_be_bytes());
@@ -510,6 +553,10 @@ impl WalletStoreControlRecord {
     }
 
     /// Decodes and validates one exact wallet control record.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the strict decoder keeps the complete persisted field order visible in one place"
+    )]
     pub fn decode(encoded: &[u8]) -> Result<Self, WalletProjectionContractError> {
         let mut decoder = WalletControlDecoder::new(encoded);
         let identity = decoder.read_bytes(WALLET_PROJECTION_STORE_IDENTITY.len())?;
@@ -533,6 +580,10 @@ impl WalletStoreControlRecord {
                 encoded: u64::from(network_id),
             }
         })?;
+        let canonical_construction_binding = WalletCanonicalConstructionBinding::new(
+            decoder.read_u16()?,
+            decoder.read_array::<32>()?,
+        );
         decoder.require_u16(
             "required canonical store schema version",
             REQUIRED_CANONICAL_STORE_SCHEMA_VERSION,
@@ -578,6 +629,7 @@ impl WalletStoreControlRecord {
         decoder.finish()?;
         let control = Self {
             network,
+            canonical_construction_binding,
             supported_reorg_depth,
             writer_generation,
             build_lease,
@@ -1054,6 +1106,7 @@ mod tests {
     fn sample_control(build_state: WalletProjectionBuildState) -> WalletStoreControlRecord {
         WalletStoreControlRecord {
             network: Network::ZcashRegtest,
+            canonical_construction_binding: WalletCanonicalConstructionBinding::new(1, [0x91; 32]),
             supported_reorg_depth: 100,
             writer_generation: 0x0102_0304_0506_0708,
             build_lease: None,
@@ -1082,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn building_control_has_exact_version_one_bytes() {
+    fn building_control_has_exact_version_two_bytes() {
         let control = sample_control(WalletProjectionBuildState::Building(
             WalletProjectionBuildPlan::complete_history(sample_source_position(0x0a0b_0c0d)),
         ));
@@ -1093,9 +1146,11 @@ mod tests {
             hex::encode(&encoded),
             concat!(
                 "77616c6c6574",
-                "0001",
+                "0002",
                 "0002",
                 "00000003",
+                "0001",
+                "9191919191919191919191919191919191919191919191919191919191919191",
                 "0006",
                 "00000001",
                 "0001",
@@ -1115,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_control_has_exact_version_one_bytes() {
+    fn ready_control_has_exact_version_two_bytes() {
         let evidence = ready_evidence();
         let control = sample_control(WalletProjectionBuildState::Ready(evidence.clone()));
         let mut expected = Vec::new();
@@ -1123,6 +1178,13 @@ mod tests {
         expected.extend_from_slice(&WALLET_PROJECTION_SCHEMA_VERSION.to_be_bytes());
         expected.extend_from_slice(&WALLET_PROJECTION_VALUE_ENCODING_VERSION.to_be_bytes());
         expected.extend_from_slice(&Network::ZcashRegtest.id().to_be_bytes());
+        expected.extend_from_slice(
+            &control
+                .canonical_construction_binding
+                .format_version()
+                .to_be_bytes(),
+        );
+        expected.extend_from_slice(&control.canonical_construction_binding.sha256());
         expected.extend_from_slice(&REQUIRED_CANONICAL_STORE_SCHEMA_VERSION.to_be_bytes());
         expected.extend_from_slice(&REQUIRED_CANONICAL_REPLAY_FORMAT_VERSION.to_be_bytes());
         expected.extend_from_slice(&REQUIRED_CANONICAL_FACTS_DIGEST_VERSION.to_be_bytes());
@@ -1186,6 +1248,7 @@ mod tests {
         );
         let control = WalletStoreControlRecord {
             network: Network::ZcashRegtest,
+            canonical_construction_binding: WalletCanonicalConstructionBinding::new(1, [0x91; 32]),
             supported_reorg_depth: 0,
             writer_generation: 7,
             build_lease: Some(lease),
@@ -1226,7 +1289,7 @@ mod tests {
 
         let mut unknown_state = encoded.clone();
         let state_offset =
-            WALLET_PROJECTION_STORE_IDENTITY.len() + 2 + 2 + 4 + 2 + 4 + 2 + 2 + 4 + 8;
+            WALLET_PROJECTION_STORE_IDENTITY.len() + 2 + 2 + 4 + 2 + 32 + 2 + 4 + 2 + 2 + 4 + 8 + 1;
         unknown_state[state_offset] = 9;
         assert!(matches!(
             WalletStoreControlRecord::decode(&unknown_state),
@@ -1295,6 +1358,7 @@ mod tests {
             BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([0x43; 32]));
         let control = WalletStoreControlRecord {
             network: Network::ZcashRegtest,
+            canonical_construction_binding: WalletCanonicalConstructionBinding::new(1, [0x91; 32]),
             supported_reorg_depth: 1,
             writer_generation: 1,
             build_lease: None,
@@ -1313,6 +1377,7 @@ mod tests {
         evidence.row_counts.reorg_undo_count = 1;
         let control = WalletStoreControlRecord {
             network: Network::ZcashRegtest,
+            canonical_construction_binding: WalletCanonicalConstructionBinding::new(1, [0x91; 32]),
             supported_reorg_depth: 2,
             writer_generation: 1,
             build_lease: None,

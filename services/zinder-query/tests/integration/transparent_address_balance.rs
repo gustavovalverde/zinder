@@ -178,7 +178,7 @@ async fn release_balance_is_unavailable_before_request_parsing_or_store_reads() 
         (),
         ingest_control,
         activations,
-    );
+    )?;
     let grpc_adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
     let status = WalletQueryService::transparent_address_balance(
         &grpc_adapter,

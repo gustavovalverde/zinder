@@ -328,6 +328,7 @@ impl RocksDbWalletStore {
             .ok_or(RocksDbWalletError::ProjectionTransitionGenerationOverflow)?;
         let next_control = WalletStoreControlRecord {
             network: self.control.network,
+            canonical_construction_binding: self.control.canonical_construction_binding,
             supported_reorg_depth: self.control.supported_reorg_depth,
             writer_generation,
             build_lease: None,
@@ -1839,8 +1840,9 @@ mod tests {
         RocksDbResourceBudget,
     };
     use zinder_wallet_projection::{
-        WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest,
-        WalletProjectionBuildOwner, WalletProjectionContractError, WalletProjectionDigestBuilder,
+        WalletCanonicalConstructionBinding, WalletCanonicalSourceIdentity,
+        WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
+        WalletProjectionContractError, WalletProjectionDigestBuilder,
         WalletProjectionReadyEvidence, WalletProjectionRetainedEventAnchor,
         WalletProjectionSourcePosition, WalletUtxoSetSummary,
     };
@@ -1926,6 +1928,16 @@ mod tests {
         let wallet_build_store = RocksDbWalletBuildStore::create_fresh(
             &wallet_path,
             Network::ZcashRegtest,
+            WalletCanonicalConstructionBinding::new(
+                canonical_store
+                    .construction_identity()
+                    .construction_manifest_binding()
+                    .version,
+                canonical_store
+                    .construction_identity()
+                    .construction_manifest_binding()
+                    .sha256,
+            ),
             initial_source,
             1,
             RocksDbResourceBudget::for_local_tests(),

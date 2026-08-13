@@ -15,13 +15,13 @@ use zinder_core::wire::{
 use zinder_core::{BlockHash, BlockHeight};
 
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockCheckpoint,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockProjection,
     MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
     MaterializedViewConsumerSchema,
 };
 use crate::{
-    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreError,
-    MaterializedViewStoreReadSnapshot,
+    MaterializedViewChainEventCheckpoint, MaterializedViewState, MaterializedViewStore,
+    MaterializedViewStoreError, MaterializedViewStoreReadSnapshot,
 };
 
 /// Timestamp-ordered canonical block rows.
@@ -425,6 +425,42 @@ impl BlockProductionTimeConsumer {
         Ok(())
     }
 
+    /// Atomically initializes the live-tail boundary, source state, and inherited checkpoint.
+    pub fn initialize_tail_boundary_with_checkpoint(
+        store: &MaterializedViewStore,
+        boundary_height: BlockHeight,
+        state: MaterializedViewState,
+        checkpoint: MaterializedViewChainEventCheckpoint,
+    ) -> Result<(), BlockProductionTimeConsumerError> {
+        let requested = BlockProductionTimeTailCoverage::from_boundary(boundary_height);
+        match Self::tail_coverage(store)? {
+            None => {}
+            Some(existing) if existing == requested => {}
+            Some(_) => {
+                return Err(BlockProductionTimeConsumerError::TailBoundaryConflict {
+                    boundary_height: boundary_height.value(),
+                });
+            }
+        }
+
+        let mut batch = WriteBatch::default();
+        let coverage_cf =
+            store.consumer_column_family(BLOCK_PRODUCTION_TIME_COVERAGE_COLUMN_FAMILY)?;
+        batch.put_cf(
+            &coverage_cf,
+            TAIL_COVERAGE_KEY,
+            encode_tail_coverage(requested),
+        );
+        store.stage_consumer_state(&mut batch, BLOCK_PRODUCTION_TIME_CONSUMER_NAME, state)?;
+        store.stage_chain_event_checkpoint(
+            &mut batch,
+            BLOCK_PRODUCTION_TIME_CONSUMER_NAME,
+            checkpoint,
+        )?;
+        store.write_consumer_batch(BLOCK_PRODUCTION_TIME_CONSUMER_NAME, &batch)?;
+        Ok(())
+    }
+
     /// Atomically writes an ordered full-history batch and its coverage record.
     pub fn write_backfill_batch(
         &mut self,
@@ -671,9 +707,9 @@ impl BlockKeyedConsumer for BlockProductionTimeConsumer {
         Ok(())
     }
 
-    fn stage_chain_event_checkpoint(
+    fn stage_block_projection_state(
         &mut self,
-        checkpoint: MaterializedViewBlockCheckpoint<'_>,
+        checkpoint: MaterializedViewBlockProjection<'_>,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
         let tip_height = checkpoint
@@ -1374,6 +1410,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            crate::store::test_construction_identity(zinder_core::Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
                 consumers: &[BLOCK_PRODUCTION_TIME_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -1420,6 +1457,42 @@ mod tests {
             },
         )?
         .rows)
+    }
+
+    #[test]
+    fn inherited_checkpoint_commits_with_tail_boundary_and_source_state() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let checkpoint = crate::store::test_chain_event_checkpoint()?;
+        let state = MaterializedViewState {
+            chain_epoch_id: zinder_core::ChainEpochId::new(7),
+            tip_height: BlockHeight::new(10),
+            tip_hash: hash(1),
+            revision: 1,
+            coverage: None,
+        };
+
+        BlockProductionTimeConsumer::initialize_tail_boundary_with_checkpoint(
+            &store,
+            BlockHeight::new(11),
+            state,
+            checkpoint,
+        )?;
+
+        assert_eq!(
+            BlockProductionTimeConsumer::tail_coverage(&store)?,
+            Some(BlockProductionTimeTailCoverage::from_boundary(
+                BlockHeight::new(11)
+            ))
+        );
+        assert_eq!(
+            store.consumer_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)?,
+            Some(state)
+        );
+        assert_eq!(
+            store.chain_event_checkpoint(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)?,
+            Some(checkpoint)
+        );
+        Ok(())
     }
 
     #[test]
@@ -1514,7 +1587,7 @@ mod tests {
             &[block(10, 1, 100), block(11, 2, 100), block(12, 3, 101)],
             &[],
         )?;
-        let snapshot = store.read_snapshot();
+        let snapshot = store.read_snapshot()?;
         let first = BlockProductionTimeConsumer::read_page_snapshot(
             &snapshot,
             BlockProductionTimePageRequest {
@@ -1557,7 +1630,7 @@ mod tests {
             ],
             &[],
         )?;
-        let snapshot = store.read_snapshot();
+        let snapshot = store.read_snapshot()?;
         let page = BlockProductionTimeConsumer::read_page_snapshot(
             &snapshot,
             BlockProductionTimePageRequest {

@@ -30,8 +30,9 @@ use zinder_materialized_views::{
     BlockProductionTimeConsumer, BlockSummaryConsumer, COMMITMENT_ROOT_SEARCH_CONSUMER_NAME,
     CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME, ChainEventDispatchInputs,
     CommitmentRootSearchConsumer, ConventionalFeeDistributionConsumer, IronwoodMigrationConsumer,
-    MaterializedViewConsumerName, MaterializedViewPreset, MaterializedViewState,
-    MaterializedViewStore, MaterializedViewStoreOptions, MaterializedViewWriteMeasurement,
+    MaterializedViewChainEventCheckpoint, MaterializedViewConsumerName, MaterializedViewPreset,
+    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreError,
+    MaterializedViewStoreOptions, MaterializedViewWriteMeasurement,
     PAID_FEE_DISTRIBUTION_CONSUMER_NAME, PaidFeeDistributionConsumer, RecentTransactionsConsumer,
     ReorgIncidentsConsumer, TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
@@ -45,13 +46,15 @@ use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
 use zinder_runtime::{IngestPhase, Readiness, ReadinessCause};
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalRetainedEvent,
-    CanonicalStoreError, ChainEpochCommitted, ChainEvent, ChainRangeReverted,
-    MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    CanonicalStoreConstructionIdentity, CanonicalStoreError, ChainEpochCommitted, ChainEvent,
+    ChainRangeReverted, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, RocksDbCanonicalSecondary,
+    RocksDbResourceBudget,
 };
 
 use crate::{
     CanonicalBlockContextReader, IngestError, MaterializedViewReplayConfig,
     MaterializedViewReplayPolicy,
+    canonical_block_context::validate_materialized_view_canonical_identity,
     chain_ingest::{ingest_error_class, outcome_status},
     conventional_fee_distribution_backfill::seed_conventional_fee_distribution_visible_tail,
     memory_pressure::RuntimeMemorySnapshot,
@@ -321,11 +324,13 @@ fn effective_replay_batch_blocks(
 /// Opens the replay-host-owned materialized-view store nested under a canonical store path.
 pub fn open_primary_materialized_view_store(
     canonical_path: &Path,
+    construction_identity: CanonicalStoreConstructionIdentity,
     materialized_view_preset: MaterializedViewPreset,
     rocksdb_resource_budget: RocksDbResourceBudget,
 ) -> Result<MaterializedViewStore, zinder_materialized_views::MaterializedViewStoreError> {
     MaterializedViewStore::open_with_materialized_view_preset(
         MaterializedViewStore::path_for_canonical(canonical_path),
+        construction_identity,
         materialized_view_preset,
         MaterializedViewStoreOptions {
             sync_writes: false,
@@ -357,10 +362,14 @@ pub fn seed_backfill_owned_consumer_cursors(
     activations: &NetworkUpgradeActivations,
     materialized_view_store: &MaterializedViewStore,
 ) -> Result<(), IngestError> {
-    let Some(cursor) = unanimous_existing_block_consumer_cursor(materialized_view_store)? else {
+    let Some((source_consumer, checkpoint)) =
+        unanimous_existing_block_consumer_checkpoint(materialized_view_store)?
+    else {
         return Ok(());
     };
-    let missing_consumers = missing_backfill_consumer_cursors(materialized_view_store, &cursor)?;
+    authenticate_materialized_view_checkpoint(canonical, source_consumer, checkpoint)?;
+    let missing_consumers =
+        missing_backfill_consumer_checkpoints(materialized_view_store, checkpoint)?;
     if missing_consumers.is_empty() {
         return Ok(());
     }
@@ -373,7 +382,7 @@ pub fn seed_backfill_owned_consumer_cursors(
         canonical,
         activations,
         materialized_view_store,
-        cursor,
+        checkpoint,
         missing_consumers,
         authoritative_height,
     }
@@ -385,7 +394,7 @@ struct BackfillCursorSeed<'canonical> {
     canonical: &'canonical RocksDbCanonicalSecondary,
     activations: &'canonical NetworkUpgradeActivations,
     materialized_view_store: &'canonical MaterializedViewStore,
-    cursor: Vec<u8>,
+    checkpoint: MaterializedViewChainEventCheckpoint,
     missing_consumers: Vec<MaterializedViewConsumerName>,
     authoritative_height: BlockHeight,
 }
@@ -406,7 +415,7 @@ impl BackfillCursorSeed<'_> {
             .contains(name)
         }) {
             self.materialized_view_store
-                .put_chain_event_cursor(consumer_name, &self.cursor)?;
+                .put_chain_event_checkpoint(consumer_name, self.checkpoint)?;
             tracing::info!(
                 target: "zinder::ingest",
                 event = "backfill_owned_consumer_cursor_seeded",
@@ -427,13 +436,30 @@ impl BackfillCursorSeed<'_> {
                     "block-production time tail boundary height overflow".to_owned(),
                 )
             })?;
-            BlockProductionTimeConsumer::initialize_tail_boundary(
+            let chain_epoch = self.canonical.chain_epoch()?;
+            let tip_hash = self
+                .canonical
+                .block_header_at(self.authoritative_height)?
+                .ok_or_else(|| {
+                    IngestError::MaterializedViewDispatch(format!(
+                        "canonical block {} is missing while seeding block-production time state",
+                        self.authoritative_height.value(),
+                    ))
+                })?
+                .block_hash;
+            BlockProductionTimeConsumer::initialize_tail_boundary_with_checkpoint(
                 self.materialized_view_store,
                 boundary_height,
+                MaterializedViewState {
+                    chain_epoch_id: chain_epoch.id,
+                    tip_height: self.authoritative_height,
+                    tip_hash,
+                    revision: 1,
+                    coverage: None,
+                },
+                self.checkpoint,
             )
             .map_err(|error| IngestError::MaterializedViewDispatch(error.to_string()))?;
-            self.materialized_view_store
-                .put_chain_event_cursor(BLOCK_PRODUCTION_TIME_CONSUMER_NAME, &self.cursor)?;
             tracing::info!(
                 target: "zinder::ingest",
                 event = "block_production_time_tail_boundary_initialized",
@@ -496,17 +522,18 @@ impl BackfillCursorSeed<'_> {
         if !(cursor_is_missing || tail_boundary_changed || tail_needs_seed) {
             return Ok(());
         }
-        seed_conventional_fee_distribution_visible_tail(
+        let checkpoint_committed_with_final_page = seed_conventional_fee_distribution_visible_tail(
             self.canonical,
             self.activations,
             self.materialized_view_store,
             self.authoritative_height,
             BACKFILL_TAIL_SEED_BATCH_BLOCKS,
+            cursor_is_missing.then_some(self.checkpoint),
         )?;
-        if cursor_is_missing {
-            self.materialized_view_store.put_chain_event_cursor(
+        if cursor_is_missing && !checkpoint_committed_with_final_page {
+            self.materialized_view_store.put_chain_event_checkpoint(
                 CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
-                &self.cursor,
+                self.checkpoint,
             )?;
         }
         let tail_boundary =
@@ -552,17 +579,18 @@ impl BackfillCursorSeed<'_> {
         if !(cursor_is_missing || tail_boundary_changed || tail_needs_seed) {
             return Ok(());
         }
-        seed_transaction_component_visible_tail(
+        let checkpoint_committed_with_final_page = seed_transaction_component_visible_tail(
             self.canonical,
             self.activations,
             self.materialized_view_store,
             self.authoritative_height,
             BACKFILL_TAIL_SEED_BATCH_BLOCKS,
+            cursor_is_missing.then_some(self.checkpoint),
         )?;
-        if cursor_is_missing {
-            self.materialized_view_store.put_chain_event_cursor(
+        if cursor_is_missing && !checkpoint_committed_with_final_page {
+            self.materialized_view_store.put_chain_event_checkpoint(
                 TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
-                &self.cursor,
+                self.checkpoint,
             )?;
         }
         let tail_boundary =
@@ -584,10 +612,19 @@ impl BackfillCursorSeed<'_> {
     }
 }
 
-pub(crate) fn unanimous_existing_block_consumer_cursor(
+pub(crate) fn unanimous_existing_block_consumer_checkpoint(
     materialized_view_store: &MaterializedViewStore,
-) -> Result<Option<Vec<u8>>, IngestError> {
-    let mut agreed_cursor: Option<Vec<u8>> = None;
+) -> Result<
+    Option<(
+        MaterializedViewConsumerName,
+        MaterializedViewChainEventCheckpoint,
+    )>,
+    IngestError,
+> {
+    let mut agreed_checkpoint: Option<(
+        MaterializedViewConsumerName,
+        MaterializedViewChainEventCheckpoint,
+    )> = None;
     for consumer_name in materialized_view_store
         .chain_event_consumer_names()
         .filter(|name| {
@@ -595,36 +632,36 @@ pub(crate) fn unanimous_existing_block_consumer_cursor(
                 && *name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME
         })
     {
-        let Some(candidate) = materialized_view_store.get_chain_event_cursor(consumer_name)? else {
+        let Some(candidate) = materialized_view_store.chain_event_checkpoint(consumer_name)? else {
             return Ok(None);
         };
-        if agreed_cursor
+        if agreed_checkpoint
             .as_ref()
-            .is_some_and(|existing| existing != &candidate)
+            .is_some_and(|(_, existing)| *existing != candidate)
         {
             return Err(IngestError::MaterializedViewDispatch(
-                "existing block materialized-view consumer cursors disagree while seeding backfill-owned consumers"
+                "existing block materialized-view consumer checkpoints disagree while seeding backfill-owned consumers"
                     .to_owned(),
             ));
         }
-        agreed_cursor = Some(candidate);
+        agreed_checkpoint = Some((consumer_name, candidate));
     }
-    Ok(agreed_cursor)
+    Ok(agreed_checkpoint)
 }
 
-fn missing_backfill_consumer_cursors(
+fn missing_backfill_consumer_checkpoints(
     materialized_view_store: &MaterializedViewStore,
-    cursor: &[u8],
+    checkpoint: MaterializedViewChainEventCheckpoint,
 ) -> Result<Vec<MaterializedViewConsumerName>, IngestError> {
     let mut missing_consumers = Vec::new();
     for consumer_name in BACKFILL_OWNED_BLOCK_CONSUMERS
         .into_iter()
         .filter(|consumer_name| materialized_view_store.has_consumer(*consumer_name))
     {
-        match materialized_view_store.get_chain_event_cursor(consumer_name)? {
-            Some(existing) if existing != cursor => {
+        match materialized_view_store.chain_event_checkpoint(consumer_name)? {
+            Some(existing) if existing != checkpoint => {
                 return Err(IngestError::MaterializedViewDispatch(
-                    "backfill-owned materialized-view consumer cursor disagrees with the existing block consumer boundary"
+                    "backfill-owned materialized-view consumer checkpoint disagrees with the existing block consumer boundary"
                         .to_owned(),
                 ));
             }
@@ -687,6 +724,7 @@ impl MaterializedViewTailer {
         }
         self.canonical.write().try_catch_up()?;
         let canonical = self.canonical.read();
+        validate_materialized_view_canonical_identity(&canonical, &self.materialized_view_store)?;
         self.replay_event_only_consumers(&canonical)?;
         self.replay_block_consumers(&canonical, pass)
     }
@@ -703,8 +741,11 @@ impl MaterializedViewTailer {
         canonical: &RocksDbCanonicalSecondary,
         pass: &mut ReplayPass,
     ) -> Result<(), IngestError> {
-        match persisted_chain_event_cursor(&self.materialized_view_store)? {
-            Some(cursor) => self.replay_retained_events(canonical, pass, cursor)?,
+        match persisted_chain_event_checkpoint(&self.materialized_view_store)? {
+            Some((consumer, checkpoint)) => {
+                authenticate_materialized_view_checkpoint(canonical, consumer, checkpoint)?;
+                self.replay_retained_events(canonical, pass, checkpoint.cursor())?;
+            }
             None => require_genesis_complete_history(canonical)?,
         }
         self.rebuild_unmaterialized_heights(canonical, pass)
@@ -728,25 +769,7 @@ impl MaterializedViewTailer {
                 read_started_at,
                 &page_outcome,
             );
-            let page = match page_outcome {
-                Ok(page) => page,
-                Err(IngestError::CanonicalStore(
-                    CanonicalStoreError::CanonicalEventCursorExpired {
-                        event_sequence,
-                        oldest_retained_sequence,
-                    },
-                )) => {
-                    return self.recover_expired_cursor(
-                        canonical,
-                        pass,
-                        ExpiredCursor {
-                            event_sequence,
-                            oldest_retained_sequence,
-                        },
-                    );
-                }
-                Err(error) => return Err(error),
-            };
+            let page = page_outcome?;
             if page.is_empty() {
                 return Ok(());
             }
@@ -777,7 +800,7 @@ impl MaterializedViewTailer {
             pass,
             &DispatchedTransition {
                 chain_epoch: resulting_epoch,
-                cursor: retained.cursor(),
+                checkpoint: MaterializedViewChainEventCheckpoint::from_retained_event(retained),
                 committed_range: retained.committed_range(),
                 reverted: reverted_range_of(&event),
             },
@@ -797,6 +820,7 @@ impl MaterializedViewTailer {
         pass: &mut ReplayPass,
     ) -> Result<(), IngestError> {
         let chain_epoch = canonical.chain_epoch()?;
+        let checkpoint = checkpoint_for_current_canonical_fence(canonical)?;
         let first_available_height = canonical.history_bounds().first_available_height();
         let start = self
             .materialized_height()?
@@ -811,61 +835,9 @@ impl MaterializedViewTailer {
             pass,
             &DispatchedTransition {
                 chain_epoch,
-                cursor: fence_cursor(canonical)?,
+                checkpoint,
                 committed_range: BlockHeightRange::inclusive(start, chain_epoch.visible_tip_height),
                 reverted: None,
-            },
-        )
-    }
-
-    /// Recovers a consumer cursor that names history the canonical store pruned.
-    ///
-    /// The view is durable through some height D. When the view applied D the
-    /// canonical settled tip was at least D minus the reorg window, so no
-    /// canonical replacement can have reached deeper than that. Reverting the
-    /// window below D and rebuilding the remainder from canonical heights
-    /// converges on the same rows an uninterrupted event replay would write.
-    fn recover_expired_cursor(
-        &self,
-        canonical: &RocksDbCanonicalSecondary,
-        pass: &mut ReplayPass,
-        expired: ExpiredCursor,
-    ) -> Result<(), IngestError> {
-        require_genesis_complete_history(canonical)?;
-        let Some(durable_height) = self.materialized_height()? else {
-            return Ok(());
-        };
-        let chain_epoch = canonical.chain_epoch()?;
-        let revert_from = BlockHeight::new(
-            durable_height
-                .value()
-                .saturating_sub(self.reorg_window_blocks)
-                .saturating_add(1)
-                .max(canonical.history_bounds().first_available_height().value()),
-        );
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "materialized_view_replay_cursor_expired",
-            persisted_event_sequence = expired.event_sequence,
-            oldest_retained_event_sequence = expired.oldest_retained_sequence,
-            durable_height = durable_height.value(),
-            revert_from_height = revert_from.value(),
-            "materialized-view consumer cursor is older than retained canonical events; reverting the reorg window and rebuilding from canonical heights"
-        );
-        self.dispatch_committed_range(
-            canonical,
-            pass,
-            &DispatchedTransition {
-                chain_epoch,
-                cursor: fence_cursor(canonical)?,
-                committed_range: BlockHeightRange::inclusive(
-                    revert_from,
-                    chain_epoch.visible_tip_height,
-                ),
-                reverted: Some(ChainRangeReverted {
-                    chain_epoch,
-                    block_range: BlockHeightRange::inclusive(revert_from, durable_height),
-                }),
             },
         )
     }
@@ -885,7 +857,7 @@ impl MaterializedViewTailer {
         if committed.start > committed.end {
             return self.dispatch_page(transition, committed, &HashMap::new(), true);
         }
-        let mut hydrator = CanonicalBlockContextReader::new(canonical, &self.activations);
+        let mut hydrator = CanonicalBlockContextReader::new(canonical, &self.activations)?;
         let mut next_height = committed.start;
         let mut first_page = true;
         while next_height <= committed.end {
@@ -931,12 +903,10 @@ impl MaterializedViewTailer {
         advance_cursor: bool,
     ) -> Result<(), IngestError> {
         let event = transition.page_event(page);
-        let cursor = transition.cursor.as_bytes();
         let inputs = ChainEventDispatchInputs {
             chain_epoch: transition.chain_epoch,
             chain_event: &event,
-            chain_cursor: &cursor,
-            event_sequence: transition.cursor.event_sequence(),
+            checkpoint: transition.checkpoint,
             settled_tip_height: transition.chain_epoch.settled_tip_height,
         };
         let dispatch_started_at = Instant::now();
@@ -957,9 +927,8 @@ impl MaterializedViewTailer {
 
     /// Replays retained transitions into consumers that never read block contexts.
     ///
-    /// An expired cursor resets the incident log to the retained floor: the log
-    /// is honestly window-bounded, so a pruned prefix is unrecoverable and the
-    /// only correct resume point is the oldest retained transition.
+    /// A persisted checkpoint must retain an exact canonical-event witness.
+    /// A pruned prefix is not interchangeable with the retention floor.
     fn replay_event_only_consumers(
         &self,
         canonical: &RocksDbCanonicalSecondary,
@@ -972,9 +941,14 @@ impl MaterializedViewTailer {
         {
             return Ok(());
         }
-        let retention_floor = canonical.canonical_event_retention_floor()?;
-        let mut cursor = persisted_event_only_chain_event_cursor(&self.materialized_view_store)?
-            .filter(|cursor| cursor.event_sequence().saturating_add(1) >= retention_floor);
+        let mut cursor =
+            match persisted_event_only_chain_event_checkpoint(&self.materialized_view_store)? {
+                Some((consumer, checkpoint)) => {
+                    authenticate_materialized_view_checkpoint(canonical, consumer, checkpoint)?;
+                    Some(checkpoint.cursor())
+                }
+                None => None,
+            };
         loop {
             let read_started_at = Instant::now();
             let page_outcome = read_canonical_event_page(canonical, cursor);
@@ -1005,12 +979,10 @@ impl MaterializedViewTailer {
             resulting_epoch,
             reverted_epoch(canonical, retained)?,
         )?;
-        let cursor = retained.cursor().as_bytes();
         let inputs = ChainEventDispatchInputs {
             chain_epoch: resulting_epoch,
             chain_event: &event,
-            chain_cursor: &cursor,
-            event_sequence: retained.cursor().event_sequence(),
+            checkpoint: MaterializedViewChainEventCheckpoint::from_retained_event(retained),
             settled_tip_height: resulting_epoch.settled_tip_height,
         };
         let dispatch_started_at = Instant::now();
@@ -1139,17 +1111,10 @@ impl MaterializedViewTailer {
     }
 }
 
-/// Persisted cursor position that retained canonical history no longer covers.
-#[derive(Clone, Copy, Debug)]
-struct ExpiredCursor {
-    event_sequence: u64,
-    oldest_retained_sequence: u64,
-}
-
 /// One canonical transition being dispatched into the block-keyed consumers.
 struct DispatchedTransition {
     chain_epoch: ChainEpoch,
-    cursor: CanonicalEventCursor,
+    checkpoint: MaterializedViewChainEventCheckpoint,
     committed_range: BlockHeightRange,
     reverted: Option<ChainRangeReverted>,
 }
@@ -1161,25 +1126,32 @@ impl DispatchedTransition {
     fn for_page(&self, first_page: bool) -> Self {
         Self {
             chain_epoch: self.chain_epoch,
-            cursor: self.cursor,
+            checkpoint: self.checkpoint,
             committed_range: self.committed_range,
             reverted: self.reverted.filter(|_| first_page),
         }
     }
 
     fn page_event(&self, page: BlockHeightRange) -> ChainEvent {
-        let committed = ChainEpochCommitted {
-            chain_epoch: self.chain_epoch,
-            block_range: page,
-        };
-        self.reverted
-            .map_or(ChainEvent::ChainCommitted { committed }, |reverted| {
-                ChainEvent::ChainReorged {
-                    reverted,
-                    committed,
-                }
-            })
+        transition_page_event(self.chain_epoch, self.reverted, page)
     }
+}
+
+fn transition_page_event(
+    chain_epoch: ChainEpoch,
+    reverted: Option<ChainRangeReverted>,
+    page: BlockHeightRange,
+) -> ChainEvent {
+    let committed = ChainEpochCommitted {
+        chain_epoch,
+        block_range: page,
+    };
+    reverted.map_or(ChainEvent::ChainCommitted { committed }, |reverted| {
+        ChainEvent::ChainReorged {
+            reverted,
+            committed,
+        }
+    })
 }
 
 #[allow(
@@ -1223,12 +1195,20 @@ fn replay_page(
     Ok(BlockHeightRange::inclusive(start, page_end))
 }
 
-fn fence_cursor(
+fn checkpoint_for_current_canonical_fence(
     canonical: &RocksDbCanonicalSecondary,
-) -> Result<CanonicalEventCursor, IngestError> {
-    Ok(CanonicalEventCursor::at(
-        canonical.event_fence().chain_event_sequence(),
-    )?)
+) -> Result<MaterializedViewChainEventCheckpoint, IngestError> {
+    let canonical_fence = canonical.event_fence();
+    let cursor = CanonicalEventCursor::at(canonical_fence.chain_event_sequence())?;
+    let retained = canonical.retained_event_at_cursor(cursor)?;
+    if retained.resulting_fence() != canonical_fence {
+        return Err(IngestError::MaterializedViewDispatch(
+            "canonical retained event does not match the admitted current fence".to_owned(),
+        ));
+    }
+    Ok(MaterializedViewChainEventCheckpoint::from_retained_event(
+        retained,
+    ))
 }
 
 fn read_canonical_event_page(
@@ -1391,10 +1371,10 @@ impl CursorRiskWatch {
     }
 
     fn observe(&mut self, materialized_view_store: &MaterializedViewStore) {
-        let Ok(cursor) = persisted_chain_event_cursor(materialized_view_store) else {
+        let Ok(checkpoint) = persisted_chain_event_checkpoint(materialized_view_store) else {
             return;
         };
-        let event_sequence = cursor.map(CanonicalEventCursor::event_sequence);
+        let event_sequence = checkpoint.map(|(_, checkpoint)| checkpoint.cursor().event_sequence());
         if event_sequence != self.last_event_sequence {
             self.last_event_sequence = event_sequence;
             self.last_advance = Instant::now();
@@ -1671,34 +1651,49 @@ fn dispatch_event_only_chain_event(
     Ok(())
 }
 
-fn persisted_event_only_chain_event_cursor(
+fn persisted_event_only_chain_event_checkpoint(
     materialized_view_store: &MaterializedViewStore,
-) -> Result<Option<CanonicalEventCursor>, IngestError> {
-    let mut cursor: Option<Vec<u8>> = None;
+) -> Result<
+    Option<(
+        MaterializedViewConsumerName,
+        MaterializedViewChainEventCheckpoint,
+    )>,
+    IngestError,
+> {
+    let mut agreed_checkpoint: Option<(
+        MaterializedViewConsumerName,
+        MaterializedViewChainEventCheckpoint,
+    )> = None;
     for consumer_name in materialized_view_store.event_only_chain_event_consumer_names() {
-        let Some(candidate) = materialized_view_store.get_chain_event_cursor(consumer_name)? else {
+        let Some(candidate) = materialized_view_store.chain_event_checkpoint(consumer_name)? else {
             return Ok(None);
         };
-        if cursor
+        if agreed_checkpoint
             .as_ref()
-            .is_some_and(|existing| existing != &candidate)
+            .is_some_and(|(_, existing)| *existing != candidate)
         {
             return Err(IngestError::MaterializedViewDispatch(
-                "event-only materialized-view consumer cursors disagree".to_owned(),
+                "event-only materialized-view consumer checkpoints disagree".to_owned(),
             ));
         }
-        cursor = Some(candidate);
+        agreed_checkpoint = Some((consumer_name, candidate));
     }
-    let Some(cursor) = cursor else {
-        return Ok(None);
-    };
-    decode_persisted_cursor(materialized_view_store, &cursor).map(Some)
+    Ok(agreed_checkpoint)
 }
 
-fn persisted_chain_event_cursor(
+fn persisted_chain_event_checkpoint(
     materialized_view_store: &MaterializedViewStore,
-) -> Result<Option<CanonicalEventCursor>, IngestError> {
-    let mut cursor: Option<Vec<u8>> = None;
+) -> Result<
+    Option<(
+        MaterializedViewConsumerName,
+        MaterializedViewChainEventCheckpoint,
+    )>,
+    IngestError,
+> {
+    let mut agreed_checkpoint: Option<(
+        MaterializedViewConsumerName,
+        MaterializedViewChainEventCheckpoint,
+    )> = None;
     let ranking_is_active = materialized_view_store
         .has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
         && TransparentAddressRankingConsumer::active_metadata(materialized_view_store)?.is_some();
@@ -1709,35 +1704,57 @@ fn persisted_chain_event_cursor(
         // A consumer without a cursor is fresh or was reset by a scoped schema
         // rebuild; the plane then rebuilds from canonical heights while the
         // others re-apply the same deterministic rows idempotently.
-        let Some(candidate) = materialized_view_store.get_chain_event_cursor(consumer_name)? else {
+        let Some(candidate) = materialized_view_store.chain_event_checkpoint(consumer_name)? else {
             return Ok(None);
         };
-        if cursor
+        if agreed_checkpoint
             .as_ref()
-            .is_some_and(|existing| existing != &candidate)
+            .is_some_and(|(_, existing)| *existing != candidate)
         {
             return Err(IngestError::MaterializedViewDispatch(
-                "chain materialized-view consumer cursors disagree".to_owned(),
+                "chain materialized-view consumer checkpoints disagree".to_owned(),
             ));
         }
-        cursor = Some(candidate);
+        agreed_checkpoint = Some((consumer_name, candidate));
     }
-    let Some(cursor) = cursor else {
-        return Ok(None);
-    };
-    decode_persisted_cursor(materialized_view_store, &cursor).map(Some)
+    Ok(agreed_checkpoint)
 }
 
-fn decode_persisted_cursor(
-    materialized_view_store: &MaterializedViewStore,
-    cursor: &[u8],
-) -> Result<CanonicalEventCursor, IngestError> {
-    CanonicalEventCursor::from_persisted(cursor).map_err(|source| {
-        IngestError::MaterializedViewCursorUnreadable {
-            path: materialized_view_store.storage_path().to_path_buf(),
-            source,
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "only the retained-event mismatch is specialized; other store errors preserve their shared mapping"
+)]
+fn authenticate_materialized_view_checkpoint(
+    canonical: &RocksDbCanonicalSecondary,
+    consumer: MaterializedViewConsumerName,
+    checkpoint: MaterializedViewChainEventCheckpoint,
+) -> Result<CanonicalRetainedEvent, IngestError> {
+    let retained = match canonical.retained_event_at_cursor(checkpoint.cursor()) {
+        Ok(retained) => retained,
+        Err(CanonicalStoreError::CanonicalEventCursorExpired {
+            event_sequence,
+            oldest_retained_sequence,
+        }) => {
+            return Err(IngestError::MaterializedViewCheckpointExpired {
+                consumer: consumer.as_str(),
+                event_sequence,
+                oldest_retained_sequence,
+            });
         }
-    })
+        Err(error) => return Err(error.into()),
+    };
+    checkpoint
+        .require_matching_retained_event(retained)
+        .map_err(|error| match error {
+            MaterializedViewStoreError::ChainEventCheckpointRetainedEventMismatch {
+                event_sequence,
+            } => IngestError::MaterializedViewCheckpointFenceMismatch {
+                consumer: consumer.as_str(),
+                event_sequence,
+            },
+            error => IngestError::MaterializedViewStore(error),
+        })?;
+    Ok(retained)
 }
 
 fn record_materialized_view_replay_stage<T>(
@@ -2346,27 +2363,21 @@ mod tests {
     }
 
     #[test]
-    fn only_the_opening_page_of_a_reorg_carries_its_revert() -> Result<(), IngestError> {
+    fn only_the_opening_page_of_a_reorg_carries_its_revert() {
         let chain_epoch = chain_epoch();
-        let transition = DispatchedTransition {
+        let reverted = ChainRangeReverted {
             chain_epoch,
-            cursor: CanonicalEventCursor::at(7)?,
-            committed_range: BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(4)),
-            reverted: Some(ChainRangeReverted {
-                chain_epoch,
-                block_range: BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(3)),
-            }),
+            block_range: BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(3)),
         };
         let page = BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(2));
 
         assert!(matches!(
-            transition.for_page(true).page_event(page),
+            transition_page_event(chain_epoch, Some(reverted), page),
             ChainEvent::ChainReorged { .. }
         ));
         assert!(matches!(
-            transition.for_page(false).page_event(page),
+            transition_page_event(chain_epoch, None, page),
             ChainEvent::ChainCommitted { .. }
         ));
-        Ok(())
     }
 }

@@ -1673,6 +1673,7 @@ mod tests {
         let directory = tempdir()?;
         let store = MaterializedViewStore::open(
             directory.path(),
+            zinder_testkit::published_regtest_canonical_construction_identity()?,
             MaterializedViewStoreOptions {
                 sync_writes: false,
                 consumers: &[VALUE_POOL_FLOW_HISTORY_SCHEMA],
@@ -1691,6 +1692,7 @@ mod tests {
         let unconfigured_directory = tempdir()?;
         let unconfigured_store = MaterializedViewStore::open(
             unconfigured_directory.path(),
+            zinder_testkit::published_regtest_canonical_construction_identity()?,
             MaterializedViewStoreOptions {
                 sync_writes: false,
                 consumers: &[],

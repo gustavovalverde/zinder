@@ -493,7 +493,7 @@ async fn serving_query_rejects_oversized_subtree_root_range() -> eyre::Result<()
         (),
         ingest_control,
         activations,
-    );
+    )?;
     let requested = MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1);
     let max_entries = NonZeroU32::new(requested).ok_or_else(|| eyre!("invalid max entries"))?;
 
@@ -849,7 +849,7 @@ async fn serving_pair_compact_range_enforces_the_release_limit_before_storage() 
         (),
         ingest_control,
         activations,
-    );
+    )?;
     let requested = DEFAULT_MAX_COMPACT_BLOCK_RANGE.get().saturating_add(1);
     let requested_count = usize::try_from(requested)?;
     let maximum_count = usize::try_from(DEFAULT_MAX_COMPACT_BLOCK_RANGE.get())?;

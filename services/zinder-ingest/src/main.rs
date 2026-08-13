@@ -745,6 +745,7 @@ async fn run_materialized_view_plane(
     };
     let materialized_view_store = match open_primary_materialized_view_store(
         &spec.storage_path,
+        canonical.construction_identity(),
         MaterializedViewPreset::Explorer,
         spec.materialized_view_rocksdb_budget,
     ) {

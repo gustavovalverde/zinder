@@ -793,7 +793,7 @@ async fn assert_native_retention_case(raw_blob_retention: RawBlobRetention) -> e
         (),
         admitted_ingest_control,
         Arc::clone(&activations),
-    );
+    )?;
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
     let server_info =
@@ -1100,7 +1100,7 @@ async fn native_grpc_service_omits_unfenced_transparent_balance_but_serves_its_p
         (),
         admitted_ingest_control,
         activations,
-    );
+    )?;
     for capability in [
         WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
         WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
@@ -1838,7 +1838,7 @@ async fn native_serving_adapter_with_ingest_control(
         (),
         admitted_ingest_control,
         activations,
-    );
+    )?;
     Ok((
         WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default()),
         store_fixture,

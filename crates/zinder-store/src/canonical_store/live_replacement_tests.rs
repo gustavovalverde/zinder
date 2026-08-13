@@ -682,6 +682,23 @@ fn retained_events_resume_exactly_and_leases_bound_pruning()
             oldest_retained_sequence: 3,
         })
     ));
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        temporary.path().join("pruned-event-secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(2)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert!(matches!(
+        secondary.retained_event_at_cursor(page[0].cursor()),
+        Err(CanonicalStoreError::CanonicalEventCursorExpired {
+            event_sequence: 1,
+            oldest_retained_sequence: 3,
+        })
+    ));
+    drop(secondary);
 
     drop(store);
     let store = open_store(&store_path, &activations, 2)?;

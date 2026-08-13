@@ -30,11 +30,12 @@ use zinder_store::{
 use zinder_wallet_projection::{
     WALLET_PROJECTION_SCHEMA_VERSION, WALLET_PROJECTION_STORE_IDENTITY, WALLET_STORE_CONTROL_KEY,
     WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
-    WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity, WalletOutpointKey,
-    WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest, WalletProjectionBuildPlan,
-    WalletProjectionBuildState, WalletProjectionDigestBuilder, WalletProjectionReadyEvidence,
-    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletStoreControlRecord,
-    WalletUnspentOutput, WalletUtxoSetSummary,
+    WalletAddressUnspentOutputKey, WalletCanonicalConstructionBinding,
+    WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildLease,
+    WalletProjectionBuildLeaseRequest, WalletProjectionBuildPlan, WalletProjectionBuildState,
+    WalletProjectionDigestBuilder, WalletProjectionReadyEvidence, WalletProjectionRowFamily,
+    WalletReorgUndo, WalletSpentOutput, WalletStoreControlRecord, WalletUnspentOutput,
+    WalletUtxoSetSummary,
 };
 
 use crate::{
@@ -59,6 +60,8 @@ pub struct WalletOwnerCheckpointEvidence {
     pub schema_version: u16,
     /// Immutable network admitted from the checkpoint.
     pub network: Network,
+    /// Canonical construction binding persisted by the checkpoint.
+    pub canonical_construction_binding: WalletCanonicalConstructionBinding,
     /// Persisted READY evidence read from the cold-opened checkpoint.
     pub ready_evidence: WalletProjectionReadyEvidence,
 }
@@ -216,9 +219,14 @@ impl RocksDbWalletBuildStore {
     /// A caller must subsequently acquire a lease before writing or promoting
     /// projection state. Existing stores, including older pre-release control
     /// layouts, are refused rather than migrated.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fresh wallet creation keeps every immutable control-record input explicit"
+    )]
     pub fn create_fresh(
         path: impl AsRef<Path>,
         network: Network,
+        canonical_construction_binding: WalletCanonicalConstructionBinding,
         target_source: WalletCanonicalSourceIdentity,
         supported_reorg_depth: u32,
         resource_budget: RocksDbResourceBudget,
@@ -239,6 +247,7 @@ impl RocksDbWalletBuildStore {
         .map_err(|source| RocksDbWalletError::rocksdb("fresh build-store open", source))?;
         let control = WalletStoreControlRecord {
             network,
+            canonical_construction_binding,
             supported_reorg_depth,
             writer_generation: 0,
             build_lease: None,
@@ -655,6 +664,7 @@ impl ValidatedRocksDbWalletBuild {
         let ready_evidence = self.ready_evidence;
         let ready_control = WalletStoreControlRecord {
             network: self.control.network,
+            canonical_construction_binding: self.control.canonical_construction_binding,
             supported_reorg_depth: self.control.supported_reorg_depth,
             writer_generation: self.control.writer_generation,
             build_lease: None,
@@ -748,6 +758,12 @@ impl RocksDbWalletStore {
     #[must_use]
     pub const fn network(&self) -> Network {
         self.control.network
+    }
+
+    /// Returns the canonical construction binding persisted with this store.
+    #[must_use]
+    pub const fn canonical_construction_binding(&self) -> WalletCanonicalConstructionBinding {
+        self.control.canonical_construction_binding
     }
 
     /// Returns one current output by exact outpoint.
@@ -1125,6 +1141,7 @@ impl RocksDbWalletFollowingStore {
             store_identity: WALLET_PROJECTION_STORE_IDENTITY,
             schema_version: WALLET_ROCKSDB_SCHEMA_VERSION,
             network: cold_checkpoint.network(),
+            canonical_construction_binding: cold_checkpoint.canonical_construction_binding(),
             ready_evidence,
         })
     }
@@ -1223,6 +1240,7 @@ impl RocksDbWalletFollowingStore {
             store_identity: WALLET_PROJECTION_STORE_IDENTITY,
             schema_version: WALLET_ROCKSDB_SCHEMA_VERSION,
             network: cold_checkpoint.network(),
+            canonical_construction_binding: cold_checkpoint.canonical_construction_binding(),
             ready_evidence: cold_checkpoint.ready_evidence().clone(),
         })
     }
@@ -1231,6 +1249,12 @@ impl RocksDbWalletFollowingStore {
     #[must_use]
     pub const fn ready_evidence(&self) -> &WalletProjectionReadyEvidence {
         self.store.ready_evidence()
+    }
+
+    /// Returns the canonical construction binding persisted by this wallet.
+    #[must_use]
+    pub const fn canonical_construction_binding(&self) -> WalletCanonicalConstructionBinding {
+        self.store.canonical_construction_binding()
     }
 
     /// Returns the immutable network admitted from the persisted wallet control.
@@ -2635,6 +2659,7 @@ mod tests {
         let build_store = RocksDbWalletBuildStore::create_fresh(
             path,
             network,
+            WalletCanonicalConstructionBinding::new(1, [0x91; 32]),
             source_identity(),
             supported_reorg_depth,
             resource_budget,

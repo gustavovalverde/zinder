@@ -4,6 +4,37 @@ use zinder_core::{ArtifactSchemaVersion, Network};
 
 use crate::{Capability, CapabilityDescriptor};
 
+/// Validated structural claim naming one canonical construction sidecar.
+///
+/// This value is descriptive evidence only. A composition root that owns an
+/// admitted canonical reader must exact-compare it with that authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalConstructionManifestBinding {
+    format_version: u16,
+    sha256: [u8; 32],
+}
+
+impl CanonicalConstructionManifestBinding {
+    pub(crate) const fn from_validated_fields(format_version: u16, sha256: [u8; 32]) -> Self {
+        Self {
+            format_version,
+            sha256,
+        }
+    }
+
+    /// Returns the exact immutable sidecar format version.
+    #[must_use]
+    pub const fn format_version(self) -> u16 {
+        self.format_version
+    }
+
+    /// Returns the exact immutable sidecar digest.
+    #[must_use]
+    pub const fn sha256(self) -> [u8; 32] {
+        self.sha256
+    }
+}
+
 /// Upstream node metadata captured by the query endpoint.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
@@ -41,6 +72,8 @@ pub struct ServerInfo {
     pub schema_version: ArtifactSchemaVersion,
     /// Configured canonical reorg window depth in blocks.
     pub reorg_window_blocks: u32,
+    /// Validated canonical construction claim, when the endpoint can prove one.
+    pub canonical_construction_manifest_binding: Option<CanonicalConstructionManifestBinding>,
     /// Upstream node metadata, when the endpoint has a source snapshot.
     pub node: Option<NodeServerInfo>,
 }

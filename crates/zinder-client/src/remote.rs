@@ -24,32 +24,34 @@ use zinder_core::{
     BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId, ChainValuePool,
     ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId, MempoolEntry,
     MempoolEvictionReason, MinedTransaction, MinedTransactionChainContext, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TransparentSpendEntry,
-    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
+    TransactionId, TransactionLocation, TransparentAddressBalance, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentOutputsByOutpointResponse,
+    TransparentSpendEntry, TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::{
     WalletWireDecodeError, chain_epoch_from_message,
     compact_block_from_message as compact_block_from_wire_message,
-    decode_transparent_utxo_set_commitment, mempool_entry_from_message, outpoint_message,
+    decode_canonical_construction_manifest_binding, decode_transparent_utxo_set_commitment,
+    mempool_entry_from_message,
+    network_upgrade_activations_from_message as network_upgrade_activations_from_wire_message,
+    outpoint_message,
     transparent_mempool_output_from_message as transparent_mempool_output_from_message_shared,
     transparent_mempool_spend_from_message as transparent_mempool_spend_from_message_shared,
 };
 
 use crate::error::ZINDER_ERROR_DOMAIN;
 use crate::{
-    BlockId, Capability, CapabilityDescriptor, ChainEpochCommitted, ChainEvent, ChainEventCursor,
-    ChainEventEnvelope, ChainEventStream, ChainEventStreamFamily, ChainIndex, ChainRangeReverted,
-    EndpointBackedIndex, EventStreamStart, IndexStream, IndexerError, MempoolEvent,
-    MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
-    MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo, ServerInfo,
-    TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
+    BlockId, CanonicalConstructionManifestBinding, Capability, CapabilityDescriptor,
+    ChainEpochCommitted, ChainEvent, ChainEventCursor, ChainEventEnvelope, ChainEventStream,
+    ChainEventStreamFamily, ChainIndex, ChainRangeReverted, EndpointBackedIndex, EventStreamStart,
+    IndexStream, IndexerError, MempoolEvent, MempoolEventCursor, MempoolEventEnvelope,
+    MempoolEventStream, MempoolSnapshotCursor, MempoolSnapshotRequest, MempoolSnapshotView,
+    NodeServerInfo, ServerInfo, TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
     TransparentUnspentOutputChunk, TransparentUtxoSetSummaryView,
@@ -1230,6 +1232,23 @@ fn server_info_from_message(
             "artifact schema version exceeds u16::MAX",
         )
     })?;
+    let canonical_construction_manifest_binding = wallet_info
+        .canonical_construction_manifest_binding
+        .as_ref()
+        .map(decode_canonical_construction_manifest_binding)
+        .transpose()
+        .map_err(|error| {
+            IndexerError::malformed(
+                "info.canonical_construction_manifest_binding",
+                error.to_string(),
+            )
+        })?
+        .map(|fields| {
+            CanonicalConstructionManifestBinding::from_validated_fields(
+                fields.format_version(),
+                fields.sha256(),
+            )
+        });
 
     Ok(ServerInfo {
         network: expected_network,
@@ -1247,6 +1266,7 @@ fn server_info_from_message(
         build_git_commit: common.build_git_commit,
         schema_version: ArtifactSchemaVersion::new(schema_version),
         reorg_window_blocks: wallet_info.reorg_window_blocks,
+        canonical_construction_manifest_binding,
         node: wallet_info.node.map(|node| NodeServerInfo {
             version: node.version,
             capabilities: node.capabilities,
@@ -1258,27 +1278,8 @@ fn network_upgrade_activations_from_message(
     network: Network,
     response: wallet::NetworkUpgradeActivationsResponse,
 ) -> Result<NetworkUpgradeActivations, IndexerError> {
-    let activations = response
-        .activations
-        .into_iter()
-        .enumerate()
-        .map(|(index, activation)| {
-            if activation.name.trim().is_empty() {
-                return Err(IndexerError::malformed(
-                    "activations.name",
-                    format!("activation at index {index} has an empty name"),
-                ));
-            }
-            Ok(NetworkUpgradeActivation {
-                branch_id: ConsensusBranchId::new(activation.consensus_branch_id),
-                activation_height: BlockHeight::new(activation.activation_height),
-                name: activation.name,
-            })
-        })
-        .collect::<Result<Vec<_>, IndexerError>>()?;
-
-    NetworkUpgradeActivations::new(network, activations)
-        .map_err(|error| IndexerError::malformed("activations", error.to_string()))
+    network_upgrade_activations_from_wire_message(network, response)
+        .map_err(|error| IndexerError::malformed(error.field(), error.to_string()))
 }
 
 #[cfg(test)]
@@ -1401,6 +1402,63 @@ mod server_info_conversion_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn current_shape_canonical_construction_binding_survives_server_info_conversion()
+    -> Result<(), IndexerError> {
+        let mut message = wallet_server_info(1);
+        message.canonical_construction_manifest_binding =
+            Some(ops::CanonicalConstructionManifestBinding {
+                format_version: 4,
+                sha256: vec![0x5a; 32],
+            });
+
+        let server_info = server_info_from_message(Network::ZcashRegtest, message)?;
+        let binding = server_info
+            .canonical_construction_manifest_binding
+            .ok_or_else(|| {
+                IndexerError::malformed(
+                    "info.canonical_construction_manifest_binding",
+                    "test binding missing after conversion",
+                )
+            })?;
+
+        assert_eq!(binding.format_version(), 4);
+        assert_eq!(binding.sha256(), [0x5a; 32]);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_canonical_construction_binding_is_rejected() {
+        let mut message = wallet_server_info(1);
+        message.canonical_construction_manifest_binding =
+            Some(ops::CanonicalConstructionManifestBinding {
+                format_version: 1,
+                sha256: vec![0x5a; 31],
+            });
+
+        let error = server_info_from_message(Network::ZcashRegtest, message);
+
+        assert!(matches!(
+            error,
+            Err(IndexerError::MalformedResponse {
+                field: "info.canonical_construction_manifest_binding",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn absent_canonical_construction_binding_remains_absent() -> Result<(), IndexerError> {
+        let server_info = server_info_from_message(Network::ZcashRegtest, wallet_server_info(1))?;
+
+        assert!(
+            server_info
+                .canonical_construction_manifest_binding
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

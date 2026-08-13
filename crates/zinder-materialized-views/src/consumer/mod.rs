@@ -148,9 +148,9 @@ pub struct MaterializedViewConsumerCtx<'a> {
     pub batch: &'a mut WriteBatch,
 }
 
-/// Materialized-view checkpoint derived from one block-consumer dispatch batch.
+/// Materialized-view projection derived from one block-consumer dispatch batch.
 #[derive(Clone, Copy, Debug)]
-pub struct MaterializedViewBlockCheckpoint<'event> {
+pub struct MaterializedViewBlockProjection<'event> {
     /// Canonical epoch carried by the chain event.
     pub chain_epoch: ChainEpoch,
     /// Event or replay chunk whose rows were staged.
@@ -169,7 +169,7 @@ pub struct MaterializedViewBlockCheckpoint<'event> {
 /// first range.
 pub(crate) fn advance_verified_materialized_view_coverage(
     coverage: Option<MaterializedViewCoverage>,
-    checkpoint: MaterializedViewBlockCheckpoint<'_>,
+    checkpoint: MaterializedViewBlockProjection<'_>,
     tip_height: BlockHeight,
     tip_hash: BlockHash,
     initial_complete_from: Option<BlockHeight>,
@@ -446,9 +446,9 @@ pub trait BlockKeyedConsumer: Send + Sync {
     /// The default is a no-op. Consumers that publish coverage or read fences
     /// use this hook because [`Self::finish_batch`] deliberately has no chain
     /// event semantics.
-    fn stage_chain_event_checkpoint(
+    fn stage_block_projection_state(
         &mut self,
-        _checkpoint: MaterializedViewBlockCheckpoint<'_>,
+        _checkpoint: MaterializedViewBlockProjection<'_>,
         _ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
         Ok(())

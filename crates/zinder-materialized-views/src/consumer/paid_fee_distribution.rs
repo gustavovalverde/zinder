@@ -1805,6 +1805,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            crate::store::test_construction_identity(zinder_core::Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
                 consumers: &[PAID_FEE_DISTRIBUTION_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -2252,7 +2253,7 @@ mod tests {
         let (_tempdir, store) = open_store()?;
         let mut consumer = PaidFeeDistributionConsumer::new();
         write_blocks(&store, &mut consumer, &[block(100, 1, 10, &[Some(10_000)])])?;
-        let snapshot = store.read_snapshot();
+        let snapshot = store.read_snapshot()?;
 
         let replacement = block(100, 2, 20, &[Some(30_000)]);
         replace_block(&store, &mut consumer, BlockHeight::new(100), &replacement)?;

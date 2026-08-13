@@ -33,6 +33,20 @@ pub struct WalletServingStoreFixture {
 }
 
 impl WalletServingStoreFixture {
+    /// Returns the immutable canonical construction identity owned by this fixture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the canonical reader was already taken.
+    pub fn canonical_construction_identity(
+        &self,
+    ) -> eyre::Result<zinder_store::CanonicalStoreConstructionIdentity> {
+        self.canonical_reader
+            .as_ref()
+            .map(RocksDbCanonicalSecondary::construction_identity)
+            .ok_or_else(|| eyre!("wallet-serving canonical reader was already taken"))
+    }
+
     /// Builds READY primaries from `chain_fixture` and opens immutable secondaries.
     ///
     /// # Errors

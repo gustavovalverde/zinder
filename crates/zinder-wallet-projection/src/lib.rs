@@ -15,11 +15,12 @@ mod serial_oracle;
 
 pub use contract_error::WalletProjectionContractError;
 pub use control::{
-    WalletCanonicalSourceIdentity, WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest,
-    WalletProjectionBuildOwner, WalletProjectionBuildPlan, WalletProjectionBuildState,
-    WalletProjectionDigest, WalletProjectionEventCursor, WalletProjectionFamilyRowCounts,
-    WalletProjectionReadyEvidence, WalletProjectionRetainedEventAnchor,
-    WalletProjectionSourcePosition, WalletStoreControlRecord, WalletUtxoSetSummary,
+    WalletCanonicalConstructionBinding, WalletCanonicalSourceIdentity, WalletProjectionBuildLease,
+    WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner, WalletProjectionBuildPlan,
+    WalletProjectionBuildState, WalletProjectionDigest, WalletProjectionEventCursor,
+    WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence,
+    WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition, WalletStoreControlRecord,
+    WalletUtxoSetSummary,
 };
 pub use digest::{
     WALLET_PROJECTION_ACCUMULATOR_LEN, WALLET_PROJECTION_ACCUMULATOR_VERSION,
@@ -33,7 +34,7 @@ pub use rows::{
 pub use serial_oracle::WalletProjectionSerialOracle;
 
 /// Physical wallet schema version under the clean `wallet` identity.
-pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 1;
+pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 2;
 
 /// Wallet projection row-value encoding version with source-bound reorg undo.
 pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 2;

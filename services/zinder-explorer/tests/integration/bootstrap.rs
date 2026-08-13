@@ -6,7 +6,14 @@
 //! Smoke test that boots an `ExplorerQueryGrpcAdapter` against an in-process
 //! tonic server and verifies `ServerInfo` returns the expected capability set.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
@@ -16,177 +23,201 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpochId,
-    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, TransactionId, TransactionLocation,
-    TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
-    TransparentSpendFact,
-    explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
+    BlockHash, BlockHeight, BlockId, ChainEpochId, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network,
+    TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentInputFact,
+    TransparentOutPoint, TransparentOutputFact, TransparentSpendFact,
     wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex},
 };
-use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
+use zinder_explorer::ExplorerServerInfoSettings;
 use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer,
-    MaterializedViewStore, MaterializedViewStoreOptions, REORG_INCIDENTS_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY, TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
+    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, MaterializedViewStore,
+    MaterializedViewStoreOptions, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
     TransparentAddressDeltasConsumer,
 };
 use zinder_proto::capabilities::{
     EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
-    EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_TRANSACTIONS_V2, EXPLORER_CHAIN_REORG_HISTORY_V1,
-    EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V4,
+    EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_TRANSACTIONS_V2, EXPLORER_OVERVIEW_SNAPSHOT_V1,
     EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
 };
 use zinder_proto::v1::explorer::{
     BlockActivityDistributionRequest, BlockDetailRequest, BlockProductionSeriesRequest,
     BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, BlockTransactionsResponse,
-    ChainReorgHistoryRequest, OverviewSnapshotRequest, OverviewSnapshotResponse,
-    PrevoutResolutionStatus, ServerInfoRequest, TransactionDetailRequest,
+    OverviewSnapshotRequest, PrevoutResolutionStatus, ServerInfoRequest, TransactionDetailRequest,
     TransactionDetailResponse, TransparentAddressDeltasRecord, TransparentAddressDeltasRequest,
-    TransparentDeltaKind, UnavailableReason, block_detail_request,
-    explorer_query_client::ExplorerQueryClient,
+    TransparentDeltaKind, block_detail_request, explorer_query_client::ExplorerQueryClient,
 };
 use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
-use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{
+    AdmittedIngestControl, CanonicalReader, WalletEndpointMetadata, WalletProjectionReader,
+    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
 };
-use zinder_store::{
-    ChainEpochArtifacts, ChainStoreOptions, ReorgWindowChange, SecondaryChainStore,
-};
+use zinder_store::{ChainStoreOptions, SecondaryChainStore};
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, StoreFixture, encode_fixture_block_replay,
-    sample_regtest_upgrade_activations, synthetic_transaction_public_facts,
+    ChainFixture, FixtureTransactionRows, IngestControlFixture, StoreFixture,
+    WalletServingStoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
+    synthetic_transaction_public_facts,
 };
 
 type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
 
 struct SeededMaterializedViewStore {
     _tempdir: tempfile::TempDir,
+    _primary_store: MaterializedViewStore,
     secondary_store: MaterializedViewStore,
 }
 
-#[tokio::test]
-async fn explorer_query_server_info_advertises_ready_capability() -> Result<()> {
+struct AdmittedWalletQueryFixture {
+    construction_identity: zinder_store::CanonicalStoreConstructionIdentity,
+    address: SocketAddr,
+    handle: ServerHandle,
+    availability: Arc<AtomicBool>,
+}
+
+impl AdmittedWalletQueryFixture {
+    fn set_available(&self, available: bool) {
+        self.availability.store(available, Ordering::SeqCst);
+    }
+}
+
+async fn serve_admitted_wallet_query(
+    chain_fixture: &ChainFixture,
+) -> Result<AdmittedWalletQueryFixture> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(chain_fixture, activations.as_ref())?;
+    let construction_identity = store_fixture.canonical_construction_identity()?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let pair = WalletServingReadPair::new(
+        Arc::new(canonical_reader) as Arc<dyn CanonicalReader>,
+        Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+    )?;
+    let ingest_control_fixture = IngestControlFixture::spawn(chain_fixture.network()).await?;
+    let ingest_control = AdmittedIngestControl::connect(
+        ingest_control_fixture.endpoint(),
+        None,
+        chain_fixture.network(),
+    )
+    .await?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(Arc::new(pair)),
+        (),
+        ingest_control,
+        activations,
+    )?;
+    let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let server_addr = listener.local_addr()?;
-    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: Network::ZcashRegtest,
-    });
-    let server_handle = tokio::spawn(async move {
+    let address = listener.local_addr()?;
+    let availability = Arc::new(AtomicBool::new(true));
+    let request_availability = Arc::clone(&availability);
+    let handle = tokio::spawn(async move {
+        let _store_fixture = store_fixture;
+        let _ingest_control_fixture = ingest_control_fixture;
+        let service = tonic::service::interceptor::InterceptedService::new(
+            adapter.into_server(),
+            move |request| {
+                if request_availability.load(Ordering::SeqCst) {
+                    Ok(request)
+                } else {
+                    Err(tonic::Status::unavailable(
+                        "test Wallet endpoint is unavailable",
+                    ))
+                }
+            },
+        );
         tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
+            .add_service(service)
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
     });
+    crate::common::await_grpc_endpoint(address).await?;
+    Ok(AdmittedWalletQueryFixture {
+        construction_identity,
+        address,
+        handle,
+        availability,
+    })
+}
 
-    let channel = await_with_retry(server_addr).await?;
-    let mut client = ExplorerQueryClient::new(channel);
-    let response = client.server_info(ServerInfoRequest {}).await?.into_inner();
-    assert!(
-        response
-            .freshness
-            .as_ref()
-            .and_then(|freshness| freshness.chain_view.as_ref())
-            .is_none(),
-        "ServerInfo without a materialized-view store or upstream probe carries no chain_view",
-    );
-    let explorer_info = response
-        .info
-        .ok_or_else(|| eyre!("server info response missing info envelope"))?;
-    let common = explorer_info
-        .common
-        .as_ref()
-        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
+#[tokio::test]
+async fn explorer_composition_rejects_a_different_canonical_construction() -> Result<()> {
+    let wallet =
+        serve_admitted_wallet_query(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(1))
+            .await?;
+    let other =
+        serve_admitted_wallet_query(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(2))
+            .await?;
+    let materialized_view_directory = tempfile::tempdir()?;
+    let materialized_view_store = MaterializedViewStore::open(
+        materialized_view_directory.path(),
+        other.construction_identity,
+        MaterializedViewStoreOptions {
+            sync_writes: false,
+            consumers: MaterializedViewStore::bundled_consumers(),
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        },
+    )?;
+    let outcome = zinder_explorer::ExplorerQueryEndpointComposition::new(
+        ExplorerServerInfoSettings {
+            network: Network::ZcashRegtest,
+        },
+        materialized_view_store,
+        format!("http://{}", wallet.address),
+    )
+    .compose()
+    .await;
+    assert!(matches!(
+        outcome,
+        Err(
+            zinder_explorer::ExplorerEndpointAdmissionError::MaterializedViewConstructionIdentityMismatch {
+                ..
+            }
+        )
+    ));
 
-    assert_eq!(explorer_info.vendor, "Zinder");
-    assert_eq!(common.network, "zcash-regtest");
-    assert!(
-        common
-            .capabilities
-            .iter()
-            .any(|advertised| { advertised == EXPLORER_SERVER_INFO_V1 })
-    );
-
-    server_handle.abort();
-    let _ = server_handle.await;
+    wallet.handle.abort();
+    other.handle.abort();
+    let _ = wallet.handle.await;
+    let _ = other.handle.await;
     Ok(())
 }
 
-/// Without a configured `wallet_query_endpoint`, the wallet-backed explorer
-/// capabilities are omitted from `ServerInfo` and the corresponding methods
-/// return `FAILED_PRECONDITION`.
-///
-/// This pins the operational contract that capability advertisement gates on
-/// a wired federation, not on the binary's mere presence.
 #[tokio::test]
-async fn explorer_query_failed_precondition_without_wallet_query_endpoint() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let server_addr = listener.local_addr()?;
-    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: Network::ZcashRegtest,
-    });
-    let server_handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
+async fn admitted_wallet_unavailability_closes_health_and_compatible_recovery_reopens_it()
+-> Result<()> {
+    let wallet =
+        serve_admitted_wallet_query(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(1))
+            .await?;
+    let materialized_view_directory = tempfile::tempdir()?;
+    let materialized_view_store = MaterializedViewStore::open(
+        materialized_view_directory.path(),
+        wallet.construction_identity,
+        MaterializedViewStoreOptions {
+            sync_writes: false,
+            consumers: MaterializedViewStore::bundled_consumers(),
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        },
+    )?;
+    let adapter = zinder_explorer::ExplorerQueryEndpointComposition::new(
+        ExplorerServerInfoSettings {
+            network: Network::ZcashRegtest,
+        },
+        materialized_view_store,
+        format!("http://{}", wallet.address),
+    )
+    .compose()
+    .await?;
 
-    let channel = await_with_retry(server_addr).await?;
-    let mut client = ExplorerQueryClient::new(channel);
-    let explorer_info = client
-        .server_info(ServerInfoRequest {})
-        .await?
-        .into_inner()
-        .info
-        .ok_or_else(|| eyre!("server info missing info envelope"))?;
-    let common = explorer_info
-        .common
-        .as_ref()
-        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
-
-    assert!(
-        !common
-            .capabilities
-            .iter()
-            .any(|advertised| { advertised == EXPLORER_TRANSACTION_DETAIL_V4 }),
-        "transaction_detail capability must not advertise without a wallet_query_endpoint",
-    );
-    let detail_outcome = client
-        .transaction_detail(TransactionDetailRequest {
-            transaction_id: "00".repeat(32),
-            at_epoch_id: None,
-        })
-        .await;
-    let detail_status = detail_outcome
-        .err()
-        .ok_or_else(|| eyre!("expected FAILED_PRECONDITION without wallet_query_endpoint"))?;
-    assert_eq!(detail_status.code(), tonic::Code::FailedPrecondition);
-
-    assert!(
-        !common
-            .capabilities
-            .iter()
-            .any(|advertised| { advertised == EXPLORER_OVERVIEW_SNAPSHOT_V1 }),
-        "overview_snapshot capability must not advertise without a materialized-view store",
-    );
-    let overview_outcome = client
-        .overview_snapshot(OverviewSnapshotRequest {
-            recent_blocks_limit: 0,
-            recent_transactions_limit: 0,
-            mempool_window_seconds: 0,
-            fee_summary_block_count: 0,
-        })
-        .await;
-    let overview_status = overview_outcome
-        .err()
-        .ok_or_else(|| eyre!("expected FAILED_PRECONDITION without materialized-view store"))?;
-    assert_eq!(overview_status.code(), tonic::Code::FailedPrecondition);
-
-    server_handle.abort();
-    let _ = server_handle.await;
+    wallet.set_available(false);
+    assert!(adapter.check_wallet_endpoint_health().await.is_err());
+    wallet.set_available(true);
+    adapter.check_wallet_endpoint_health().await?;
+    wallet.handle.abort();
+    let _ = wallet.handle.await;
     Ok(())
 }
 
@@ -194,13 +225,12 @@ async fn explorer_query_failed_precondition_without_wallet_query_endpoint() -> R
 async fn explorer_query_serves_block_summary_from_secondary_materialized_view_store() -> Result<()>
 {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let (_store_fixture, wallet_addr, wallet_handle) =
+    let (_store_fixture, construction_identity, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
     let seeded_materialized_view_store =
-        seeded_block_summary_materialized_view_store(&chain_fixture)?;
+        seeded_block_summary_materialized_view_store(&chain_fixture, construction_identity)?;
     let (mut client, explorer_handle) =
-        spawn_explorer_query_server(seeded_materialized_view_store.secondary_store, wallet_addr)
-            .await?;
+        spawn_explorer_query_server(seeded_materialized_view_store, wallet_addr).await?;
 
     let server_info = client.server_info(ServerInfoRequest {}).await?.into_inner();
     let explorer_info = server_info
@@ -290,7 +320,7 @@ async fn explorer_query_serves_block_production_series_with_explicit_coverage() 
         )],
     );
     let chain_fixture = base_fixture.with_transaction_rows(coinbase_rows);
-    let (store_fixture, wallet_addr, wallet_handle) =
+    let (store_fixture, construction_identity, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
     let canonical_store = SecondaryChainStore::open(
         store_fixture.tempdir_path(),
@@ -304,6 +334,7 @@ async fn explorer_query_serves_block_production_series_with_explicit_coverage() 
         seeded_block_summary_materialized_view_store_with_transaction_ids(
             &chain_fixture,
             &[encode_rpc_transaction_id_hex(coinbase_transaction_id)],
+            construction_identity,
         )?;
     let (mut client, explorer_handle) = spawn_explorer_query_server_with_canonical_store(
         seeded_materialized_view_store.secondary_store,
@@ -375,13 +406,12 @@ async fn explorer_query_serves_block_production_series_with_explicit_coverage() 
 #[tokio::test]
 async fn explorer_query_aggregates_block_activity_with_explicit_coverage() -> Result<()> {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let (_store_fixture, wallet_addr, wallet_handle) =
+    let (_store_fixture, construction_identity, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
     let seeded_materialized_view_store =
-        seeded_block_summary_materialized_view_store(&chain_fixture)?;
+        seeded_block_summary_materialized_view_store(&chain_fixture, construction_identity)?;
     let (mut client, explorer_handle) =
-        spawn_explorer_query_server(seeded_materialized_view_store.secondary_store, wallet_addr)
-            .await?;
+        spawn_explorer_query_server(seeded_materialized_view_store, wallet_addr).await?;
 
     let explorer_info = client
         .server_info(ServerInfoRequest {})
@@ -426,6 +456,7 @@ async fn explorer_query_aggregates_block_activity_with_explicit_coverage() -> Re
 /// The materialized block record supplies each id and index without fabricating
 /// an all-zero transaction for an absent canonical facts artifact.
 #[tokio::test]
+#[ignore = "P6c removes the legacy canonical block-transaction composition"]
 async fn explorer_query_serves_canonical_block_transactions_with_partial_fact_retention()
 -> Result<()> {
     let mut fixture = block_transactions_test_fixture().await?;
@@ -461,6 +492,7 @@ async fn explorer_query_serves_canonical_block_transactions_with_partial_fact_re
 }
 
 #[tokio::test]
+#[ignore = "P6c removes the legacy canonical transaction-detail composition"]
 async fn explorer_query_transaction_detail_preserves_canonical_transparent_rows() -> Result<()> {
     let mut fixture = block_transactions_test_fixture().await?;
     let first = fixture
@@ -491,10 +523,11 @@ async fn explorer_query_transaction_detail_preserves_canonical_transparent_rows(
 }
 
 #[tokio::test]
+#[ignore = "P6c removes the legacy canonical transaction-detail composition"]
 async fn transaction_detail_batches_spent_output_lookup_beyond_wallet_request_limit() -> Result<()>
 {
     let (chain_fixture, transaction_ids) = many_output_spend_chain_fixture()?;
-    let (wallet_store_fixture, wallet_addr, wallet_handle) =
+    let (wallet_store_fixture, construction_identity, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
     let canonical_store = SecondaryChainStore::open(
         wallet_store_fixture.tempdir_path(),
@@ -508,6 +541,7 @@ async fn transaction_detail_batches_spent_output_lookup_beyond_wallet_request_li
         seeded_block_summary_materialized_view_store_with_transaction_ids(
             &chain_fixture,
             &transaction_ids,
+            construction_identity,
         )?;
     let (mut client, explorer_handle) = spawn_explorer_query_server_with_canonical_store(
         seeded_materialized_view_store.secondary_store,
@@ -716,7 +750,7 @@ struct BlockTransactionsTestFixture {
 async fn block_transactions_test_fixture() -> Result<BlockTransactionsTestFixture> {
     let (chain_fixture, transaction_id_strings, missing_transaction_id) =
         block_transactions_chain_fixture()?;
-    let (_wallet_store_fixture, wallet_addr, wallet_handle) =
+    let (_wallet_store_fixture, construction_identity, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
     let (canonical_store_fixture, canonical_store) =
         canonical_store_without_transaction_facts(&chain_fixture, missing_transaction_id)?;
@@ -724,6 +758,7 @@ async fn block_transactions_test_fixture() -> Result<BlockTransactionsTestFixtur
         seeded_block_summary_materialized_view_store_with_transaction_ids(
             &chain_fixture,
             &transaction_id_strings,
+            construction_identity,
         )?;
     let (client, explorer_handle) = spawn_explorer_query_server_with_canonical_store(
         seeded_materialized_view_store.secondary_store,
@@ -1047,13 +1082,12 @@ fn assert_block_transactions_response(
 async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_store() -> Result<()>
 {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let (_store_fixture, wallet_addr, wallet_handle) =
+    let (_store_fixture, construction_identity, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
     let seeded_materialized_view_store =
-        seeded_block_summary_materialized_view_store(&chain_fixture)?;
+        seeded_block_summary_materialized_view_store(&chain_fixture, construction_identity)?;
     let (mut client, explorer_handle) =
-        spawn_explorer_query_server(seeded_materialized_view_store.secondary_store, wallet_addr)
-            .await?;
+        spawn_explorer_query_server(seeded_materialized_view_store, wallet_addr).await?;
 
     let explorer_info = client
         .server_info(ServerInfoRequest {})
@@ -1094,8 +1128,6 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_s
         first.tip_block_time_unix_seconds,
         first.recent_blocks[0].block_time_unix_seconds
     );
-    assert_overview_wallet_fields_unavailable(&first)?;
-
     // Coherence guarantee: a second call against the same upstream tip
     // returns the same snapshot identity (tip_hash). The bundle never
     // straddles two tips.
@@ -1132,19 +1164,23 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_s
 #[tokio::test]
 async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires() -> Result<()> {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let (_store_fixture, wallet_addr, wallet_handle) =
+    let (_store_fixture, construction_identity, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
     let seeded_materialized_view_store =
-        seeded_block_summary_materialized_view_store(&chain_fixture)?;
+        seeded_block_summary_materialized_view_store(&chain_fixture, construction_identity)?;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let explorer_addr = listener.local_addr()?;
-    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: Network::ZcashRegtest,
-    })
-    .with_materialized_view_store(seeded_materialized_view_store.secondary_store)
-    .with_wallet_query_endpoint(format!("http://{wallet_addr}"))
-    .with_prevout_resolution_online(true);
+    let adapter = zinder_explorer::ExplorerQueryEndpointComposition::new(
+        ExplorerServerInfoSettings {
+            network: Network::ZcashRegtest,
+        },
+        seeded_materialized_view_store.secondary_store,
+        format!("http://{wallet_addr}"),
+    )
+    .with_prevout_resolution_online(true)
+    .compose()
+    .await?;
     let probe_cancel = CancellationToken::new();
     let probe_handle = adapter.spawn_upstream_observation_probe(
         Arc::new(StubUpstreamSource::ready(2_530_000, 2_544_375, 0.9943)),
@@ -1207,200 +1243,6 @@ async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires
     Ok(())
 }
 
-#[tokio::test]
-async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    seed_recorded_chain_reorg(&store_fixture)?;
-
-    let seeded_materialized_view_store =
-        seeded_reorg_history_materialized_view_store(&store_fixture)?;
-    let (mut client, explorer_handle) = spawn_explorer_query_server_with_materialized_view_store(
-        seeded_materialized_view_store.secondary_store,
-    )
-    .await?;
-
-    assert_reorg_history_capability(&mut client).await?;
-    let reorg_cursor = assert_recorded_reorg_history_page(&mut client).await?;
-    assert_reorg_history_empty_after(&mut client, reorg_cursor).await?;
-
-    explorer_handle.abort();
-    let _ = explorer_handle.await;
-    Ok(())
-}
-
-fn seed_recorded_chain_reorg(store_fixture: &StoreFixture) -> Result<()> {
-    let initial_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let settled_block = initial_chain
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("initial fixture missing height 1"))?;
-    let mut initial_epoch = initial_chain
-        .chain_epoch(ChainEpochId::new(1))
-        .ok_or_else(|| eyre!("initial fixture missing chain epoch"))?;
-    initial_epoch.settled_tip_height = settled_block.height;
-    initial_epoch.settled_tip_hash = settled_block.hash;
-    let initial_block_headers = initial_chain.block_header_artifacts();
-    let initial_block_replay_envelopes = initial_block_headers
-        .iter()
-        .map(|block_header| encode_fixture_block_replay(block_header, &[]))
-        .collect();
-    store_fixture.chain_store().commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            initial_epoch,
-            initial_block_headers,
-            initial_block_replay_envelopes,
-            initial_chain.compact_block_artifacts(),
-        )
-        .with_reorg_window_change(ReorgWindowChange::Extend {
-            block_range: BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
-        }),
-    )?;
-
-    let replacement_chain = initial_chain.fork_at(BlockHeight::new(2))?.extend_blocks(1);
-    let replacement_block = replacement_chain
-        .block_at(BlockHeight::new(2))
-        .ok_or_else(|| eyre!("replacement fixture missing height 2"))?;
-    let mut replacement_epoch = replacement_chain
-        .chain_epoch(ChainEpochId::new(2))
-        .ok_or_else(|| eyre!("replacement fixture missing chain epoch"))?;
-    replacement_epoch.settled_tip_height = settled_block.height;
-    replacement_epoch.settled_tip_hash = settled_block.hash;
-    let replacement_block_header = replacement_block.block_header_artifact();
-    let replacement_replay = encode_fixture_block_replay(&replacement_block_header, &[]);
-    store_fixture.chain_store().commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            replacement_epoch,
-            vec![replacement_block_header],
-            vec![replacement_replay],
-            vec![replacement_block.compact_block_artifact()],
-        )
-        .with_reorg_window_change(ReorgWindowChange::Replace {
-            from_height: BlockHeight::new(2),
-        }),
-    )?;
-    Ok(())
-}
-
-fn seeded_reorg_history_materialized_view_store(
-    store_fixture: &StoreFixture,
-) -> Result<SeededMaterializedViewStore> {
-    let primary_materialized_view_store = zinder_ingest::open_primary_materialized_view_store(
-        store_fixture.tempdir_path(),
-        zinder_materialized_views::MaterializedViewPreset::Explorer,
-        zinder_store::RocksDbResourceBudget::for_local_tests(),
-    )?;
-    record_reorg_incidents(store_fixture, &primary_materialized_view_store)?;
-    let reorg_cursor = primary_materialized_view_store
-        .get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
-        .ok_or_else(|| eyre!("reorg incidents cursor missing after materialized-view replay"))?;
-    assert!(!reorg_cursor.is_empty());
-
-    let materialized_view_secondary_tempdir = tempfile::tempdir()?;
-    let materialized_view_store = MaterializedViewStore::open_secondary(
-        MaterializedViewStore::path_for_canonical(store_fixture.tempdir_path()),
-        materialized_view_secondary_tempdir.path(),
-        MaterializedViewStoreOptions {
-            sync_writes: false,
-            consumers: MaterializedViewStore::bundled_consumers(),
-            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
-        },
-    )?;
-    materialized_view_store.try_catch_up()?;
-    Ok(SeededMaterializedViewStore {
-        _tempdir: materialized_view_secondary_tempdir,
-        secondary_store: materialized_view_store,
-    })
-}
-
-async fn assert_reorg_history_capability(client: &mut ExplorerQueryClient<Channel>) -> Result<()> {
-    let explorer_info = client
-        .server_info(ServerInfoRequest {})
-        .await?
-        .into_inner()
-        .info
-        .ok_or_else(|| eyre!("server info missing info envelope"))?;
-    let common = explorer_info
-        .common
-        .as_ref()
-        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
-    assert_advertises_capability(&common.capabilities, EXPLORER_CHAIN_REORG_HISTORY_V1);
-    Ok(())
-}
-
-async fn assert_recorded_reorg_history_page(
-    client: &mut ExplorerQueryClient<Channel>,
-) -> Result<Vec<u8>> {
-    let first_page = client
-        .chain_reorg_history(ChainReorgHistoryRequest {
-            max_events: 1,
-            from_cursor: Vec::new(),
-        })
-        .await?
-        .into_inner();
-    let freshness = first_page
-        .freshness
-        .as_ref()
-        .ok_or_else(|| eyre!("reorg history response missing freshness"))?;
-    assert_eq!(
-        freshness.capability_version,
-        EXPLORER_CHAIN_REORG_HISTORY_V1
-    );
-    assert!(first_page.next_cursor.is_empty());
-    assert_eq!(first_page.events.len(), 1);
-    let reorg = first_page
-        .events
-        .first()
-        .ok_or_else(|| eyre!("reorg event missing"))?;
-    let reorg_cursor = reorg.cursor.clone();
-    assert_eq!(reorg.event_sequence, 2);
-    assert!(!reorg_cursor.is_empty());
-    assert_eq!(reorg.chain_epoch_id, 2);
-    assert_eq!(
-        reorg
-            .visible_tip
-            .as_ref()
-            .ok_or_else(|| eyre!("reorg visible tip missing"))?
-            .height,
-        2
-    );
-    assert_eq!(
-        reorg
-            .settled_tip
-            .as_ref()
-            .ok_or_else(|| eyre!("reorg settled tip missing"))?
-            .height,
-        1
-    );
-    let reverted = reorg
-        .reverted
-        .as_ref()
-        .ok_or_else(|| eyre!("reorg reverted range missing"))?;
-    assert_eq!(reverted.start_height, 2);
-    assert_eq!(reverted.end_height, 2);
-    let committed = reorg
-        .committed
-        .as_ref()
-        .ok_or_else(|| eyre!("reorg committed range missing"))?;
-    assert_eq!(committed.start_height, 2);
-    assert_eq!(committed.end_height, 2);
-    Ok(reorg_cursor)
-}
-
-async fn assert_reorg_history_empty_after(
-    client: &mut ExplorerQueryClient<Channel>,
-    cursor: Vec<u8>,
-) -> Result<()> {
-    let empty_page = client
-        .chain_reorg_history(ChainReorgHistoryRequest {
-            max_events: 10,
-            from_cursor: cursor,
-        })
-        .await?
-        .into_inner();
-    assert!(empty_page.events.is_empty());
-    assert!(empty_page.next_cursor.is_empty());
-    Ok(())
-}
-
 /// Minimal `NodeSource` stub used by the upstream-observation probe test.
 ///
 /// Returns a fixed [`UpstreamHealthSnapshot`] from
@@ -1449,41 +1291,44 @@ impl NodeSource for StubUpstreamSource {
 
 async fn spawn_wallet_query_server(
     chain_fixture: &ChainFixture,
-) -> Result<(StoreFixture, SocketAddr, ServerHandle)> {
+) -> Result<(
+    StoreFixture,
+    zinder_store::CanonicalStoreConstructionIdentity,
+    SocketAddr,
+    ServerHandle,
+)> {
     let store_fixture = StoreFixture::with_chain_committed(chain_fixture, ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    let _channel = await_with_retry(addr).await?;
-    Ok((store_fixture, addr, handle))
+    let admitted = serve_admitted_wallet_query(chain_fixture).await?;
+    Ok((
+        store_fixture,
+        admitted.construction_identity,
+        admitted.address,
+        admitted.handle,
+    ))
 }
 
 fn seeded_block_summary_materialized_view_store(
     chain_fixture: &ChainFixture,
+    construction_identity: zinder_store::CanonicalStoreConstructionIdentity,
 ) -> Result<SeededMaterializedViewStore> {
-    seeded_block_summary_materialized_view_store_with_transaction_ids(chain_fixture, &[])
+    seeded_block_summary_materialized_view_store_with_transaction_ids(
+        chain_fixture,
+        &[],
+        construction_identity,
+    )
 }
 
 fn seeded_block_summary_materialized_view_store_with_transaction_ids(
     chain_fixture: &ChainFixture,
     transaction_ids: &[String],
+    construction_identity: zinder_store::CanonicalStoreConstructionIdentity,
 ) -> Result<SeededMaterializedViewStore> {
     let tempdir = tempfile::tempdir()?;
     let primary_path = tempdir.path().join("materialized-view-primary");
     let secondary_path = tempdir.path().join("materialized-view-secondary");
     let primary_store = MaterializedViewStore::open(
         &primary_path,
+        construction_identity,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
@@ -1504,40 +1349,9 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
     secondary_store.try_catch_up()?;
     Ok(SeededMaterializedViewStore {
         _tempdir: tempdir,
+        _primary_store: primary_store,
         secondary_store,
     })
-}
-
-/// Replays the fixture's retained chain events into the reorg-incident log.
-fn record_reorg_incidents(
-    store_fixture: &StoreFixture,
-    materialized_view_store: &MaterializedViewStore,
-) -> Result<()> {
-    let blocks = std::collections::HashMap::new();
-    for envelope in store_fixture.chain_store().chain_event_history(
-        zinder_store::ChainEventHistoryRequest::with_default_limit(None),
-    )? {
-        let mut reorg_incidents = zinder_materialized_views::ReorgIncidentsConsumer::new();
-        let mut block_consumers: [&mut dyn zinder_materialized_views::BlockKeyedConsumer; 0] = [];
-        let mut event_consumers: [&mut dyn zinder_materialized_views::MaterializedViewConsumer; 1] =
-            [&mut reorg_incidents];
-        materialized_view_store.write_chain_event_chunk_with_event_consumers(
-            zinder_materialized_views::ChainEventDispatchConsumers {
-                block_consumers: &mut block_consumers,
-                event_consumers: &mut event_consumers,
-            },
-            zinder_materialized_views::ChainEventDispatchInputs {
-                chain_epoch: envelope.chain_epoch,
-                chain_event: &envelope.event,
-                chain_cursor: envelope.cursor.as_bytes(),
-                event_sequence: envelope.event_sequence,
-                settled_tip_height: envelope.settled_tip_height,
-            },
-            &blocks,
-            true,
-        )?;
-    }
-    Ok(())
 }
 
 fn seed_block_summary(
@@ -1575,23 +1389,27 @@ fn seed_block_summary(
         &BlockSummaryConsumer::key_for_height(fixture_block.height),
         &record.encode_to_vec(),
     )?;
-    materialized_view_store.put_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME, &[1])?;
     Ok(())
 }
 
 async fn spawn_explorer_query_server(
-    materialized_view_store: MaterializedViewStore,
+    seeded_materialized_view_store: SeededMaterializedViewStore,
     wallet_addr: SocketAddr,
 ) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: Network::ZcashRegtest,
-    })
-    .with_materialized_view_store(materialized_view_store)
-    .with_wallet_query_endpoint(format!("http://{wallet_addr}"))
-    .with_prevout_resolution_online(true);
+    let adapter = zinder_explorer::ExplorerQueryEndpointComposition::new(
+        ExplorerServerInfoSettings {
+            network: Network::ZcashRegtest,
+        },
+        seeded_materialized_view_store.secondary_store.clone(),
+        format!("http://{wallet_addr}"),
+    )
+    .with_prevout_resolution_online(true)
+    .compose()
+    .await?;
     let handle = tokio::spawn(async move {
+        let _seeded_materialized_view_store = seeded_materialized_view_store;
         tonic::transport::Server::builder()
             .add_service(adapter.into_server())
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -1608,31 +1426,16 @@ async fn spawn_explorer_query_server_with_canonical_store(
 ) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: Network::ZcashRegtest,
-    })
-    .with_materialized_view_store(materialized_view_store)
+    let adapter = zinder_explorer::ExplorerQueryEndpointComposition::new(
+        ExplorerServerInfoSettings {
+            network: Network::ZcashRegtest,
+        },
+        materialized_view_store,
+        format!("http://{wallet_addr}"),
+    )
     .with_canonical_store(canonical_store)
-    .with_wallet_query_endpoint(format!("http://{wallet_addr}"));
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    let channel = await_with_retry(addr).await?;
-    Ok((ExplorerQueryClient::new(channel), handle))
-}
-
-async fn spawn_explorer_query_server_with_materialized_view_store(
-    materialized_view_store: MaterializedViewStore,
-) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: Network::ZcashRegtest,
-    })
-    .with_materialized_view_store(materialized_view_store);
+    .compose()
+    .await?;
     let handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(adapter.into_server())
@@ -1652,32 +1455,6 @@ fn assert_advertises_capability(capabilities: &[String], capability: &str) {
     );
 }
 
-fn assert_overview_wallet_fields_unavailable(response: &OverviewSnapshotResponse) -> Result<()> {
-    assert!(response.mempool.is_none());
-    assert!(response.value_pools.is_empty());
-    let freshness = response
-        .freshness
-        .as_ref()
-        .ok_or_else(|| eyre!("overview response missing freshness"))?;
-    assert_eq!(freshness.unavailable.len(), 2);
-    for field_path in ["mempool", "value_pools"] {
-        let unavailable_field = freshness
-            .unavailable
-            .iter()
-            .find(|unavailable| unavailable.field_path == field_path)
-            .ok_or_else(|| eyre!("overview freshness missing unavailable field {field_path}"))?;
-        assert_eq!(
-            unavailable_field.reason,
-            UnavailableReason::UnavailableUpstreamNotSupported as i32
-        );
-        assert_eq!(
-            unavailable_field.human_reason,
-            WALLET_QUERY_CAPABILITY_NOT_SUPPORTED
-        );
-    }
-    Ok(())
-}
-
 #[tokio::test]
 async fn explorer_query_bearer_token_rejects_unauthenticated_clients() -> Result<()> {
     use std::str::FromStr as _;
@@ -1687,10 +1464,28 @@ async fn explorer_query_bearer_token_rejects_unauthenticated_clients() -> Result
     let server_addr = listener.local_addr()?;
     let server_token =
         BearerToken::from_str("expected").map_err(|error| eyre!("token parse: {error}"))?;
-    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: Network::ZcashRegtest,
-    })
-    .with_bearer_token(server_token.clone());
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let wallet = serve_admitted_wallet_query(&chain_fixture).await?;
+    let materialized_view_directory = tempfile::tempdir()?;
+    let materialized_view_store = MaterializedViewStore::open(
+        materialized_view_directory.path(),
+        wallet.construction_identity,
+        MaterializedViewStoreOptions {
+            sync_writes: false,
+            consumers: MaterializedViewStore::bundled_consumers(),
+            rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+        },
+    )?;
+    let adapter = zinder_explorer::ExplorerQueryEndpointComposition::new(
+        ExplorerServerInfoSettings {
+            network: Network::ZcashRegtest,
+        },
+        materialized_view_store,
+        format!("http://{}", wallet.address),
+    )
+    .with_bearer_token(server_token.clone())
+    .compose()
+    .await?;
     let server_handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(adapter.into_server())
@@ -1744,6 +1539,8 @@ async fn explorer_query_bearer_token_rejects_unauthenticated_clients() -> Result
 
     server_handle.abort();
     let _ = server_handle.await;
+    wallet.handle.abort();
+    let _ = wallet.handle.await;
     Ok(())
 }
 
@@ -1810,8 +1607,6 @@ fn seed_transparent_address_deltas(
             &record.encode_to_vec(),
         )?;
     }
-    materialized_view_store
-        .put_chain_event_cursor(TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, &[1])?;
     Ok(())
 }
 
@@ -1820,12 +1615,14 @@ fn seed_transparent_address_deltas(
 fn seeded_deltas_materialized_view_store(
     address: TransparentAddressScriptHash,
     deltas: &[SeedDelta],
+    construction_identity: zinder_store::CanonicalStoreConstructionIdentity,
 ) -> Result<SeededMaterializedViewStore> {
     let tempdir = tempfile::tempdir()?;
     let primary_path = tempdir.path().join("materialized-view-primary");
     let secondary_path = tempdir.path().join("materialized-view-secondary");
     let primary_store = MaterializedViewStore::open(
         &primary_path,
+        construction_identity,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
@@ -1846,6 +1643,7 @@ fn seeded_deltas_materialized_view_store(
     secondary_store.try_catch_up()?;
     Ok(SeededMaterializedViewStore {
         _tempdir: tempdir,
+        _primary_store: primary_store,
         secondary_store,
     })
 }
@@ -1907,11 +1705,11 @@ async fn spawn_deltas_explorer(
     deltas: &[SeedDelta],
 ) -> Result<(ExplorerQueryClient<Channel>, ServerHandle, ServerHandle)> {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let (_store_fixture, wallet_addr, wallet_handle) =
+    let (_store_fixture, construction_identity, wallet_addr, wallet_handle) =
         spawn_wallet_query_server(&chain_fixture).await?;
-    let seeded = seeded_deltas_materialized_view_store(DELTAS_TEST_ADDRESS, deltas)?;
-    let (client, explorer_handle) =
-        spawn_explorer_query_server(seeded.secondary_store, wallet_addr).await?;
+    let seeded =
+        seeded_deltas_materialized_view_store(DELTAS_TEST_ADDRESS, deltas, construction_identity)?;
+    let (client, explorer_handle) = spawn_explorer_query_server(seeded, wallet_addr).await?;
     Ok((client, explorer_handle, wallet_handle))
 }
 

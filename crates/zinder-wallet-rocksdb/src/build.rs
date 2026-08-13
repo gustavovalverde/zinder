@@ -13,13 +13,14 @@ use zinder_core::{
 };
 use zinder_rocksdb_bulk_load::VariableValueSortEvidence;
 use zinder_store::{
-    CanonicalReplayScan, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalConstructionManifestBinding, CanonicalReplayScan, CanonicalStoreError,
+    CanonicalStoreReadyEvidence, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
-    WalletCanonicalSourceIdentity, WalletProjectionAccumulator, WalletProjectionBuildLease,
-    WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner, WalletProjectionDigest,
-    WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence,
+    WalletCanonicalConstructionBinding, WalletCanonicalSourceIdentity, WalletProjectionAccumulator,
+    WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
+    WalletProjectionDigest, WalletProjectionFamilyRowCounts, WalletProjectionReadyEvidence,
     WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition, WalletUtxoSetSummary,
 };
 
@@ -41,6 +42,9 @@ const DEFAULT_BUILD_LEASE_DURATION_MILLIS: u64 = 60 * 60 * 1000;
 pub trait WalletProjectionReplaySource {
     /// Returns the immutable network admitted by this replay source.
     fn wallet_projection_network(&self) -> zinder_core::Network;
+
+    /// Returns the canonical construction binding that owns the replay rows.
+    fn wallet_projection_construction_binding(&self) -> CanonicalConstructionManifestBinding;
 
     /// Returns the authenticated canonical fence pinned before replay begins.
     fn wallet_projection_ready_evidence(&self) -> CanonicalStoreReadyEvidence;
@@ -163,6 +167,10 @@ impl WalletProjectionReplaySource for RocksDbCanonicalStore {
         self.network()
     }
 
+    fn wallet_projection_construction_binding(&self) -> CanonicalConstructionManifestBinding {
+        self.construction_identity().construction_manifest_binding()
+    }
+
     fn wallet_projection_ready_evidence(&self) -> CanonicalStoreReadyEvidence {
         self.ready_evidence()
     }
@@ -175,6 +183,10 @@ impl WalletProjectionReplaySource for RocksDbCanonicalStore {
 impl WalletProjectionReplaySource for RocksDbCanonicalSecondary {
     fn wallet_projection_network(&self) -> zinder_core::Network {
         self.network()
+    }
+
+    fn wallet_projection_construction_binding(&self) -> CanonicalConstructionManifestBinding {
+        self.construction_identity().construction_manifest_binding()
     }
 
     fn wallet_projection_ready_evidence(&self) -> CanonicalStoreReadyEvidence {
@@ -550,6 +562,7 @@ where
     let build_store = RocksDbWalletBuildStore::create_fresh(
         wallet_path,
         network,
+        wallet_construction_binding(canonical_store.wallet_projection_construction_binding()),
         source_identity,
         options.supported_reorg_depth,
         options.resource_budget,
@@ -721,6 +734,12 @@ where
         }
         Err(build_error) => finish_failed_wallet_build(&mut lease_cleanup, build_error),
     }
+}
+
+fn wallet_construction_binding(
+    binding: CanonicalConstructionManifestBinding,
+) -> WalletCanonicalConstructionBinding {
+    WalletCanonicalConstructionBinding::new(binding.version, binding.sha256)
 }
 
 fn canonical_source_identity(

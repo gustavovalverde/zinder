@@ -994,6 +994,13 @@ pub struct WalletServerInfo {
     /// Upstream node capabilities detected by zinder-source.
     #[prost(message, optional, tag = "8")]
     pub node: ::core::option::Option<NodeCapabilitiesDescriptor>,
+    /// Immutable canonical construction backing this admitted Wallet serving
+    /// pair. Consumers must treat this as a structural claim and exact-compare
+    /// it with their own canonical authority before using Wallet-backed rows.
+    #[prost(message, optional, tag = "9")]
+    pub canonical_construction_manifest_binding: ::core::option::Option<
+        super::ops::CanonicalConstructionManifestBinding,
+    >,
 }
 /// Upstream node capability descriptor. Storage-only query deployments may
 /// leave this empty when the query service has no source probe snapshot.

@@ -11,7 +11,8 @@ use zinder_core::{
     ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
     ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
     CompactSaplingSpend, CompactShieldedAction, CompactTransaction, CompactTransactionData,
-    CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolObservation,
+    CompactTransparentInput, CompactTransparentOutput, ConsensusBranchId, MempoolEntry,
+    MempoolObservation, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
     RawTransactionBytes, TransactionId, TransparentMempoolOutput, TransparentMempoolSpend,
     TransparentOutPoint, UnixTimestampMillis,
 };
@@ -68,6 +69,14 @@ pub enum WalletWireDecodeError {
         /// Unsupported wire value.
         network_name: String,
     },
+    /// A structured field violated the native domain contract.
+    #[error("{field}: {reason}")]
+    InvalidField {
+        /// Static field path.
+        field: &'static str,
+        /// Stable domain validation failure.
+        reason: String,
+    },
     /// Derived transparent indexes contradict the structured scan data.
     #[error("mempool entry transparent indexes contradict compact transaction data")]
     InconsistentMempoolIndexes,
@@ -89,12 +98,44 @@ impl WalletWireDecodeError {
             | Self::WrongLength { field, .. }
             | Self::InvalidRpcHex { field, .. }
             | Self::Overflow { field, .. }
-            | Self::UnknownNetwork { field, .. } => field,
+            | Self::UnknownNetwork { field, .. }
+            | Self::InvalidField { field, .. } => field,
             Self::InconsistentMempoolIndexes => "mempool_entry.transparent_indexes",
             Self::InvalidChainEpoch => "chain_epoch",
             Self::InvalidCompactTransactionOrder => "compact_block.transactions.index",
         }
     }
+}
+
+/// Decodes and validates one Wallet activation-table response for `network`.
+pub fn network_upgrade_activations_from_message(
+    network: Network,
+    response: wallet::NetworkUpgradeActivationsResponse,
+) -> Result<NetworkUpgradeActivations, WalletWireDecodeError> {
+    let activations = response
+        .activations
+        .into_iter()
+        .enumerate()
+        .map(|(index, activation)| {
+            if activation.name.trim().is_empty() {
+                return Err(WalletWireDecodeError::InvalidField {
+                    field: "activations.name",
+                    reason: format!("activation at index {index} has an empty name"),
+                });
+            }
+            Ok(NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(activation.consensus_branch_id),
+                activation_height: BlockHeight::new(activation.activation_height),
+                name: activation.name,
+            })
+        })
+        .collect::<Result<Vec<_>, WalletWireDecodeError>>()?;
+    NetworkUpgradeActivations::new(network, activations).map_err(|error| {
+        WalletWireDecodeError::InvalidField {
+            field: "activations",
+            reason: error.to_string(),
+        }
+    })
 }
 
 /// Encodes one structured compact block.
@@ -622,4 +663,64 @@ fn decode_auth_digest(
         field,
         reason: error.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_upgrade_activations_rejects_duplicate_branch_ids() -> Result<(), &'static str> {
+        let response = wallet::NetworkUpgradeActivationsResponse {
+            activations: vec![
+                wallet::NetworkUpgradeActivation {
+                    consensus_branch_id: 0x5ba8_1b19,
+                    name: "Overwinter".to_owned(),
+                    activation_height: 1,
+                },
+                wallet::NetworkUpgradeActivation {
+                    consensus_branch_id: 0x5ba8_1b19,
+                    name: "Duplicate".to_owned(),
+                    activation_height: 2,
+                },
+            ],
+        };
+
+        let error = network_upgrade_activations_from_message(Network::ZcashRegtest, response)
+            .err()
+            .ok_or("duplicate branch id must be rejected")?;
+
+        assert!(matches!(
+            error,
+            WalletWireDecodeError::InvalidField {
+                field: "activations",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn network_upgrade_activations_rejects_blank_names() -> Result<(), &'static str> {
+        let response = wallet::NetworkUpgradeActivationsResponse {
+            activations: vec![wallet::NetworkUpgradeActivation {
+                consensus_branch_id: 0x5ba8_1b19,
+                name: " \t".to_owned(),
+                activation_height: 1,
+            }],
+        };
+
+        let error = network_upgrade_activations_from_message(Network::ZcashRegtest, response)
+            .err()
+            .ok_or("blank activation name must be rejected")?;
+
+        assert!(matches!(
+            error,
+            WalletWireDecodeError::InvalidField {
+                field: "activations.name",
+                ..
+            }
+        ));
+        Ok(())
+    }
 }

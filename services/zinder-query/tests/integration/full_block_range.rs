@@ -371,7 +371,7 @@ async fn serving_pair_with_all_retention_advertises_and_serves_full_blocks() -> 
         (),
         ingest_control,
         activations,
-    );
+    )?;
 
     assert!(
         query
@@ -426,7 +426,7 @@ async fn serving_pair_without_block_retention_omits_and_rejects_full_blocks() ->
         (),
         ingest_control,
         activations,
-    );
+    )?;
 
     assert!(
         !query

@@ -14,8 +14,8 @@ use zinder_core::{
     SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
 };
 use zinder_query::{
-    CanonicalReader, QueryError, WalletProjectionReader, WalletQueryApi, WalletServingPairSlot,
-    WalletServingQuery, WalletServingReadPair,
+    CanonicalReader, QueryError, WalletProjectionReader, WalletQueryApi,
+    WalletServingAdmissionError, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{
     BlockHashLookup, CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope,
@@ -26,6 +26,30 @@ use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upg
 
 /// Bounds how long the gated read waits for the reactor to make progress.
 const REACTOR_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[test]
+fn serving_pair_rejects_wallet_rows_from_a_different_canonical_construction() -> eyre::Result<()> {
+    let activations = sample_regtest_upgrade_activations();
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let mut block_retaining = WalletServingStoreFixture::from_chain(
+        &chain.clone().with_raw_blob_retention(RawBlobRetention::All),
+        &activations,
+    )?;
+    let mut transaction_retaining = WalletServingStoreFixture::from_chain(
+        &chain.with_raw_blob_retention(RawBlobRetention::Transactions),
+        &activations,
+    )?;
+    let (canonical_reader, _) = block_retaining.take_readers()?;
+    let (_, wallet_reader) = transaction_retaining.take_readers()?;
+
+    let admission = WalletServingReadPair::validate_readers(&canonical_reader, &wallet_reader);
+
+    assert!(matches!(
+        admission,
+        Err(WalletServingAdmissionError::ConstructionBindingMismatch { .. })
+    ));
+    Ok(())
+}
 
 #[tokio::test]
 async fn wallet_serving_reads_leave_the_reactor_free() -> eyre::Result<()> {
@@ -46,7 +70,7 @@ async fn wallet_serving_reads_leave_the_reactor_free() -> eyre::Result<()> {
         )?)),
         (),
         Arc::clone(&activations),
-    );
+    )?;
 
     // The runtime is single-threaded, so this task only runs while the store
     // read is off the reactor.
@@ -81,7 +105,7 @@ async fn compact_block_range_is_capped_before_any_canonical_read() -> eyre::Resu
         )?)),
         (),
         Arc::clone(&activations),
-    );
+    )?;
 
     let over_cap = query
         .compact_blocks_in_range(
@@ -157,6 +181,10 @@ struct GatedCanonicalReader {
 }
 
 impl CanonicalReader for GatedCanonicalReader {
+    fn construction_identity(&self) -> zinder_store::CanonicalStoreConstructionIdentity {
+        self.canonical_reader.construction_identity()
+    }
+
     fn raw_blob_retention(&self) -> RawBlobRetention {
         self.canonical_reader.raw_blob_retention()
     }

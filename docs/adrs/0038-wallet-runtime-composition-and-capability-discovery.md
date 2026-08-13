@@ -158,6 +158,12 @@ through construction, append, replacement, reopen, secondary catch-up, and
 serving-pair admission. The reader declares the retention it expects and fails
 without mutation when the persisted identity differs.
 
+The pair also exact-compares the canonical construction-manifest binding with
+the binding persisted by wallet projection schema 2. This prevents a wallet
+projection built from another same-network construction from attaching merely
+because its dynamic fence and row evidence happen to match. A schema-1 wallet
+store has no construction proof and must be rebuilt on a fresh path.
+
 `RawBlobRetention::All` makes serialized full-block reads structurally
 available. `RawBlobRetention::Transactions` retains transaction bytes but omits
 full-block capabilities. The query never repairs missing historical blobs from

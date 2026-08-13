@@ -203,6 +203,13 @@ pub(crate) fn decide_recovery(
         | IngestError::SourceSegmentFetchTaskStopped { .. }
         | IngestError::MaterializedViewDispatch(_)
         | IngestError::MaterializedViewCursorUnreadable { .. }
+        | IngestError::CanonicalActivationsNetworkMismatch { .. }
+        | IngestError::CanonicalActivationsFingerprintMismatch { .. }
+        | IngestError::MaterializedViewCanonicalNetworkMismatch { .. }
+        | IngestError::MaterializedViewCanonicalActivationsFingerprintMismatch { .. }
+        | IngestError::MaterializedViewCanonicalConstructionBindingMismatch { .. }
+        | IngestError::MaterializedViewCheckpointExpired { .. }
+        | IngestError::MaterializedViewCheckpointFenceMismatch { .. }
         | IngestError::MaterializedViewStore(_) => SourceRecoveryDecision::Exit,
     }
 }

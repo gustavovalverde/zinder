@@ -156,6 +156,21 @@ pub(crate) enum ProjectorError {
     #[error("canonical control and secondary could not authenticate one exact writer fence")]
     CanonicalFenceDidNotConverge,
 
+    #[error("canonical writer status omitted its construction-manifest binding")]
+    CanonicalConstructionBindingMissing,
+
+    #[error("canonical writer status construction-manifest binding is malformed")]
+    CanonicalConstructionBindingMalformed {
+        /// Strict protocol-shape failure.
+        #[source]
+        source: zinder_proto::wire::CanonicalConstructionManifestBindingDecodeError,
+    },
+
+    #[error(
+        "canonical writer status construction-manifest binding disagrees with the admitted secondary"
+    )]
+    CanonicalConstructionBindingMismatch,
+
     #[error("constructed wallet source differs from its fixed canonical construction fence")]
     WalletConstructionFenceMismatch,
 

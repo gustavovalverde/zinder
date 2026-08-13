@@ -23,7 +23,7 @@ use zinder_proto::wire::encode_privacy_shape;
 
 use crate::MaterializedViewState;
 use crate::consumer::{
-    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockCheckpoint,
+    BlockCommitContext, BlockKeyedConsumer, MaterializedViewBlockProjection,
     MaterializedViewConsumerCtx, MaterializedViewConsumerError, MaterializedViewConsumerName,
     MaterializedViewConsumerSchema, advance_verified_materialized_view_coverage,
 };
@@ -197,9 +197,9 @@ impl BlockKeyedConsumer for TransactionHistoryConsumer {
         Ok(())
     }
 
-    fn stage_chain_event_checkpoint(
+    fn stage_block_projection_state(
         &mut self,
-        checkpoint: MaterializedViewBlockCheckpoint<'_>,
+        checkpoint: MaterializedViewBlockProjection<'_>,
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
         let tip_height = checkpoint
@@ -322,7 +322,7 @@ mod tests {
     use zinder_store::{ChainEpochCommitted, ChainEvent};
 
     use super::{
-        MaterializedViewBlockCheckpoint, MaterializedViewState, TRANSACTION_HISTORY_CONSUMER_NAME,
+        MaterializedViewBlockProjection, MaterializedViewState, TRANSACTION_HISTORY_CONSUMER_NAME,
         TransactionHistoryConsumer,
     };
     use crate::consumer::{BlockKeyedConsumer, MaterializedViewConsumerCtx};
@@ -382,7 +382,7 @@ mod tests {
         chunk_event: &ChainEvent,
         tip: u32,
     ) -> Result<()> {
-        let checkpoint = MaterializedViewBlockCheckpoint {
+        let checkpoint = MaterializedViewBlockProjection {
             chain_epoch,
             chain_event: chunk_event,
             tip_height: Some(BlockHeight::new(tip)),
@@ -394,7 +394,7 @@ mod tests {
             batch: &mut batch,
         };
         TransactionHistoryConsumer::new()
-            .stage_chain_event_checkpoint(checkpoint, &mut ctx)
+            .stage_block_projection_state(checkpoint, &mut ctx)
             .map_err(|error| eyre::eyre!("{error}"))?;
         store.write_batch(&batch)?;
         Ok(())
@@ -403,8 +403,11 @@ mod tests {
     #[test]
     fn re_applied_lower_committed_chunk_preserves_advanced_coverage() -> Result<()> {
         let tempdir = tempdir()?;
-        let store =
-            MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            crate::store::test_construction_identity(zinder_core::Network::ZcashRegtest)?,
+            MaterializedViewStoreOptions::default(),
+        )?;
         let armed = seed_materialized_view_state(&store, 180_512, 180_512)?;
 
         let epoch = chain_epoch(1, 180_512);
@@ -421,8 +424,11 @@ mod tests {
     #[test]
     fn contiguous_committed_chunk_advances_coverage_to_tip() -> Result<()> {
         let tempdir = tempdir()?;
-        let store =
-            MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            crate::store::test_construction_identity(zinder_core::Network::ZcashRegtest)?,
+            MaterializedViewStoreOptions::default(),
+        )?;
         seed_materialized_view_state(&store, 180_256, 180_256)?;
 
         let epoch = chain_epoch(1, 180_512);

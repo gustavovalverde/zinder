@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -28,11 +28,12 @@ use rust_rocksdb::{
     Cache, ColumnFamilyDescriptor, DB, IteratorMode, Options, ReadOptions, Snapshot, WriteBatch,
     WriteOptions, checkpoint::Checkpoint,
 };
-use zinder_core::{BlockHash, BlockHeight, ChainEpoch, ChainEpochId};
+use zinder_core::{BlockHash, BlockHeight, ChainEpoch, ChainEpochId, Network};
 use zinder_store::{
-    ChainEvent, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
-    RocksDbResourceGaugeInputs, StoreRole, build_block_based_table_factory, open_bounded_rocksdb,
-    record_rocksdb_resource_gauges,
+    CanonicalEventCursor, CanonicalEventFence, CanonicalRetainedEvent,
+    CanonicalStoreConstructionIdentity, ChainEvent, ResourceGaugeThrottle, RocksDbIoMode,
+    RocksDbOpenRole, RocksDbResourceBudget, RocksDbResourceGaugeInputs, StoreRole,
+    build_block_based_table_factory, open_bounded_rocksdb, record_rocksdb_resource_gauges,
 };
 
 use crate::{
@@ -84,7 +85,7 @@ use crate::{
     },
     consumer::{
         BlockCommitContext, BlockKeyedConsumer, ChainCommittedEvent, ChainReorgedEvent,
-        CommittedRange, MaterializedViewBlockCheckpoint, MaterializedViewConsumer,
+        CommittedRange, MaterializedViewBlockProjection, MaterializedViewConsumer,
         MaterializedViewConsumerCtx, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
         MaterializedViewMempoolConsumer, RevertedRange, apply_chain_committed_in_memory,
         apply_chain_reorged_in_memory,
@@ -115,7 +116,7 @@ pub const MATERIALIZED_VIEW_STORE_SUBDIR: &str = "materialized-views";
 /// rebuilds it from a certified recovery source. The version is persisted in
 /// the `consumer_metadata` column family on first open and validated on
 /// subsequent opens.
-pub const MATERIALIZED_VIEW_STORE_FORMAT_VERSION: u16 = 9;
+pub const MATERIALIZED_VIEW_STORE_FORMAT_VERSION: u16 = 10;
 
 /// Total attempts used to cross a primary-compaction race while a secondary
 /// catches up and validates its newly replayed manifest.
@@ -125,6 +126,9 @@ const STORE_FORMAT_VERSION_KEY: &[u8] = b"\x00\x01schema_version";
 const MATERIALIZED_VIEW_STATUS_KEY: &[u8] = b"\x00\x02materialized_view_status";
 const CONSUMER_SCHEMA_KEY_PREFIX: &[u8] = b"\x00\x03consumer_schema:";
 const MATERIALIZED_VIEW_STATE_KEY_PREFIX: &[u8] = b"\x00\x04consumer_state:";
+const STORE_CANONICAL_CONSTRUCTION_IDENTITY_KEY: &[u8] = b"\x00\x05canonical_construction_identity";
+const MATERIALIZED_VIEW_CHAIN_EVENT_CHECKPOINT_VERSION: u8 = 1;
+const MATERIALIZED_VIEW_CHAIN_EVENT_CHECKPOINT_BYTES: usize = 1 + 9 + 95;
 const MATERIALIZED_VIEW_STATE_VERSION: u8 = 1;
 const MATERIALIZED_VIEW_STATE_LEN: usize = 94;
 const MATERIALIZED_VIEW_ROCKSDB_PROPERTIES: [&str; 7] = [
@@ -472,17 +476,71 @@ impl Default for MaterializedViewStoreOptions {
 /// bytes copied out of the iterator's borrowed buffers.
 pub type ConsumerEntry = (Vec<u8>, Vec<u8>);
 
-/// Cursor entry observed by materialized-view cursor readers.
+/// Exact canonical event applied by one materialized-view chain consumer.
 ///
-/// Carries the raw cursor bytes and a copy of the consumer name the caller
-/// queried with so callers can match cursors to their owning consumer when
-/// processing batches of reads.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MaterializedViewCursorEntry {
-    /// Consumer the cursor was persisted for.
-    pub consumer: MaterializedViewConsumerName,
-    /// Opaque cursor bytes the consumer last persisted.
-    pub cursor_bytes: Vec<u8>,
+/// The cursor and resulting fence are persisted as one versioned value in the
+/// same batch as that consumer's rows. Different replay cohorts therefore
+/// retain independent truthful boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaterializedViewChainEventCheckpoint {
+    cursor: CanonicalEventCursor,
+    resulting_fence: CanonicalEventFence,
+}
+
+impl MaterializedViewChainEventCheckpoint {
+    /// Captures the exact cursor and fence carried by one retained event.
+    #[must_use]
+    pub const fn from_retained_event(event: CanonicalRetainedEvent) -> Self {
+        Self {
+            cursor: event.cursor(),
+            resulting_fence: event.resulting_fence(),
+        }
+    }
+
+    /// Returns the exact canonical cursor persisted for this consumer.
+    #[must_use]
+    pub const fn cursor(self) -> CanonicalEventCursor {
+        self.cursor
+    }
+
+    /// Returns the authenticated canonical fence produced by the event.
+    #[must_use]
+    pub const fn resulting_fence(self) -> CanonicalEventFence {
+        self.resulting_fence
+    }
+
+    /// Verifies that this checkpoint names exactly one retained canonical event.
+    ///
+    /// Replay and rebuild callers must obtain `retained_event` from the
+    /// admitted canonical secondary with
+    /// [`zinder_store::RocksDbCanonicalSecondary::retained_event_at_cursor`]
+    /// before they reuse a persisted checkpoint. A matching sequence alone is
+    /// insufficient because a different canonical fence can carry that same
+    /// sequence after a source mismatch or corruption.
+    pub fn require_matching_retained_event(
+        self,
+        retained_event: CanonicalRetainedEvent,
+    ) -> Result<(), MaterializedViewStoreError> {
+        self.require_matching_retained_event_boundary(
+            retained_event.cursor(),
+            retained_event.resulting_fence(),
+        )
+    }
+
+    fn require_matching_retained_event_boundary(
+        self,
+        cursor: CanonicalEventCursor,
+        resulting_fence: CanonicalEventFence,
+    ) -> Result<(), MaterializedViewStoreError> {
+        if self.cursor != cursor || self.resulting_fence != resulting_fence {
+            return Err(
+                MaterializedViewStoreError::ChainEventCheckpointRetainedEventMismatch {
+                    event_sequence: self.cursor.event_sequence(),
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Inputs that bind a canonical chain event to one materialized-view write.
@@ -492,10 +550,8 @@ pub struct ChainEventDispatchInputs<'event> {
     pub chain_epoch: ChainEpoch,
     /// Post-commit event emitted by the canonical store.
     pub chain_event: &'event ChainEvent,
-    /// Chain-event cursor emitted by the canonical store.
-    pub chain_cursor: &'event [u8],
-    /// Monotonic event sequence assigned by the canonical store.
-    pub event_sequence: u64,
+    /// Exact cursor and resulting fence emitted by the canonical store.
+    pub checkpoint: MaterializedViewChainEventCheckpoint,
     /// Settled tip height observed at commit time.
     pub settled_tip_height: BlockHeight,
 }
@@ -548,12 +604,14 @@ pub struct ChainEventDispatchConsumers<
 #[derive(Clone)]
 pub struct MaterializedViewStore {
     db: Arc<DB>,
+    construction_identity: CanonicalStoreConstructionIdentity,
     sync_writes: bool,
     storage_path: PathBuf,
     consumers: &'static [MaterializedViewConsumerSchema],
     rocksdb_resource_budget: RocksDbResourceBudget,
     is_secondary: bool,
     catch_up_barrier: Arc<RwLock<()>>,
+    terminal_catch_up_failure: Arc<AtomicBool>,
     block_cache: Cache,
     write_buffer_manager: rust_rocksdb::WriteBufferManager,
     statistics: Arc<Options>,
@@ -609,11 +667,11 @@ impl MaterializedViewStoreReadSnapshot<'_> {
             .transpose()
     }
 
-    /// Reads a chain-event consumer's persisted cursor from this snapshot.
-    pub fn get_chain_event_cursor(
+    /// Reads a chain-event consumer's exact applied checkpoint from this snapshot.
+    pub fn chain_event_checkpoint(
         &self,
         consumer: MaterializedViewConsumerName,
-    ) -> Result<Option<Vec<u8>>, MaterializedViewStoreError> {
+    ) -> Result<Option<MaterializedViewChainEventCheckpoint>, MaterializedViewStoreError> {
         let column_family = self
             .store
             .column_family(MaterializedViewStoreTable::ChainEventCursor)?;
@@ -628,6 +686,11 @@ impl MaterializedViewStoreReadSnapshot<'_> {
                 operation: "get",
                 column_family: MaterializedViewStoreColumnFamily::ChainEventCursor,
                 source,
+            })
+            .and_then(|checkpoint| {
+                checkpoint
+                    .map(|encoded| decode_chain_event_checkpoint(consumer, &encoded))
+                    .transpose()
             })
     }
 
@@ -919,6 +982,7 @@ impl fmt::Debug for MaterializedViewStore {
         formatter
             .debug_struct("MaterializedViewStore")
             .field("db", &self.db)
+            .field("construction_identity", &self.construction_identity)
             .field("sync_writes", &self.sync_writes)
             .field("storage_path", &self.storage_path)
             .field("consumers", &self.consumers)
@@ -944,20 +1008,34 @@ impl fmt::Debug for MaterializedViewStore {
 }
 
 impl MaterializedViewStore {
-    /// Captures a consistent read view at the store's current sequence.
+    /// Returns the immutable canonical construction claim persisted by the store.
     #[must_use]
-    pub fn read_snapshot(&self) -> MaterializedViewStoreReadSnapshot<'_> {
+    pub const fn construction_identity(&self) -> CanonicalStoreConstructionIdentity {
+        self.construction_identity
+    }
+
+    /// Returns the network carried by the canonical construction identity.
+    #[must_use]
+    pub const fn network(&self) -> Network {
+        self.construction_identity.network()
+    }
+
+    /// Captures a consistent read view at the store's current sequence.
+    pub fn read_snapshot(
+        &self,
+    ) -> Result<MaterializedViewStoreReadSnapshot<'_>, MaterializedViewStoreError> {
         let consistency = if self.is_secondary {
+            let catch_up_guard = self.admit_secondary_read()?;
             MaterializedViewReadConsistency::Secondary {
-                _catch_up_guard: self.catch_up_barrier.read(),
+                _catch_up_guard: catch_up_guard,
             }
         } else {
             MaterializedViewReadConsistency::Primary(Snapshot::new(self.db.as_ref()))
         };
-        MaterializedViewStoreReadSnapshot {
+        Ok(MaterializedViewStoreReadSnapshot {
             store: self,
             consistency,
-        }
+        })
     }
 
     /// Returns the conventional materialized-view path for a canonical-store
@@ -1055,9 +1133,10 @@ impl MaterializedViewStore {
     /// rebuild from a certified recovery source.
     pub fn open(
         path: impl AsRef<Path>,
+        construction_identity: CanonicalStoreConstructionIdentity,
         options: MaterializedViewStoreOptions,
     ) -> Result<Self, MaterializedViewStoreError> {
-        Self::open_primary(path.as_ref(), options, None)
+        Self::open_primary(path.as_ref(), construction_identity, options, None)
     }
 
     /// Opens or creates a materialized-view store for one closed materialized-view preset.
@@ -1067,11 +1146,17 @@ impl MaterializedViewStore {
     /// store as wallet, fails before that manifest can be expanded or reduced.
     pub fn open_with_materialized_view_preset(
         path: impl AsRef<Path>,
+        construction_identity: CanonicalStoreConstructionIdentity,
         materialized_view_preset: MaterializedViewPreset,
         mut options: MaterializedViewStoreOptions,
     ) -> Result<Self, MaterializedViewStoreError> {
         options.consumers = materialized_view_preset.consumer_schemas();
-        Self::open_primary(path.as_ref(), options, Some(materialized_view_preset))
+        Self::open_primary(
+            path.as_ref(),
+            construction_identity,
+            options,
+            Some(materialized_view_preset),
+        )
     }
 
     /// Detects the closed materialized-view preset recorded by an existing materialized-view
@@ -1085,6 +1170,10 @@ impl MaterializedViewStore {
         path: impl AsRef<Path>,
     ) -> Result<Option<MaterializedViewPreset>, MaterializedViewStoreError> {
         Self::require_matching_store_format_at_path(path.as_ref())?;
+        let existing_column_families = existing_column_family_names(path.as_ref());
+        if !existing_column_families.is_empty() {
+            Self::peek_canonical_construction_identity(path.as_ref(), &existing_column_families)?;
+        }
         let Some(recorded_consumers) = Self::read_consumer_manifest_at_path(path.as_ref())? else {
             return Ok(None);
         };
@@ -1096,6 +1185,7 @@ impl MaterializedViewStore {
 
     fn open_primary(
         path: &Path,
+        construction_identity: CanonicalStoreConstructionIdentity,
         options: MaterializedViewStoreOptions,
         materialized_view_preset: Option<MaterializedViewPreset>,
     ) -> Result<Self, MaterializedViewStoreError> {
@@ -1105,6 +1195,7 @@ impl MaterializedViewStore {
             .map_err(|reason| MaterializedViewStoreError::InvalidOptions { reason })?;
         validate_consumer_declarations(options.consumers)?;
         Self::require_matching_store_format_at_path(path)?;
+        Self::require_matching_construction_identity_at_path(path, construction_identity)?;
         let existing_column_families = existing_column_family_names(path);
         let is_fresh_store = existing_column_families.is_empty();
         if let Some(materialized_view_preset) = materialized_view_preset {
@@ -1132,12 +1223,14 @@ impl MaterializedViewStore {
         })?;
         let store = Self {
             db: Arc::new(bounded_open.db),
+            construction_identity,
             sync_writes: options.sync_writes,
             storage_path: path.to_path_buf(),
             consumers: options.consumers,
             rocksdb_resource_budget: options.rocksdb_resource_budget,
             is_secondary: false,
             catch_up_barrier: Arc::new(RwLock::new(())),
+            terminal_catch_up_failure: Arc::new(AtomicBool::new(false)),
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
             statistics: bounded_open.statistics,
@@ -1146,11 +1239,12 @@ impl MaterializedViewStore {
             logical_write_bytes: Arc::new(AtomicU64::new(0)),
         };
         if is_fresh_store {
-            store.initialize_schema_manifest()?;
-        } else {
-            store.require_matching_store_format_version()?;
-            store.validate_consumer_schemas()?;
+            store.initialize_store_metadata()?;
         }
+        store.require_matching_store_format_version()?;
+        store.require_matching_construction_identity()?;
+        store.validate_consumer_schemas()?;
+        store.validate_chain_event_checkpoints()?;
         store.record_rocksdb_properties();
         Ok(store)
     }
@@ -1219,13 +1313,15 @@ impl MaterializedViewStore {
             .map_err(|reason| MaterializedViewStoreError::InvalidOptions { reason })?;
         validate_consumer_declarations(options.consumers)?;
         Self::require_matching_store_format_at_path(primary_path)?;
+        let existing_column_families = existing_column_family_names(primary_path);
+        let construction_identity =
+            Self::peek_canonical_construction_identity(primary_path, &existing_column_families)?;
         if let Some(materialized_view_preset) = materialized_view_preset {
             Self::preflight_materialized_view_preset_at_path(
                 primary_path,
                 materialized_view_preset,
             )?;
         }
-        let existing_column_families = existing_column_family_names(primary_path);
         if !existing_column_families.is_empty() {
             Self::preflight_consumer_schemas_at_path(primary_path, options.consumers)?;
             validate_column_family_identity(&existing_column_families, options.consumers)?;
@@ -1251,12 +1347,14 @@ impl MaterializedViewStore {
         })?;
         let store = Self {
             db: Arc::new(bounded_open.db),
+            construction_identity,
             sync_writes: options.sync_writes,
             storage_path: primary_path.to_path_buf(),
             consumers: options.consumers,
             rocksdb_resource_budget: options.rocksdb_resource_budget,
             is_secondary: true,
             catch_up_barrier: Arc::new(RwLock::new(())),
+            terminal_catch_up_failure: Arc::new(AtomicBool::new(false)),
             block_cache: bounded_open.block_cache,
             write_buffer_manager: bounded_open.write_buffer_manager,
             statistics: bounded_open.statistics,
@@ -1265,7 +1363,9 @@ impl MaterializedViewStore {
             logical_write_bytes: Arc::new(AtomicU64::new(0)),
         };
         store.require_matching_store_format_version()?;
+        store.require_matching_construction_identity()?;
         store.validate_secondary_consumer_schemas()?;
+        store.validate_chain_event_checkpoints()?;
         store.record_rocksdb_properties();
         Ok(store)
     }
@@ -1279,7 +1379,17 @@ impl MaterializedViewStore {
         if !self.is_secondary {
             return Ok(());
         }
+        if self.terminal_catch_up_failure.load(Ordering::Acquire) {
+            return Err(MaterializedViewStoreError::SecondaryReadsFenced);
+        }
         let _catch_up_guard = self.catch_up_barrier.write();
+        if self.terminal_catch_up_failure.load(Ordering::Acquire) {
+            return Err(MaterializedViewStoreError::SecondaryReadsFenced);
+        }
+        self.try_catch_up_while_reads_blocked()
+    }
+
+    fn try_catch_up_while_reads_blocked(&self) -> Result<(), MaterializedViewStoreError> {
         let mut attempt = 1;
         loop {
             let outcome = self.try_catch_up_once();
@@ -1301,8 +1411,20 @@ impl MaterializedViewStore {
                 attempt += 1;
                 continue;
             }
+            if outcome.is_err() {
+                self.terminal_catch_up_failure
+                    .store(true, Ordering::Release);
+            }
             return outcome;
         }
+    }
+
+    fn admit_secondary_read(&self) -> Result<RwLockReadGuard<'_, ()>, MaterializedViewStoreError> {
+        let catch_up_guard = self.catch_up_barrier.read();
+        if self.terminal_catch_up_failure.load(Ordering::Acquire) {
+            return Err(MaterializedViewStoreError::SecondaryReadsFenced);
+        }
+        Ok(catch_up_guard)
     }
 
     fn try_catch_up_once(&self) -> Result<(), MaterializedViewStoreError> {
@@ -1314,7 +1436,9 @@ impl MaterializedViewStore {
             }
         })?;
         self.require_matching_store_format_version()?;
-        self.validate_secondary_consumer_schemas()
+        self.require_matching_construction_identity()?;
+        self.validate_secondary_consumer_schemas()?;
+        self.validate_chain_event_checkpoints()
     }
 
     /// Flushes the write-ahead log to disk so every prior write is durable.
@@ -1487,6 +1611,7 @@ impl MaterializedViewStore {
     where
         S: BuildHasher,
     {
+        self.validate_chain_event_dispatch_inputs(inputs)?;
         let ChainEventDispatchConsumers {
             block_consumers,
             event_consumers,
@@ -1496,7 +1621,7 @@ impl MaterializedViewStore {
             store: self,
             batch: &mut batch,
         };
-        let block_checkpoint = block_checkpoint(inputs, blocks);
+        let block_projection = block_projection(inputs, blocks);
         let mut measurements =
             Vec::with_capacity(block_consumers.len().saturating_add(event_consumers.len()));
 
@@ -1512,7 +1637,7 @@ impl MaterializedViewStore {
                 .finish_batch(&mut ctx)
                 .map_err(MaterializedViewError::Consumer)?;
             consumer
-                .stage_chain_event_checkpoint(block_checkpoint, &mut ctx)
+                .stage_block_projection_state(block_projection, &mut ctx)
                 .map_err(MaterializedViewError::Consumer)?;
             measurements.push(MaterializedViewWriteMeasurement::from_batch_delta(
                 consumer_name,
@@ -1538,20 +1663,20 @@ impl MaterializedViewStore {
             let cursor_column_family =
                 self.column_family(MaterializedViewStoreTable::ChainEventCursor)?;
             for consumer in block_consumers.iter() {
-                stage_consumer_cursor_and_measure(
+                stage_consumer_checkpoint_and_measure(
                     &mut batch,
                     &cursor_column_family,
                     consumer.name(),
-                    inputs.chain_cursor,
+                    inputs.checkpoint,
                     &mut measurements,
                 );
             }
             for consumer in event_consumers.iter() {
-                stage_consumer_cursor_and_measure(
+                stage_consumer_checkpoint_and_measure(
                     &mut batch,
                     &cursor_column_family,
                     consumer.name(),
-                    inputs.chain_cursor,
+                    inputs.checkpoint,
                     &mut measurements,
                 );
             }
@@ -1559,6 +1684,32 @@ impl MaterializedViewStore {
         self.write_batch(&batch)?;
         record_materialized_view_write_measurements(&measurements);
         Ok(measurements)
+    }
+
+    fn validate_chain_event_dispatch_inputs(
+        &self,
+        inputs: ChainEventDispatchInputs<'_>,
+    ) -> Result<(), MaterializedViewError> {
+        if inputs.chain_epoch.network != self.network() {
+            return Err(MaterializedViewStoreError::ChainEventNetworkMismatch {
+                expected: self.network(),
+                observed: inputs.chain_epoch.network,
+            }
+            .into());
+        }
+        let resulting_fence = inputs.checkpoint.resulting_fence();
+        if resulting_fence.chain_epoch_id() != inputs.chain_epoch.id
+            || resulting_fence.visible_tip().height != inputs.chain_epoch.visible_tip_height
+            || resulting_fence.visible_tip().hash != inputs.chain_epoch.visible_tip_hash
+        {
+            return Err(
+                MaterializedViewStoreError::ChainEventCheckpointEpochMismatch {
+                    event_sequence: inputs.checkpoint.cursor().event_sequence(),
+                }
+                .into(),
+            );
+        }
+        Ok(())
     }
 
     /// Dispatches one mempool consumer and atomically writes its rows plus
@@ -1594,32 +1745,38 @@ impl MaterializedViewStore {
         Ok(measurement)
     }
 
-    /// Reads a chain-event consumer's persisted cursor bytes, when present.
-    pub fn get_chain_event_cursor(
+    /// Reads a chain-event consumer's exact persisted checkpoint, when present.
+    pub fn chain_event_checkpoint(
         &self,
         consumer: MaterializedViewConsumerName,
-    ) -> Result<Option<Vec<u8>>, MaterializedViewStoreError> {
+    ) -> Result<Option<MaterializedViewChainEventCheckpoint>, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         self.get(
             MaterializedViewStoreTable::ChainEventCursor,
             consumer.as_str().as_bytes(),
-        )
+        )?
+        .map(|encoded| decode_chain_event_checkpoint(consumer, &encoded))
+        .transpose()
     }
 
-    /// Atomically persists `cursor_bytes` for a chain-event consumer.
+    /// Atomically persists one authenticated checkpoint for a chain consumer.
     ///
     /// Each call commits its own `WriteBatch`. Consumers that need to bundle
-    /// cursor advances with their own data writes use [`Self::write_batch`]
+    /// checkpoint advances with their own data writes use [`Self::write_batch`]
     /// instead.
-    pub fn put_chain_event_cursor(
+    pub fn put_chain_event_checkpoint(
         &self,
         consumer: MaterializedViewConsumerName,
-        cursor_bytes: &[u8],
+        checkpoint: MaterializedViewChainEventCheckpoint,
     ) -> Result<(), MaterializedViewStoreError> {
         let mut batch = WriteBatch::default();
-        self.stage_chain_event_cursor(&mut batch, consumer, cursor_bytes)?;
+        self.stage_chain_event_checkpoint(&mut batch, consumer, checkpoint)?;
         self.write(&batch)
             .map_err(|source| MaterializedViewStoreError::Operation {
-                operation: "put_chain_event_cursor",
+                operation: "put_chain_event_checkpoint",
                 column_family: MaterializedViewStoreColumnFamily::ChainEventCursor,
                 source,
             })?;
@@ -1643,18 +1800,31 @@ impl MaterializedViewStore {
         self.logical_write_bytes.load(Ordering::Relaxed)
     }
 
-    /// Stages one chain-event cursor in a caller-owned atomic write batch.
+    /// Stages one chain-event checkpoint in a caller-owned atomic write batch.
     ///
     /// Snapshot-backed consumers use this to activate materialized state and
     /// adopt the event boundary in the same commit.
-    pub fn stage_chain_event_cursor(
+    pub fn stage_chain_event_checkpoint(
         &self,
         batch: &mut WriteBatch,
         consumer: MaterializedViewConsumerName,
-        cursor_bytes: &[u8],
+        checkpoint: MaterializedViewChainEventCheckpoint,
     ) -> Result<(), MaterializedViewStoreError> {
+        if !self
+            .chain_event_consumer_names()
+            .chain(self.event_only_chain_event_consumer_names())
+            .any(|selected| selected == consumer)
+        {
+            return Err(MaterializedViewStoreError::ConsumerNotSelected {
+                consumer: consumer.as_str(),
+            });
+        }
         let column_family = self.column_family(MaterializedViewStoreTable::ChainEventCursor)?;
-        batch.put_cf(&column_family, consumer.as_str().as_bytes(), cursor_bytes);
+        batch.put_cf(
+            &column_family,
+            consumer.as_str().as_bytes(),
+            encode_chain_event_checkpoint(checkpoint),
+        );
         Ok(())
     }
 
@@ -1678,6 +1848,14 @@ impl MaterializedViewStore {
     /// Returns the persisted store-format version recorded under
     /// `consumer_metadata`.
     pub fn store_format_version(&self) -> Result<u16, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
+        self.store_format_version_unfenced()
+    }
+
+    fn store_format_version_unfenced(&self) -> Result<u16, MaterializedViewStoreError> {
         let Some(bytes) = self.get(
             MaterializedViewStoreTable::ConsumerMetadata,
             STORE_FORMAT_VERSION_KEY,
@@ -1788,6 +1966,10 @@ impl MaterializedViewStore {
         column_family: &'static str,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         let handle = self.consumer_column_family(column_family)?;
         self.db.get_cf(&handle, key).map_err(|source| {
             MaterializedViewStoreError::ConsumerOperation {
@@ -1845,6 +2027,10 @@ impl MaterializedViewStore {
     pub fn get_materialized_view_status(
         &self,
     ) -> Result<Option<Vec<u8>>, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         self.get(
             MaterializedViewStoreTable::ConsumerMetadata,
             MATERIALIZED_VIEW_STATUS_KEY,
@@ -1856,6 +2042,10 @@ impl MaterializedViewStore {
         &self,
         consumer: MaterializedViewConsumerName,
     ) -> Result<Option<MaterializedViewState>, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         let key = consumer_state_key(consumer.as_str());
         self.get(MaterializedViewStoreTable::ConsumerMetadata, &key)?
             .map(|payload| decode_materialized_view_state(consumer, &payload))
@@ -1905,6 +2095,10 @@ impl MaterializedViewStore {
     where
         K: AsRef<[u8]>,
     {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -1938,6 +2132,10 @@ impl MaterializedViewStore {
         end_key_inclusive: &[u8],
         entries_cap: usize,
     ) -> Result<Vec<ConsumerEntry>, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         if entries_cap == 0 {
             return Ok(Vec::new());
         }
@@ -1976,6 +2174,10 @@ impl MaterializedViewStore {
         offset: u64,
         limit: usize,
     ) -> Result<Vec<ConsumerEntry>, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -2015,6 +2217,10 @@ impl MaterializedViewStore {
         &self,
         column_family: &'static str,
     ) -> Result<u64, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         let handle = self.consumer_column_family(column_family)?;
         let mut row_count = 0_u64;
         for entry in self.db.iterator_cf(&handle, IteratorMode::Start) {
@@ -2039,6 +2245,10 @@ impl MaterializedViewStore {
         column_family: &'static str,
         mut visitor: impl FnMut(&[u8], &[u8]) -> Result<(), String>,
     ) -> Result<(), MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         let handle = self.consumer_column_family(column_family)?;
         for entry in self.db.iterator_cf(&handle, IteratorMode::Start) {
             let (key, payload) =
@@ -2069,6 +2279,10 @@ impl MaterializedViewStore {
         key_range: std::ops::RangeInclusive<&[u8]>,
         mut visitor: impl FnMut(&[u8], &[u8]) -> Result<(), String>,
     ) -> Result<(), MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         let handle = self.consumer_column_family(column_family)?;
         let (start_key, end_key_inclusive) = key_range.into_inner();
         let iterator = self.db.iterator_cf(
@@ -2105,6 +2319,10 @@ impl MaterializedViewStore {
         column_family: &'static str,
         mut predicate: impl FnMut(&[u8], &[u8]) -> Result<bool, String>,
     ) -> Result<u64, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         let handle = self.consumer_column_family(column_family)?;
         let mut matching_count = 0_u64;
         for entry in self.db.iterator_cf(&handle, IteratorMode::Start) {
@@ -2138,6 +2356,10 @@ impl MaterializedViewStore {
         &self,
         column_family: &'static str,
     ) -> Result<Option<Vec<u8>>, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         let handle = self.consumer_column_family(column_family)?;
         let mut iterator = self.db.iterator_cf(&handle, IteratorMode::End);
         let Some(entry) = iterator.next() else {
@@ -2163,6 +2385,10 @@ impl MaterializedViewStore {
         &self,
         column_family: &'static str,
     ) -> Result<Option<ConsumerEntry>, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         let handle = self.consumer_column_family(column_family)?;
         let mut iterator = self.db.iterator_cf(&handle, IteratorMode::End);
         let Some(entry) = iterator.next() else {
@@ -2218,6 +2444,10 @@ impl MaterializedViewStore {
         &self,
         column_family: &'static str,
     ) -> Result<Option<BlockHeight>, MaterializedViewStoreError> {
+        let _secondary_read_guard = self
+            .is_secondary
+            .then(|| self.admit_secondary_read())
+            .transpose()?;
         let handle = self.consumer_column_family(column_family)?;
         let mut iterator = self.db.iterator_cf(&handle, IteratorMode::Start);
         let Some(entry) = iterator.next() else {
@@ -2263,7 +2493,7 @@ impl MaterializedViewStore {
     /// Secondary readers cannot initialize or migrate, so they reject a
     /// divergent container version instead of writing to the store.
     fn require_matching_store_format_version(&self) -> Result<(), MaterializedViewStoreError> {
-        let persisted = self.store_format_version()?;
+        let persisted = self.store_format_version_unfenced()?;
         if persisted == MATERIALIZED_VIEW_STORE_FORMAT_VERSION {
             Ok(())
         } else {
@@ -2274,10 +2504,51 @@ impl MaterializedViewStore {
         }
     }
 
+    /// Fails unless the opened store carries the admitted construction identity.
+    fn require_matching_construction_identity(&self) -> Result<(), MaterializedViewStoreError> {
+        let Some(bytes) = self.get(
+            MaterializedViewStoreTable::ConsumerMetadata,
+            STORE_CANONICAL_CONSTRUCTION_IDENTITY_KEY,
+        )?
+        else {
+            return Err(MaterializedViewStoreError::CanonicalConstructionIdentityMissing);
+        };
+        let observed = decode_canonical_construction_identity(&bytes)?;
+        require_matching_construction_identity(self.construction_identity, observed)
+    }
+
     /// Rejects a secondary open whose consumer declaration cannot safely read
     /// the persisted manifest.
     fn validate_secondary_consumer_schemas(&self) -> Result<(), MaterializedViewStoreError> {
         self.validate_consumer_schemas()
+    }
+
+    /// Validates every persisted chain-event checkpoint before rows are read.
+    fn validate_chain_event_checkpoints(&self) -> Result<(), MaterializedViewStoreError> {
+        let column_family = self.column_family(MaterializedViewStoreTable::ChainEventCursor)?;
+        for entry in self.db.iterator_cf(&column_family, IteratorMode::Start) {
+            let (consumer_bytes, encoded) =
+                entry.map_err(|source| MaterializedViewStoreError::Operation {
+                    operation: "validate_chain_event_checkpoints",
+                    column_family: MaterializedViewStoreColumnFamily::ChainEventCursor,
+                    source,
+                })?;
+            let Some(consumer) = self
+                .chain_event_consumer_names()
+                .chain(self.event_only_chain_event_consumer_names())
+                .find(|name| name.as_str().as_bytes() == consumer_bytes.as_ref())
+            else {
+                return Err(MaterializedViewStoreError::ConsumerManifest {
+                    operation: "validate_chain_event_checkpoints",
+                    reason: format!(
+                        "checkpoint belongs to non-chain consumer `{}`",
+                        String::from_utf8_lossy(&consumer_bytes)
+                    ),
+                });
+            };
+            decode_chain_event_checkpoint(consumer, &encoded)?;
+        }
+        Ok(())
     }
 
     /// Rejects a persisted container version different from the running
@@ -2295,6 +2566,47 @@ impl MaterializedViewStore {
             persisted,
             running: MATERIALIZED_VIEW_STORE_FORMAT_VERSION,
         })
+    }
+
+    /// Rejects an existing store whose construction identity differs from the opener.
+    fn require_matching_construction_identity_at_path(
+        path: &Path,
+        expected: CanonicalStoreConstructionIdentity,
+    ) -> Result<(), MaterializedViewStoreError> {
+        let existing_column_families = existing_column_family_names(path);
+        if existing_column_families.is_empty() {
+            return Ok(());
+        }
+        let observed = Self::peek_canonical_construction_identity(path, &existing_column_families)?;
+        require_matching_construction_identity(expected, observed)
+    }
+
+    fn peek_canonical_construction_identity(
+        path: &Path,
+        existing_column_families: &[String],
+    ) -> Result<CanonicalStoreConstructionIdentity, MaterializedViewStoreError> {
+        let db =
+            DB::open_cf_for_read_only(&Options::default(), path, existing_column_families, false)
+                .map_err(|source| MaterializedViewStoreError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let column_family = db
+            .cf_handle(MaterializedViewStoreTable::ConsumerMetadata.column_family_name())
+            .ok_or(MaterializedViewStoreError::ColumnFamilyMissing {
+                column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
+            })?;
+        let Some(bytes) = db
+            .get_cf(&column_family, STORE_CANONICAL_CONSTRUCTION_IDENTITY_KEY)
+            .map_err(|source| MaterializedViewStoreError::Operation {
+                operation: "get",
+                column_family: MaterializedViewStoreColumnFamily::ConsumerMetadata,
+                source,
+            })?
+        else {
+            return Err(MaterializedViewStoreError::CanonicalConstructionIdentityMissing);
+        };
+        decode_canonical_construction_identity(&bytes)
     }
 
     /// Reads the persisted container version without keeping the store open.
@@ -2373,16 +2685,22 @@ impl MaterializedViewStore {
         Ok(Some(recorded_consumers))
     }
 
-    /// Writes the current container version and the full consumer manifest to
-    /// a fresh store. A crash before this batch commits leaves no initialized
-    /// schema to reopen; a crash after it commits leaves a complete identity.
-    fn initialize_schema_manifest(&self) -> Result<(), MaterializedViewStoreError> {
+    /// Writes the format, canonical construction, and full manifest atomically.
+    ///
+    /// A crash before this batch commits leaves no initialized store metadata
+    /// to reopen; a crash after it commits leaves a complete identity.
+    fn initialize_store_metadata(&self) -> Result<(), MaterializedViewStoreError> {
         let metadata = self.column_family(MaterializedViewStoreTable::ConsumerMetadata)?;
         let mut batch = WriteBatch::default();
         batch.put_cf(
             &metadata,
             STORE_FORMAT_VERSION_KEY,
             MATERIALIZED_VIEW_STORE_FORMAT_VERSION.to_be_bytes(),
+        );
+        batch.put_cf(
+            &metadata,
+            STORE_CANONICAL_CONSTRUCTION_IDENTITY_KEY,
+            self.construction_identity.encode_persisted(),
         );
         for consumer in self.consumers {
             let payload = encode_manifest_entry(consumer.schema_version, consumer.column_families)
@@ -2628,18 +2946,18 @@ impl MaterializedViewStore {
     }
 }
 
-fn stage_consumer_cursor_and_measure(
+fn stage_consumer_checkpoint_and_measure(
     batch: &mut WriteBatch,
     cursor_column_family: &Arc<rust_rocksdb::BoundColumnFamily<'_>>,
     consumer: MaterializedViewConsumerName,
-    cursor_bytes: &[u8],
+    checkpoint: MaterializedViewChainEventCheckpoint,
     measurements: &mut [MaterializedViewWriteMeasurement],
 ) {
     let before = WriteBatchSize::capture(batch);
     batch.put_cf(
         cursor_column_family,
         consumer.as_str().as_bytes(),
-        cursor_bytes,
+        encode_chain_event_checkpoint(checkpoint),
     );
     if let Some(measurement) = measurements
         .iter_mut()
@@ -2690,7 +3008,7 @@ where
     match inputs.chain_event {
         ChainEvent::ChainCommitted { committed } => {
             let event = ChainCommittedEvent::new(
-                inputs.event_sequence,
+                inputs.checkpoint.cursor().event_sequence(),
                 inputs.chain_epoch,
                 inputs.settled_tip_height,
                 committed.block_range.start,
@@ -2704,7 +3022,7 @@ where
             committed,
         } => {
             let event = ChainReorgedEvent::new(
-                inputs.event_sequence,
+                inputs.checkpoint.cursor().event_sequence(),
                 inputs.chain_epoch,
                 inputs.settled_tip_height,
                 RevertedRange::new(
@@ -2725,10 +3043,10 @@ where
     }
 }
 
-fn block_checkpoint<'event, S>(
+fn block_projection<'event, S>(
     inputs: ChainEventDispatchInputs<'event>,
     blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
-) -> MaterializedViewBlockCheckpoint<'event>
+) -> MaterializedViewBlockProjection<'event>
 where
     S: BuildHasher,
 {
@@ -2752,7 +3070,7 @@ where
             .get(&range.end)
             .map(|block| (block.height, block.block_hash))
     });
-    MaterializedViewBlockCheckpoint {
+    MaterializedViewBlockProjection {
         chain_epoch: inputs.chain_epoch,
         chain_event: inputs.chain_event,
         tip_height: projected_tip.map(|(height, _hash)| height),
@@ -2771,7 +3089,7 @@ where
     match inputs.chain_event {
         ChainEvent::ChainCommitted { committed } => {
             let event = ChainCommittedEvent::new(
-                inputs.event_sequence,
+                inputs.checkpoint.cursor().event_sequence(),
                 inputs.chain_epoch,
                 inputs.settled_tip_height,
                 committed.block_range.start,
@@ -2786,7 +3104,7 @@ where
             committed,
         } => {
             let event = ChainReorgedEvent::new(
-                inputs.event_sequence,
+                inputs.checkpoint.cursor().event_sequence(),
                 inputs.chain_epoch,
                 inputs.settled_tip_height,
                 RevertedRange::new(
@@ -2813,6 +3131,147 @@ fn decode_store_format_version(bytes: &[u8]) -> Result<u16, String> {
         .try_into()
         .map_err(|_| format!("store format version requires 2 bytes; got {}", bytes.len()))?;
     Ok(u16::from_be_bytes(array))
+}
+
+fn decode_canonical_construction_identity(
+    bytes: &[u8],
+) -> Result<CanonicalStoreConstructionIdentity, MaterializedViewStoreError> {
+    CanonicalStoreConstructionIdentity::decode_persisted(bytes).map_err(|source| {
+        MaterializedViewStoreError::CanonicalConstructionIdentityMalformed { source }
+    })
+}
+
+fn encode_chain_event_checkpoint(
+    checkpoint: MaterializedViewChainEventCheckpoint,
+) -> [u8; MATERIALIZED_VIEW_CHAIN_EVENT_CHECKPOINT_BYTES] {
+    let mut encoded = [0; MATERIALIZED_VIEW_CHAIN_EVENT_CHECKPOINT_BYTES];
+    encoded[0] = MATERIALIZED_VIEW_CHAIN_EVENT_CHECKPOINT_VERSION;
+    encoded[1..10].copy_from_slice(&checkpoint.cursor().as_bytes());
+    encoded[10..105].copy_from_slice(&checkpoint.resulting_fence().encode_persisted());
+    encoded
+}
+
+fn decode_chain_event_checkpoint(
+    consumer: MaterializedViewConsumerName,
+    encoded: &[u8],
+) -> Result<MaterializedViewChainEventCheckpoint, MaterializedViewStoreError> {
+    if encoded.len() != MATERIALIZED_VIEW_CHAIN_EVENT_CHECKPOINT_BYTES {
+        return Err(MaterializedViewStoreError::ChainEventCheckpointMalformed {
+            consumer: consumer.as_str(),
+            reason: format!(
+                "checkpoint requires {MATERIALIZED_VIEW_CHAIN_EVENT_CHECKPOINT_BYTES} bytes; observed {}",
+                encoded.len()
+            ),
+        });
+    }
+    if encoded[0] != MATERIALIZED_VIEW_CHAIN_EVENT_CHECKPOINT_VERSION {
+        return Err(MaterializedViewStoreError::ChainEventCheckpointMalformed {
+            consumer: consumer.as_str(),
+            reason: format!("unsupported checkpoint version {}", encoded[0]),
+        });
+    }
+    let cursor = CanonicalEventCursor::from_persisted(&encoded[1..10]).map_err(|source| {
+        MaterializedViewStoreError::ChainEventCheckpointMalformed {
+            consumer: consumer.as_str(),
+            reason: source.to_string(),
+        }
+    })?;
+    let resulting_fence =
+        CanonicalEventFence::decode_persisted(&encoded[10..105]).map_err(|source| {
+            MaterializedViewStoreError::ChainEventCheckpointMalformed {
+                consumer: consumer.as_str(),
+                reason: source.to_string(),
+            }
+        })?;
+    if cursor.event_sequence() != resulting_fence.chain_event_sequence() {
+        return Err(
+            MaterializedViewStoreError::ChainEventCheckpointFenceMismatch {
+                consumer: consumer.as_str(),
+                event_sequence: cursor.event_sequence(),
+            },
+        );
+    }
+    Ok(MaterializedViewChainEventCheckpoint {
+        cursor,
+        resulting_fence,
+    })
+}
+
+fn require_matching_construction_identity(
+    expected: CanonicalStoreConstructionIdentity,
+    observed: CanonicalStoreConstructionIdentity,
+) -> Result<(), MaterializedViewStoreError> {
+    if observed.network() != expected.network() {
+        return Err(
+            MaterializedViewStoreError::CanonicalConstructionNetworkMismatch {
+                expected: expected.network(),
+                observed: observed.network(),
+            },
+        );
+    }
+    if observed.network_upgrade_activations_fingerprint()
+        != expected.network_upgrade_activations_fingerprint()
+    {
+        return Err(
+            MaterializedViewStoreError::CanonicalConstructionActivationsFingerprintMismatch {
+                expected: expected.network_upgrade_activations_fingerprint(),
+                observed: observed.network_upgrade_activations_fingerprint(),
+            },
+        );
+    }
+    if observed.construction_manifest_binding() != expected.construction_manifest_binding() {
+        return Err(
+            MaterializedViewStoreError::CanonicalConstructionManifestBindingMismatch {
+                expected: expected.construction_manifest_binding(),
+                observed: observed.construction_manifest_binding(),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Creates one structurally valid, non-admitted construction claim for isolated store tests.
+///
+/// Production callers must obtain the claim from an admitted canonical store;
+/// this helper exists only to exercise the materialized-view persistence boundary
+/// without constructing a full canonical fixture in every unit test.
+pub(crate) fn test_construction_identity(
+    network: Network,
+) -> Result<
+    CanonicalStoreConstructionIdentity,
+    zinder_store::CanonicalStoreConstructionIdentityDecodeError,
+> {
+    let mut encoded = [0_u8; 73];
+    encoded[0] = 1;
+    encoded[1..5].copy_from_slice(&network.id().to_be_bytes());
+    encoded[5..7].copy_from_slice(
+        &zinder_core::NetworkUpgradeActivationsFingerprintVersion::CURRENT
+            .value()
+            .to_be_bytes(),
+    );
+    encoded[39..41].copy_from_slice(
+        &zinder_store::CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION.to_be_bytes(),
+    );
+    CanonicalStoreConstructionIdentity::decode_persisted(&encoded)
+}
+
+#[cfg(test)]
+/// Creates one valid checkpoint for tests that exercise only local persistence.
+pub(crate) fn test_chain_event_checkpoint() -> eyre::Result<MaterializedViewChainEventCheckpoint> {
+    let mut encoded = [0_u8; MATERIALIZED_VIEW_CHAIN_EVENT_CHECKPOINT_BYTES - 10];
+    encoded[0] = 1;
+    encoded[1..9].copy_from_slice(&1_u64.to_be_bytes());
+    encoded[9..17].copy_from_slice(&1_u64.to_be_bytes());
+    encoded[17..21].copy_from_slice(&1_u32.to_be_bytes());
+    encoded[21..53].copy_from_slice(&[0x11; 32]);
+    encoded[53..55].copy_from_slice(&1_u16.to_be_bytes());
+    encoded[55..63].copy_from_slice(&1_u64.to_be_bytes());
+    let fence = CanonicalEventFence::decode_persisted(&encoded)?;
+    Ok(MaterializedViewChainEventCheckpoint {
+        cursor: CanonicalEventCursor::at(fence.chain_event_sequence())?,
+        resulting_fence: fence,
+    })
 }
 
 fn decode_consumer_manifest_entries(
@@ -3145,33 +3604,175 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_fresh_store_writes_the_store_format_version() -> Result<()> {
+    fn opening_a_fresh_store_atomically_writes_its_format_and_construction_identity() -> Result<()>
+    {
         let tempdir = tempdir()?;
-        let store =
-            MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
+        let construction_identity = test_construction_identity(Network::ZcashRegtest)?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            construction_identity,
+            MaterializedViewStoreOptions::default(),
+        )?;
         assert_eq!(
             store.store_format_version()?,
             MATERIALIZED_VIEW_STORE_FORMAT_VERSION
+        );
+        assert_eq!(store.construction_identity(), construction_identity);
+        assert_eq!(
+            store.get(
+                MaterializedViewStoreTable::ConsumerMetadata,
+                STORE_CANONICAL_CONSTRUCTION_IDENTITY_KEY,
+            )?,
+            Some(construction_identity.encode_persisted().to_vec())
         );
         Ok(())
     }
 
     #[test]
-    fn cursor_round_trip_persists_and_retrieves_bytes() -> Result<()> {
+    fn primary_rejects_a_different_canonical_construction_identity_before_opening() -> Result<()> {
         let tempdir = tempdir()?;
-        let store =
-            MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
-        assert!(store.get_chain_event_cursor(TEST_CONSUMER)?.is_none());
-        store.put_chain_event_cursor(TEST_CONSUMER, &[1, 2, 3])?;
-        assert_eq!(
-            store.get_chain_event_cursor(TEST_CONSUMER)?,
-            Some(vec![1, 2, 3])
+        MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            MaterializedViewStoreOptions::default(),
+        )?;
+
+        let outcome = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashTestnet)?,
+            MaterializedViewStoreOptions::default(),
         );
-        store.put_chain_event_cursor(TEST_CONSUMER, &[4, 5])?;
-        assert_eq!(
-            store.get_chain_event_cursor(TEST_CONSUMER)?,
-            Some(vec![4, 5])
+
+        assert!(matches!(
+            outcome,
+            Err(
+                MaterializedViewStoreError::CanonicalConstructionNetworkMismatch {
+                    expected: Network::ZcashTestnet,
+                    observed: Network::ZcashRegtest,
+                }
+            )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn chain_event_checkpoint_round_trip_persists_and_retrieves_identity() -> Result<()> {
+        let tempdir = tempdir()?;
+        let options = MaterializedViewStoreOptions {
+            consumers: &[TRANSPARENT_OUTPOINT_SPEND_SCHEMA],
+            ..MaterializedViewStoreOptions::default()
+        };
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        )?;
+        assert!(
+            store
+                .chain_event_checkpoint(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?
+                .is_none()
         );
+        let checkpoint = test_chain_event_checkpoint()?;
+        store.put_chain_event_checkpoint(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, checkpoint)?;
+        assert_eq!(
+            store.chain_event_checkpoint(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?,
+            Some(checkpoint)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chain_event_checkpoint_rejects_an_unselected_consumer_before_write() -> Result<()> {
+        let tempdir = tempdir()?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            MaterializedViewStoreOptions::default(),
+        )?;
+
+        let outcome =
+            store.put_chain_event_checkpoint(TEST_CONSUMER, test_chain_event_checkpoint()?);
+
+        assert!(matches!(
+            outcome,
+            Err(MaterializedViewStoreError::ConsumerNotSelected { consumer })
+                if consumer == TEST_CONSUMER.as_str()
+        ));
+        assert!(store.chain_event_checkpoint(TEST_CONSUMER)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn chain_event_checkpoint_rejects_a_cursor_sequence_different_from_its_resulting_fence()
+    -> Result<()> {
+        let mut encoded = encode_chain_event_checkpoint(test_chain_event_checkpoint()?);
+        encoded[2..10].copy_from_slice(&2_u64.to_be_bytes());
+
+        let outcome = decode_chain_event_checkpoint(TEST_CONSUMER, &encoded);
+
+        assert!(matches!(
+            outcome,
+            Err(MaterializedViewStoreError::ChainEventCheckpointFenceMismatch {
+                consumer,
+                event_sequence: 2,
+            }) if consumer == TEST_CONSUMER.as_str()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_reuse_rejects_a_same_sequence_different_retained_fence() -> Result<()> {
+        let checkpoint = test_chain_event_checkpoint()?;
+        let mut other_fence_record = checkpoint.resulting_fence().encode_persisted();
+        other_fence_record[21] ^= 0xff;
+        let other_fence = CanonicalEventFence::decode_persisted(&other_fence_record)?;
+
+        assert_eq!(
+            checkpoint.cursor().event_sequence(),
+            other_fence.chain_event_sequence()
+        );
+        assert!(matches!(
+            checkpoint.require_matching_retained_event_boundary(checkpoint.cursor(), other_fence),
+            Err(
+                MaterializedViewStoreError::ChainEventCheckpointRetainedEventMismatch {
+                    event_sequence: 1,
+                }
+            )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_open_rejects_a_malformed_persisted_chain_event_checkpoint() -> Result<()> {
+        let primary_directory = tempdir()?;
+        let secondary_directory = tempdir()?;
+        let options = MaterializedViewStoreOptions {
+            consumers: &[TRANSPARENT_OUTPOINT_SPEND_SCHEMA],
+            ..MaterializedViewStoreOptions::default()
+        };
+        let primary = MaterializedViewStore::open(
+            primary_directory.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        )?;
+        primary.put(
+            MaterializedViewStoreTable::ChainEventCursor,
+            TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str().as_bytes(),
+            &[0],
+        )?;
+        drop(primary);
+
+        let outcome = MaterializedViewStore::open_secondary(
+            primary_directory.path(),
+            secondary_directory.path(),
+            options,
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(MaterializedViewStoreError::ChainEventCheckpointMalformed { consumer, .. })
+                if consumer == TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str()
+        ));
         Ok(())
     }
 
@@ -3181,6 +3782,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
                 consumers: &[TEST_CONSUMER_SCHEMA],
                 ..MaterializedViewStoreOptions::default()
@@ -3199,11 +3801,11 @@ mod tests {
         )];
         let cursor_column_family =
             store.column_family(MaterializedViewStoreTable::ChainEventCursor)?;
-        stage_consumer_cursor_and_measure(
+        stage_consumer_checkpoint_and_measure(
             &mut batch,
             &cursor_column_family,
             consumer_name,
-            b"cursor",
+            test_chain_event_checkpoint()?,
             &mut measurements,
         );
 
@@ -3216,8 +3818,11 @@ mod tests {
     #[test]
     fn materialized_view_owned_batch_rejects_an_unselected_identity_before_write() -> Result<()> {
         let tempdir = tempdir()?;
-        let store =
-            MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            MaterializedViewStoreOptions::default(),
+        )?;
         let metadata = store.column_family(MaterializedViewStoreTable::ConsumerMetadata)?;
         let mut batch = WriteBatch::default();
         batch.put_cf(&metadata, b"must-not-commit", b"row");
@@ -3244,18 +3849,30 @@ mod tests {
         let tempdir = tempdir()?;
         let source_path = tempdir.path().join("materialized-view-source");
         let checkpoint_path = tempdir.path().join("materialized-view-checkpoint");
+        let options = MaterializedViewStoreOptions {
+            consumers: &[TRANSPARENT_OUTPOINT_SPEND_SCHEMA],
+            ..MaterializedViewStoreOptions::default()
+        };
         {
-            let store =
-                MaterializedViewStore::open(&source_path, MaterializedViewStoreOptions::default())?;
-            store.put_chain_event_cursor(TEST_CONSUMER, &[4, 5, 6])?;
+            let store = MaterializedViewStore::open(
+                &source_path,
+                test_construction_identity(Network::ZcashRegtest)?,
+                options,
+            )?;
+            let checkpoint = test_chain_event_checkpoint()?;
+            store
+                .put_chain_event_checkpoint(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, checkpoint)?;
             store.create_checkpoint(&checkpoint_path)?;
         }
 
-        let checkpoint =
-            MaterializedViewStore::open(&checkpoint_path, MaterializedViewStoreOptions::default())?;
+        let checkpoint = MaterializedViewStore::open(
+            &checkpoint_path,
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        )?;
         assert_eq!(
-            checkpoint.get_chain_event_cursor(TEST_CONSUMER)?,
-            Some(vec![4, 5, 6])
+            checkpoint.chain_event_checkpoint(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?,
+            Some(test_chain_event_checkpoint()?)
         );
         Ok(())
     }
@@ -3267,7 +3884,11 @@ mod tests {
             consumers: &[TEST_CONSUMER_SCHEMA],
             ..MaterializedViewStoreOptions::default()
         };
-        let store = MaterializedViewStore::open(tempdir.path(), options)?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        )?;
         assert_eq!(store.last_consumer_key("test_cf")?, None);
         Ok(())
     }
@@ -3279,7 +3900,11 @@ mod tests {
             consumers: &[TEST_CONSUMER_SCHEMA],
             ..MaterializedViewStoreOptions::default()
         };
-        let store = MaterializedViewStore::open(tempdir.path(), options)?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        )?;
         let handle = store.consumer_column_family("test_cf")?;
         let mut batch = WriteBatch::default();
         batch.put_cf(&handle, 1_u32.to_be_bytes(), b"a");
@@ -3368,6 +3993,7 @@ mod tests {
         let tempdir = tempdir()?;
         let store = MaterializedViewStore::open(
             tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
                 consumers: &[TEST_CONSUMER_SCHEMA],
                 ..MaterializedViewStoreOptions::default()
@@ -3389,7 +4015,7 @@ mod tests {
         };
         store.put_consumer_state(TEST_CONSUMER, initial_state)?;
 
-        let snapshot = store.read_snapshot();
+        let snapshot = store.read_snapshot()?;
 
         let advanced_state = MaterializedViewState {
             chain_epoch_id: ChainEpochId::new(1),
@@ -3439,14 +4065,18 @@ mod tests {
             consumers: &[TEST_CONSUMER_SCHEMA],
             ..MaterializedViewStoreOptions::default()
         };
-        let primary = MaterializedViewStore::open(primary_directory.path(), options)?;
+        let primary = MaterializedViewStore::open(
+            primary_directory.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        )?;
         primary.put_consumer(TEST_CONSUMER_CF, b"before", b"visible")?;
         let secondary = MaterializedViewStore::open_secondary(
             primary_directory.path(),
             secondary_directory.path(),
             options,
         )?;
-        let snapshot = secondary.read_snapshot();
+        let snapshot = secondary.read_snapshot()?;
         primary.put_consumer(TEST_CONSUMER_CF, b"after", b"new")?;
 
         let (started_sender, started_receiver) = mpsc::channel();
@@ -3472,13 +4102,82 @@ mod tests {
     }
 
     #[test]
+    fn terminal_secondary_catchup_failure_fences_a_concurrent_read_before_rows_serve() -> Result<()>
+    {
+        let primary_directory = tempdir()?;
+        let secondary_directory = tempdir()?;
+        let options = MaterializedViewStoreOptions {
+            consumers: &[TEST_CONSUMER_SCHEMA],
+            ..MaterializedViewStoreOptions::default()
+        };
+        let primary = MaterializedViewStore::open(
+            primary_directory.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        )?;
+        let secondary = MaterializedViewStore::open_secondary(
+            primary_directory.path(),
+            secondary_directory.path(),
+            options,
+        )?;
+        primary.put_consumer(TEST_CONSUMER_CF, b"advanced", b"must-not-serve")?;
+        primary.put(
+            MaterializedViewStoreTable::ConsumerMetadata,
+            STORE_CANONICAL_CONSTRUCTION_IDENTITY_KEY,
+            &test_construction_identity(Network::ZcashTestnet)?.encode_persisted(),
+        )?;
+
+        let (catch_up_locked_sender, catch_up_locked_receiver) = mpsc::channel();
+        let (continue_catch_up_sender, continue_catch_up_receiver) = mpsc::channel();
+        let catch_up_store = secondary.clone();
+        let catch_up = thread::spawn(move || {
+            let _catch_up_guard = catch_up_store.catch_up_barrier.write();
+            let _ = catch_up_locked_sender.send(());
+            let _ = continue_catch_up_receiver.recv();
+            catch_up_store.try_catch_up_while_reads_blocked()
+        });
+        catch_up_locked_receiver.recv_timeout(Duration::from_secs(1))?;
+
+        let (read_started_sender, read_started_receiver) = mpsc::channel();
+        let concurrent_store = secondary.clone();
+        let concurrent_read = thread::spawn(move || {
+            let _ = read_started_sender.send(());
+            concurrent_store
+                .read_snapshot()
+                .and_then(|snapshot| snapshot.get_consumer(TEST_CONSUMER_CF, b"advanced"))
+        });
+        read_started_receiver.recv_timeout(Duration::from_secs(1))?;
+        continue_catch_up_sender.send(())?;
+
+        assert!(matches!(
+            catch_up.join(),
+            Ok(Err(
+                MaterializedViewStoreError::CanonicalConstructionNetworkMismatch { .. }
+            ))
+        ));
+        assert!(matches!(
+            concurrent_read.join(),
+            Ok(Err(MaterializedViewStoreError::SecondaryReadsFenced))
+        ));
+        assert!(matches!(
+            secondary.get_consumer(TEST_CONSUMER_CF, b"advanced"),
+            Err(MaterializedViewStoreError::SecondaryReadsFenced)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn visit_consumer_rows_streams_rows_and_fails_closed() -> Result<()> {
         let tempdir = tempdir()?;
         let options = MaterializedViewStoreOptions {
             consumers: &[TEST_CONSUMER_SCHEMA],
             ..MaterializedViewStoreOptions::default()
         };
-        let store = MaterializedViewStore::open(tempdir.path(), options)?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        )?;
         store.put_consumer(TEST_CONSUMER_CF, b"a", b"one")?;
         store.put_consumer(TEST_CONSUMER_CF, b"b", b"two")?;
 
@@ -3513,7 +4212,11 @@ mod tests {
             consumers: &[TEST_CONSUMER_SCHEMA],
             ..MaterializedViewStoreOptions::default()
         };
-        let store = MaterializedViewStore::open(tempdir.path(), options)?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        )?;
         for key in [b"a", b"b", b"c", b"d"] {
             store.put_consumer(TEST_CONSUMER_CF, key, key)?;
         }
@@ -3547,13 +4250,17 @@ mod tests {
         {
             let store = MaterializedViewStore::open(
                 tempdir.path(),
+                test_construction_identity(Network::ZcashRegtest)?,
                 MaterializedViewStoreOptions {
-                    consumers: &[TEST_CONSUMER_SCHEMA],
+                    consumers: &[TEST_CONSUMER_SCHEMA, TRANSPARENT_OUTPOINT_SPEND_SCHEMA],
                     ..MaterializedViewStoreOptions::default()
                 },
             )?;
             store.put_consumer(TEST_CONSUMER_CF, b"row", b"value")?;
-            store.put_chain_event_cursor(TEST_CONSUMER, b"cursor")?;
+            store.put_chain_event_checkpoint(
+                TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+                test_chain_event_checkpoint()?,
+            )?;
             store.put(
                 MaterializedViewStoreTable::ConsumerMetadata,
                 STORE_FORMAT_VERSION_KEY,
@@ -3563,8 +4270,9 @@ mod tests {
         let column_families_before = existing_column_family_names(tempdir.path());
         let outcome = MaterializedViewStore::open(
             tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
             MaterializedViewStoreOptions {
-                consumers: &[TEST_CONSUMER_SCHEMA],
+                consumers: &[TEST_CONSUMER_SCHEMA, TRANSPARENT_OUTPOINT_SPEND_SCHEMA],
                 ..MaterializedViewStoreOptions::default()
             },
         );
@@ -3597,9 +4305,12 @@ mod tests {
             .cf_handle(MaterializedViewStoreTable::ChainEventCursor.column_family_name())
             .ok_or_else(|| eyre::eyre!("chain-event cursor column family is missing"))?;
         assert_eq!(
-            db.get_cf(&cursor, TEST_CONSUMER.as_str().as_bytes())?
-                .as_deref(),
-            Some(b"cursor".as_slice())
+            db.get_cf(
+                &cursor,
+                TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str().as_bytes()
+            )?
+            .as_deref(),
+            Some(encode_chain_event_checkpoint(test_chain_event_checkpoint()?).as_slice())
         );
         let metadata = db
             .cf_handle(MaterializedViewStoreTable::ConsumerMetadata.column_family_name())
@@ -3632,6 +4343,7 @@ mod tests {
         {
             let store = MaterializedViewStore::open(
                 tempdir.path(),
+                test_construction_identity(Network::ZcashRegtest)?,
                 MaterializedViewStoreOptions {
                     consumers: &[TEST_CONSUMER_SCHEMA],
                     ..MaterializedViewStoreOptions::default()
@@ -3654,6 +4366,7 @@ mod tests {
                 .map(|_| ()),
             MaterializedViewStore::open_with_materialized_view_preset(
                 tempdir.path(),
+                test_construction_identity(Network::ZcashRegtest)?,
                 MaterializedViewPreset::Explorer,
                 MaterializedViewStoreOptions::default(),
             )
@@ -3759,7 +4472,11 @@ mod tests {
         let mut options = MaterializedViewStoreOptions::default();
         options.rocksdb_resource_budget.max_wal_bytes = 0;
 
-        let outcome = MaterializedViewStore::open(tempdir.path(), options);
+        let outcome = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        );
 
         assert!(matches!(
             outcome,
@@ -3775,7 +4492,11 @@ mod tests {
         let mut options = MaterializedViewStoreOptions::default();
         options.rocksdb_resource_budget.max_open_files = -1;
 
-        let outcome = MaterializedViewStore::open(tempdir.path(), options);
+        let outcome = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            options,
+        );
 
         assert!(matches!(
             outcome,
@@ -3806,8 +4527,11 @@ mod tests {
     #[test]
     fn staging_materialized_view_coverage_with_inverted_bounds_is_rejected() -> Result<()> {
         let tempdir = tempdir()?;
-        let store =
-            MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            MaterializedViewStoreOptions::default(),
+        )?;
 
         let inverted = materialized_view_state_with_coverage(200, 150, 100);
         match store.put_consumer_state(TEST_CONSUMER, inverted) {
@@ -3836,8 +4560,11 @@ mod tests {
     #[test]
     fn staging_materialized_view_coverage_beyond_tip_is_rejected() -> Result<()> {
         let tempdir = tempdir()?;
-        let store =
-            MaterializedViewStore::open(tempdir.path(), MaterializedViewStoreOptions::default())?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            test_construction_identity(Network::ZcashRegtest)?,
+            MaterializedViewStoreOptions::default(),
+        )?;
 
         let beyond_tip = materialized_view_state_with_coverage(180_256, 1, 180_512);
         match store.put_consumer_state(TEST_CONSUMER, beyond_tip) {

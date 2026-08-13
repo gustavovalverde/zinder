@@ -1,5 +1,6 @@
 use std::{collections::HashMap, error::Error, sync::Arc};
 
+use super::construction_identity;
 use rust_rocksdb::WriteBatch;
 use tempfile::tempdir;
 use zinder_core::{
@@ -88,6 +89,7 @@ fn open_store() -> TestResult<(tempfile::TempDir, MaterializedViewStore)> {
     let tempdir = tempdir()?;
     let store = MaterializedViewStore::open(
         tempdir.path(),
+        construction_identity()?,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[VALUE_POOL_FLOW_HISTORY_SCHEMA],
@@ -392,7 +394,6 @@ fn missing_intrinsic_balance_fails_before_any_rows_are_written() -> TestResult {
 #[test]
 fn lifecycle_persists_coverage_without_advancing_cursor_and_rewinds_tail() -> TestResult {
     let (tempdir, store) = open_store()?;
-    store.put_chain_event_cursor(VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, b"inherited")?;
     assert!(
         ValuePoolFlowHistoryConsumer::widen_tail_boundary_for_startup(
             &store,
@@ -414,8 +415,8 @@ fn lifecycle_persists_coverage_without_advancing_cursor_and_rewinds_tail() -> Te
         })
     );
     assert_eq!(
-        store.get_chain_event_cursor(VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME)?,
-        Some(b"inherited".to_vec())
+        store.chain_event_checkpoint(VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME)?,
+        None
     );
 
     let historical_block = block(1, 10, &[TransactionIntrinsicValueBalances::new(0, 0, 7, 0)]);
@@ -430,6 +431,7 @@ fn lifecycle_persists_coverage_without_advancing_cursor_and_rewinds_tail() -> Te
 
     let store = MaterializedViewStore::open(
         tempdir.path(),
+        construction_identity()?,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[VALUE_POOL_FLOW_HISTORY_SCHEMA],
