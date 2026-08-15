@@ -15,7 +15,7 @@ use tonic::{Request, Response, Status};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, CompactBlockArtifact, CompactTransaction,
     CompactTransactionData, Network, NetworkUpgradeActivations,
-    wire::{encode_internal_block_hash, encode_internal_transaction_id},
+    wire::{encode_branch_id_hex, encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::{
     compat::lightwalletd::{self, compact_tx_streamer_server},
@@ -1195,7 +1195,7 @@ fn lightd_info(
     let current = activations.active_at(tip_height);
     let consensus_branch_id = current.map_or_else(
         || "00000000".to_owned(),
-        |activation| format!("{:08x}", activation.branch_id),
+        |activation| encode_branch_id_hex(activation.branch_id),
     );
     let upgrade_name = current.map_or_else(String::new, |activation| activation.name.clone());
     let upgrade_height = current.map_or(0, |activation| {

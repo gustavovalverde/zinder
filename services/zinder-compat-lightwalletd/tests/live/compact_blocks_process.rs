@@ -24,7 +24,10 @@ use tokio::{net::TcpListener, process::Command, time::sleep};
 use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
 use tonic::{Code, Request, Response, Status, transport::Server};
 use zinder_core::{
-    CompactBlockArtifact, CompactTransaction, CompactTransactionData, Network,
+    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
+    CommitmentTreeFrontiers, CompactBlockArtifact, CompactTransaction, CompactTransactionData,
+    Network, ShieldedProtocol, TransactionId, TransactionLocation, UnixTimestampMillis,
+    decode_canonical_block_replay,
     wire::{
         decode_rpc_block_hash_hex, encode_internal_block_hash, encode_internal_transaction_id,
         encode_zinder_native_chain_name,
@@ -44,13 +47,22 @@ use zinder_proto::{
 };
 use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
-    CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence, CanonicalLiveAppend,
+    CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
+    CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    TREE_STATE_CHECKPOINT_STRIDE,
 };
-use zinder_testkit::live::{init, optional_env, require_live_for};
+use zinder_testkit::{
+    ChainFixture, FixtureTransactionRows, encode_fixture_block_replay_with_raw_block,
+    live::{init, optional_env, require_live_for},
+    synthetic_transaction_public_facts,
+};
 
+const BINARY_PATH_ENV: &str = "ZINDER_TEST_COMPACT_BINARY_PATH";
 const CANONICAL_PATH_ENV: &str = "ZINDER_TEST_COMPACT_CANONICAL_PATH";
 const EVIDENCE_ROOT_ENV: &str = "ZINDER_TEST_COMPACT_EVIDENCE_ROOT";
+const REORG_EVIDENCE_ROOT_ENV: &str = "ZINDER_TEST_COMPACT_REORG_EVIDENCE_ROOT";
 const EXPECTED_RAW_BLOB_POLICY_ENV: &str = "ZINDER_TEST_COMPACT_EXPECTED_RAW_BLOB_POLICY";
 const EXPECTED_HEIGHT_ENV: &str = "ZINDER_TEST_COMPACT_EXPECTED_HEIGHT";
 const EXPECTED_RPC_HASH_ENV: &str = "ZINDER_TEST_COMPACT_EXPECTED_RPC_HASH";
@@ -141,7 +153,20 @@ struct ProcessReport {
     protocol: ProtocolReport,
     isolation: IsolationReport,
     shutdown: ShutdownReport,
-    non_claims: Vec<&'static str>,
+    non_claims: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ReorgProcessReport {
+    network: String,
+    binary_source: String,
+    initial_fence: WriterFenceReport,
+    replacement_fence: WriterFenceReport,
+    observed_replacement_hash: String,
+    process_start_to_ready_ms: u128,
+    replacement_commit_to_observed_ms: u128,
+    shutdown: ShutdownReport,
+    non_claims: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -170,7 +195,7 @@ struct WriterFenceReport {
 
 #[derive(Serialize)]
 struct CommandReport {
-    binary_source: &'static str,
+    binary_source: String,
     command_shape: Vec<String>,
     environment_shape: Vec<String>,
     runtime_secondary_path: String,
@@ -221,6 +246,12 @@ struct ShutdownReport {
     compat_port_stopped: bool,
     ops_port_stopped: bool,
     fake_control_stopped: bool,
+}
+
+struct SelectedBinary {
+    path: PathBuf,
+    source: &'static str,
+    evidence_boundary: &'static str,
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -339,9 +370,9 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
         expected_raw_blob_policy,
     );
     fs::write(&config_path, config)?;
-    let binary = env!("CARGO_BIN_EXE_zinder-compat-lightwalletd");
+    let binary = selected_binary()?;
     let process_started = Instant::now();
-    let mut child = Command::new(binary)
+    let mut child = Command::new(&binary.path)
         .env_remove("ZINDER_NETWORK")
         .arg("--config")
         .arg(&config_path)
@@ -534,8 +565,11 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
             },
         },
         command: CommandReport {
-            binary_source: "cargo-provided test binary",
-            command_shape: vec![binary.to_owned(), "--config <redacted-path>".to_owned()],
+            binary_source: binary.source.to_owned(),
+            command_shape: vec![
+                binary.path.display().to_string(),
+                "--config <redacted-path>".to_owned(),
+            ],
             environment_shape: vec![
                 "ZINDER_NETWORK=<live-gate-only; removed from child>".to_owned(),
                 format!(
@@ -579,9 +613,9 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
             fake_control_stopped: control_shutdown.is_cancelled(),
         },
         non_claims: vec![
-            "This is bounded local live process evidence from a preserved canonical artifact, not fresh end-to-end, capacity, production, or release evidence.",
-            "The binary was the Cargo-provided test binary, not a separately installed release artifact.",
-            "No wallet, materialized-view, mempool, or upstream fallback topology was exercised in compact mode.",
+            "This is bounded local live process evidence from a preserved canonical artifact, not fresh end-to-end, capacity, or production evidence.".to_owned(),
+            binary.evidence_boundary.to_owned(),
+            "No wallet, materialized-view, mempool, or upstream fallback topology was exercised in compact mode.".to_owned(),
         ],
     };
     assert!(output.status.success());
@@ -589,6 +623,391 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
     assert!(compat_stopped && ops_stopped && control_shutdown.is_cancelled());
     write_report_atomically(&evidence_root.join("report.json"), &report)?;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The process gate keeps the primary replacement, writer-fence advance, serving observation, and shutdown in one causal proof."
+)]
+async fn compact_blocks_process_refreshes_after_shallow_reorg() -> Result<()> {
+    let _guard = init();
+    let Some(env) = require_live_for(&[Network::ZcashRegtest, Network::ZcashTestnet])? else {
+        return Ok(());
+    };
+    let Some(evidence_text) = optional_env(REORG_EVIDENCE_ROOT_ENV)? else {
+        return Ok(());
+    };
+    let evidence_root = PathBuf::from(evidence_text);
+    if evidence_root.exists() {
+        return Err(eyre!(
+            "{REORG_EVIDENCE_ROOT_ENV} must name a fresh directory"
+        ));
+    }
+    fs::create_dir_all(&evidence_root)?;
+
+    let source = ZebraJsonRpcSource::with_options(
+        env.target.network,
+        env.target.json_rpc_addr.clone(),
+        env.target.node_auth.clone(),
+        ZebraJsonRpcSourceOptions {
+            request_timeout: env.target.request_timeout,
+            max_response_bytes: env.target.max_response_bytes,
+            broadcast_timeout: None,
+        },
+    )?;
+    let activations = source.fetch_network_upgrade_activations().await?;
+    let canonical_path = evidence_root.join("canonical-primary");
+    let chain = ChainFixture::new(env.target.network).extend_blocks(4);
+    let mut primary = build_reorg_process_primary(&canonical_path, &chain, &activations)?;
+    let initial_fence = primary.event_fence();
+    let initial_status = writer_status_for_fence(initial_fence, env.target.network);
+    let shared_status = std::sync::Arc::new(Mutex::new(initial_status.clone()));
+
+    let control_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let control_addr = control_listener.local_addr()?;
+    let control_shutdown = tokio_util::sync::CancellationToken::new();
+    let control_shutdown_for_server = control_shutdown.clone();
+    let control = MutableCanonicalControl {
+        status: std::sync::Arc::clone(&shared_status),
+    };
+    let control_server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(CanonicalControlServer::new(control))
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(control_listener),
+                control_shutdown_for_server.cancelled_owned(),
+            )
+            .await
+    });
+
+    let compat_addr = free_loopback_addr()?;
+    let ops_addr = free_loopback_addr()?;
+    let runtime_secondary = evidence_root.join("runtime-secondary");
+    let config_path = evidence_root.join("compact-reorg-process.toml");
+    fs::write(
+        &config_path,
+        process_config(
+            &env,
+            &canonical_path,
+            &runtime_secondary,
+            compat_addr,
+            ops_addr,
+            control_addr,
+            RawBlobRetention::None,
+        ),
+    )?;
+    let binary = selected_binary()?;
+    let process_started = Instant::now();
+    let mut child = Command::new(&binary.path)
+        .env_remove("ZINDER_NETWORK")
+        .arg("--config")
+        .arg(&config_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    wait_until_ready(&mut child, ops_addr).await?;
+    let ready_at = Instant::now();
+
+    let endpoint = tonic::transport::Endpoint::new(format!("http://{compat_addr}"))?;
+    let channel = endpoint.connect().await?;
+    let mut client = CompactTxStreamerClient::new(channel);
+    let initial = client
+        .get_latest_block(lightwalletd::ChainSpec::default())
+        .await?
+        .into_inner();
+    assert_eq!(
+        initial.hash,
+        encode_internal_block_hash(initial_fence.visible_tip().hash)
+    );
+
+    let replacement_chain = chain
+        .fork_at(initial_fence.visible_tip().height)?
+        .extend_blocks(1);
+    let replacement_block = canonical_build_blocks(&replacement_chain, &activations)?
+        .pop()
+        .ok_or_else(|| eyre!("replacement fixture did not produce a tip block"))?;
+    let replacement_started = Instant::now();
+    let (next_primary, replacement_fence) = primary.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            initial_fence,
+            vec![CanonicalReplacementBlock::new(
+                replacement_block,
+                Vec::new(),
+            )],
+            UnixTimestampMillis::new(1_774_669_100_000),
+        ),
+        &activations,
+    )?;
+    primary = next_primary;
+    let replacement_status = writer_status_for_fence(replacement_fence, env.target.network);
+    *shared_status.lock() = replacement_status.clone();
+    let observed = wait_for_latest_fence(&mut child, &mut client, replacement_fence).await?;
+    let replacement_observed_at = Instant::now();
+    assert_eq!(primary.event_fence(), replacement_fence);
+    assert_ne!(
+        replacement_fence.visible_tip().hash,
+        initial_fence.visible_tip().hash
+    );
+    let replacement_block = client
+        .get_block(lightwalletd::BlockId {
+            height: u64::from(replacement_fence.visible_tip().height.value()),
+            hash: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(replacement_block.hash, observed.hash);
+
+    send_sigterm(&child).await?;
+    let output = tokio::time::timeout(PROCESS_SHUTDOWN_TIMEOUT, child.wait_with_output()).await??;
+    control_shutdown.cancel();
+    control_server.await??;
+    let compat_stopped = wait_for_port_closed(compat_addr).await;
+    let ops_stopped = wait_for_port_closed(ops_addr).await;
+    let report = ReorgProcessReport {
+        network: encode_zinder_native_chain_name(env.target.network).to_owned(),
+        binary_source: binary.source.to_owned(),
+        initial_fence: writer_fence_report(&initial_status),
+        replacement_fence: writer_fence_report(&replacement_status),
+        observed_replacement_hash: hex::encode(observed.hash),
+        process_start_to_ready_ms: ready_at.duration_since(process_started).as_millis(),
+        replacement_commit_to_observed_ms: replacement_observed_at
+            .duration_since(replacement_started)
+            .as_millis(),
+        shutdown: ShutdownReport {
+            sigterm_sent: true,
+            process_exit_success: output.status.success(),
+            compat_port_stopped: compat_stopped,
+            ops_port_stopped: ops_stopped,
+            fake_control_stopped: control_shutdown.is_cancelled(),
+        },
+        non_claims: vec![
+            "This gate proves a bounded local process refresh after one synthetic shallow canonical replacement; it is not a node-driven reorg, capacity, or production claim.".to_owned(),
+            binary.evidence_boundary.to_owned(),
+        ],
+    };
+    assert!(output.status.success());
+    assert!(compat_stopped && ops_stopped && control_shutdown.is_cancelled());
+    write_report_atomically(&evidence_root.join("report.json"), &report)?;
+    Ok(())
+}
+
+fn selected_binary() -> Result<SelectedBinary> {
+    let Some(path_text) = optional_env(BINARY_PATH_ENV)? else {
+        return Ok(SelectedBinary {
+            path: PathBuf::from(env!("CARGO_BIN_EXE_zinder-compat-lightwalletd")),
+            source: "Cargo-provided test binary",
+            evidence_boundary: "The binary was the Cargo-provided test binary, not a separately built release artifact.",
+        });
+    };
+    let path = PathBuf::from(path_text);
+    if !path.is_file() {
+        return Err(eyre!("{BINARY_PATH_ENV} is not a file"));
+    }
+    Ok(SelectedBinary {
+        path,
+        source: "explicit binary path supplied by the test operator",
+        evidence_boundary: "The explicit binary was built locally and is not an installed, signed, or production-deployed release artifact.",
+    })
+}
+
+fn build_reorg_process_primary(
+    path: &Path,
+    chain: &ChainFixture,
+    activations: &zinder_core::NetworkUpgradeActivations,
+) -> Result<RocksDbCanonicalStore> {
+    let tip_height = chain
+        .tip_height()
+        .ok_or_else(|| eyre!("reorg process fixture requires at least two blocks"))?;
+    let baseline_chain = chain.fork_at(tip_height)?;
+    let baseline_tip_block = baseline_chain
+        .blocks()
+        .last()
+        .ok_or_else(|| eyre!("reorg process fixture requires at least two blocks"))?;
+    let baseline_tip = BlockId::new(baseline_tip_block.height, baseline_tip_block.hash);
+    let reorg_policy = CanonicalReorgPolicy::new(100)?;
+    let build_plan = CanonicalStoreBuildPlan::complete(
+        activations,
+        baseline_tip_block.block_time_seconds.saturating_sub(1),
+        baseline_tip,
+        RawBlobRetention::None,
+        reorg_policy,
+    )?;
+    let mut builder = RocksDbCanonicalBuilder::create_fresh(
+        path,
+        CanonicalStoreWorkload::Wallet,
+        build_plan,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    builder.bulk_load_blocks(
+        canonical_build_blocks(&baseline_chain, activations)?
+            .into_iter()
+            .map(Ok::<_, std::convert::Infallible>),
+    )?;
+    builder.load_subtree_roots(std::iter::empty())?;
+    builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+        baseline_tip,
+        baseline_tip_block.block_time_seconds,
+        checkpoint_frontiers(activations, baseline_tip.height),
+    ))?;
+    let validated = builder.prepare_cold_certified_publication()?;
+    let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+        baseline_tip,
+        UnixTimestampMillis::new(1_774_669_000_000),
+    ))?;
+    let primary = validated.publish_baseline(publication)?;
+    let live_block = canonical_build_blocks(chain, activations)?
+        .pop()
+        .ok_or_else(|| eyre!("reorg process fixture did not produce a live block"))?;
+    let expected_fence = primary.event_fence();
+    let (primary, _) = primary.commit_live_append(
+        CanonicalLiveAppend::new(
+            expected_fence,
+            live_block,
+            Vec::new(),
+            baseline_tip,
+            UnixTimestampMillis::new(1_774_669_050_000),
+        ),
+        activations,
+    )?;
+    Ok(primary)
+}
+
+fn canonical_build_blocks(
+    chain: &ChainFixture,
+    activations: &zinder_core::NetworkUpgradeActivations,
+) -> Result<Vec<CanonicalBuildBlock>> {
+    if chain.raw_blob_retention() != RawBlobRetention::None {
+        return Err(eyre!(
+            "compact reorg process fixture requires raw-blob retention none"
+        ));
+    }
+    let tip_height = chain
+        .tip_height()
+        .ok_or_else(|| eyre!("compact reorg process fixture requires a tip"))?;
+    let mut blocks = Vec::with_capacity(chain.block_count());
+    for fixture_block in chain.blocks() {
+        let mut fixture_block = fixture_block.clone();
+        if fixture_block.height == BlockHeight::new(1) {
+            fixture_block.parent_hash = chain.network().genesis_hash();
+        }
+        let transaction_id = TransactionId::from_bytes(fixture_block.hash.as_bytes());
+        let mut coinbase_facts = synthetic_transaction_public_facts(transaction_id, 0);
+        coinbase_facts.is_coinbase = true;
+        let coinbase = FixtureTransactionRows::from_public_facts(
+            TransactionLocation::new(transaction_id, fixture_block.height, fixture_block.hash, 0),
+            coinbase_facts,
+        );
+        let replay_envelope = encode_fixture_block_replay_with_raw_block(
+            &fixture_block.block_header_artifact(),
+            &fixture_block.raw_block_bytes,
+            &[coinbase],
+        );
+        let facts = decode_canonical_block_replay(replay_envelope.as_bytes())?.into_facts();
+        let compact_block = fixture_block.compact_block_artifact();
+        let checkpoint_required = fixture_block.height == tip_height
+            || fixture_block
+                .height
+                .value()
+                .is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
+        let tree_state_checkpoint = checkpoint_required.then(|| {
+            CommitmentTreeCheckpoint::new(
+                BlockId::new(fixture_block.height, fixture_block.hash),
+                fixture_block.block_time_seconds,
+                checkpoint_frontiers(activations, fixture_block.height),
+            )
+        });
+        blocks.push(CanonicalBuildBlock {
+            facts,
+            replay_envelope,
+            compact_block,
+            tip_metadata: ChainTipMetadata::empty(),
+            tree_state_checkpoint,
+            block_final_note_commitment_roots: None,
+            transaction_blobs: Vec::new(),
+            block_blob: None,
+        });
+    }
+    Ok(blocks)
+}
+
+fn checkpoint_frontiers(
+    activations: &zinder_core::NetworkUpgradeActivations,
+    height: BlockHeight,
+) -> CommitmentTreeFrontiers {
+    let active_frontier = |protocol: ShieldedProtocol| {
+        activations
+            .activation_height_by_name(protocol.activation_upgrade_name())
+            .is_some_and(|activation_height| activation_height <= height)
+            .then(|| CommitmentTreeFrontier::empty(protocol))
+    };
+    CommitmentTreeFrontiers::from_validated_parts(
+        active_frontier(ShieldedProtocol::Sapling),
+        active_frontier(ShieldedProtocol::Orchard),
+        active_frontier(ShieldedProtocol::Ironwood),
+    )
+}
+
+async fn wait_for_latest_fence(
+    child: &mut tokio::process::Child,
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    expected: CanonicalEventFence,
+) -> Result<lightwalletd::BlockId> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(eyre!(
+                "compat process exited before serving replacement: {status}"
+            ));
+        }
+        if let Ok(response) = client
+            .get_latest_block(lightwalletd::ChainSpec::default())
+            .await
+        {
+            let latest = response.into_inner();
+            if latest.height == u64::from(expected.visible_tip().height.value())
+                && latest.hash == encode_internal_block_hash(expected.visible_tip().hash)
+            {
+                return Ok(latest);
+            }
+        }
+        if started.elapsed() >= READY_TIMEOUT {
+            return Err(eyre!(
+                "compact process did not serve the replacement fence within {READY_TIMEOUT:?}"
+            ));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn writer_fence_report(status: &CanonicalWriterStatusResponse) -> WriterFenceReport {
+    WriterFenceReport {
+        chain_epoch_id: status
+            .fence
+            .as_ref()
+            .map_or(0, |fence| fence.chain_epoch_id),
+        event_sequence: status
+            .fence
+            .as_ref()
+            .map_or(0, |fence| fence.event_sequence),
+        visible_tip_height: status
+            .fence
+            .as_ref()
+            .map_or(0, |fence| fence.visible_tip_height),
+        visible_tip_hash: status
+            .fence
+            .as_ref()
+            .map_or_else(String::new, |fence| hex::encode(&fence.visible_tip_hash)),
+        visible_block_count: status
+            .fence
+            .as_ref()
+            .map_or(0, |fence| fence.visible_block_count),
+        canonical_sequence_digest: status.fence.as_ref().map_or_else(String::new, |fence| {
+            hex::encode(&fence.canonical_sequence_digest)
+        }),
+    }
 }
 
 #[allow(
@@ -854,7 +1273,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(digest.finalize())
 }
 
-fn write_report_atomically(path: &Path, report: &ProcessReport) -> Result<()> {
+fn write_report_atomically(path: &Path, report: &impl Serialize) -> Result<()> {
     let encoded = serde_json::to_vec_pretty(report)?;
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let temporary = path.with_extension(format!("json.{nanos}.tmp"));

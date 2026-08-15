@@ -774,6 +774,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `127.0.0.1:9067`.",
     },
     EnvVarDoc {
+        name: "ZINDER_COMPAT__SERVING",
+        toml_path: "compat.serving",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults \
+                      to `wallet`. `compact-blocks` rejects wallet settings, and no canonical or \
+                      legacy aliases are accepted.",
+    },
+    EnvVarDoc {
         name: "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
         toml_path: "compat.reorg_window_blocks",
         used_by: &["zinder-compat-lightwalletd"],
@@ -788,8 +798,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum bounded attempts to converge and admit compatibility's canonical \
-                      and wallet secondary pair. Must be in 1..=64; defaults to 12.",
+        description: "Maximum bounded attempts to converge and admit compatibility's \
+                      wallet-serving pair or compact-serving canonical secondary. Must be in \
+                      1..=64; defaults to 12.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES",
@@ -864,6 +875,19 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       choice is a writer-private implementation decision: `[node]` describes the \
                       upstream node itself, `[ingest].source` describes which adapter ingest \
                       uses to talk to it. See [ADR-0016](../adrs/0016-source-segment-fetching.md).",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__EXPLORER_VIEWS",
+        toml_path: "ingest.explorer_views",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Boolean request for the complete bundled Explorer materialized-view \
+                      workload. Defaults to `false` for every coverage. `true` requires \
+                      genesis-complete canonical history or the authenticated \
+                      `checkpoint_height = 0`; checkpoint heights above zero are rejected before \
+                      storage mutation. The request appears in `--print-config`; admission \
+                      evidence appears only after the Explorer store opens successfully.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__RAW_BLOB_POLICY",
@@ -1442,6 +1466,7 @@ mod tests {
             compat_specific,
             [
                 "ZINDER_COMPAT__LISTEN_ADDR",
+                "ZINDER_COMPAT__SERVING",
                 "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
                 "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
             ]
