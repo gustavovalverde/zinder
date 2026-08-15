@@ -92,6 +92,7 @@ const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
 pub(crate) struct IngestCommandConfig {
     pub(crate) runtime_config: IngestRuntimeConfig,
     pub(crate) coverage: IngestCoverage,
+    pub(crate) explorer_views: bool,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_checkpoint_bearer_token_path: Option<PathBuf>,
@@ -437,6 +438,9 @@ struct IngestSection {
     /// Canonical source-adapter selector. The supported value is
     /// `zebra-json-rpc`.
     source: Option<String>,
+    /// Whether the complete bundled Explorer materialized-view workload is
+    /// requested. Omitted values remain false for every coverage.
+    explorer_views: bool,
     /// Chain-truth invariant: how deep into the upstream tip the
     /// settled-tip cliff sits. Defaults to `100`.
     reorg_window_blocks: Option<u32>,
@@ -722,6 +726,10 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
 
     let coverage = config.ingest.run_overrides.coverage.unwrap_or_default();
     let raw_blob_policy = resolve_raw_blob_policy(coverage, configured_raw_blob_policy)?;
+    let explorer_views = resolve_explorer_views(
+        config.ingest.explorer_views,
+        config.ingest.run_overrides.checkpoint_height,
+    )?;
 
     let allow_reorg_window_settlement = require_field(
         config.ingest.run_overrides.allow_reorg_window_settlement,
@@ -815,6 +823,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     Ok(IngestCommandConfig {
         runtime_config,
         coverage,
+        explorer_views,
         ingest_control_listen_addr,
         ingest_control_bearer_token_path,
         ingest_control_checkpoint_bearer_token_path,
@@ -825,6 +834,18 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         allow_public_bind,
         retention,
     })
+}
+
+fn resolve_explorer_views(
+    explorer_views: bool,
+    checkpoint_height: Option<u32>,
+) -> Result<bool, ConfigError> {
+    if explorer_views && checkpoint_height.is_some_and(|height| height > 0) {
+        return Err(ConfigError::invalid(
+            "ingest.explorer_views = true requires genesis-complete canonical history or checkpoint_height = 0; checkpoint heights above zero are not supported for Explorer views, or set explorer_views = false",
+        ));
+    }
+    Ok(explorer_views)
 }
 
 fn guard_ingest_control_bearer_token(
@@ -916,6 +937,7 @@ impl RedactedIngestConfigToml {
             },
             ingest: IngestToml {
                 source: node_source_name(runtime_config.node_source),
+                explorer_views: config.explorer_views,
                 reorg_window_blocks: runtime_config.reorg_window_blocks,
                 phase_classification: IngestPhaseClassificationToml {
                     catchup_threshold_blocks: runtime_config
@@ -1039,6 +1061,7 @@ impl RedactedCanonicalReplayVerificationConfigToml {
 #[derive(Serialize)]
 struct IngestToml {
     source: &'static str,
+    explorer_views: bool,
     reorg_window_blocks: u32,
     phase_classification: IngestPhaseClassificationToml,
     construction: IngestConstructionToml,
@@ -1172,5 +1195,25 @@ mod tests {
             None,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn explorer_views_default_false_for_every_coverage() {
+        assert!(matches!(resolve_explorer_views(false, None), Ok(false)));
+        assert!(matches!(
+            resolve_explorer_views(false, Some(100)),
+            Ok(false)
+        ));
+    }
+
+    #[test]
+    fn explorer_views_accept_zero_checkpoint_and_reject_positive_checkpoint() {
+        assert!(matches!(resolve_explorer_views(true, Some(0)), Ok(true)));
+        let error_result = resolve_explorer_views(true, Some(100));
+        assert!(error_result.is_err());
+        let Some(error) = error_result.err() else {
+            return;
+        };
+        assert!(error.to_string().contains("explorer_views = true"));
     }
 }

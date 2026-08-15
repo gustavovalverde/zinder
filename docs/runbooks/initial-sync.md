@@ -53,8 +53,9 @@ directory, fixes a source range, loads and validates it, publishes a baseline
 fence, installs it at the configured path, and starts continuous following.
 The configured path does not become a ready store until publication succeeds.
 
-The checked ingest configuration uses `coverage = "wallet-serving"`. The
-writer uses the genesis block as the authenticated predecessor and retains
+The checked ingest configuration uses `coverage = "wallet-serving"` and
+explicitly sets `explorer_views = false`. The writer uses the
+genesis block as the authenticated predecessor and retains
 every block from height one. This is required for transparent predecessor
 resolution even though shielded wallet data begins at later activation heights.
 An explicit checkpoint remains available only for non-wallet-serving workloads

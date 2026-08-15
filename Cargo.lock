@@ -5768,11 +5768,13 @@ dependencies = [
 name = "zinder-compat-lightwalletd"
 version = "0.6.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "clap",
  "config",
  "eyre",
  "hex",
+ "metrics",
  "parking_lot",
  "prost",
  "secrecy",

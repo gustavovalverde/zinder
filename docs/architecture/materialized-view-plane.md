@@ -27,8 +27,44 @@ the release composition: the checked release topology does not start it or
 expose its native query service. An operator who wants the explorer query
 surface runs it separately against the same storage path.
 
-A store built with `ingest.run_overrides.checkpoint_height` does not host
-materialized views. Cumulative address views resolve spends against the
+## Runtime selection
+
+The ingest runtime requests the optional Explorer materialized-view workload
+with `[ingest].explorer_views = true`. The boolean defaults to `false` for
+every coverage and deployment shape; coverage never enables Explorer views
+implicitly. When false, the existing materialized-view directory remains
+untouched and no materialized-view secondary, store, tailer, replay sampler,
+or historical backfill starts. It does not change canonical-writer or
+wallet-projection ownership or readiness.
+
+`explorer_views = true` selects `MaterializedViewPreset::Explorer` and
+preserves the complete Explorer workload. Wallet projection and wallet-serving readiness
+remain owned by `zinder-projector`, `zinder-wallet-rocksdb`, and the wallet
+readers; that projection is not an operator-selectable materialized-view
+profile.
+
+When the field is true, the request is printed by `--print-config` and the
+admitted state is emitted in bounded ingest startup evidence. Wallet-serving
+deployment files set `explorer_views = false`; the Explorer Compose overlay
+sets `ZINDER_INGEST__EXPLORER_VIEWS=true`.
+
+An enabled workload is admitted only after the selected preset's persisted
+manifest matches exactly. Reopening the same preset is supported; changing the
+consumer set fails before mutation and requires a fresh materialized-view
+store. This selection does not introduce a storage-layout migration. Enabled
+materialized views require genesis-complete canonical history or the
+authenticated height-0 checkpoint: checkpoint heights above zero are not
+admitted because cumulative address views can under-report when their producing
+blocks precede the first retained height.
+
+Readiness reports materialized-view preset and consumer identities only after
+enabled-store admission. Disabled ingest therefore omits materialized-view
+workload fields rather than claiming view readiness.
+
+A store built with `ingest.run_overrides.checkpoint_height` at height 0 may host
+enabled materialized views because height 0 is the authenticated predecessor
+for the complete height-1 history. A checkpoint above height 0 does not host
+materialized views: cumulative address views resolve spends against the
 producing block, so a store whose first available height is above block 1
 would silently under-report. The tailer refuses such a store instead.
 

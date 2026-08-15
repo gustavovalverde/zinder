@@ -6,6 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_compat_lightwalletd::LightwalletdAdmissionError;
@@ -25,14 +26,35 @@ use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreBuildPlanError, RocksDbResourceBudget, StoreError,
 };
 
+/// Operator-selected lightwalletd compatibility capability.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CompatServing {
+    /// Full wallet-compatible serving over an admitted canonical and wallet pair.
+    #[default]
+    Wallet,
+    /// Canonical compact-block serving without wallet storage.
+    CompactBlocks,
+}
+
+impl CompatServing {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wallet => "wallet",
+            Self::CompactBlocks => "compact-blocks",
+        }
+    }
+}
+
 /// Resolved lightwalletd compatibility runtime configuration.
 #[derive(Clone, Debug)]
 pub(crate) struct LightwalletdConfig {
     pub(crate) network: Network,
+    pub(crate) serving: CompatServing,
     pub(crate) storage: ResolvedCanonicalSecondaryStorage,
-    pub(crate) wallet_primary_path: PathBuf,
-    pub(crate) wallet_secondary_root: PathBuf,
-    pub(crate) wallet_rocksdb_budget: RocksDbResourceBudget,
+    pub(crate) wallet_primary_path: Option<PathBuf>,
+    pub(crate) wallet_secondary_root: Option<PathBuf>,
+    pub(crate) wallet_rocksdb_budget: Option<RocksDbResourceBudget>,
     pub(crate) ingest_control_addr: String,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
@@ -48,6 +70,7 @@ pub(crate) struct LightwalletdConfig {
 #[derive(Debug, Default)]
 pub(crate) struct LightwalletdConfigOverrides {
     pub(crate) network: Option<String>,
+    pub(crate) serving: Option<CompatServing>,
     pub(crate) canonical_primary_path: Option<PathBuf>,
     pub(crate) canonical_secondary_root: Option<PathBuf>,
     pub(crate) wallet_primary_path: Option<PathBuf>,
@@ -87,6 +110,9 @@ pub(crate) enum LightwalletdConfigError {
     #[error(transparent)]
     CompatibilityAdmission(#[from] LightwalletdAdmissionError),
 
+    #[error(transparent)]
+    CompactServing(#[from] crate::compact_block_serving::CompactBlockServingError),
+
     #[error("node source initialization failed: {0}")]
     Source(Box<zinder_source::SourceError>),
 
@@ -116,6 +142,10 @@ pub(crate) fn load_lightwalletd_config(
         .with_file(config_path)
         .with_zinder_env()?
         .with_override_if("network.name", overrides.network)?
+        .with_override_if(
+            "compat.serving",
+            overrides.serving.map(|serving| serving.as_str().to_owned()),
+        )?
         .with_override_path_if("storage.path", overrides.canonical_primary_path)?
         .with_override_path_if("storage.secondary_path", overrides.canonical_secondary_root)?
         .with_override_path_if("wallet.path", overrides.wallet_primary_path)?
@@ -155,7 +185,7 @@ struct LightwalletdRawConfig {
     network: NetworkSection,
     ops: OpsSection,
     storage: CanonicalSecondaryStorageSection,
-    wallet: WalletSection,
+    wallet: Option<WalletSection>,
     ingest_control: IngestControlSection,
     compat: CompatSection,
     node: NodeSection,
@@ -168,6 +198,7 @@ struct CompatSection {
     listen_addr: Option<String>,
     reorg_window_blocks: Option<u32>,
     pair_convergence_attempts: Option<u8>,
+    serving: Option<CompatServing>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -181,19 +212,38 @@ struct WalletSection {
 fn resolve_lightwalletd_config(
     config: LightwalletdRawConfig,
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
+    let serving = config.compat.serving.unwrap_or_default();
+    let wallet = config.wallet;
+    if matches!(serving, CompatServing::CompactBlocks) && wallet.is_some() {
+        return Err(ConfigError::invalid(
+            "compat.serving = \"compact-blocks\" does not accept wallet.path, wallet.secondary_path, or wallet.rocksdb settings; remove the wallet section or select compat.serving = \"wallet\"",
+        )
+        .into());
+    }
+    let wallet = wallet.unwrap_or_default();
     let network = config.network.resolve()?;
     let storage = resolve_canonical_secondary_storage(config.storage)?;
-    let wallet_primary_path = require_field(config.wallet.path, "wallet.path")?;
-    let wallet_secondary_root =
-        require_field(config.wallet.secondary_path, "wallet.secondary_path")?;
-    let wallet_rocksdb_budget =
-        resolve_wallet_projection_reader_rocksdb_budget(config.wallet.rocksdb)?;
-    require_distinct_storage_paths(
-        &storage.path,
-        &storage.secondary_path,
-        &wallet_primary_path,
-        &wallet_secondary_root,
-    )?;
+    let (wallet_primary_path, wallet_secondary_root, wallet_rocksdb_budget) =
+        if matches!(serving, CompatServing::Wallet) {
+            let wallet_primary_path = require_field(wallet.path, "wallet.path")?;
+            let wallet_secondary_root =
+                require_field(wallet.secondary_path, "wallet.secondary_path")?;
+            let wallet_rocksdb_budget =
+                resolve_wallet_projection_reader_rocksdb_budget(wallet.rocksdb)?;
+            require_distinct_storage_paths(
+                &storage.path,
+                &storage.secondary_path,
+                &wallet_primary_path,
+                &wallet_secondary_root,
+            )?;
+            (
+                Some(wallet_primary_path),
+                Some(wallet_secondary_root),
+                Some(wallet_rocksdb_budget),
+            )
+        } else {
+            (None, None, None)
+        };
     let ResolvedIngestControlReader {
         addr: ingest_control_addr,
         bearer_token_path: ingest_control_bearer_token_path,
@@ -216,6 +266,7 @@ fn resolve_lightwalletd_config(
 
     Ok(LightwalletdConfig {
         network,
+        serving,
         storage,
         wallet_primary_path,
         wallet_secondary_root,
@@ -238,7 +289,8 @@ struct LightwalletdConfigToml {
     ops: OpsToml,
     security: SecurityToml,
     storage: CanonicalSecondaryStorageToml,
-    wallet: WalletToml,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet: Option<WalletToml>,
     ingest_control: IngestControlReaderToml,
     compat: CompatToml,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -252,11 +304,16 @@ impl LightwalletdConfigToml {
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             storage: CanonicalSecondaryStorageToml::from_resolved(&config.storage),
-            wallet: WalletToml {
-                path: config.wallet_primary_path.clone(),
-                secondary_path: config.wallet_secondary_root.clone(),
-                rocksdb: RocksDbResourceBudgetToml::from_resolved(config.wallet_rocksdb_budget),
-            },
+            wallet: config
+                .wallet_primary_path
+                .as_ref()
+                .zip(config.wallet_secondary_root.as_ref())
+                .zip(config.wallet_rocksdb_budget)
+                .map(|((path, secondary_path), rocksdb)| WalletToml {
+                    path: path.clone(),
+                    secondary_path: secondary_path.clone(),
+                    rocksdb: RocksDbResourceBudgetToml::from_resolved(rocksdb),
+                }),
             ingest_control: IngestControlReaderToml::from_resolved(
                 config.ingest_control_addr.clone(),
                 config.ingest_control_bearer_token_path.as_deref(),
@@ -265,6 +322,7 @@ impl LightwalletdConfigToml {
                 listen_addr: config.listen_addr.to_string(),
                 reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
                 pair_convergence_attempts: config.pair_convergence_attempts.get(),
+                serving: config.serving,
             },
             node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
         }
@@ -276,6 +334,7 @@ struct CompatToml {
     listen_addr: String,
     reorg_window_blocks: u32,
     pair_convergence_attempts: u8,
+    serving: CompatServing,
 }
 
 #[derive(Serialize)]

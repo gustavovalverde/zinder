@@ -43,6 +43,7 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
     assert!(stdout.contains("[network]"), "{stdout}");
     assert!(stdout.contains("name = \"zcash-regtest\""), "{stdout}");
     assert!(stdout.contains("[compat]"), "{stdout}");
+    assert!(stdout.contains("serving = \"wallet\""), "{stdout}");
     assert!(stdout.contains("reorg_window_blocks = 100"), "{stdout}");
     assert!(
         stdout.contains("pair_convergence_attempts = 12"),
@@ -80,6 +81,102 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
     );
     assert!(!stderr.contains("ERROR"), "{stderr}");
 
+    Ok(())
+}
+
+#[test]
+fn compact_blocks_print_config_omits_wallet_configuration() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let storage_path = temporary.path().join("compact-blocks-store");
+    let secondary_path = temporary.path().join("compact-blocks-secondary");
+    let config_path = temporary.path().join("compact-blocks.toml");
+    fs::write(
+        &config_path,
+        compact_blocks_config_toml(&storage_path, &secondary_path)?,
+    )?;
+
+    let output = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("serving = \"compact-blocks\""), "{stdout}");
+    assert!(!stdout.contains("[wallet]"), "{stdout}");
+    assert!(!stdout.contains("wallet.path"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn compact_blocks_serving_can_be_selected_by_cli_and_environment() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let storage_path = temporary.path().join("compact-blocks-store");
+    let secondary_path = temporary.path().join("compact-blocks-secondary");
+    let config_path = temporary.path().join("compact-blocks.toml");
+    fs::write(
+        &config_path,
+        compact_blocks_config_toml(&storage_path, &secondary_path)?,
+    )?;
+
+    let cli_output = zinder_compat_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "--serving",
+            "compact-blocks",
+        ])
+        .output()?;
+    assert!(cli_output.status.success(), "{cli_output:?}");
+    assert!(String::from_utf8(cli_output.stdout)?.contains("serving = \"compact-blocks\""));
+
+    let env_output = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_COMPAT__SERVING", "compact-blocks")
+        .output()?;
+    assert!(env_output.status.success(), "{env_output:?}");
+    assert!(String::from_utf8(env_output.stdout)?.contains("serving = \"compact-blocks\""));
+    Ok(())
+}
+
+#[test]
+fn compact_blocks_rejects_explicit_wallet_configuration() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let storage_path = temporary.path().join("compact-blocks-store");
+    let secondary_path = temporary.path().join("compact-blocks-secondary");
+    let wallet_path = temporary.path().join("wallet");
+    let config_path = temporary.path().join("compact-blocks.toml");
+    let config = format!(
+        "{}\n[wallet]\npath = \"{}\"\nsecondary_path = \"{}\"\n",
+        compact_blocks_config_toml(&storage_path, &secondary_path)?,
+        path_str(&wallet_path)?,
+        path_str(&wallet_path.with_extension("secondary"))?,
+    );
+    fs::write(&config_path, config)?;
+
+    let output = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8(output.stderr)?.contains("does not accept wallet.path"));
+    Ok(())
+}
+
+#[test]
+fn compatibility_serving_rejects_unapproved_aliases() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let storage_path = temporary.path().join("compat-alias-store");
+    let secondary_path = temporary.path().join("compat-alias-secondary");
+    let config_path = temporary.path().join("compat-alias.toml");
+    let config = compact_blocks_config_toml(&storage_path, &secondary_path)?
+        .replace("serving = \"compact-blocks\"", "serving = \"canonical\"");
+    fs::write(&config_path, config)?;
+
+    let output = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8(output.stderr)?.contains("serving"));
     Ok(())
 }
 
@@ -290,6 +387,24 @@ listen_addr = "127.0.0.1:9067"
         path_str(secondary_path)?,
         path_str(wallet_path)?,
         path_str(&wallet_secondary_path)?,
+    ))
+}
+
+fn compact_blocks_config_toml(storage_path: &Path, secondary_path: &Path) -> eyre::Result<String> {
+    Ok(format!(
+        r#"[network]
+name = "zcash-regtest"
+
+[storage]
+path = "{}"
+secondary_path = "{}"
+
+[compat]
+serving = "compact-blocks"
+listen_addr = "127.0.0.1:9067"
+"#,
+        path_str(storage_path)?,
+        path_str(secondary_path)?,
     ))
 }
 
