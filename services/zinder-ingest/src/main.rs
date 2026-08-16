@@ -26,7 +26,7 @@ use zinder_ingest::{
     spawn_runtime_memory_metrics_task, spawn_transaction_component_backfill_task,
     spawn_upstream_health_probe_task,
 };
-use zinder_materialized_views::MaterializedViewPreset;
+use zinder_materialized_views::{MaterializedViewPreset, MaterializedViewStore};
 use zinder_runtime::{
     OpsEndpointHandle, OpsServerError, Readiness, ReadinessState, RuntimeService, StartupPhase,
     cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
@@ -320,8 +320,16 @@ async fn run_ingest(
     let termination = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(termination.clone());
     let worker_cancel = termination.child_token();
+    record_explorer_views_admitted(false);
     let materialized_view_plane =
         materialized_view_plane_spec(&command_config, Arc::clone(&network_upgrade_activations))?;
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "explorer_views_config_resolved",
+        coverage = command_config.coverage.as_kebab_case(),
+        explorer_views = command_config.explorer_views,
+        "resolved Explorer views configuration"
+    );
     let worker_tasks = IngestWorkerTaskHandles {
         upstream_health_probe: spawn_upstream_health_probe_for(
             &command_config.runtime_config.node,
@@ -335,16 +343,19 @@ async fn run_ingest(
         ),
         materialized_view_plane: tokio::spawn(run_materialized_view_plane(
             materialized_view_plane,
+            readiness.clone(),
             HistoricalWorkGate::new(readiness.clone()),
             worker_cancel.clone(),
         )),
-        replay_budget_metrics: spawn_materialized_view_replay_budget_metrics_task(
-            MaterializedViewReplayConfig::DEFAULT,
-            DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
-            MATERIALIZED_VIEW_REPLAY_BUDGET_SAMPLE_INTERVAL,
-            readiness.clone(),
-            worker_cancel.clone(),
-        ),
+        replay_budget_metrics: command_config.explorer_views.then(|| {
+            spawn_materialized_view_replay_budget_metrics_task(
+                MaterializedViewReplayConfig::DEFAULT,
+                DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
+                MATERIALIZED_VIEW_REPLAY_BUDGET_SAMPLE_INTERVAL,
+                readiness.clone(),
+                worker_cancel.clone(),
+            )
+        }),
     };
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
@@ -620,7 +631,7 @@ struct IngestWorkerTaskHandles {
     memory_metrics: JoinHandle<()>,
     upstream_health_probe: Option<JoinHandle<()>>,
     materialized_view_plane: JoinHandle<()>,
-    replay_budget_metrics: JoinHandle<()>,
+    replay_budget_metrics: Option<JoinHandle<()>>,
 }
 
 async fn shutdown_ingest_worker_tasks(
@@ -647,11 +658,13 @@ async fn shutdown_ingest_worker_tasks(
         worker_tasks.materialized_view_plane,
     )
     .await;
-    await_worker_task(
-        "materialized_view_replay_budget_metrics",
-        worker_tasks.replay_budget_metrics,
-    )
-    .await;
+    if let Some(replay_budget_metrics) = worker_tasks.replay_budget_metrics {
+        await_worker_task(
+            "materialized_view_replay_budget_metrics",
+            replay_budget_metrics,
+        )
+        .await;
+    }
 }
 
 async fn await_worker_task(worker: &'static str, handle: JoinHandle<()>) {
@@ -692,6 +705,7 @@ async fn await_canonical_control_server_shutdown(server: Option<CanonicalControl
 /// Everything the in-process materialized-view plane needs to open its own
 /// storage handles once the canonical writer has published a READY primary.
 struct MaterializedViewPlaneSpec {
+    explorer_views: bool,
     storage_path: PathBuf,
     secondary_path: PathBuf,
     canonical_rocksdb_budget: RocksDbResourceBudget,
@@ -709,6 +723,7 @@ fn materialized_view_plane_spec(
 ) -> Result<MaterializedViewPlaneSpec, IngestConfigError> {
     let runtime_config = &command_config.runtime_config;
     Ok(MaterializedViewPlaneSpec {
+        explorer_views: command_config.explorer_views,
         secondary_path: materialized_view_secondary_path(&runtime_config.storage_path),
         storage_path: runtime_config.storage_path.clone(),
         canonical_rocksdb_budget: runtime_config.canonical_rocksdb_budget,
@@ -728,7 +743,7 @@ fn materialized_view_secondary_path(storage_path: &std::path::Path) -> PathBuf {
     PathBuf::from(secondary_path)
 }
 
-/// Builds and follows the explorer materialized views from canonical storage.
+/// Builds and follows the selected materialized views from canonical storage.
 ///
 /// The canonical primary may not exist yet: a fresh deployment publishes it
 /// only after the writer finishes construction. The view store nests inside the
@@ -737,28 +752,38 @@ fn materialized_view_secondary_path(storage_path: &std::path::Path) -> PathBuf {
 /// writer's fresh construction into a reopen it cannot satisfy.
 async fn run_materialized_view_plane(
     spec: MaterializedViewPlaneSpec,
+    readiness: Readiness,
     historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
 ) {
+    if !spec.explorer_views {
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "explorer_views_disabled",
+            explorer_views = false,
+            "Explorer views are disabled by resolved configuration"
+        );
+        return;
+    }
     let Some(canonical) = open_canonical_secondary_when_published(&spec, &cancel).await else {
         return;
     };
-    let materialized_view_store = match open_primary_materialized_view_store(
-        &spec.storage_path,
-        MaterializedViewPreset::Explorer,
-        spec.materialized_view_rocksdb_budget,
-    ) {
-        Ok(materialized_view_store) => materialized_view_store,
-        Err(error) => {
-            tracing::error!(
-                target: "zinder::ingest",
-                event = "materialized_view_store_open_failed",
-                error = %error,
-                "failed to open the materialized-view store; explorer views stay dark"
-            );
-            return;
-        }
+    let Some(materialized_view_preset) = explorer_view_preset(spec.explorer_views) else {
+        return;
     };
+    let Some(materialized_view_store) =
+        open_and_admit_materialized_view_store(&spec, materialized_view_preset, &readiness)
+    else {
+        return;
+    };
+    record_explorer_views_admitted(true);
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "explorer_views_admitted",
+        explorer_views = true,
+        preset = materialized_view_preset.as_str(),
+        "Explorer views admitted after store open"
+    );
     if let Err(error) = seed_backfill_owned_consumer_cursors(
         &canonical,
         &spec.activations,
@@ -786,37 +811,124 @@ async fn run_materialized_view_plane(
         historical_work_gate.clone(),
         cancel.clone(),
     );
-    let conventional_fee_distribution_backfill = spawn_conventional_fee_distribution_backfill_task(
-        ConventionalFeeDistributionBackfillConfig::DEFAULT,
-        ConventionalFeeDistributionBackfillContext::new(
-            Arc::clone(&canonical),
-            Arc::clone(&spec.activations),
-            materialized_view_store.clone(),
-        ),
-        historical_work_gate.clone(),
-        cancel.clone(),
-    );
-    let transaction_component_backfill = spawn_transaction_component_backfill_task(
-        TransactionComponentBackfillConfig::DEFAULT,
-        TransactionComponentBackfillContext::new(
+    await_materialized_view_workers(
+        MaterializedViewWorkerContext {
+            explorer_views: spec.explorer_views,
             canonical,
-            spec.activations,
+            activations: spec.activations,
             materialized_view_store,
-        ),
+        },
+        tailer,
         historical_work_gate,
         cancel,
+    )
+    .await;
+}
+
+fn open_and_admit_materialized_view_store(
+    spec: &MaterializedViewPlaneSpec,
+    preset: MaterializedViewPreset,
+    readiness: &Readiness,
+) -> Option<MaterializedViewStore> {
+    let materialized_view_store = match open_primary_materialized_view_store(
+        &spec.storage_path,
+        preset,
+        spec.materialized_view_rocksdb_budget,
+    ) {
+        Ok(materialized_view_store) => materialized_view_store,
+        Err(error) => {
+            tracing::error!(
+                target: "zinder::ingest",
+                event = "materialized_view_store_open_failed",
+                error = %error,
+                explorer_views = spec.explorer_views,
+                "failed to open the materialized-view store; selected views stay unavailable"
+            );
+            return None;
+        }
+    };
+    readiness.set_materialized_view_workload(
+        preset.as_str(),
+        preset
+            .consumer_schemas()
+            .iter()
+            .map(|schema| schema.name.as_str().to_owned())
+            .collect(),
     );
+    Some(materialized_view_store)
+}
+
+struct MaterializedViewWorkerContext {
+    explorer_views: bool,
+    canonical: Arc<RwLock<RocksDbCanonicalSecondary>>,
+    activations: Arc<NetworkUpgradeActivations>,
+    materialized_view_store: MaterializedViewStore,
+}
+
+async fn await_materialized_view_workers(
+    context: MaterializedViewWorkerContext,
+    tailer: JoinHandle<()>,
+    historical_work_gate: HistoricalWorkGate,
+    cancel: CancellationToken,
+) {
+    let (conventional_fee_distribution_backfill, transaction_component_backfill) =
+        if explorer_views_start_backfills(context.explorer_views) {
+            (
+                Some(spawn_conventional_fee_distribution_backfill_task(
+                    ConventionalFeeDistributionBackfillConfig::DEFAULT,
+                    ConventionalFeeDistributionBackfillContext::new(
+                        Arc::clone(&context.canonical),
+                        Arc::clone(&context.activations),
+                        context.materialized_view_store.clone(),
+                    ),
+                    historical_work_gate.clone(),
+                    cancel.clone(),
+                )),
+                Some(spawn_transaction_component_backfill_task(
+                    TransactionComponentBackfillConfig::DEFAULT,
+                    TransactionComponentBackfillContext::new(
+                        context.canonical,
+                        context.activations,
+                        context.materialized_view_store,
+                    ),
+                    historical_work_gate,
+                    cancel,
+                )),
+            )
+        } else {
+            (None, None)
+        };
     await_worker_task("materialized_view_tailer", tailer).await;
-    await_worker_task(
-        "conventional_fee_distribution_backfill",
-        conventional_fee_distribution_backfill,
-    )
-    .await;
-    await_worker_task(
-        "transaction_component_backfill",
-        transaction_component_backfill,
-    )
-    .await;
+    if let Some(conventional_fee_distribution_backfill) = conventional_fee_distribution_backfill {
+        await_worker_task(
+            "conventional_fee_distribution_backfill",
+            conventional_fee_distribution_backfill,
+        )
+        .await;
+    }
+    if let Some(transaction_component_backfill) = transaction_component_backfill {
+        await_worker_task(
+            "transaction_component_backfill",
+            transaction_component_backfill,
+        )
+        .await;
+    }
+}
+
+const fn explorer_views_start_backfills(explorer_views: bool) -> bool {
+    explorer_views
+}
+
+const fn explorer_view_preset(explorer_views: bool) -> Option<MaterializedViewPreset> {
+    if explorer_views {
+        Some(MaterializedViewPreset::Explorer)
+    } else {
+        None
+    }
+}
+
+fn record_explorer_views_admitted(admitted: bool) {
+    metrics::gauge!("zinder_explorer_views_admitted").set(if admitted { 1.0 } else { 0.0 });
 }
 
 /// Retries the canonical secondary open until the writer publishes a READY
@@ -1249,19 +1361,84 @@ impl From<CanonicalReplayVerificationArgs> for CanonicalReplayVerificationConfig
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+    use std::{
+        fs,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
+    use tempfile::tempdir;
     use tokio::task::JoinHandle;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CanonicalControlTasks, NodeCapabilities, NodeCapability, ZebraJsonRpcSource,
-        coordinate_canonical_writer_lifecycle, require_ingest_node_capabilities,
-        supervise_canonical_writer,
+        CanonicalControlTasks, MaterializedViewPlaneSpec, NodeCapabilities, NodeCapability,
+        ZebraJsonRpcSource, coordinate_canonical_writer_lifecycle, explorer_view_preset,
+        explorer_views_start_backfills, materialized_view_secondary_path,
+        require_ingest_node_capabilities, run_materialized_view_plane, supervise_canonical_writer,
     };
+
+    #[test]
+    fn explorer_views_task_composition_matches_admission() {
+        assert!(!explorer_views_start_backfills(false));
+        assert!(explorer_views_start_backfills(true));
+        assert!(explorer_view_preset(false).is_none());
+        assert_eq!(
+            explorer_view_preset(true),
+            Some(zinder_materialized_views::MaterializedViewPreset::Explorer)
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_explorer_views_leaves_storage_and_readiness_untouched()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let storage_path = temporary.path().join("canonical");
+        let materialized_view_path =
+            zinder_materialized_views::MaterializedViewStore::path_for_canonical(&storage_path);
+        fs::create_dir_all(&materialized_view_path)?;
+        let sentinel_path = materialized_view_path.join("disabled-sentinel");
+        fs::write(&sentinel_path, b"leave this store untouched")?;
+        let readiness = zinder_runtime::Readiness::default();
+        let spec = MaterializedViewPlaneSpec {
+            explorer_views: false,
+            secondary_path: materialized_view_secondary_path(&storage_path),
+            storage_path,
+            canonical_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget::for_local_tests(
+            ),
+            activations: Arc::new(zinder_core::NetworkUpgradeActivations::empty(
+                zinder_core::Network::ZcashRegtest,
+            )),
+            raw_blob_retention: zinder_store::RawBlobRetention::None,
+            reorg_policy: zinder_store::CanonicalReorgPolicy::new(100)?,
+            chain_event_retention_window: None,
+            cursor_at_risk_warning: std::time::Duration::from_mins(1),
+        };
+
+        run_materialized_view_plane(
+            spec,
+            readiness.clone(),
+            zinder_ingest::HistoricalWorkGate::new(readiness.clone()),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let report = readiness.report();
+        assert!(report.materialized_view_preset.is_none());
+        assert!(report.materialized_view_identities.is_empty());
+        assert!(materialized_view_path.is_dir());
+        assert_eq!(fs::read(&sentinel_path)?, b"leave this store untouched");
+        assert!(
+            !temporary
+                .path()
+                .join("canonical.materialized-view-secondary")
+                .exists()
+        );
+        Ok(())
+    }
 
     fn reorg_window_exceeded_writer_result() -> Result<(), zinder_ingest::CanonicalWriterError> {
         Err(zinder_ingest::CanonicalWriterError::Follow(

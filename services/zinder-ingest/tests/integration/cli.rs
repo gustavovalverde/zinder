@@ -160,6 +160,7 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("[ingest]"));
+    assert!(stdout.contains("explorer_views = false"), "{stdout}");
     assert!(stdout.contains("reorg_window_blocks = 100"));
     assert!(stdout.contains("[ingest.phase_classification]"));
     assert!(stdout.contains("catchup_threshold_blocks ="));
@@ -483,11 +484,59 @@ fn wallet_serving_print_config_marks_coverage() -> Result<(), Box<dyn Error>> {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("coverage = \"wallet-serving\""), "{stdout}");
+    assert!(stdout.contains("explorer_views = false"), "{stdout}");
     assert!(
         stdout.contains("raw_blob_policy = \"transactions\""),
         "{stdout}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn explorer_views_can_be_enabled_through_environment_without_changing_coverage()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempdir()?;
+    let storage_path = temporary.path().join("explorer-views-store");
+    let config_path = temporary.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_INGEST__EXPLORER_VIEWS", "true")
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("explorer_views = true"), "{stdout}");
+    assert!(stdout.contains("coverage = \"explicit\""), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn explorer_views_reject_positive_checkpoint_before_storage_mutation() -> Result<(), Box<dyn Error>>
+{
+    let temporary = tempdir()?;
+    let storage_path = temporary.path().join("explorer-views-checkpoint-store");
+    let config_path = temporary.path().join("zinder-ingest.toml");
+    let config = ingest_config_toml(&storage_path)?.replacen(
+        "[ingest]\nsource = \"zebra-json-rpc\"\n",
+        "[ingest]\nsource = \"zebra-json-rpc\"\nexplorer_views = true\n",
+        1,
+    );
+    fs::write(
+        &config_path,
+        format!("{config}\n[ingest.run_overrides]\ncheckpoint_height = 1\n"),
+    )?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("explorer_views = true"), "{stderr}");
+    assert!(!storage_path.exists());
     Ok(())
 }
 

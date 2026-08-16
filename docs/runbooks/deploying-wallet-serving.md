@@ -74,6 +74,7 @@ private network; substitute your host's):
 | `ZINDER_NODE__AUTH__METHOD` | `cookie` |
 | `ZINDER_NODE__AUTH__COOKIE` | the inline `user:password` cookie string |
 | `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | a stable 32-character hexadecimal value |
+| `ZINDER_INGEST__EXPLORER_VIEWS` | `false` |
 
 These are optional:
 
@@ -91,6 +92,14 @@ and the entrypoint delivers the two role-scoped variables above to their owner
 alone. Add no other role-scoped variable. Storage paths, listen addresses,
 control endpoints, and bearer token paths are fixed in
 `deploy/config/wallet-serving/`.
+
+The wallet-serving ingest configuration sets
+`ingest.explorer_views = false` explicitly. Wallet projection and
+wallet-serving readiness do not depend on the optional materialized-view plane;
+an existing materialized-view directory is left untouched. To serve Explorer
+views on the same host, use the documented Explorer Compose overlay, which
+explicitly overrides Explorer views to `true` and requires the matching
+persisted preset.
 
 `PORT` names the port Railway healthchecks. It must stay `9106`, the
 operational endpoint of the query process.

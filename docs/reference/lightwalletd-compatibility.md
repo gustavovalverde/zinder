@@ -41,6 +41,29 @@ and the exact wallet-serving pair provides the transparent reads; insufficient
 retention fails before the listener binds. Later pair lag or provider outage
 changes readiness without rewriting `GetLightdInfo`.
 
+## Runtime serving selection
+
+The compatibility binary selects its serving plane at runtime through the
+operator configuration. Set `[compat].serving` in TOML, use the
+`ZINDER_COMPAT__SERVING` environment variable, or pass `--serving` on the
+command line. The only accepted values are `wallet` and `compact-blocks`;
+omitting the setting preserves the migration-safe `wallet` default.
+
+`wallet` admits the canonical and wallet projection pair and retains the
+existing wallet-compatible behavior. `compact-blocks` admits only the
+canonical secondary and rejects any `[wallet]` section or wallet settings;
+its resolved configuration omits the wallet section. This selector is a
+runtime operator contract, not a new Rust library export or a storage/proto
+layout change.
+
+Compact-block serving admits exactly `GetLightdInfo`, `GetLatestBlock`,
+`GetBlock`, and `GetBlockRange`. Every other `CompactTxStreamer` RPC returns
+`UNIMPLEMENTED`, including wallet queries, mempool methods, tree/subtree
+methods, transparent-address methods, transaction submission, and ping.
+`GetLightdInfo` reports the admitted network and tip with
+`taddrSupport = false`; node discovery and liveness are still required for
+that identity response.
+
 ## Certification work
 
 1. Keep the protocol pin and generated-client coverage green. Updating the

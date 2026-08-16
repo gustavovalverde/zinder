@@ -14,6 +14,8 @@
 
 services:
   zinder-ingest:
+    environment:
+      ZINDER_INGEST__EXPLORER_VIEWS: "true"
     ports:
       - "127.0.0.1:${ZINDER_EXPLORER_HOST_PORT:-9068}:9068"
       - "127.0.0.1:${ZINDER_EXPLORER_OPS_HOST_PORT:-9069}:9069"

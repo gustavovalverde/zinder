@@ -31,6 +31,8 @@ bearer_token_path = "/var/run/zinder-control/ingest.token"
 listen_addr = "0.0.0.0:9067"
 reorg_window_blocks = 100
 pair_convergence_attempts = 12
+# Runtime serving selector. Omit this key to retain the wallet default.
+serving = "wallet"
 
 [ops]
 listen_addr = "127.0.0.1:9107"
