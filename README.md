@@ -1,5 +1,12 @@
 # Zinder
 
+> [!WARNING]
+> **Zinder is alpha.** Native `WalletQuery`, the lightwalletd compatibility
+> surface, storage layouts, and deployment topology will change. A tagged
+> release is not a stability promise. Production use is a deliberate risk:
+> pin exact versions, expect breaking upgrades, and recertify consumers
+> after each upgrade.
+
 Zinder is a self-hosted Zcash chain-data service. It indexes the chain once from a [Zebra](https://github.com/ZcashFoundation/zebra) full node, then exposes one durable, consistent, versioned view that multiple wallets and products can share. Every read pins to one chain epoch, so a sync batch never combines data from competing tips, while shielded scanning and keys remain in the wallet.
 
 The release topology serves both Zinder's native `WalletQuery` protocol and [lightwalletd](https://github.com/zcash/lightwalletd)'s `CompactTxStreamer` protocol. Native clients use `zinder-query`; existing lightwalletd clients use the independent `zinder-compat-lightwalletd` adapter. Both pin reads to exact canonical and wallet-projection fences, and every named wallet and release still requires end-to-end certification before Zinder claims support.
